@@ -13,8 +13,7 @@ repository = "https://github.com/wpm/SocialDeception"
 publish = false
 
 [workspace.dependencies]
-# Agent inboxes and the router. ADR-0001 names `recv_timeout` as the mechanism
-# by which an agent's timer fires, so this is a decided dependency.
+# Agent inboxes, wake channels, and the router.
 crossbeam-channel = "0.5"
 # Trajectory records.
 serde = { version = "1", features = ["derive"] }

@@ -4,6 +4,7 @@
 //! [`Timestamp`]s: whole nanoseconds since that origin, read from the
 //! process's monotonic clock.
 
+use std::ops::Add;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -11,7 +12,7 @@ use serde::Serialize;
 /// A moment in an episode, as whole nanoseconds since the episode's [`Clock`]
 /// was started.
 ///
-/// Serialises as a bare integer. Two timestamps are comparable only when they
+/// Serializes as a bare integer. Two timestamps are comparable only when they
 /// came from the same clock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
@@ -22,6 +23,15 @@ impl Timestamp {
     #[must_use]
     pub const fn nanos(self) -> u64 {
         self.0
+    }
+}
+
+impl Add<Duration> for Timestamp {
+    type Output = Self;
+
+    /// The timestamp `rhs` later. Saturates rather than wrapping.
+    fn add(self, rhs: Duration) -> Self {
+        Self(u64::try_from(u128::from(self.0) + rhs.as_nanos()).unwrap_or(u64::MAX))
     }
 }
 
@@ -56,6 +66,12 @@ impl Clock {
     pub fn now(self) -> Timestamp {
         Timestamp::from(self.origin.elapsed())
     }
+
+    /// The process instant a timestamp from this clock refers to, or `None`
+    /// if the process clock cannot represent it.
+    pub(crate) fn instant_of(self, stamp: Timestamp) -> Option<Instant> {
+        self.origin.checked_add(Duration::from_nanos(stamp.nanos()))
+    }
 }
 
 #[cfg(test)]
@@ -80,5 +96,23 @@ mod tests {
     #[test]
     fn overlong_duration_saturates() {
         assert_eq!(Timestamp::from(Duration::MAX).nanos(), u64::MAX);
+    }
+
+    #[test]
+    fn adding_a_duration_moves_a_timestamp_later() {
+        let stamp = Timestamp::from(Duration::from_nanos(5)) + Duration::from_nanos(7);
+        assert_eq!(stamp.nanos(), 12);
+        assert_eq!(
+            (Timestamp::from(Duration::MAX) + Duration::MAX).nanos(),
+            u64::MAX
+        );
+    }
+
+    #[test]
+    fn instant_of_inverts_now() {
+        let clock = Clock::start();
+        let stamp = clock.now();
+        let instant = clock.instant_of(stamp).unwrap();
+        assert_eq!(instant, clock.origin + Duration::from_nanos(stamp.nanos()));
     }
 }

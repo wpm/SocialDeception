@@ -3,6 +3,7 @@
 **Status:** Accepted
 **Date:** 2026-09-18
 **Deciders:** Bill McNeill
+**Amended by:** [ADR-0003](0003-event-record-stamps.md), which replaces the event record's `time` field
 
 ## Context
 

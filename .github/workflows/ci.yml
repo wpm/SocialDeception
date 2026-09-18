@@ -45,7 +45,7 @@ jobs:
         run: cargo run
 
   deny:
-    name: Licences and advisories
+    name: Licenses and advisories
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

@@ -3,7 +3,7 @@
 
 [graph]
 # Check every feature of every crate, so that an optional dependency cannot
-# smuggle in a licence or advisory that the default build never sees.
+# smuggle in a license or advisory that the default build never sees.
 all-features = true
 
 [output]
@@ -20,10 +20,10 @@ yanked = "deny"
 # each with its identifier and a reason.
 ignore = []
 
-# Licences we are willing to depend on. Anything not on this list fails the
-# check, so a new dependency with a new licence is a conscious decision.
+# Licenses we are willing to depend on. Anything not on this list fails the
+# check, so a new dependency with a new license is a conscious decision.
 [licenses]
-# Only licences that actually occur in the dependency graph are listed;
+# Only licenses that actually occur in the dependency graph are listed;
 # cargo-deny warns about allowances that match nothing, so the list stays
 # honest about what we depend on.
 allow = [

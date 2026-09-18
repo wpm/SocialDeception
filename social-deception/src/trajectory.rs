@@ -10,7 +10,7 @@
 //! the start. Each pass produces:
 //!
 //! - an [`EventRecord`] per event: the agent it belongs to, the agent's
-//!   sequence number for it, its time, and the event itself;
+//!   sequence number for it, its [`Stamp`], and the event itself;
 //! - a [`CycleRecord`] per pass: the handling window, the sequence numbers of
 //!   the events that were in the drain, and the sequence numbers of whatever
 //!   the fold emitted.
@@ -20,11 +20,39 @@
 //! sender's side and a separate one on each recipient's side when it arrives
 //! there.
 //!
+//! # Ordering
+//!
+//! Within one agent's records, each pass is a contiguous run: one event
+//! record per input in drain order, with `Think` last if a deadline fired;
+//! then one event record per output in the order the handler returned them;
+//! then the pass's cycle record. Nothing else from that agent appears between
+//! them: the agent is one thread, and its next pass cannot start until the
+//! cycle record has been sent.
+//!
+//! So a cycle record always follows every event record it references, and,
+//! filtered to one agent, the event records between two cycle records belong
+//! to the cycle that ends the run. A cycle's `inputs` followed by its
+//! `outputs` is exactly the sequence numbers since that agent's previous
+//! cycle; the lists are a consistency check on the grouping, not the only way
+//! to recover it.
+//!
+//! Every pass has at least one input, since a pass runs only after a delivery
+//! arrived or a deadline produced a `Think`. Outputs can be empty, so the
+//! smallest pass is one event record then one cycle record.
+//!
+//! These guarantees are per agent. Every agent sends to the same writer, so
+//! records from different agents interleave arbitrarily, and a recipient's
+//! cycle can precede the sender's output record that caused it.
+//!
+//! If the writer fails mid-pass, the agent's loop exits with an error and its
+//! records end with event records and no closing cycle record.
+//!
 //! # On-disk format
 //!
 //! One JSON object per line. Both record types are wrapped in [`LogRecord`],
-//! whose `type` field is `"event"` or `"cycle"`. Nothing here reads a log
-//! back; only `Serialize` is required of a payload.
+//! whose `type` field is `"event"` or `"cycle"`. An event line carries exactly
+//! one of `arrived`, `sent` or `due`, the [`Stamp`] flattened into it. Nothing
+//! here reads a log back; only `Serialize` is required of a payload.
 
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
@@ -45,6 +73,24 @@ use crate::event::{AgentId, Event, Payload};
 #[serde(transparent)]
 pub struct Seq(pub u64);
 
+/// When an event crossed the agent's boundary, and in which direction.
+///
+/// Serializes as a single field named after the variant, so an event record
+/// has exactly one of `arrived`, `sent` or `due`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Stamp {
+    /// An input, a control event or a message from another agent: when the
+    /// router put it on this agent's inbox.
+    Arrived(Timestamp),
+    /// An output, a message this agent sent: when the loop handed it to the
+    /// router.
+    Sent(Timestamp),
+    /// A `Think`: the deadline it was scheduled for, which is at or before
+    /// the moment the loop noticed it.
+    Due(Timestamp),
+}
+
 /// One event in one agent's trajectory.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct EventRecord<P> {
@@ -52,9 +98,9 @@ pub struct EventRecord<P> {
     pub agent: AgentId,
     /// The agent's sequence number for this event.
     pub seq: Seq,
-    /// When the event arrived on the agent's channel, or, for an event the
-    /// agent itself emitted, when the loop handed it to the router.
-    pub time: Timestamp,
+    /// When the event crossed the agent's boundary, and in which direction.
+    #[serde(flatten)]
+    pub stamp: Stamp,
     /// The event.
     pub event: Event<P>,
 }
@@ -175,6 +221,7 @@ mod tests {
 
     use super::*;
     use crate::event::Control;
+    use crate::testing::parse_lines;
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
     enum TestPayload {
@@ -193,21 +240,21 @@ mod tests {
             EventRecord {
                 agent: a.clone(),
                 seq: Seq(0),
-                time: at(10),
+                stamp: Stamp::Arrived(at(10)),
                 event: Event::Control(Control::Start),
             }
             .into(),
             EventRecord {
                 agent: a.clone(),
                 seq: Seq(1),
-                time: at(20),
+                stamp: Stamp::Arrived(at(20)),
                 event: Event::message("b", ["a"], TestPayload::Step(6)),
             }
             .into(),
             EventRecord {
                 agent: a.clone(),
                 seq: Seq(2),
-                time: at(40),
+                stamp: Stamp::Sent(at(40)),
                 event: Event::message("a", ["b"], TestPayload::Step(3)),
             }
             .into(),
@@ -224,25 +271,17 @@ mod tests {
 
     fn expected_lines() -> Vec<Value> {
         vec![
-            json!({"type": "event", "agent": "a", "seq": 0, "time": 10,
+            json!({"type": "event", "agent": "a", "seq": 0, "arrived": 10,
                    "event": {"kind": "control", "control": "start"}}),
-            json!({"type": "event", "agent": "a", "seq": 1, "time": 20,
+            json!({"type": "event", "agent": "a", "seq": 1, "arrived": 20,
                    "event": {"kind": "message", "sender": "b", "recipients": ["a"],
                              "payload": {"Step": 6}}}),
-            json!({"type": "event", "agent": "a", "seq": 2, "time": 40,
+            json!({"type": "event", "agent": "a", "seq": 2, "sent": 40,
                    "event": {"kind": "message", "sender": "a", "recipients": ["b"],
                              "payload": {"Step": 3}}}),
             json!({"type": "cycle", "agent": "a", "t_start": 30, "t_stop": 50,
                    "inputs": [0, 1], "outputs": [2]}),
         ]
-    }
-
-    fn parse_lines(bytes: &[u8]) -> Vec<Value> {
-        let text = std::str::from_utf8(bytes).unwrap();
-        assert!(text.ends_with('\n'), "file must end with a newline");
-        text.lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect()
     }
 
     #[test]
@@ -289,7 +328,7 @@ mod tests {
                         let record = EventRecord {
                             agent: agent.clone(),
                             seq: Seq(seq),
-                            time: at(seq),
+                            stamp: Stamp::Due(at(seq)),
                             event: Event::<TestPayload>::Think,
                         };
                         sender.send(record.into()).unwrap();
@@ -367,7 +406,7 @@ mod tests {
         let big: LogRecord<TestPayload> = EventRecord {
             agent: AgentId::new("a"),
             seq: Seq(0),
-            time: at(0),
+            stamp: Stamp::Sent(at(0)),
             event: Event::message(
                 "a",
                 (0..20_000)
@@ -386,7 +425,7 @@ mod tests {
         let late: LogRecord<TestPayload> = LogRecord::Event(EventRecord {
             agent: AgentId::new("a"),
             seq: Seq(1),
-            time: at(2),
+            stamp: Stamp::Due(at(2)),
             event: Event::Think,
         });
         assert!(

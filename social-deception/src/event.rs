@@ -59,8 +59,6 @@ impl From<String> for AgentId {
 }
 
 /// A runtime instruction to an agent.
-///
-/// Start and stop are the whole vocabulary for now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(tag = "control", rename_all = "snake_case")]
 pub enum Control {
@@ -74,7 +72,7 @@ pub enum Control {
 ///
 /// This is the one type that ever arrives on an agent's receiver.
 ///
-/// Serialises as an internally tagged object whose `kind` field names the
+/// Serializes as an internally tagged object whose `kind` field names the
 /// variant.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
