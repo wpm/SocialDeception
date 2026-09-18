@@ -74,7 +74,7 @@ pub enum Control {
 ///
 /// This is the one type that ever arrives on an agent's receiver.
 ///
-/// Serialises as an internally tagged object whose `kind` field names the
+/// Serializes as an internally tagged object whose `kind` field names the
 /// variant.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]

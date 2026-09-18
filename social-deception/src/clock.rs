@@ -12,7 +12,7 @@ use serde::Serialize;
 /// A moment in an episode, as whole nanoseconds since the episode's [`Clock`]
 /// was started.
 ///
-/// Serialises as a bare integer. Two timestamps are comparable only when they
+/// Serializes as a bare integer. Two timestamps are comparable only when they
 /// came from the same clock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]

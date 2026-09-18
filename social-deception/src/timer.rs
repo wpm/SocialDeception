@@ -6,7 +6,7 @@
 //! production it is the episode [`Clock`], whose channels fire when the
 //! process's monotonic clock reaches the deadline. In tests it is a
 //! [`ManualTimer`], whose channel fires when the test says so, so that timing
-//! behaviour can be exercised without sleeping.
+//! behavior can be exercised without sleeping.
 //!
 //! A wake channel is asked for with an absolute deadline, never with an
 //! interval. That is what keeps the deadline fixed while messages arrive: an

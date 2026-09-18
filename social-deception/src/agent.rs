@@ -99,7 +99,7 @@ use crate::event::{AgentId, Control, Event, Payload};
 use crate::timer::TimerSource;
 use crate::trajectory::{CycleRecord, EventRecord, LogRecord, Seq};
 
-/// An environment's behaviour for one agent.
+/// An environment's behavior for one agent.
 ///
 /// The loop calls [`handle`](Handler::handle) once per pass with everything
 /// that came out of the drain, in arrival order, with a `Think` last if the
