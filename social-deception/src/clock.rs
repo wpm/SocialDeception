@@ -1,10 +1,8 @@
 //! The episode clock.
 //!
-//! ADR-0001: times are taken from a monotonic clock, and one process means one
-//! clock, so timestamps are directly comparable across agents with no skew to
-//! correct. Rust's monotonic clock is [`Instant`], which cannot be serialised
-//! because it has no defined origin. A [`Clock`] fixes the origin — the moment
-//! the episode started — and hands out [`Timestamp`]s measured from it.
+//! A [`Clock`] fixes an origin, the moment it was started, and hands out
+//! [`Timestamp`]s: whole nanoseconds since that origin, read from the
+//! process's monotonic clock.
 
 use std::time::{Duration, Instant};
 
@@ -14,7 +12,7 @@ use serde::Serialize;
 /// was started.
 ///
 /// Serialises as a bare integer. Two timestamps are comparable only when they
-/// came from the same clock, which in practice means the same episode.
+/// came from the same clock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct Timestamp(u64);
@@ -29,7 +27,7 @@ impl Timestamp {
 
 impl From<Duration> for Timestamp {
     /// Converts a duration since the clock's origin. A duration too long to fit
-    /// in 64 bits of nanoseconds — more than five centuries — saturates.
+    /// in 64 bits of nanoseconds saturates.
     fn from(since_start: Duration) -> Self {
         Self(u64::try_from(since_start.as_nanos()).unwrap_or(u64::MAX))
     }
@@ -37,8 +35,8 @@ impl From<Duration> for Timestamp {
 
 /// A monotonic clock with a fixed origin, shared by every agent in an episode.
 ///
-/// It is `Copy` so that each agent thread can carry its own copy; they all
-/// read the same underlying instant and so produce comparable timestamps.
+/// It is `Copy`; every copy reads the same origin and produces comparable
+/// timestamps.
 #[derive(Debug, Clone, Copy)]
 pub struct Clock {
     origin: Instant,

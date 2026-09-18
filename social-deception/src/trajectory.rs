@@ -1,40 +1,30 @@
 //! Trajectory records and the writer that puts them on disk.
 //!
-//! ADR-0001: the fold is the log. Each agent's own event sequence is its
-//! trajectory, recorded by the agent loop as it folds and sent over an
-//! in-process channel to a writer — not published onto a transport where a
-//! slow consumer could silently drop it.
+//! Each agent's own event sequence is its trajectory. The agent loop records
+//! it as it folds and sends the records over an in-process channel to a
+//! [`Writer`].
 //!
 //! # Two record types
 //!
-//! An agent handles a *batch* of events in one pass, draining its whole inbox
-//! at the start. So "when it arrived" and "when it was handled" do not both
-//! belong to an event; they split across two records:
+//! An agent handles a batch of events per pass, draining its whole inbox at
+//! the start. Each pass produces:
 //!
-//! - an [`EventRecord`] per event — the agent it belongs to, the agent's
-//!   sequence number for it, when it arrived, and the event itself;
-//! - a [`CycleRecord`] per pass — the handling window, the sequence numbers of
+//! - an [`EventRecord`] per event: the agent it belongs to, the agent's
+//!   sequence number for it, its time, and the event itself;
+//! - a [`CycleRecord`] per pass: the handling window, the sequence numbers of
 //!   the events that were in the drain, and the sequence numbers of whatever
 //!   the fold emitted.
 //!
-//! How long the agent was busy is recoverable from the two together, and the
-//! cycle's input list records exactly what the agent saw on that pass, which
-//! is what makes a cycle replayable. Because that list already says what each
-//! agent saw, there is no separate per-recipient delivery record: in a single
-//! process, arrival time is send time plus scheduler jitter.
-//!
 //! Sequence numbers are per agent and cover everything that agent recorded,
-//! inputs and outputs alike, so that a cycle can name its outputs by number.
-//! An emitted message therefore has an event record of its own on the sender's
-//! side, and a separate one on each recipient's side when it arrives there.
+//! inputs and outputs alike. An emitted message has an event record on the
+//! sender's side and a separate one on each recipient's side when it arrives
+//! there.
 //!
 //! # On-disk format
 //!
 //! One JSON object per line. Both record types are wrapped in [`LogRecord`],
-//! whose `type` field is `"event"` or `"cycle"`, so a file is one dispatchable
-//! stream. Analysis is in Python, so the Rust side only serialises; nothing
-//! here reads a log back. ADR-0002 in `docs/decision-history/` records this
-//! decision.
+//! whose `type` field is `"event"` or `"cycle"`. Nothing here reads a log
+//! back; only `Serialize` is required of a payload.
 
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
@@ -49,11 +39,8 @@ use crate::event::{AgentId, Event, Payload};
 
 /// An agent's sequence number for one of its own records.
 ///
-/// Sequence numbers are assigned by the agent loop, the only place that sees
-/// an agent's events in order. They pair with a [`Timestamp`] because two
-/// events can read the same instant, and a training record cannot tolerate a
-/// tie it has no way to break. They are meaningful only together with the
-/// agent id: two agents both have a sequence number 0.
+/// Sequence numbers are assigned by the agent loop and are meaningful only
+/// together with the agent id: two agents both have a sequence number 0.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct Seq(pub u64);
@@ -91,8 +78,7 @@ pub struct CycleRecord {
 
 /// One line of a trajectory file.
 ///
-/// Internally tagged so that the file is one stream a reader can dispatch on
-/// by looking at the `type` field of each line.
+/// Internally tagged: the `type` field of each line names the record kind.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum LogRecord<P> {
@@ -122,10 +108,9 @@ impl<P> From<CycleRecord> for LogRecord<P> {
 /// sender has been dropped, then flushes and exits. [`Writer::join`] waits for
 /// that and reports how it went.
 ///
-/// A trajectory that is silently incomplete is worse than one that is loudly
-/// broken, so a write failure is loud twice over: the thread stops and drops
-/// its receiver, which makes every subsequent `send` fail at the agent that
-/// attempted it; and the failure is returned from [`Writer::join`].
+/// On a write failure the thread stops and drops its receiver, so every
+/// subsequent `send` fails at the agent that attempted it, and the failure is
+/// returned from [`Writer::join`].
 #[derive(Debug)]
 pub struct Writer<W> {
     thread: JoinHandle<io::Result<W>>,
@@ -368,7 +353,7 @@ mod tests {
     #[test]
     fn a_write_failure_is_loud_at_both_ends() {
         let (sender, writer) = Writer::spawn(BrokenSink);
-        // The buffer absorbs a small record; the failure surfaces on flush.
+        // A record small enough to sit in the buffer.
         let record: LogRecord<TestPayload> = CycleRecord {
             agent: AgentId::new("a"),
             t_start: at(0),
@@ -377,9 +362,8 @@ mod tests {
             outputs: vec![],
         }
         .into();
-        // A record large enough to overflow the buffer forces the write to
-        // happen while the loop is still running, which is what should make
-        // the thread stop and drop its receiver.
+        // A record larger than the buffer is written while the loop is still
+        // running; the thread stops and drops its receiver at that point.
         let big: LogRecord<TestPayload> = EventRecord {
             agent: AgentId::new("a"),
             seq: Seq(0),
@@ -395,8 +379,8 @@ mod tests {
         .into();
         sender.send(record).unwrap();
         sender.send(big).unwrap();
-        // Once the writer has failed, sending fails too. The thread has to get
-        // there first, so wait for it via join before checking the sender.
+        // join waits for the thread to have failed before the sender is
+        // checked.
         let error = writer.join().unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::StorageFull);
         let late: LogRecord<TestPayload> = LogRecord::Event(EventRecord {

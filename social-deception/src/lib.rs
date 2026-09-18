@@ -5,13 +5,12 @@
 //! over in-process channels. See `docs/decision-history/` for the decisions
 //! behind that shape.
 //!
-//! The crate is organised around three ideas from ADR-0001:
+//! The crate has three modules:
 //!
-//! - every agent has exactly one receiver, and everything that can happen to it
-//!   arrives there as an [`Event`];
-//! - the fold is the log: an agent's own event sequence is its trajectory, and
-//!   the agent loop records it as it goes ([`trajectory`]);
-//! - times come from one monotonic clock per episode ([`clock`]).
+//! - [`event`]: the [`Event`] type that arrives on an agent's receiver;
+//! - [`trajectory`]: the records an agent's loop produces and the [`Writer`]
+//!   that puts them on disk;
+//! - [`clock`]: the episode [`Clock`] the records are timestamped with.
 
 pub mod clock;
 pub mod event;
