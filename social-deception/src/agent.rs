@@ -45,7 +45,8 @@
 //! ```
 //! use crossbeam_channel::unbounded;
 //! use social_deception::{
-//!     Agent, Clock, Control, CycleReport, Delivery, Event, Handler, Outgoing, Wiring, Writer,
+//!     Agent, AgentId, Clock, Control, CycleReport, Delivery, Event, Handler, Outgoing, Wiring,
+//!     Writer,
 //! };
 //!
 //! struct Echo;
@@ -68,7 +69,8 @@
 //! let (to_agent, inbox) = unbounded();
 //! let (reports, from_agent) = unbounded();
 //! let (records, writer) = Writer::spawn(Vec::new());
-//! let wiring = Wiring { id: "echo".into(), clock, inbox, reports, records, think_every: None };
+//! let peers = [AgentId::new("caller")].into();
+//! let wiring = Wiring { id: "echo".into(), clock, inbox, reports, records, think_every: None, peers };
 //! let agent = Agent::spawn(wiring, Echo, clock);
 //!
 //! let hello = Event::message("caller", ["echo"], String::from("hello"));
@@ -110,6 +112,19 @@ pub trait Handler<P> {
     fn handle(&mut self, events: &[Event<P>]) -> Vec<Outgoing<P>>;
 }
 
+/// Whom an outgoing message is for, as the handler states it.
+///
+/// The loop turns this into the explicit recipient set the sent
+/// [`Event::Message`] carries, so a broadcast is recorded as the agents it
+/// went to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Recipients {
+    /// Every other agent in the roster: the agent's [`Wiring::peers`].
+    Broadcast,
+    /// These agents and no others.
+    To(BTreeSet<AgentId>),
+}
+
 /// A message a handler wants sent.
 ///
 /// The sender is the agent itself, and it is the loop that says so; a handler
@@ -117,7 +132,7 @@ pub trait Handler<P> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Outgoing<P> {
     /// The agents to send it to.
-    pub recipients: BTreeSet<AgentId>,
+    pub recipients: Recipients,
     /// What to say.
     pub payload: P,
 }
@@ -130,7 +145,15 @@ impl<P> Outgoing<P> {
         A: Into<AgentId>,
     {
         Self {
-            recipients: recipients.into_iter().map(Into::into).collect(),
+            recipients: Recipients::To(recipients.into_iter().map(Into::into).collect()),
+            payload,
+        }
+    }
+
+    /// A message to every other agent in the roster.
+    pub fn broadcast(payload: P) -> Self {
+        Self {
+            recipients: Recipients::Broadcast,
             payload,
         }
     }
@@ -196,6 +219,8 @@ pub struct Wiring<P> {
     /// How often the agent thinks unprompted, or `None` for an agent that
     /// only ever reacts.
     pub think_every: Option<Duration>,
+    /// The other agents in the roster: what a broadcast goes to.
+    pub peers: BTreeSet<AgentId>,
 }
 
 /// Why an agent's loop stopped before its inbox closed or it was told to
@@ -443,6 +468,10 @@ where
             payload,
         } in outgoing
         {
+            let recipients = match recipients {
+                Recipients::Broadcast => self.wiring.peers.clone(),
+                Recipients::To(recipients) => recipients,
+            };
             let event = Event::Message {
                 sender: self.wiring.id.clone(),
                 recipients,
@@ -589,6 +618,15 @@ mod tests {
         }
     }
 
+    /// Broadcasts a step on every pass.
+    struct Town;
+
+    impl Handler<TestPayload> for Town {
+        fn handle(&mut self, _: &[TestEvent]) -> Vec<Outgoing<TestPayload>> {
+            vec![Outgoing::broadcast(TestPayload::Step(0))]
+        }
+    }
+
     /// A panicking handler.
     struct Faulty;
 
@@ -627,6 +665,7 @@ mod tests {
             reports: reporter,
             records: recorder,
             think_every,
+            peers: ["b", "c"].map(AgentId::new).into(),
         };
         Wires {
             wiring,
@@ -952,6 +991,19 @@ mod tests {
         );
         assert_eq!((cycle.inputs, cycle.outputs), (vec![Seq(1)], vec![Seq(2)]));
         assert!(second.iter().all(|r| r.agent == AgentId::new("a")));
+        rig.send(stop());
+        rig.agent.join().unwrap();
+    }
+
+    #[test]
+    fn a_broadcast_is_sent_and_recorded_as_every_peer() {
+        let rig = rig(Town, None);
+        rig.send(start());
+        let expected = Event::message("a", ["b", "c"], TestPayload::Step(0));
+        assert_eq!(rig.report().sent, std::slice::from_ref(&expected));
+        let (records, cycle) = rig.cycle();
+        assert_eq!(records[1].event, expected);
+        assert_eq!(cycle.outputs, [Seq(1)]);
         rig.send(stop());
         rig.agent.join().unwrap();
     }
