@@ -39,7 +39,8 @@ pub fn parse(bytes: &[u8]) -> Vec<Value> {
 /// - per-agent sequence numbers are contiguous and strictly increasing from
 ///   zero, in file order;
 /// - no cycle's input list is empty;
-/// - no message has its sender among its recipients;
+/// - no message has its sender among its recipients, and a message that
+///   arrived at an agent lists that agent among them;
 /// - an event record's stamp matches its direction: `arrived` on a control
 ///   event or a message from another agent, `sent` on a message from the
 ///   agent itself, `due` on a think.
@@ -48,12 +49,7 @@ pub fn parse(bytes: &[u8]) -> Vec<Value> {
 ///
 /// On the first invariant that does not hold, naming the record.
 pub fn check(lines: &[Value]) {
-    let records: HashMap<(&str, u64), &Value> = lines
-        .iter()
-        .filter(|line| line["type"] == "event")
-        .map(|line| ((agent(line), seq(line)), line))
-        .collect();
-
+    let records = records(lines);
     for line in lines {
         match line["type"].as_str() {
             Some("event") => check_event(line),
@@ -63,6 +59,15 @@ pub fn check(lines: &[Value]) {
     }
     check_sequence_numbers(lines);
     check_grouping(lines);
+}
+
+/// The event records of `lines`, by agent and sequence number.
+pub fn records(lines: &[Value]) -> HashMap<(&str, u64), &Value> {
+    lines
+        .iter()
+        .filter(|line| line["type"] == "event")
+        .map(|line| ((agent(line), seq(line)), line))
+        .collect()
 }
 
 /// The agent a record belongs to.
@@ -121,6 +126,12 @@ fn check_event(line: &Value) {
             !recipients.contains(&event["sender"]),
             "no message has its sender among its recipients: {line}"
         );
+        if expected == "arrived" {
+            assert!(
+                recipients.contains(&Value::from(agent(line))),
+                "a message arrives only at its recipients: {line}"
+            );
+        }
     }
 }
 
@@ -142,11 +153,12 @@ fn check_cycle(cycle: &Value, records: &HashMap<(&str, u64), &Value>) {
         "no cycle's input list is empty: {cycle}"
     );
     for record in inputs.map(record) {
-        let stamp = if record["arrived"].is_null() {
-            "due"
-        } else {
-            "arrived"
-        };
+        let stamp = ["arrived", "due"]
+            .into_iter()
+            .find(|stamp| !record[stamp].is_null())
+            .unwrap_or_else(|| {
+                panic!("an input is an arrival or a think, not an output: {record} in {cycle}")
+            });
         assert!(
             time(record, stamp) <= t_start,
             "an input is on the inbox, or due, before its cycle starts: {record} in {cycle}"
@@ -271,6 +283,23 @@ mod tests {
     #[should_panic(expected = "input list is empty")]
     fn an_empty_drain_is_caught() {
         check(&edited(5, |line| line["inputs"] = json!([])));
+    }
+
+    #[test]
+    #[should_panic(expected = "arrives only at its recipients")]
+    fn a_message_delivered_to_a_non_recipient_is_caught() {
+        check(&edited(1, |line| {
+            line["event"]["recipients"] = json!(["c"]);
+        }));
+    }
+
+    #[test]
+    #[should_panic(expected = "not an output")]
+    fn a_cycle_that_lists_an_output_as_an_input_is_caught() {
+        check(&edited(3, |line| {
+            line["inputs"] = json!([0, 1, 2]);
+            line["outputs"] = json!([]);
+        }));
     }
 
     #[test]
