@@ -20,6 +20,33 @@
 //! sender's side and a separate one on each recipient's side when it arrives
 //! there.
 //!
+//! # Ordering
+//!
+//! Within one agent's records, each pass is a contiguous run: one event
+//! record per input in drain order, with `Think` last if a deadline fired;
+//! then one event record per output in the order the handler returned them;
+//! then the pass's cycle record. Nothing else from that agent appears between
+//! them: the agent is one thread, and its next pass cannot start until the
+//! cycle record has been sent.
+//!
+//! So a cycle record always follows every event record it references, and,
+//! filtered to one agent, the event records between two cycle records belong
+//! to the cycle that ends the run. A cycle's `inputs` followed by its
+//! `outputs` is exactly the sequence numbers since that agent's previous
+//! cycle; the lists are a consistency check on the grouping, not the only way
+//! to recover it.
+//!
+//! Every pass has at least one input, since a pass runs only after a delivery
+//! arrived or a deadline produced a `Think`. Outputs can be empty, so the
+//! smallest pass is one event record then one cycle record.
+//!
+//! These guarantees are per agent. Every agent sends to the same writer, so
+//! records from different agents interleave arbitrarily, and a recipient's
+//! cycle can precede the sender's output record that caused it.
+//!
+//! If the writer fails mid-pass, the agent's loop exits with an error and its
+//! records end with event records and no closing cycle record.
+//!
 //! # On-disk format
 //!
 //! One JSON object per line. Both record types are wrapped in [`LogRecord`],
