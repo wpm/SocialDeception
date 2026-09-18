@@ -59,8 +59,6 @@ impl From<String> for AgentId {
 }
 
 /// A runtime instruction to an agent.
-///
-/// Start and stop are the whole vocabulary for now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(tag = "control", rename_all = "snake_case")]
 pub enum Control {

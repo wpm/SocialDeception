@@ -327,8 +327,8 @@ struct Loop<P, H, T> {
     timer: T,
     /// The next sequence number to assign.
     next_seq: u64,
-    /// Deadlines not yet reached, earliest first. The think interval keeps at
-    /// most one here; the heap is where several would go.
+    /// Pending deadlines, earliest first. The think interval keeps at most
+    /// one here.
     deadlines: BinaryHeap<Reverse<Timestamp>>,
     /// The earliest deadline and the wake channel asked for it, kept across
     /// passes until it fires.

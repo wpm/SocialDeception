@@ -23,9 +23,8 @@
 //! In-flight work is counted in **deliveries, not messages**: one event
 //! addressed to six agents is six handles that have not happened yet.
 //!
-//! An episode whose agents have deadlines would never go quiescent on its
-//! own and needs some other way to end; that belongs with whatever
-//! environment needs it, so an episode's agents have no think interval.
+//! An episode's agents have no think interval: an agent with one keeps
+//! waking on its own, and the episode would never go quiescent.
 
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};

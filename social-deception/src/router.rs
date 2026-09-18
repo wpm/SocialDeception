@@ -10,10 +10,10 @@
 //! unknown agent id, an empty recipient set, and a sender in its own
 //! recipient set are each rejected loudly. There is no loopback.
 //!
-//! Channels are unbounded, deliberately. With bounded channels one agent slow
-//! to drain its inbox would apply back-pressure through the router to every
-//! other agent in the episode. A slow agent is a normal condition here and
-//! must not be able to stall the world. Do not "fix" this by bounding them.
+//! Channels are unbounded. With bounded channels one agent slow to drain its
+//! inbox would apply back-pressure through the router to every other agent in
+//! the episode. A slow agent is a normal condition here and must not be able
+//! to stall the world.
 
 use std::collections::BTreeMap;
 use std::error::Error;
