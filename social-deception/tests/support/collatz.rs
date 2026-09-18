@@ -23,9 +23,7 @@
 //! [`Event`], and the runtime's end-to-end test.
 
 use serde::Serialize;
-
-use crate::agent::{Handler, Outgoing};
-use crate::event::{AgentId, Control, Event};
+use social_deception::{AgentId, Control, Event, Handler, Outgoing};
 
 /// What Collatz agents say to each other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
@@ -45,7 +43,6 @@ pub enum CollatzPayload {
 ///
 /// If `n` is 0, which is not in the function's domain and would map to
 /// itself forever, or if `3n + 1` does not fit in a `u64`.
-#[must_use]
 pub fn next(n: u64) -> u64 {
     assert!(
         n > 0,
@@ -65,25 +62,6 @@ pub fn next(n: u64) -> u64 {
 /// It passes every value it receives one step on to a single other agent,
 /// and opens chains of its own when the episode starts. It keeps no state
 /// between passes: the chain's name and value travel with the message.
-///
-/// # Example
-///
-/// A ring of two, one of which opens a chain from 6:
-///
-/// ```
-/// use social_deception::collatz::Collatz;
-/// use social_deception::{Episode, Writer};
-///
-/// let (records, writer) = Writer::spawn(Vec::new());
-/// let mut episode = Episode::new(records);
-/// episode.add("a", Collatz::new("b").opening(6)).unwrap();
-/// episode.add("b", Collatz::new("a")).unwrap();
-/// episode.run().unwrap();
-///
-/// // 6, 3, 10, 5, 16, 8, 4, 2, 1: nine values, each sent once.
-/// let trajectory = String::from_utf8(writer.join().unwrap()).unwrap();
-/// assert_eq!(trajectory.matches("\"sent\"").count(), 9);
-/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Collatz {
     to: AgentId,
@@ -110,7 +88,6 @@ impl Collatz {
     /// # Panics
     ///
     /// If `start` is 0, which is not in the Collatz function's domain.
-    #[must_use]
     pub fn opening(mut self, start: u64) -> Self {
         assert!(start > 0, "a Collatz chain starts at a positive integer");
         self.opens.push(start);
@@ -118,13 +95,11 @@ impl Collatz {
     }
 
     /// The agent this one passes to.
-    #[must_use]
     pub fn to(&self) -> &AgentId {
         &self.to
     }
 
     /// The starting numbers of the chains this agent opens, in order.
-    #[must_use]
     pub fn opens(&self) -> &[u64] {
         &self.opens
     }

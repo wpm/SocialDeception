@@ -1,10 +1,12 @@
-//! Helpers shared by the integration tests: reading a trajectory file back,
-//! and checking the invariants every trajectory satisfies whatever the
-//! environment.
+//! Helpers shared by the integration tests: the [`collatz`] environment,
+//! reading a trajectory file back, and checking the invariants every
+//! trajectory satisfies whatever the environment.
 //!
 //! The checks here are properties of the log, not of any environment. They
 //! are meant to run unchanged against episodes where no independent check on
 //! the content is available.
+
+pub mod collatz;
 
 use std::collections::HashMap;
 

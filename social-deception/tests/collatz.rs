@@ -15,8 +15,8 @@ use std::process;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde_json::Value;
-use social_deception::collatz::Collatz;
 use social_deception::{Episode, Writer};
+use support::collatz::Collatz;
 
 /// A ring of agents: each passes to the next in the list, and the last to
 /// the first. Each agent opens a chain from every starting number listed for

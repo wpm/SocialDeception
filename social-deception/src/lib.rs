@@ -15,14 +15,9 @@
 //!   through a [`Handler`], and records what it saw and sent;
 //! - [`router`]: the [`Router`] from agent ids to their channels;
 //! - [`episode`]: the [`Episode`] that runs a roster from start to stop.
-//!
-//! On top of the runtime sits one environment, [`collatz`], in which agents
-//! pass a Collatz chain around a ring. Every value of a chain is known in
-//! advance, so it is the runtime's end-to-end check.
 
 pub mod agent;
 pub mod clock;
-pub mod collatz;
 pub mod episode;
 pub mod event;
 pub mod router;
