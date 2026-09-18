@@ -11,6 +11,11 @@
 //! Collatz agents never think unprompted, so once every chain has reached 1
 //! nothing is in flight and the episode ends on its own.
 //!
+//! A chain is named by its starting number, and every step carries the name
+//! of the chain it belongs to. Chains from different starting numbers merge,
+//! so without the name a value in the log could not be attributed to a
+//! chain once it had.
+//!
 //! Every value at every step is known in advance, so any difference between
 //! the trajectory an episode writes and the sequence computed independently
 //! is a bug in the runtime, not a model being unpredictable. That is what the
@@ -25,8 +30,13 @@ use crate::event::{AgentId, Control, Event};
 /// What Collatz agents say to each other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub enum CollatzPayload {
-    /// The chain's current value. The recipient takes the next step.
-    Step(u64),
+    /// One step of a chain. The recipient takes the next.
+    Step {
+        /// The chain this step belongs to: its starting number.
+        chain: u64,
+        /// The chain's current value.
+        value: u64,
+    },
 }
 
 /// The Collatz function: `n / 2` for even `n`, `3n + 1` for odd `n`.
@@ -54,7 +64,7 @@ pub fn next(n: u64) -> u64 {
 ///
 /// It passes every value it receives one step on to a single other agent,
 /// and opens chains of its own when the episode starts. It keeps no state
-/// between passes: the chain's value travels with the message.
+/// between passes: the chain's name and value travel with the message.
 ///
 /// # Example
 ///
@@ -93,6 +103,10 @@ impl Collatz {
     /// The same agent, also opening a chain from `start` when the episode
     /// starts. An agent opens its chains in the order this was called.
     ///
+    /// The chain is named by `start`. Two chains opened from the same
+    /// number, by this agent or by two, share a name and cannot be told
+    /// apart in the trajectory.
+    ///
     /// # Panics
     ///
     /// If `start` is 0, which is not in the Collatz function's domain.
@@ -115,17 +129,27 @@ impl Collatz {
         &self.opens
     }
 
-    /// The values one event calls for sending.
-    fn reply(&self, event: &Event<CollatzPayload>) -> Vec<u64> {
+    /// The steps one event calls for sending.
+    fn reply(&self, event: &Event<CollatzPayload>) -> Vec<CollatzPayload> {
         match event {
-            Event::Control(Control::Start) => self.opens.clone(),
+            Event::Control(Control::Start) => self
+                .opens
+                .iter()
+                .map(|&start| CollatzPayload::Step {
+                    chain: start,
+                    value: start,
+                })
+                .collect(),
             Event::Message {
-                payload: CollatzPayload::Step(n),
+                payload: CollatzPayload::Step { chain, value },
                 ..
-            } => match *n {
+            } => match *value {
                 // A chain that has reached 1 is over.
                 1 => Vec::new(),
-                n => vec![next(n)],
+                value => vec![CollatzPayload::Step {
+                    chain: *chain,
+                    value: next(value),
+                }],
             },
             Event::Control(Control::Stop) | Event::Think => Vec::new(),
         }
@@ -137,7 +161,7 @@ impl Handler<CollatzPayload> for Collatz {
         events
             .iter()
             .flat_map(|event| self.reply(event))
-            .map(|value| Outgoing::to([self.to.clone()], CollatzPayload::Step(value)))
+            .map(|step| Outgoing::to([self.to.clone()], step))
             .collect()
     }
 }
@@ -146,8 +170,9 @@ impl Handler<CollatzPayload> for Collatz {
 mod tests {
     use super::*;
 
-    fn step(sender: &str, n: u64) -> Event<CollatzPayload> {
-        Event::message(sender, ["a"], CollatzPayload::Step(n))
+    /// A step of chain 27 arriving at `a`.
+    fn step(sender: &str, value: u64) -> Event<CollatzPayload> {
+        Event::message(sender, ["a"], CollatzPayload::Step { chain: 27, value })
     }
 
     fn sent(
@@ -157,8 +182,8 @@ mod tests {
         agent.handle(events)
     }
 
-    fn to_b(n: u64) -> Outgoing<CollatzPayload> {
-        Outgoing::to(["b"], CollatzPayload::Step(n))
+    fn to_b(chain: u64, value: u64) -> Outgoing<CollatzPayload> {
+        Outgoing::to(["b"], CollatzPayload::Step { chain, value })
     }
 
     #[test]
@@ -184,8 +209,8 @@ mod tests {
     #[test]
     fn a_value_is_passed_on_one_step_further() {
         let mut agent = Collatz::new("b");
-        assert_eq!(sent(&mut agent, &[step("c", 6)]), [to_b(3)]);
-        assert_eq!(sent(&mut agent, &[step("c", 3)]), [to_b(10)]);
+        assert_eq!(sent(&mut agent, &[step("c", 6)]), [to_b(27, 3)]);
+        assert_eq!(sent(&mut agent, &[step("c", 3)]), [to_b(27, 10)]);
     }
 
     #[test]
@@ -195,13 +220,27 @@ mod tests {
     }
 
     #[test]
-    fn chains_are_opened_on_start_in_order() {
+    fn a_step_keeps_its_chain() {
+        let mut agent = Collatz::new("b");
+        let step = Event::message(
+            "c",
+            ["a"],
+            CollatzPayload::Step {
+                chain: 7,
+                value: 10,
+            },
+        );
+        assert_eq!(sent(&mut agent, &[step]), [to_b(7, 5)]);
+    }
+
+    #[test]
+    fn chains_are_opened_on_start_in_order_and_named_by_their_start() {
         let mut agent = Collatz::new("b").opening(6).opening(7);
         assert_eq!(agent.opens(), [6, 7]);
         assert_eq!(agent.to(), &AgentId::new("b"));
         assert_eq!(
             sent(&mut agent, &[Event::Control(Control::Start)]),
-            [to_b(6), to_b(7)]
+            [to_b(6, 6), to_b(7, 7)]
         );
         assert!(
             Collatz::new("b")
@@ -219,7 +258,10 @@ mod tests {
             step("c", 1),
             step("c", 3),
         ];
-        assert_eq!(sent(&mut agent, &batch), [to_b(5), to_b(4), to_b(10)]);
+        assert_eq!(
+            sent(&mut agent, &batch),
+            [to_b(5, 5), to_b(27, 4), to_b(27, 10)]
+        );
     }
 
     #[test]

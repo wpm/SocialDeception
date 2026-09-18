@@ -9,7 +9,7 @@
 
 mod support;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::process;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -32,6 +32,15 @@ fn sequence(start: u64) -> Vec<u64> {
         values.push(n);
     }
     values
+}
+
+/// The chains a ring opens, each named by its start, with the sequence each
+/// one should pass.
+fn expected_chains(ring: &Ring) -> BTreeMap<u64, Vec<u64>> {
+    ring.iter()
+        .flat_map(|(_, opens)| opens.iter().copied())
+        .map(|start| (start, sequence(start)))
+        .collect()
 }
 
 /// Runs one episode over `ring` and returns the trajectory it wrote, read
@@ -59,9 +68,11 @@ fn run(ring: &Ring) -> Vec<Value> {
     support::parse(&bytes)
 }
 
-/// The value a message record carries, or `None` for a control or a think.
-fn value(record: &Value) -> Option<u64> {
-    record["event"]["payload"]["Step"].as_u64()
+/// The step a message record carries, as the chain's name and the value, or
+/// `None` for a control or a think.
+fn step(record: &Value) -> Option<(u64, u64)> {
+    let step = &record["event"]["payload"]["Step"];
+    Some((step["chain"].as_u64()?, step["value"].as_u64()?))
 }
 
 /// The event records of `lines`, by agent and sequence number.
@@ -77,47 +88,53 @@ fn cycles(lines: &[Value]) -> impl Iterator<Item = &Value> {
     lines.iter().filter(|line| line["type"] == "cycle")
 }
 
+/// The steps a cycle sent, in order.
+fn outputs(cycle: &Value, records: &HashMap<(&str, u64), &Value>) -> Vec<(u64, u64)> {
+    support::seqs(cycle, "outputs")
+        .map(|seq| records[&(support::agent(cycle), seq)])
+        .map(|output| step(output).expect("an agent only ever sends a step"))
+        .collect()
+}
+
 /// Asserts that every cycle sent exactly what the rule says its inputs call
-/// for, in order: the agent's own chains on `Start`, the next value for each
-/// value above 1, and nothing for a 1, a stop or a think.
+/// for, in order: the agent's own chains on `Start`, each at its starting
+/// value; the next value of the same chain for each value above 1; and
+/// nothing for a 1, a stop or a think.
 fn every_hop_follows_the_rule(lines: &[Value], ring: &Ring) {
     let opens: HashMap<&str, &[u64]> = ring.iter().copied().collect();
     let records = records(lines);
     for cycle in cycles(lines) {
         let agent = support::agent(cycle);
-        let record = |seq| records[&(agent, seq)];
-        let expected: Vec<u64> = support::seqs(cycle, "inputs")
-            .map(record)
+        let expected: Vec<(u64, u64)> = support::seqs(cycle, "inputs")
+            .map(|seq| records[&(agent, seq)])
             .flat_map(
-                |input| match (input["event"]["control"].as_str(), value(input)) {
-                    (Some("start"), _) => opens[agent].to_vec(),
-                    (_, Some(1) | None) => Vec::new(),
-                    (_, Some(n)) => vec![if n % 2 == 0 { n / 2 } else { 3 * n + 1 }],
+                |input| match (input["event"]["control"].as_str(), step(input)) {
+                    (Some("start"), _) => opens[agent].iter().map(|&s| (s, s)).collect(),
+                    (_, Some((_, 1)) | None) => Vec::new(),
+                    (_, Some((chain, n))) => {
+                        vec![(chain, if n % 2 == 0 { n / 2 } else { 3 * n + 1 })]
+                    }
                 },
             )
             .collect();
-        let sent: Vec<u64> = support::seqs(cycle, "outputs")
-            .map(record)
-            .map(|output| value(output).expect("an agent only ever sends a step"))
-            .collect();
-        assert_eq!(sent, expected, "the outputs of {cycle}");
+        assert_eq!(outputs(cycle, &records), expected, "the outputs of {cycle}");
     }
 }
 
-/// The one chain in `lines`, in the order it was passed, starting from the
-/// chain `opener` opened on `Start`.
+/// Every chain in `lines`, by name, each in the order it was passed.
 ///
-/// Each hop is followed from the record of the value's arrival to the
-/// output of the cycle that handled it, so the order recovered is causal and
-/// owes nothing to timestamps.
-fn chain(lines: &[Value], opener: &str) -> Vec<u64> {
+/// A chain is followed hop by hop from the record of a step's arrival to
+/// the output of the cycle that handled it, so the order recovered is causal
+/// and owes nothing to timestamps. A chain begins at the step that carries
+/// its name as its value, which is what its opener sends on `Start`.
+fn chains(lines: &[Value]) -> BTreeMap<u64, Vec<u64>> {
     let records = records(lines);
-    let mut arrivals: HashMap<u64, (&str, u64)> = HashMap::new();
+    let mut arrivals: HashMap<(u64, u64), (&str, u64)> = HashMap::new();
     for (&(agent, seq), record) in &records {
-        if let Some(n) = value(record).filter(|_| !record["arrived"].is_null()) {
+        if let Some(step) = step(record).filter(|_| !record["arrived"].is_null()) {
             assert!(
-                arrivals.insert(n, (agent, seq)).is_none(),
-                "a single chain never carries the same value twice: {n}"
+                arrivals.insert(step, (agent, seq)).is_none(),
+                "a chain never carries the same value twice: {step:?}"
             );
         }
     }
@@ -126,53 +143,70 @@ fn chain(lines: &[Value], opener: &str) -> Vec<u64> {
             support::seqs(cycle, "inputs").map(move |seq| ((support::agent(cycle), seq), cycle))
         })
         .collect();
-    let outputs = |cycle: &Value| -> Vec<u64> {
-        support::seqs(cycle, "outputs")
-            .map(|seq| value(records[&(support::agent(cycle), seq)]).unwrap())
-            .collect()
-    };
+    let names: Vec<u64> = arrivals
+        .keys()
+        .filter(|(chain, value)| chain == value)
+        .map(|(chain, _)| *chain)
+        .collect();
 
-    let opening = cycles(lines)
-        .filter(|cycle| support::agent(cycle) == opener)
-        .find(|cycle| {
-            support::seqs(cycle, "inputs")
-                .any(|seq| records[&(opener, seq)]["event"]["control"] == "start")
-        })
-        .expect("the opener handled a start");
-    let mut values = outputs(opening);
-    assert_eq!(values.len(), 1, "the opener opened one chain on start");
-    loop {
-        let current = *values.last().unwrap();
-        let handled = handled_by[&arrivals[&current]];
-        let next = outputs(handled);
-        if current == 1 {
-            assert!(next.is_empty(), "nothing is sent after a 1: {handled}");
-            return values;
+    let mut chains = BTreeMap::new();
+    for chain in names {
+        let mut values = vec![chain];
+        loop {
+            let current = *values.last().unwrap();
+            let handled = handled_by[&arrivals[&(chain, current)]];
+            let next: Vec<u64> = outputs(handled, &records)
+                .into_iter()
+                .filter(|(name, _)| *name == chain)
+                .map(|(_, value)| value)
+                .collect();
+            if current == 1 {
+                assert!(next.is_empty(), "nothing is sent after a 1: {handled}");
+                break;
+            }
+            assert_eq!(next.len(), 1, "one step of a chain in, one out: {handled}");
+            values.push(next[0]);
         }
-        assert_eq!(next.len(), 1, "one value in, one value out: {handled}");
-        values.push(next[0]);
+        chains.insert(chain, values);
     }
+    chains
 }
 
-/// Every value sent by anyone, in ascending order.
-fn values_sent(lines: &[Value]) -> Vec<u64> {
-    let mut values: Vec<u64> = lines
+/// Every step sent by anyone, in ascending order.
+fn steps_sent(lines: &[Value]) -> Vec<(u64, u64)> {
+    let mut steps: Vec<(u64, u64)> = lines
         .iter()
         .filter(|line| !line["sent"].is_null())
-        .map(|line| value(line).expect("an agent only ever sends a step"))
+        .map(|line| step(line).expect("an agent only ever sends a step"))
         .collect();
-    values.sort_unstable();
-    values
+    steps.sort_unstable();
+    steps
+}
+
+/// Asserts everything the outcome of an episode over `ring` must satisfy:
+/// every chain the ring opened was passed in exactly its Collatz sequence,
+/// every hop obeyed the rule, and nothing was sent that belongs to no chain.
+fn check_outcome(lines: &[Value], ring: &Ring) {
+    let expected = expected_chains(ring);
+    assert_eq!(chains(lines), expected);
+    every_hop_follows_the_rule(lines, ring);
+    let mut steps: Vec<(u64, u64)> = expected
+        .iter()
+        .flat_map(|(&chain, values)| values.iter().map(move |&value| (chain, value)))
+        .collect();
+    steps.sort_unstable();
+    assert_eq!(steps_sent(lines), steps);
 }
 
 #[test]
 fn a_chain_passed_around_a_ring_is_the_collatz_sequence() {
     let ring: &Ring = &[("a", &[27]), ("b", &[]), ("c", &[])];
     let lines = run(ring);
-    let chain = chain(&lines, "a");
-    assert_eq!(chain, sequence(27));
-    assert_eq!(chain.len(), 112, "27 takes 111 steps to reach 1");
-    every_hop_follows_the_rule(&lines, ring);
+    let chains = chains(&lines);
+    assert_eq!(chains.len(), 1);
+    assert_eq!(chains[&27], sequence(27));
+    assert_eq!(chains[&27].len(), 112, "27 takes 111 steps to reach 1");
+    check_outcome(&lines, ring);
     support::check(&lines);
 }
 
@@ -180,35 +214,114 @@ fn a_chain_passed_around_a_ring_is_the_collatz_sequence() {
 fn a_chain_from_one_is_over_at_once() {
     let ring: &Ring = &[("a", &[1]), ("b", &[])];
     let lines = run(ring);
-    assert_eq!(chain(&lines, "a"), [1]);
-    every_hop_follows_the_rule(&lines, ring);
+    assert_eq!(chains(&lines)[&1], [1]);
+    check_outcome(&lines, ring);
     support::check(&lines);
 }
 
 #[test]
-fn several_chains_at_once_all_reach_one() {
-    // 6 and 7 merge at 10, so a chain cannot be told from another by its
-    // values alone; what can be checked is that every hop is right and that
-    // the values sent are exactly the union of the chains, with every 1
-    // reached exactly once.
+fn several_chains_at_once_are_each_the_collatz_sequence() {
+    // 6 and 7 merge at 10 and every chain here ends 4, 2, 1, so a step's
+    // value alone does not say which chain it belongs to; the chain's name
+    // on each step is what lets every chain be followed separately.
     let ring: &Ring = &[("a", &[6, 7]), ("b", &[27]), ("c", &[]), ("d", &[97, 871])];
     let lines = run(ring);
-    every_hop_follows_the_rule(&lines, ring);
-    let mut expected: Vec<u64> = ring
-        .iter()
-        .flat_map(|(_, opens)| opens.iter().copied())
-        .flat_map(sequence)
-        .collect();
-    expected.sort_unstable();
-    assert_eq!(values_sent(&lines), expected);
+    let chains = chains(&lines);
+    assert_eq!(
+        chains.keys().copied().collect::<Vec<_>>(),
+        [6, 7, 27, 97, 871]
+    );
+    for (chain, values) in &chains {
+        assert_eq!(*values, sequence(*chain), "chain {chain}");
+    }
+    check_outcome(&lines, ring);
     support::check(&lines);
+}
+
+#[test]
+fn chains_that_share_a_value_stay_apart() {
+    // 3 is one hop from 6, so from the second hop on the two chains carry
+    // the same values, in step, around a ring of two.
+    let ring: &Ring = &[("a", &[6, 3]), ("b", &[])];
+    let lines = run(ring);
+    check_outcome(&lines, ring);
+    support::check(&lines);
+}
+
+/// A hand-written trajectory of a ring of two in which `a` opens 4 and 2,
+/// `b` drains both opening steps in one pass, and `a` drains both replies in
+/// one pass. The runtime makes such passes likely but not certain, so the
+/// case is pinned down here rather than hoped for in a live episode.
+fn mixed_drains() -> Vec<Value> {
+    let control = |agent: &str, seq: u64, time: u64, control: &str| {
+        serde_json::json!({"type": "event", "agent": agent, "seq": seq, "arrived": time,
+                           "event": {"kind": "control", "control": control}})
+    };
+    let step = |agent: &str, seq: u64, stamp: &str, time: u64, chain: u64, value: u64| {
+        let other = if agent == "a" { "b" } else { "a" };
+        let (sender, recipient) = if stamp == "sent" {
+            (agent, other)
+        } else {
+            (other, agent)
+        };
+        serde_json::json!({"type": "event", "agent": agent, "seq": seq, stamp: time,
+                           "event": {"kind": "message", "sender": sender, "recipients": [recipient],
+                                     "payload": {"Step": {"chain": chain, "value": value}}}})
+    };
+    let cycle = |agent: &str, t_start: u64, t_stop: u64, inputs: &[u64], outputs: &[u64]| {
+        serde_json::json!({"type": "cycle", "agent": agent, "t_start": t_start, "t_stop": t_stop,
+                           "inputs": inputs, "outputs": outputs})
+    };
+    vec![
+        control("a", 0, 10, "start"),
+        step("a", 1, "sent", 20, 4, 4),
+        step("a", 2, "sent", 21, 2, 2),
+        cycle("a", 15, 25, &[0], &[1, 2]),
+        control("b", 0, 10, "start"),
+        step("b", 1, "arrived", 20, 4, 4),
+        step("b", 2, "arrived", 21, 2, 2),
+        step("b", 3, "sent", 40, 4, 2),
+        step("b", 4, "sent", 41, 2, 1),
+        cycle("b", 30, 45, &[0, 1, 2], &[3, 4]),
+        step("a", 3, "arrived", 40, 4, 2),
+        step("a", 4, "arrived", 41, 2, 1),
+        step("a", 5, "sent", 60, 4, 1),
+        cycle("a", 50, 65, &[3, 4], &[5]),
+        step("b", 5, "arrived", 60, 4, 1),
+        cycle("b", 70, 75, &[5], &[]),
+        control("a", 6, 80, "stop"),
+        cycle("a", 85, 86, &[6], &[]),
+        control("b", 6, 80, "stop"),
+        cycle("b", 85, 86, &[6], &[]),
+    ]
+}
+
+#[test]
+fn chains_are_told_apart_within_one_drain() {
+    let lines = mixed_drains();
+    support::check(&lines);
+    let ring: &Ring = &[("a", &[4, 2]), ("b", &[])];
+    check_outcome(&lines, ring);
+    let chains = chains(&lines);
+    assert_eq!(chains[&4], [4, 2, 1]);
+    assert_eq!(chains[&2], [2, 1]);
+}
+
+#[test]
+#[should_panic(expected = "the outputs of")]
+fn a_step_sent_on_the_wrong_chain_is_caught() {
+    let mut lines = mixed_drains();
+    // b's reply to chain 4's step is filed under chain 2.
+    lines[7]["event"]["payload"]["Step"]["chain"] = serde_json::json!(2);
+    let ring: &Ring = &[("a", &[4, 2]), ("b", &[])];
+    every_hop_follows_the_rule(&lines, ring);
 }
 
 #[test]
 fn a_ring_that_opens_nothing_goes_quiescent_at_once() {
     let ring: &Ring = &[("a", &[]), ("b", &[])];
     let lines = run(ring);
-    assert!(values_sent(&lines).is_empty());
+    assert!(chains(&lines).is_empty());
     let controls: Vec<&Value> = lines
         .iter()
         .filter(|line| line["event"]["kind"] == "control")
@@ -218,6 +331,6 @@ fn a_ring_that_opens_nothing_goes_quiescent_at_once() {
         4,
         "a start and a stop for each of two agents"
     );
-    every_hop_follows_the_rule(&lines, ring);
+    check_outcome(&lines, ring);
     support::check(&lines);
 }
