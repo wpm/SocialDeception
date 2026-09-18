@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# Pre-commit hook: the same checks CI runs, so a commit that passes here is
+# very unlikely to fail there.
+#
+# Wire it up once per clone with:
+#
+#     git config core.hooksPath .githooks
+#
+# The three cargo checks are mandatory. cargo-deny and typos run when
+# installed; when they are not, the hook says so and CI still enforces them.
+
+set -euo pipefail
+
+cd "$(git rev-parse --show-toplevel)"
+
+step() {
+    printf '\n==> %s\n' "$*"
+}
+
+step "cargo fmt --check"
+cargo fmt --check
+
+step "cargo clippy --all-targets -- -D warnings"
+cargo clippy --all-targets -- -D warnings
+
+step "cargo test"
+cargo test
+
+if cargo deny --version >/dev/null 2>&1; then
+    step "cargo deny check"
+    cargo deny check
+else
+    printf '\n!! cargo-deny is not installed; skipping. CI runs it.\n'
+    printf '   Install with: cargo install --locked cargo-deny\n'
+fi
+
+if command -v typos >/dev/null 2>&1; then
+    step "typos"
+    typos
+else
+    printf '\n!! typos is not installed; skipping. CI runs it.\n'
+    printf '   Install with: cargo install --locked typos-cli\n'
+fi
+
+printf '\nAll pre-commit checks passed.\n'

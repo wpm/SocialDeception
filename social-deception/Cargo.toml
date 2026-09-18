@@ -1,0 +1,25 @@
+[package]
+name = "social-deception"
+description = "A framework for real-time, turnless multi-agent environments"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+name = "social_deception"
+path = "src/lib.rs"
+
+[[bin]]
+name = "social-deception"
+path = "src/main.rs"
+
+[dependencies]
+crossbeam-channel.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

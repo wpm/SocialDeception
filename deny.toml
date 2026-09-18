@@ -1,0 +1,51 @@
+# Configuration for cargo-deny (https://embarkstudios.github.io/cargo-deny/).
+# Run `cargo deny check` at the repository root.
+
+[graph]
+# Check every feature of every crate, so that an optional dependency cannot
+# smuggle in a licence or advisory that the default build never sees.
+all-features = true
+
+[output]
+feature-depth = 1
+
+# Security advisories from the RustSec database.
+[advisories]
+db-path = "$CARGO_HOME/advisory-dbs"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+# Unmaintained and yanked crates are reported, not merely tolerated.
+unmaintained = "all"
+yanked = "deny"
+# Advisories we have looked at and decided to accept go here, one per line,
+# each with its identifier and a reason.
+ignore = []
+
+# Licences we are willing to depend on. Anything not on this list fails the
+# check, so a new dependency with a new licence is a conscious decision.
+[licenses]
+# Only licences that actually occur in the dependency graph are listed;
+# cargo-deny warns about allowances that match nothing, so the list stays
+# honest about what we depend on.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+]
+confidence-threshold = 0.8
+# Per-crate exceptions to the allow list, each with a reason.
+exceptions = []
+
+[bans]
+# Several versions of one crate in the graph is a smell, not a crime.
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+# Crates that must never appear in the graph, each with a reason.
+deny = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

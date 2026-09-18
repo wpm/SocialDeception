@@ -1,0 +1,38 @@
+[workspace]
+resolver = "3"
+members = ["social-deception"]
+
+# Settings shared by every workspace member. A member opts in with
+# `<key>.workspace = true` in its own manifest.
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/wpm/SocialDeception"
+publish = false
+
+[workspace.dependencies]
+# Agent inboxes and the router. ADR-0001 names `recv_timeout` as the mechanism
+# by which an agent's timer fires, so this is a decided dependency.
+crossbeam-channel = "0.5"
+# Trajectory records.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Lint configuration lives here, in one place, and is inherited by every
+# workspace member through `[lints] workspace = true`. Do not configure lints
+# with crate-level attributes.
+#
+# Any lint we cannot live with is allowed here explicitly, one at a time, with
+# the reason stated next to it. Never switch a group off wholesale.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "deny"
+warnings = "deny"
+
+[workspace.lints.clippy]
+# `priority = -1` makes the groups apply before the individual overrides that
+# follow, whatever order they are written in.
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
