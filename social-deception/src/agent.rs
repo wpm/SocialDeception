@@ -9,7 +9,7 @@
 //! 3. records the batch, one event record per event;
 //! 4. hands the batch to the environment's [`Handler`] and gets back what to
 //!    send;
-//! 5. records what came out, sends it to the router as one [`CycleReport`],
+//! 5. records what came out, sends it to the router as one [`CycleDispatch`],
 //!    and records the pass as a cycle.
 //!
 //! An event that arrives while the agent is busy waits in the inbox and is
@@ -45,7 +45,7 @@
 //! ```
 //! use crossbeam_channel::unbounded;
 //! use social_deception::{
-//!     Agent, AgentId, Clock, Control, CycleReport, Delivery, Event, Handler, Outgoing, Wiring,
+//!     Agent, AgentId, Clock, Control, CycleDispatch, Delivery, Event, Handler, Outgoing, Wiring,
 //!     Writer,
 //! };
 //!
@@ -67,10 +67,10 @@
 //!
 //! let clock = Clock::start();
 //! let (to_agent, inbox) = unbounded();
-//! let (reports, from_agent) = unbounded();
+//! let (dispatches, from_agent) = unbounded();
 //! let (records, writer) = Writer::spawn(Vec::new());
 //! let peers = [AgentId::new("caller")].into();
-//! let wiring = Wiring { id: "echo".into(), clock, inbox, reports, records, think_every: None, peers };
+//! let wiring = Wiring { id: "echo".into(), clock, inbox, dispatches, records, think_every: None, peers };
 //! let agent = Agent::spawn(wiring, Echo, clock);
 //!
 //! let hello = Event::message("caller", ["echo"], String::from("hello"));
@@ -79,7 +79,7 @@
 //! to_agent.send(Delivery::now(clock, Event::Control(Control::Stop))).unwrap();
 //!
 //! agent.join().unwrap();
-//! let sent: Vec<Event<String>> = from_agent.iter().flat_map(|r: CycleReport<_>| r.sent).collect();
+//! let sent: Vec<Event<String>> = from_agent.iter().flat_map(|r: CycleDispatch<_>| r.sent).collect();
 //! assert_eq!(sent, [Event::message("echo", ["caller"], String::from("hello"))]);
 //! let trajectory = writer.join().unwrap();
 //! assert!(!trajectory.is_empty());
@@ -183,15 +183,15 @@ impl<P> Delivery<P> {
     }
 }
 
-/// What one pass of an agent's loop tells the router.
+/// What one pass of an agent's loop hands the router.
 ///
-/// One report is sent per pass, after the pass's outputs have been recorded
+/// One dispatch is sent per pass, after the pass's outputs have been recorded
 /// and before its cycle record is written. Because the number of deliveries
 /// consumed and the messages produced arrive together, whoever counts
 /// in-flight deliveries never sees a pass's inputs settled before its outputs
 /// exist.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CycleReport<P> {
+pub struct CycleDispatch<P> {
     /// The agent whose pass this was.
     pub agent: AgentId,
     /// How many deliveries the pass took off the inbox. A `Think` is not a
@@ -212,8 +212,8 @@ pub struct Wiring<P> {
     pub clock: Clock,
     /// The agent's one receiver.
     pub inbox: Receiver<Delivery<P>>,
-    /// Where each pass's report goes.
-    pub reports: Sender<CycleReport<P>>,
+    /// Where each pass's dispatch goes.
+    pub dispatches: Sender<CycleDispatch<P>>,
     /// Where the agent's trajectory goes.
     pub records: Sender<LogRecord<P>>,
     /// How often the agent thinks unprompted, or `None` for an agent that
@@ -229,7 +229,7 @@ pub struct Wiring<P> {
 pub enum Error {
     /// A record could not be sent: the trajectory writer has gone away.
     WriterClosed,
-    /// A report could not be sent: the router has gone away.
+    /// A dispatch could not be sent: the router has gone away.
     RouterClosed,
     /// The timer source disconnected a wake channel the agent was waiting on.
     TimerClosed,
@@ -480,14 +480,14 @@ where
             outputs.push(self.record(self.wiring.clock.now(), event.clone())?);
             sent.push(event);
         }
-        let report = CycleReport {
+        let dispatch = CycleDispatch {
             agent: self.wiring.id.clone(),
             deliveries,
             sent,
         };
         self.wiring
-            .reports
-            .send(report)
+            .dispatches
+            .send(dispatch)
             .map_err(|_| Error::RouterClosed)?;
         let cycle = CycleRecord {
             agent: self.wiring.id.clone(),
@@ -642,7 +642,7 @@ mod tests {
         agent: Agent<H>,
         clock: Clock,
         inbox: Sender<Delivery<TestPayload>>,
-        reports: Receiver<CycleReport<TestPayload>>,
+        dispatches: Receiver<CycleDispatch<TestPayload>>,
         records: Receiver<LogRecord<TestPayload>>,
         timer: ManualTimerControl,
     }
@@ -651,19 +651,19 @@ mod tests {
     struct Wires {
         wiring: Wiring<TestPayload>,
         inbox: Sender<Delivery<TestPayload>>,
-        reports: Receiver<CycleReport<TestPayload>>,
+        dispatches: Receiver<CycleDispatch<TestPayload>>,
         records: Receiver<LogRecord<TestPayload>>,
     }
 
     fn wires(think_every: Option<Duration>) -> Wires {
         let (inbox, receiver) = unbounded();
-        let (reporter, reports) = unbounded();
+        let (outbox, dispatches) = unbounded();
         let (recorder, records) = unbounded();
         let wiring = Wiring {
             id: AgentId::new("a"),
             clock: Clock::start(),
             inbox: receiver,
-            reports: reporter,
+            dispatches: outbox,
             records: recorder,
             think_every,
             peers: ["b", "c"].map(AgentId::new).into(),
@@ -671,7 +671,7 @@ mod tests {
         Wires {
             wiring,
             inbox,
-            reports,
+            dispatches,
             records,
         }
     }
@@ -687,7 +687,7 @@ mod tests {
             agent: Agent::spawn(wires.wiring, handler, timer),
             clock,
             inbox: wires.inbox,
-            reports: wires.reports,
+            dispatches: wires.dispatches,
             records: wires.records,
             timer: control,
         }
@@ -698,8 +698,8 @@ mod tests {
             self.inbox.send(Delivery::now(self.clock, event)).unwrap();
         }
 
-        fn report(&self) -> CycleReport<TestPayload> {
-            recv(&self.reports)
+        fn dispatch(&self) -> CycleDispatch<TestPayload> {
+            recv(&self.dispatches)
         }
 
         /// The records of one pass: its event records and then its cycle
@@ -751,10 +751,10 @@ mod tests {
             handler.batches,
             [vec![start(), step("b", 6), step("c", 3), step("b", 5)]]
         );
-        let reports: Vec<_> = wires.reports.iter().collect();
+        let dispatches: Vec<_> = wires.dispatches.iter().collect();
         assert_eq!(
-            reports,
-            [CycleReport {
+            dispatches,
+            [CycleDispatch {
                 agent: AgentId::new("a"),
                 deliveries: 4,
                 sent: vec![
@@ -815,7 +815,7 @@ mod tests {
         drop(rig.inbox);
         let handler = rig.agent.join().unwrap();
         assert!(handler.batches.is_empty());
-        assert!(rig.reports.try_recv().is_err());
+        assert!(rig.dispatches.try_recv().is_err());
         assert!(rig.records.try_recv().is_err());
     }
 
@@ -823,13 +823,13 @@ mod tests {
     fn think_fires_when_the_deadline_passes_and_not_before() {
         let rig = rig(Recorder::default(), Some(EVERY));
         rig.send(start());
-        assert_eq!(rig.report().deliveries, 1);
+        assert_eq!(rig.dispatch().deliveries, 1);
         let (_, started) = rig.cycle();
         let first = recv(rig.timer.requests());
         assert_eq!(first, started.t_start + EVERY);
 
         rig.send(step("b", 1));
-        assert_eq!(rig.report().deliveries, 1);
+        assert_eq!(rig.dispatch().deliveries, 1);
         assert_eq!(
             rig.kinds(),
             [
@@ -839,7 +839,7 @@ mod tests {
         );
 
         rig.timer.fire().unwrap();
-        assert_eq!(rig.report().deliveries, 0);
+        assert_eq!(rig.dispatch().deliveries, 0);
         let (events, thought) = rig.cycle();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event, Event::Think);
@@ -912,9 +912,9 @@ mod tests {
     fn thinking_starts_only_once_the_episode_has() {
         let rig = rig(Recorder::default(), Some(EVERY));
         rig.send(step("b", 1));
-        rig.report();
+        rig.dispatch();
         rig.send(start());
-        rig.report();
+        rig.dispatch();
         // The first request is made only after the start was handled, so it
         // is the first thing on the channel either way; what the test can
         // check is which pass it was measured from.
@@ -993,7 +993,7 @@ mod tests {
         let rig = rig(Town, None);
         rig.send(start());
         let expected = Event::message("a", ["b", "c"], TestPayload::Step(0));
-        assert_eq!(rig.report().sent, std::slice::from_ref(&expected));
+        assert_eq!(rig.dispatch().sent, std::slice::from_ref(&expected));
         let (records, cycle) = rig.cycle();
         assert_eq!(records[1].event, expected);
         assert_eq!(cycle.outputs, [Seq(1)]);
@@ -1013,7 +1013,7 @@ mod tests {
     fn a_vanished_router_is_an_error() {
         let rig = rig(Recorder::default(), None);
         rig.send(start());
-        drop(rig.reports);
+        drop(rig.dispatches);
         assert_eq!(rig.agent.join(), Err(Error::RouterClosed));
     }
 
@@ -1021,7 +1021,7 @@ mod tests {
     fn a_vanished_timer_is_an_error() {
         let rig = rig(Recorder::default(), Some(EVERY));
         rig.send(start());
-        rig.report();
+        rig.dispatch();
         recv(rig.timer.requests());
         drop(rig.timer);
         assert_eq!(rig.agent.join(), Err(Error::TimerClosed));

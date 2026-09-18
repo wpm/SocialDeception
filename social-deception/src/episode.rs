@@ -1,7 +1,7 @@
 //! An episode: one run of an environment with a fixed roster of agents, from
 //! coordinated startup to coordinated shutdown.
 //!
-//! The episode constructs the roster, wires each agent's inbox, report
+//! The episode constructs the roster, wires each agent's inbox, dispatch
 //! channel and record channel, spawns one thread per agent, tells every
 //! agent to start, routes what the agents send until the episode is over,
 //! tells every agent to stop, and joins the threads. [`Control`] events are
@@ -16,7 +16,7 @@
 //! and the passes the agents have reported. It keeps one count, of
 //! deliveries routed and not yet reported handled. A cycle in progress is
 //! exactly a set of deliveries taken off an inbox and not yet reported, and
-//! an agent reports a pass's deliveries and its outputs together, so the
+//! an agent dispatches a pass's deliveries and its outputs together, so the
 //! count never reads zero while a pass that might still send is under way.
 //! When it reaches zero the episode is quiescent and shutdown begins.
 //!
@@ -35,7 +35,7 @@ use std::panic::{self, AssertUnwindSafe};
 
 use crossbeam_channel::{Receiver, Sender, select, unbounded};
 
-use crate::agent::{self, Agent, CycleReport, Handler, Outgoing, Wiring};
+use crate::agent::{self, Agent, CycleDispatch, Handler, Outgoing, Wiring};
 use crate::clock::Clock;
 use crate::event::{AgentId, Control, Event, Payload};
 use crate::router::{RouteError, Router};
@@ -190,7 +190,7 @@ impl<P: Payload> Episode<P> {
             clock,
         } = self;
         let ids: BTreeSet<AgentId> = roster.keys().cloned().collect();
-        let (report, reports) = unbounded();
+        let (dispatch, dispatches) = unbounded();
         let (obituary, obituaries) = unbounded();
         let mut inboxes = BTreeMap::new();
         // Every inbox stays open until every thread has been joined, so that
@@ -206,7 +206,7 @@ impl<P: Payload> Episode<P> {
                 id: id.clone(),
                 clock,
                 inbox,
-                reports: report.clone(),
+                dispatches: dispatch.clone(),
                 records: records.clone(),
                 think_every: None,
                 peers: ids.iter().filter(|peer| **peer != id).cloned().collect(),
@@ -218,13 +218,13 @@ impl<P: Payload> Episode<P> {
             };
             agents.push(Agent::spawn(wiring, watched, clock));
         }
-        drop((report, obituary, records));
+        drop((dispatch, obituary, records));
         let router = Router::new(inboxes, clock);
 
         let outcome = router
             .control(Control::Start)
             .map_err(|error| Halt::Error(EpisodeError::Control(error)))
-            .and_then(|in_flight| drive(&router, &reports, &obituaries, in_flight));
+            .and_then(|in_flight| drive(&router, &dispatches, &obituaries, in_flight));
         let stopped = router.control(Control::Stop).map_err(EpisodeError::Control);
         let failures = join(agents);
         drop(held);
@@ -253,28 +253,28 @@ use Halt::Departure;
 /// Routes what the agents send until nothing is in flight.
 ///
 /// `in_flight` is the number of deliveries already made and not yet reported
-/// handled. Each report takes a pass's deliveries off the count and puts the
+/// handled. Each dispatch takes a pass's deliveries off the count and puts the
 /// deliveries its outputs cause onto it, in that order but as one step, so
 /// the count reads zero only when no agent has anything left to handle or
 /// send.
 fn drive<P: Payload>(
     router: &Router<P>,
-    reports: &Receiver<CycleReport<P>>,
+    dispatches: &Receiver<CycleDispatch<P>>,
     obituaries: &Receiver<AgentId>,
     mut in_flight: usize,
 ) -> Result<(), Halt> {
     while in_flight > 0 {
-        let report = select! {
-            recv(reports) -> report => report.map_err(|_| Departure)?,
+        let dispatch = select! {
+            recv(dispatches) -> dispatch => dispatch.map_err(|_| Departure)?,
             recv(obituaries) -> _ => return Err(Departure),
         };
         in_flight = in_flight
-            .checked_sub(report.deliveries)
+            .checked_sub(dispatch.deliveries)
             .expect("an agent reported more deliveries than were routed to it");
-        for event in &report.sent {
+        for event in &dispatch.sent {
             in_flight += router.route(event).map_err(|error| {
                 Halt::Error(EpisodeError::Route {
-                    agent: report.agent.clone(),
+                    agent: dispatch.agent.clone(),
                     error,
                 })
             })?;

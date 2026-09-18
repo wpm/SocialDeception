@@ -26,7 +26,7 @@ mod testing;
 pub mod timer;
 pub mod trajectory;
 
-pub use agent::{Agent, CycleReport, Delivery, Error, Handler, Outgoing, Recipients, Wiring};
+pub use agent::{Agent, CycleDispatch, Delivery, Error, Handler, Outgoing, Recipients, Wiring};
 pub use clock::{Clock, Timestamp};
 pub use episode::{Episode, EpisodeError, Failure};
 pub use event::{AgentId, Control, Event, Payload};
