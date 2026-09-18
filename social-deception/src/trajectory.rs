@@ -175,6 +175,7 @@ mod tests {
 
     use super::*;
     use crate::event::Control;
+    use crate::testing::parse_lines;
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
     enum TestPayload {
@@ -235,14 +236,6 @@ mod tests {
             json!({"type": "cycle", "agent": "a", "t_start": 30, "t_stop": 50,
                    "inputs": [0, 1], "outputs": [2]}),
         ]
-    }
-
-    fn parse_lines(bytes: &[u8]) -> Vec<Value> {
-        let text = std::str::from_utf8(bytes).unwrap();
-        assert!(text.ends_with('\n'), "file must end with a newline");
-        text.lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect()
     }
 
     #[test]

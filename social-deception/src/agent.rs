@@ -528,9 +528,10 @@ mod tests {
 
     use crossbeam_channel::unbounded;
     use serde::Serialize;
-    use serde_json::{Value, json};
+    use serde_json::json;
 
     use super::*;
+    use crate::testing::parse_lines;
     use crate::timer::{ManualTimer, ManualTimerControl};
     use crate::trajectory::Writer;
 
@@ -925,14 +926,6 @@ mod tests {
         rig.agent.join().unwrap();
     }
 
-    fn lines(bytes: &[u8]) -> Vec<Value> {
-        std::str::from_utf8(bytes)
-            .unwrap()
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect()
-    }
-
     #[test]
     fn a_pass_is_recorded_as_events_then_a_cycle() {
         let mut wires = wires(None);
@@ -945,7 +938,7 @@ mod tests {
         Agent::spawn(wires.wiring, Recorder::default(), clock)
             .join()
             .unwrap();
-        let lines = lines(&writer.join().unwrap());
+        let lines = parse_lines(&writer.join().unwrap());
 
         assert_eq!(lines.len(), 4);
         assert_eq!(

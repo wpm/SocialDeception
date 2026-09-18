@@ -341,6 +341,7 @@ mod tests {
     use serde_json::Value;
 
     use super::*;
+    use crate::testing::parse_lines;
     use crate::trajectory::Writer;
 
     /// Volleys a count back and forth with `partner` until it reaches
@@ -410,14 +411,6 @@ mod tests {
         }
     }
 
-    fn lines(bytes: &[u8]) -> Vec<Value> {
-        std::str::from_utf8(bytes)
-            .unwrap()
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect()
-    }
-
     fn of<'a>(lines: &'a [Value], agent: &str) -> impl Iterator<Item = &'a Value> {
         lines.iter().filter(move |line| line["agent"] == agent)
     }
@@ -450,7 +443,7 @@ mod tests {
         episode.run().unwrap();
 
         // Every sender is gone, so the writer finishes on its own.
-        let lines = lines(&writer.join().unwrap());
+        let lines = parse_lines(&writer.join().unwrap());
         // The file interleaves agents in whatever order their records reached
         // the writer; only each agent's own order is promised.
         let sent = |agent: &str| -> Vec<u64> {
@@ -494,7 +487,7 @@ mod tests {
         // Had the broadcast counted as one delivery, the episode would have
         // gone quiescent after the first spoke's reply, and the hub would
         // not have handled all six.
-        let lines = lines(&writer.join().unwrap());
+        let lines = parse_lines(&writer.join().unwrap());
         let replies_seen_by_hub = of(&lines, "hub")
             .filter(|line| line["event"]["kind"] == "message" && line["event"]["sender"] != "hub")
             .count();
@@ -544,7 +537,7 @@ mod tests {
         );
         assert!(error.to_string().contains("the handler is broken"));
         // The other agent was still stopped cleanly.
-        let lines = lines(&writer.join().unwrap());
+        let lines = parse_lines(&writer.join().unwrap());
         assert!(of(&lines, "b").any(|line| line["event"]["control"] == "stop"));
     }
 

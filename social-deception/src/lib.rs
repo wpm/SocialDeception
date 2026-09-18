@@ -21,6 +21,8 @@ pub mod clock;
 pub mod episode;
 pub mod event;
 pub mod router;
+#[cfg(test)]
+mod testing;
 pub mod timer;
 pub mod trajectory;
 
