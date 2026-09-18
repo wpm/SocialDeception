@@ -34,3 +34,4 @@ from the earlier attempt at the project are not part of its history.
 | ADR | Title | Status |
 |-----|-------|--------|
 | [0001](0001-single-process-thread-per-agent.md) | A single process per episode, one thread per agent | Accepted |
+| [0002](0002-jsonl-trajectory-format.md) | Trajectories are JSON Lines of event and cycle records | Accepted |
