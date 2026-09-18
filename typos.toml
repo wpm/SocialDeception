@@ -1,0 +1,12 @@
+# Configuration for the `typos` spell checker (https://github.com/crate-ci/typos).
+# Run `typos` at the repository root; it checks source and docs alike.
+
+[files]
+extend-exclude = ["Cargo.lock"]
+
+[default]
+# Identifiers that are spelled the way we want them, not typos. Add sparingly,
+# and prefer the narrowest form that stops the false positive.
+extend-ignore-identifiers-re = []
+
+[default.extend-words]

@@ -1,0 +1,7 @@
+# Only stable rustfmt options belong here, so that `cargo fmt --check` behaves
+# identically on the stable toolchain used by the pre-commit hook and CI.
+style_edition = "2024"
+max_width = 100
+newline_style = "Unix"
+use_field_init_shorthand = true
+use_try_shorthand = true
