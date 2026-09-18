@@ -11,6 +11,7 @@ mod support;
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
+use std::path::PathBuf;
 use std::process;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -23,15 +24,52 @@ use support::collatz::Collatz;
 /// it.
 type Ring<'a> = [(&'a str, &'a [u64])];
 
+/// The Collatz function, computed here rather than borrowed from the
+/// environment so that the check and the thing checked cannot share a bug.
+fn successor(n: u64) -> u64 {
+    assert!(
+        n > 0,
+        "the Collatz function is defined on positive integers"
+    );
+    if n % 2 == 0 { n / 2 } else { 3 * n + 1 }
+}
+
 /// The Collatz sequence from `start` down to 1.
 fn sequence(start: u64) -> Vec<u64> {
     let mut values = vec![start];
     let mut n = start;
     while n != 1 {
-        n = if n % 2 == 0 { n / 2 } else { 3 * n + 1 };
+        n = successor(n);
         values.push(n);
     }
     values
+}
+
+/// The agent that position `i` of `ring` passes to: the next in the list,
+/// or the first after the last.
+fn passes_to<'a>(ring: &Ring<'a>, i: usize) -> &'a str {
+    ring[(i + 1) % ring.len()].0
+}
+
+/// A trajectory file in the temp dir, removed when this is dropped so that a
+/// failing test does not leave it behind.
+struct TempFile(PathBuf);
+
+impl TempFile {
+    fn new() -> Self {
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        Self(std::env::temp_dir().join(format!(
+            "social-deception-collatz-{}-{}.jsonl",
+            process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        )))
+    }
+}
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
 }
 
 /// The chains a ring opens, each named by its start, with the sequence each
@@ -45,27 +83,27 @@ fn expected_chains(ring: &Ring) -> BTreeMap<u64, Vec<u64>> {
 
 /// Runs one episode over `ring` and returns the trajectory it wrote, read
 /// back from disk.
+///
+/// The log is checked against the invariants in [`support`] before it is
+/// returned, so that a malformed log fails by the name of the invariant it
+/// breaks rather than by a lookup that misses in the Collatz checks below.
 fn run(ring: &Ring) -> Vec<Value> {
-    static COUNTER: AtomicUsize = AtomicUsize::new(0);
-    let path = std::env::temp_dir().join(format!(
-        "social-deception-collatz-{}-{}.jsonl",
-        process::id(),
-        COUNTER.fetch_add(1, Ordering::Relaxed)
-    ));
-    let (records, writer) = Writer::create(&path).unwrap();
+    let file = TempFile::new();
+    let (records, writer) = Writer::create(&file.0).unwrap();
     let mut episode = Episode::new(records);
     for (i, (name, opens)) in ring.iter().enumerate() {
-        let to = ring[(i + 1) % ring.len()].0;
         let agent = opens
             .iter()
-            .fold(Collatz::new(to), |agent, &start| agent.opening(start));
+            .fold(Collatz::new(passes_to(ring, i)), |agent, &start| {
+                agent.opening(start)
+            });
         episode.add(*name, agent).unwrap();
     }
     episode.run().unwrap();
     writer.join().unwrap();
-    let bytes = fs::read(&path).unwrap();
-    fs::remove_file(&path).unwrap();
-    support::parse(&bytes)
+    let lines = support::parse(&fs::read(&file.0).unwrap());
+    support::check(&lines);
+    lines
 }
 
 /// The step a message record carries, as the chain's name and the value, or
@@ -73,15 +111,6 @@ fn run(ring: &Ring) -> Vec<Value> {
 fn step(record: &Value) -> Option<(u64, u64)> {
     let step = &record["event"]["payload"]["Step"];
     Some((step["chain"].as_u64()?, step["value"].as_u64()?))
-}
-
-/// The event records of `lines`, by agent and sequence number.
-fn records(lines: &[Value]) -> HashMap<(&str, u64), &Value> {
-    lines
-        .iter()
-        .filter(|line| line["type"] == "event")
-        .map(|line| ((support::agent(line), support::seq(line)), line))
-        .collect()
 }
 
 fn cycles(lines: &[Value]) -> impl Iterator<Item = &Value> {
@@ -102,7 +131,7 @@ fn outputs(cycle: &Value, records: &HashMap<(&str, u64), &Value>) -> Vec<(u64, u
 /// nothing for a 1, a stop or a think.
 fn every_hop_follows_the_rule(lines: &[Value], ring: &Ring) {
     let opens: HashMap<&str, &[u64]> = ring.iter().copied().collect();
-    let records = records(lines);
+    let records = support::records(lines);
     for cycle in cycles(lines) {
         let agent = support::agent(cycle);
         let expected: Vec<(u64, u64)> = support::seqs(cycle, "inputs")
@@ -111,9 +140,7 @@ fn every_hop_follows_the_rule(lines: &[Value], ring: &Ring) {
                 |input| match (input["event"]["control"].as_str(), step(input)) {
                     (Some("start"), _) => opens[agent].iter().map(|&s| (s, s)).collect(),
                     (_, Some((_, 1)) | None) => Vec::new(),
-                    (_, Some((chain, n))) => {
-                        vec![(chain, if n % 2 == 0 { n / 2 } else { 3 * n + 1 })]
-                    }
+                    (_, Some((chain, n))) => vec![(chain, successor(n))],
                 },
             )
             .collect();
@@ -128,7 +155,7 @@ fn every_hop_follows_the_rule(lines: &[Value], ring: &Ring) {
 /// and owes nothing to timestamps. A chain begins at the step that carries
 /// its name as its value, which is what its opener sends on `Start`.
 fn chains(lines: &[Value]) -> BTreeMap<u64, Vec<u64>> {
-    let records = records(lines);
+    let records = support::records(lines);
     let mut arrivals: HashMap<(u64, u64), (&str, u64)> = HashMap::new();
     for (&(agent, seq), record) in &records {
         if let Some(step) = step(record).filter(|_| !record["arrived"].is_null()) {
@@ -185,11 +212,27 @@ fn steps_sent(lines: &[Value]) -> Vec<(u64, u64)> {
 
 /// Asserts everything the outcome of an episode over `ring` must satisfy:
 /// every chain the ring opened was passed in exactly its Collatz sequence,
-/// every hop obeyed the rule, and nothing was sent that belongs to no chain.
+/// every hop obeyed the rule, every step went to the next agent in the
+/// ring, and nothing was sent that belongs to no chain.
 fn check_outcome(lines: &[Value], ring: &Ring) {
     let expected = expected_chains(ring);
     assert_eq!(chains(lines), expected);
     every_hop_follows_the_rule(lines, ring);
+    let next: HashMap<&str, &str> = ring
+        .iter()
+        .enumerate()
+        .map(|(i, (name, _))| (*name, passes_to(ring, i)))
+        .collect();
+    for line in lines.iter().filter(|line| !line["sent"].is_null()) {
+        let recipients = line["event"]["recipients"]
+            .as_array()
+            .expect("a message lists its recipients");
+        assert_eq!(
+            recipients.as_slice(),
+            [Value::from(next[support::agent(line)])],
+            "a step goes to the next agent in the ring: {line}"
+        );
+    }
     let mut steps: Vec<(u64, u64)> = expected
         .iter()
         .flat_map(|(&chain, values)| values.iter().map(move |&value| (chain, value)))
@@ -202,12 +245,13 @@ fn check_outcome(lines: &[Value], ring: &Ring) {
 fn a_chain_passed_around_a_ring_is_the_collatz_sequence() {
     let ring: &Ring = &[("a", &[27]), ("b", &[]), ("c", &[])];
     let lines = run(ring);
-    let chains = chains(&lines);
-    assert_eq!(chains.len(), 1);
-    assert_eq!(chains[&27], sequence(27));
-    assert_eq!(chains[&27].len(), 112, "27 takes 111 steps to reach 1");
     check_outcome(&lines, ring);
-    support::check(&lines);
+    // `check_outcome` trusts `sequence`; one well-known length pins that down.
+    assert_eq!(
+        chains(&lines)[&27].len(),
+        112,
+        "27 takes 111 steps to reach 1"
+    );
 }
 
 #[test]
@@ -216,7 +260,6 @@ fn a_chain_from_one_is_over_at_once() {
     let lines = run(ring);
     assert_eq!(chains(&lines)[&1], [1]);
     check_outcome(&lines, ring);
-    support::check(&lines);
 }
 
 #[test]
@@ -226,16 +269,7 @@ fn several_chains_at_once_are_each_the_collatz_sequence() {
     // on each step is what lets every chain be followed separately.
     let ring: &Ring = &[("a", &[6, 7]), ("b", &[27]), ("c", &[]), ("d", &[97, 871])];
     let lines = run(ring);
-    let chains = chains(&lines);
-    assert_eq!(
-        chains.keys().copied().collect::<Vec<_>>(),
-        [6, 7, 27, 97, 871]
-    );
-    for (chain, values) in &chains {
-        assert_eq!(*values, sequence(*chain), "chain {chain}");
-    }
     check_outcome(&lines, ring);
-    support::check(&lines);
 }
 
 #[test]
@@ -245,7 +279,6 @@ fn chains_that_share_a_value_stay_apart() {
     let ring: &Ring = &[("a", &[6, 3]), ("b", &[])];
     let lines = run(ring);
     check_outcome(&lines, ring);
-    support::check(&lines);
 }
 
 /// A hand-written trajectory of a ring of two in which `a` opens 4 and 2,
@@ -318,6 +351,16 @@ fn a_step_sent_on_the_wrong_chain_is_caught() {
 }
 
 #[test]
+#[should_panic(expected = "next agent in the ring")]
+fn a_step_sent_to_the_wrong_agent_is_caught() {
+    let mut lines = mixed_drains();
+    // a's opening step for chain 4 is addressed to c, who is not in the ring.
+    lines[1]["event"]["recipients"] = serde_json::json!(["c"]);
+    let ring: &Ring = &[("a", &[4, 2]), ("b", &[])];
+    check_outcome(&lines, ring);
+}
+
+#[test]
 fn a_ring_that_opens_nothing_goes_quiescent_at_once() {
     let ring: &Ring = &[("a", &[]), ("b", &[])];
     let lines = run(ring);
@@ -332,5 +375,4 @@ fn a_ring_that_opens_nothing_goes_quiescent_at_once() {
         "a start and a stop for each of two agents"
     );
     check_outcome(&lines, ring);
-    support::check(&lines);
 }
