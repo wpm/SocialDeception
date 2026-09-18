@@ -32,4 +32,4 @@ pub use episode::{Episode, EpisodeError, Failure};
 pub use event::{AgentId, Control, Event, Payload};
 pub use router::{RouteError, Router};
 pub use timer::{ManualTimer, ManualTimerControl, TimerSource};
-pub use trajectory::{CycleRecord, EventRecord, LogRecord, Seq, Writer};
+pub use trajectory::{CycleRecord, EventRecord, LogRecord, Seq, Stamp, Writer};

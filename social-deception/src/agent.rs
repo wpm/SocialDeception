@@ -97,7 +97,7 @@ use crossbeam_channel::{Receiver, Sender, TryRecvError, never, select};
 use crate::clock::{Clock, Timestamp};
 use crate::event::{AgentId, Control, Event, Payload};
 use crate::timer::TimerSource;
-use crate::trajectory::{CycleRecord, EventRecord, LogRecord, Seq};
+use crate::trajectory::{CycleRecord, EventRecord, LogRecord, Seq, Stamp};
 
 /// An environment's behavior for one agent.
 ///
@@ -448,11 +448,11 @@ where
                 Event::Control(Control::Stop) => stopped = true,
                 _ => {}
             }
-            inputs.push(self.record(time, event.clone())?);
+            inputs.push(self.record(Stamp::Arrived(time), event.clone())?);
             events.push(event);
         }
         if let Some(deadline) = due {
-            inputs.push(self.record(deadline, Event::Think)?);
+            inputs.push(self.record(Stamp::Due(deadline), Event::Think)?);
             events.push(Event::Think);
             self.schedule_think(t_start);
         }
@@ -477,7 +477,7 @@ where
                 recipients,
                 payload,
             };
-            outputs.push(self.record(self.wiring.clock.now(), event.clone())?);
+            outputs.push(self.record(Stamp::Sent(self.wiring.clock.now()), event.clone())?);
             sent.push(event);
         }
         let dispatch = CycleDispatch {
@@ -505,13 +505,13 @@ where
 
     /// Writes an event record with the next sequence number and returns that
     /// number.
-    fn record(&mut self, time: Timestamp, event: Event<P>) -> Result<Seq, Error> {
+    fn record(&mut self, stamp: Stamp, event: Event<P>) -> Result<Seq, Error> {
         let seq = Seq(self.next_seq);
         self.next_seq += 1;
         let record = EventRecord {
             agent: self.wiring.id.clone(),
             seq,
-            time,
+            stamp,
             event,
         };
         self.wiring
@@ -844,7 +844,8 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event, Event::Think);
         assert_eq!(
-            events[0].time, first,
+            events[0].stamp,
+            Stamp::Due(first),
             "a think is stamped with its deadline"
         );
         assert_eq!(thought.inputs, [events[0].seq]);
@@ -943,19 +944,19 @@ mod tests {
         assert_eq!(lines.len(), 4);
         assert_eq!(
             lines[0],
-            json!({"type": "event", "agent": "a", "seq": 0, "time": 10,
+            json!({"type": "event", "agent": "a", "seq": 0, "arrived": 10,
                    "event": {"kind": "control", "control": "start"}})
         );
         assert_eq!(
             lines[1],
-            json!({"type": "event", "agent": "a", "seq": 1, "time": 20,
+            json!({"type": "event", "agent": "a", "seq": 1, "arrived": 20,
                    "event": {"kind": "message", "sender": "b", "recipients": ["a"],
                              "payload": {"Step": 6}}})
         );
-        let sent = lines[2]["time"].as_u64().unwrap();
+        let sent = lines[2]["sent"].as_u64().unwrap();
         assert_eq!(
             lines[2],
-            json!({"type": "event", "agent": "a", "seq": 2, "time": sent,
+            json!({"type": "event", "agent": "a", "seq": 2, "sent": sent,
                    "event": {"kind": "message", "sender": "a", "recipients": ["b"],
                              "payload": {"Step": 7}}})
         );

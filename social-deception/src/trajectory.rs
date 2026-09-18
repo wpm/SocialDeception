@@ -10,7 +10,7 @@
 //! the start. Each pass produces:
 //!
 //! - an [`EventRecord`] per event: the agent it belongs to, the agent's
-//!   sequence number for it, its time, and the event itself;
+//!   sequence number for it, its [`Stamp`], and the event itself;
 //! - a [`CycleRecord`] per pass: the handling window, the sequence numbers of
 //!   the events that were in the drain, and the sequence numbers of whatever
 //!   the fold emitted.
@@ -50,8 +50,9 @@
 //! # On-disk format
 //!
 //! One JSON object per line. Both record types are wrapped in [`LogRecord`],
-//! whose `type` field is `"event"` or `"cycle"`. Nothing here reads a log
-//! back; only `Serialize` is required of a payload.
+//! whose `type` field is `"event"` or `"cycle"`. An event line carries exactly
+//! one of `arrived`, `sent` or `due`, the [`Stamp`] flattened into it. Nothing
+//! here reads a log back; only `Serialize` is required of a payload.
 
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
@@ -72,6 +73,24 @@ use crate::event::{AgentId, Event, Payload};
 #[serde(transparent)]
 pub struct Seq(pub u64);
 
+/// When an event crossed the agent's boundary, and in which direction.
+///
+/// Serializes as a single field named after the variant, so an event record
+/// has exactly one of `arrived`, `sent` or `due`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Stamp {
+    /// An input, a control event or a message from another agent: when the
+    /// router put it on this agent's inbox.
+    Arrived(Timestamp),
+    /// An output, a message this agent sent: when the loop handed it to the
+    /// router.
+    Sent(Timestamp),
+    /// A `Think`: the deadline it was scheduled for, which is at or before
+    /// the moment the loop noticed it.
+    Due(Timestamp),
+}
+
 /// One event in one agent's trajectory.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct EventRecord<P> {
@@ -79,9 +98,9 @@ pub struct EventRecord<P> {
     pub agent: AgentId,
     /// The agent's sequence number for this event.
     pub seq: Seq,
-    /// When the event arrived on the agent's channel, or, for an event the
-    /// agent itself emitted, when the loop handed it to the router.
-    pub time: Timestamp,
+    /// When the event crossed the agent's boundary, and in which direction.
+    #[serde(flatten)]
+    pub stamp: Stamp,
     /// The event.
     pub event: Event<P>,
 }
@@ -221,21 +240,21 @@ mod tests {
             EventRecord {
                 agent: a.clone(),
                 seq: Seq(0),
-                time: at(10),
+                stamp: Stamp::Arrived(at(10)),
                 event: Event::Control(Control::Start),
             }
             .into(),
             EventRecord {
                 agent: a.clone(),
                 seq: Seq(1),
-                time: at(20),
+                stamp: Stamp::Arrived(at(20)),
                 event: Event::message("b", ["a"], TestPayload::Step(6)),
             }
             .into(),
             EventRecord {
                 agent: a.clone(),
                 seq: Seq(2),
-                time: at(40),
+                stamp: Stamp::Sent(at(40)),
                 event: Event::message("a", ["b"], TestPayload::Step(3)),
             }
             .into(),
@@ -252,12 +271,12 @@ mod tests {
 
     fn expected_lines() -> Vec<Value> {
         vec![
-            json!({"type": "event", "agent": "a", "seq": 0, "time": 10,
+            json!({"type": "event", "agent": "a", "seq": 0, "arrived": 10,
                    "event": {"kind": "control", "control": "start"}}),
-            json!({"type": "event", "agent": "a", "seq": 1, "time": 20,
+            json!({"type": "event", "agent": "a", "seq": 1, "arrived": 20,
                    "event": {"kind": "message", "sender": "b", "recipients": ["a"],
                              "payload": {"Step": 6}}}),
-            json!({"type": "event", "agent": "a", "seq": 2, "time": 40,
+            json!({"type": "event", "agent": "a", "seq": 2, "sent": 40,
                    "event": {"kind": "message", "sender": "a", "recipients": ["b"],
                              "payload": {"Step": 3}}}),
             json!({"type": "cycle", "agent": "a", "t_start": 30, "t_stop": 50,
@@ -309,7 +328,7 @@ mod tests {
                         let record = EventRecord {
                             agent: agent.clone(),
                             seq: Seq(seq),
-                            time: at(seq),
+                            stamp: Stamp::Due(at(seq)),
                             event: Event::<TestPayload>::Think,
                         };
                         sender.send(record.into()).unwrap();
@@ -387,7 +406,7 @@ mod tests {
         let big: LogRecord<TestPayload> = EventRecord {
             agent: AgentId::new("a"),
             seq: Seq(0),
-            time: at(0),
+            stamp: Stamp::Sent(at(0)),
             event: Event::message(
                 "a",
                 (0..20_000)
@@ -406,7 +425,7 @@ mod tests {
         let late: LogRecord<TestPayload> = LogRecord::Event(EventRecord {
             agent: AgentId::new("a"),
             seq: Seq(1),
-            time: at(2),
+            stamp: Stamp::Due(at(2)),
             event: Event::Think,
         });
         assert!(
