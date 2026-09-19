@@ -10,15 +10,22 @@
 //!
 //! # The action space, and its order
 //!
-//! Every role's action space is [`base_action_space`]: a target for each
-//! living player other than the agent itself, in sorted agent order, then
-//! [`Action::Abstain`] exactly where [`RequestKind::may_abstain`] permits
-//! it. The two universal rules fall out of that base, since the target must
-//! be living and no action may target the agent taking it; neither is
+//! Every action space in the game is computed by one function,
+//! [`action_space`]: a target for each living player other than the agent
+//! itself, in sorted agent order, less the one the doctor protected last
+//! night, then [`Action::Abstain`] exactly where [`RequestKind::may_abstain`]
+//! permits it. The two universal rules fall out of that, since the target
+//! must be living and no action may target the agent taking it; neither is
 //! strategy, and nothing can do them. The order is canonical and
 //! load-bearing: an index into the vector is a stable action label, the
 //! same on every run and in every episode with the same living set, which
 //! is why the action space is a `Vec<Action>` and not a set.
+//!
+//! The roles here compute their action spaces from what they know, and the
+//! [`Game`](super::Game) checks every response against the same function
+//! from what it knows, so the two cannot disagree about what the rules
+//! permit: a player that is not one of these types, a language-model agent
+//! or a test stub, is held to exactly the space these types compute.
 //!
 //! Which requests a role answers is [`Role::asked_in`]'s to say, and a
 //! request of any other kind is a bug in the moderator: the role panics
@@ -27,7 +34,7 @@
 //! nights, so its `Protect` action space also excludes
 //! [`Knowledge::last_protected`]. That is a rule of the variant, not
 //! advice, and it is why `Abstain` has to be in that action space: with few
-//! players living, the base set minus last night's target can be empty.
+//! players living, the targets minus last night's can be empty.
 //!
 //! The action space is never empty when a request is legitimately issued:
 //! `Nominate` and `Devour` are only asked while at least one valid target
@@ -40,16 +47,51 @@
 //! policy's judgement (ADR-0005), and the tests in this module assert that
 //! it stays that way.
 
+use std::collections::BTreeSet;
+
 use super::knowledge::Knowledge;
 use super::message::{Action, Request, RequestKind};
 use super::player::Player;
 use super::role::Role;
 use crate::event::AgentId;
 
-/// The action space every role starts from for `request`: a target for each
-/// living player other than the agent itself, in sorted agent order, then
-/// [`Action::Abstain`] if and only if the request's kind
+/// The action space the rules permit `me` for a request of `kind` while
+/// `living` are alive: a target for each living player other than `me`, in
+/// sorted agent order, less `last_protected` if the request is a `Protect`,
+/// then [`Action::Abstain`] if and only if the kind
 /// [may be abstained from](RequestKind::may_abstain).
+///
+/// This is the whole of the rules about what a player may do, and the one
+/// place they are written: the roles below compute their action spaces with
+/// it from their knowledge, and the game checks every response against it
+/// from its own state. `last_protected` is whom the doctor protected the
+/// night before, or `None` for anyone else, for a doctor that abstained,
+/// and for a doctor on the first night.
+#[must_use]
+pub fn action_space(
+    me: &AgentId,
+    living: &BTreeSet<AgentId>,
+    kind: RequestKind,
+    last_protected: Option<&AgentId>,
+) -> Vec<Action> {
+    let excluded = |who: &&AgentId| {
+        *who != me && !(kind == RequestKind::Protect && Some(*who) == last_protected)
+    };
+    let mut space: Vec<Action> = living
+        .iter()
+        .filter(excluded)
+        .cloned()
+        .map(Action::Target)
+        .collect();
+    if kind.may_abstain() {
+        space.push(Action::Abstain);
+    }
+    space
+}
+
+/// The action space [`action_space`] permits a player with `knowledge` for
+/// `request`, from what it knows: who is living, and, for a doctor, whom it
+/// protected last night.
 ///
 /// # Panics
 ///
@@ -63,15 +105,12 @@ pub fn base_action_space(knowledge: &Knowledge, request: &Request) -> Vec<Action
         "a {} is never asked to {kind:?}",
         knowledge.role
     );
-    let mut space: Vec<Action> = knowledge
-        .living_others()
-        .into_iter()
-        .map(Action::Target)
-        .collect();
-    if kind.may_abstain() {
-        space.push(Action::Abstain);
-    }
-    space
+    action_space(
+        &knowledge.me,
+        &knowledge.living,
+        kind,
+        knowledge.last_protected.as_ref(),
+    )
 }
 
 /// A player with no power beyond the day vote.
@@ -196,21 +235,18 @@ impl Player for Doctor {
         &mut self.knowledge
     }
 
-    /// For `Protect`, the base action space minus whoever it protected last
-    /// night. `Abstain` is always there, so the space is never empty.
+    /// For `Protect`, everyone living but itself and whoever it protected
+    /// last night, which its knowledge remembers. `Abstain` is always there,
+    /// so the space is never empty.
     fn action_space(&self, request: &Request) -> Vec<Action> {
-        let mut space = base_action_space(&self.knowledge, request);
-        if let (RequestKind::Protect, Some(last)) = (request.kind, &self.knowledge.last_protected) {
-            space.retain(|action: &Action| action.target() != Some(last));
-        }
-        space
+        base_action_space(&self.knowledge, request)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{ME, id, knowing, request, seer_knowing, target, werewolf_knowing};
+    use crate::testing::{ME, id, ids, knowing, request, seer_knowing, target, werewolf_knowing};
 
     /// `player` with `knowledge` in place of what it was constructed with.
     fn with<R: Player>(mut player: R, knowledge: Knowledge) -> R {
@@ -376,6 +412,27 @@ mod tests {
         assert_eq!(
             doctor.action_space(&request(RequestKind::Protect)),
             [Action::Abstain]
+        );
+    }
+
+    #[test]
+    fn the_rules_are_one_function_whoever_computes_them() {
+        // What a doctor computes from its knowledge is what the game
+        // computes from its state, given the same facts.
+        let mut doctor = doctor(["alice", "bob", "carol"]);
+        protected(&mut doctor, &target("bob"));
+        let living = ids(["alice", "bob", "carol", ME]);
+        for kind in [RequestKind::Protect, RequestKind::Nominate] {
+            assert_eq!(
+                doctor.action_space(&request(kind)),
+                action_space(&id(ME), &living, kind, Some(&id("bob"))),
+                "{kind:?}"
+            );
+        }
+        // Somebody else's last protection is nobody else's constraint.
+        assert_eq!(
+            action_space(&id(ME), &living, RequestKind::Devour, Some(&id("bob"))),
+            ["alice", "bob", "carol"].map(target)
         );
     }
 

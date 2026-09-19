@@ -253,7 +253,7 @@ mod tests {
     use super::*;
     use crate::agent::Outgoing;
     use crate::event::Event;
-    use crate::testing::{TempPath, id, ids, parse_lines};
+    use crate::testing::{TempDir, id, ids, parse_lines};
     use crate::werewolf::config::{DEFAULT_MAX_ROUNDS, DEFAULT_MODERATOR, RoleCounts};
     use crate::werewolf::message::Round;
     use crate::werewolf::transcript::{self, Transcript};
@@ -375,12 +375,13 @@ mod tests {
 
     #[test]
     fn the_trajectory_is_written_and_agrees_with_the_outcome() {
-        let trajectory = TempPath::new("jsonl");
+        let dir = TempDir::new();
+        let trajectory = dir.join("werewolf.jsonl");
         let mut config = town();
-        config.trajectory = Some(trajectory.to_path_buf());
+        config.trajectory = Some(trajectory.clone());
         let outcome = run(&config).unwrap();
 
-        let lines = parse_lines(&fs::read(&*trajectory).unwrap());
+        let lines = parse_lines(&fs::read(&trajectory).unwrap());
         assert!(!lines.is_empty());
 
         // The outcome on the channel and the one the moderator announced in
@@ -391,12 +392,13 @@ mod tests {
 
     #[test]
     fn the_trajectory_is_the_same_game_across_runs() {
-        let first = TempPath::new("jsonl");
-        let second = TempPath::new("jsonl");
+        let dir = TempDir::new();
+        let first = dir.join("first.jsonl");
+        let second = dir.join("second.jsonl");
         let mut config = town();
-        config.trajectory = Some(first.to_path_buf());
+        config.trajectory = Some(first.clone());
         run(&config).unwrap();
-        config.trajectory = Some(second.to_path_buf());
+        config.trajectory = Some(second.clone());
         run(&config).unwrap();
         assert_eq!(transcript(&first, &config), transcript(&second, &config));
     }

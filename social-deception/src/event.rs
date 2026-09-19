@@ -23,9 +23,27 @@ impl<P: Serialize + Send + Clone + 'static> Payload for P {}
 /// The name of an agent within an episode.
 ///
 /// Agent ids are strings. Application code addresses agents by id.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+///
+/// An id serializes as its bare string, and deserializes from one that is
+/// not empty: an empty id names nobody, so a file that carries one is
+/// malformed wherever the empty string appears, and every reader gets that
+/// check from the type rather than writing its own.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct AgentId(String);
+
+impl<'de> Deserialize<'de> for AgentId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let id = String::deserialize(deserializer)?;
+        if id.is_empty() {
+            return Err(serde::de::Error::invalid_value(
+                serde::de::Unexpected::Str(&id),
+                &"a non-empty agent id",
+            ));
+        }
+        Ok(Self(id))
+    }
+}
 
 impl AgentId {
     /// Creates an agent id.
@@ -156,5 +174,23 @@ mod tests {
     fn agent_id_serialises_as_a_bare_string() {
         assert_eq!(json(&AgentId::new("alice")), serde_json::json!("alice"));
         assert_eq!(AgentId::new("alice").to_string(), "alice");
+    }
+
+    #[test]
+    fn agent_id_deserialises_from_a_bare_string() {
+        let id: AgentId = serde_json::from_value(serde_json::json!("alice")).unwrap();
+        assert_eq!(id, AgentId::new("alice"));
+    }
+
+    #[test]
+    fn an_empty_agent_id_does_not_deserialise() {
+        let error = serde_json::from_value::<AgentId>(serde_json::json!("")).unwrap_err();
+        assert!(error.to_string().contains("non-empty agent id"), "{error}");
+        // Inside a collection too, since that is where a reader meets it.
+        let error =
+            serde_json::from_value::<Vec<AgentId>>(serde_json::json!(["alice", ""])).unwrap_err();
+        assert!(error.to_string().contains("non-empty agent id"), "{error}");
+        // A number is not an id either.
+        assert!(serde_json::from_value::<AgentId>(serde_json::json!(7)).is_err());
     }
 }

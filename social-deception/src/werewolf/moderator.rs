@@ -64,8 +64,6 @@ use crate::event::{Control, Event};
 pub struct Moderator {
     game: Game,
     outcome: Sender<Outcome>,
-    /// Whether the outcome has been announced and sent on the channel.
-    over: bool,
 }
 
 impl Moderator {
@@ -76,11 +74,7 @@ impl Moderator {
     /// [`Control::Start`].
     #[must_use]
     pub const fn new(game: Game, outcome: Sender<Outcome>) -> Self {
-        Self {
-            game,
-            outcome,
-            over: false,
-        }
+        Self { game, outcome }
     }
 
     /// What one event makes the game say.
@@ -127,12 +121,15 @@ impl Handler<Message> for Moderator {
     fn handle(&mut self, events: &[Event<Message>]) -> Vec<Outgoing<Message>> {
         let mut outgoing = Vec::new();
         for event in events {
-            if self.over {
+            // Whether the game is over is the game's to say, and it is
+            // asked before every event, so the event that ends it is the
+            // last one folded and the only one after which the outcome is
+            // seen for the first time.
+            if self.game.outcome().is_some() {
                 break;
             }
             outgoing.extend(self.fold(event).into_iter().map(send));
             if let Some(outcome) = self.game.outcome() {
-                self.over = true;
                 // The caller may have dropped the receiver. That is not the
                 // game's problem: the in-world announcement is the record.
                 let _ = self.outcome.send(outcome.clone());
@@ -540,7 +537,7 @@ mod tests {
             assert_eq!(padded.handle(&batch), outgoing);
             pending = respond(&outgoing, first_other, reference.game.living());
         }
-        assert!(reference.over && padded.over);
+        assert!(reference.game.outcome().is_some() && padded.game.outcome().is_some());
     }
 
     #[test]

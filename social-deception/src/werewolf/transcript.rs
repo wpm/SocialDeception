@@ -155,12 +155,6 @@ pub enum TranscriptError {
         /// The one found.
         found: u64,
     },
-    /// An agent id is the empty string. `AgentId` deserializes without
-    /// validating, so this is where an empty id is caught.
-    EmptyAgentId {
-        /// The line.
-        line: usize,
-    },
     /// A response answers a request the moderator did not send, has already
     /// had answered, or sent to somebody else.
     UnknownRequest {
@@ -212,7 +206,6 @@ impl fmt::Display for TranscriptError {
                 f,
                 "line {line} has sequence number {found} where {expected} was expected"
             ),
-            Self::EmptyAgentId { line } => write!(f, "line {line} names an empty agent id"),
             Self::UnknownRequest {
                 line,
                 from,
@@ -363,12 +356,6 @@ fn message(record: &Map<String, Value>, line: usize) -> Result<Option<Record>, T
         .ok_or_else(|| malformed(line, "no payload"))?;
     let message = Message::deserialize(payload)
         .map_err(|source| TranscriptError::Payload { line, source })?;
-    // The only strings in a message event besides its tags are agent ids,
-    // and no tag is empty, so an empty string anywhere in it is an empty id,
-    // wherever a future field puts one.
-    if event.values().any(has_empty_string) {
-        return Err(TranscriptError::EmptyAgentId { line });
-    }
     Ok(Some(Record {
         line,
         direction,
@@ -376,16 +363,6 @@ fn message(record: &Map<String, Value>, line: usize) -> Result<Option<Record>, T
         recipients,
         message,
     }))
-}
-
-/// Whether an empty string appears anywhere in a JSON value.
-fn has_empty_string(value: &Value) -> bool {
-    match value {
-        Value::String(text) => text.is_empty(),
-        Value::Array(items) => items.iter().any(has_empty_string),
-        Value::Object(fields) => fields.values().any(has_empty_string),
-        Value::Null | Value::Bool(_) | Value::Number(_) => false,
-    }
 }
 
 fn malformed(line: usize, what: &str) -> TranscriptError {
@@ -424,6 +401,21 @@ fn decode<T: serde::de::DeserializeOwned>(
     T::deserialize(value).map_err(|error| malformed(line, &format!("{key}: {error}")))
 }
 
+/// The one agent a message addressed to exactly one agent was addressed to,
+/// or [`TranscriptError::Malformed`] saying `what` was expected if it was
+/// addressed to none or to several.
+fn only(
+    line: usize,
+    recipients: BTreeSet<AgentId>,
+    what: &str,
+) -> Result<AgentId, TranscriptError> {
+    let mut recipients = recipients.into_iter();
+    match (recipients.next(), recipients.next()) {
+        (Some(who), None) => Ok(who),
+        _ => Err(malformed(line, what)),
+    }
+}
+
 /// The game so far, as a fold over the moderator's records.
 #[derive(Default)]
 struct Reader {
@@ -447,10 +439,7 @@ impl Reader {
             (Direction::Sent, Message::Narration(narration)) => {
                 self.narrated(line, recipients, narration)
             }
-            (Direction::Sent, Message::Request(request)) => {
-                self.asked(recipients, &request);
-                Ok(())
-            }
+            (Direction::Sent, Message::Request(request)) => self.asked(line, recipients, &request),
             (Direction::Arrived, Message::Response(response)) => {
                 self.answered(line, sender, response)
             }
@@ -489,11 +478,9 @@ impl Reader {
                 }
                 _ => return Err(TranscriptError::NoPhase { line }),
             },
-            // A finding is addressed to the one seer.
             Narration::Investigated { target, faction } => {
-                if let Some(seer) = recipients.into_iter().next() {
-                    self.current(line)?.investigation = Some((seer, target, faction));
-                }
+                let seer = only(line, recipients, "a finding is addressed to one seer")?;
+                self.current(line)?.investigation = Some((seer, target, faction));
             }
             Narration::Eliminated {
                 who, role, cause, ..
@@ -506,11 +493,15 @@ impl Reader {
         Ok(())
     }
 
-    /// A request is addressed to the one agent asked.
-    fn asked(&mut self, recipients: BTreeSet<AgentId>, request: &Request) {
-        if let Some(who) = recipients.into_iter().next() {
-            self.outstanding.insert(request.id, (who, request.kind));
-        }
+    fn asked(
+        &mut self,
+        line: usize,
+        recipients: BTreeSet<AgentId>,
+        request: &Request,
+    ) -> Result<(), TranscriptError> {
+        let who = only(line, recipients, "a request is addressed to one player")?;
+        self.outstanding.insert(request.id, (who, request.kind));
+        Ok(())
     }
 
     fn answered(
@@ -1086,27 +1077,30 @@ mod tests {
 
     #[test]
     fn an_empty_agent_id_is_an_error_wherever_it_appears() {
+        // `AgentId` refuses to deserialize from the empty string, so an
+        // empty id in the envelope is a malformed envelope and one in the
+        // payload is a payload that is not a Werewolf message, each naming
+        // the line.
         let index = moderator_record(&fixture(), is_response);
-        // Where in the record the empty id goes, as a path of keys.
-        let corruptions = [
-            (&["event", "sender"][..], json!("")),
-            (&["event", "recipients"], json!([""])),
-            (
-                &["event", "payload", "Response", "action", "Target"],
-                json!(""),
-            ),
-        ];
-        for (path, empty) in corruptions {
+        for (key, empty) in [("sender", json!("")), ("recipients", json!([""]))] {
             let mut lines = fixture();
-            *path
-                .iter()
-                .fold(&mut lines[index], |value, key| &mut value[*key]) = empty;
+            lines[index]["event"][key] = empty;
             let error = read(&lines).unwrap_err();
             assert!(
-                matches!(&error, TranscriptError::EmptyAgentId { line } if *line == index + 1),
-                "{path:?}: {error:?}"
+                matches!(&error, TranscriptError::Malformed { line, what }
+                    if *line == index + 1 && what.starts_with(key)),
+                "{key}: {error:?}"
             );
+            assert!(error.to_string().contains("non-empty agent id"), "{error}");
         }
+        let mut lines = fixture();
+        lines[index]["event"]["payload"]["Response"]["action"]["Target"] = json!("");
+        let error = read(&lines).unwrap_err();
+        assert!(
+            matches!(&error, TranscriptError::Payload { line, .. } if *line == index + 1),
+            "{error:?}"
+        );
+        assert!(error.to_string().contains("non-empty agent id"), "{error}");
         // A narration's ids are checked too.
         let mut lines = fixture();
         let index = moderator_record(&lines, |payload| {
@@ -1115,10 +1109,47 @@ mod tests {
         lines[index]["event"]["payload"]["Narration"]["Eliminated"]["who"] = json!("");
         let error = read(&lines).unwrap_err();
         assert!(
-            matches!(error, TranscriptError::EmptyAgentId { .. }),
+            matches!(&error, TranscriptError::Payload { line, .. } if *line == index + 1),
             "{error:?}"
         );
-        assert!(error.to_string().contains("empty agent id"), "{error}");
+    }
+
+    fn is_request(payload: &Value) -> bool {
+        !payload["Request"].is_null()
+    }
+
+    #[test]
+    fn a_request_addressed_to_other_than_one_player_is_an_error() {
+        // Naming the request's line, not the line of whichever response
+        // later fails to match it.
+        for to in [json!([]), json!(["alice", "bob"])] {
+            let mut lines = fixture();
+            let index = moderator_record(&lines, is_request);
+            lines[index]["event"]["recipients"] = to.clone();
+            let error = read(&lines).unwrap_err();
+            assert!(
+                matches!(&error, TranscriptError::Malformed { line, what }
+                    if *line == index + 1 && what == "a request is addressed to one player"),
+                "{to}: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_finding_addressed_to_other_than_one_seer_is_an_error() {
+        for to in [json!([]), json!(["alice", "grace"])] {
+            let mut lines = fixture();
+            let index = moderator_record(&lines, |payload| {
+                !payload["Narration"]["Investigated"].is_null()
+            });
+            lines[index]["event"]["recipients"] = to.clone();
+            let error = read(&lines).unwrap_err();
+            assert!(
+                matches!(&error, TranscriptError::Malformed { line, what }
+                    if *line == index + 1 && what == "a finding is addressed to one seer"),
+                "{to}: {error:?}"
+            );
+        }
     }
 
     #[test]

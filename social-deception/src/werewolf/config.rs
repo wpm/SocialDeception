@@ -34,6 +34,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use super::seed;
 use crate::event::AgentId;
 
 /// The round cap when the file does not set one.
@@ -103,6 +104,9 @@ fn default_moderator() -> AgentId {
 }
 
 /// Why a configuration was rejected.
+///
+/// An empty agent id is not among these: `AgentId` does not deserialize
+/// from the empty string, so a file naming one fails to parse.
 #[derive(Debug)]
 pub enum ConfigError {
     /// The file could not be read.
@@ -143,12 +147,13 @@ pub enum ConfigError {
     TooManySeers(usize),
     /// `roles.doctors` is more than one.
     TooManyDoctors(usize),
-    /// A player id, or the moderator's, is the empty string.
-    EmptyAgentId,
     /// A player id appears more than once.
     DuplicatePlayer(AgentId),
     /// A player has the moderator's id.
     PlayerIsModerator(AgentId),
+    /// A player has the name of one of the seed streams that are not a
+    /// player's, [`seed::RESERVED`], and would share its generator with it.
+    ReservedPlayer(AgentId),
     /// `max_rounds` is zero.
     NoRounds,
 }
@@ -175,11 +180,23 @@ impl fmt::Display for ConfigError {
             Self::TooManyDoctors(doctors) => {
                 write!(f, "roles.doctors must be 0 or 1, not {doctors}")
             }
-            Self::EmptyAgentId => f.write_str("agent ids must not be empty"),
-            Self::DuplicatePlayer(who) => write!(f, "player {who:?} is listed more than once"),
-            Self::PlayerIsModerator(who) => {
-                write!(f, "player {who:?} has the moderator's id")
+            Self::DuplicatePlayer(who) => {
+                write!(f, "player {:?} is listed more than once", who.as_str())
             }
+            Self::PlayerIsModerator(who) => {
+                write!(f, "player {:?} has the moderator's id", who.as_str())
+            }
+            Self::ReservedPlayer(who) => write!(
+                f,
+                "player {:?} has a name reserved for the game's own random streams; the \
+                 reserved names are {}",
+                who.as_str(),
+                seed::RESERVED
+                    .iter()
+                    .map(|label| format!("{label:?}"))
+                    .collect::<Vec<_>>()
+                    .join(" and ")
+            ),
             Self::NoRounds => f.write_str("max_rounds must be at least 1"),
         }
     }
@@ -292,19 +309,16 @@ impl Config {
         if doctors > 1 {
             return Err(ConfigError::TooManyDoctors(doctors));
         }
-        if self.moderator.as_str().is_empty() {
-            return Err(ConfigError::EmptyAgentId);
-        }
         let mut seen = BTreeSet::new();
         for player in &self.players {
-            if player.as_str().is_empty() {
-                return Err(ConfigError::EmptyAgentId);
-            }
             if !seen.insert(player) {
                 return Err(ConfigError::DuplicatePlayer(player.clone()));
             }
             if *player == self.moderator {
                 return Err(ConfigError::PlayerIsModerator(player.clone()));
+            }
+            if seed::RESERVED.contains(&player.as_str()) {
+                return Err(ConfigError::ReservedPlayer(player.clone()));
             }
         }
         if self.max_rounds == 0 {
@@ -340,7 +354,7 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::TempPath;
+    use crate::testing::TempDir;
 
     /// The example configuration, as committed at the repository root.
     const EXAMPLE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../examples/werewolf.toml");
@@ -544,20 +558,19 @@ mod tests {
     }
 
     #[test]
-    fn empty_player_id() {
-        let mut config = valid();
-        config.players[3] = AgentId::new("");
-        let error = config.validate().unwrap_err();
-        assert!(matches!(error, ConfigError::EmptyAgentId), "{error:?}");
-        assert!(error.to_string().contains("empty"));
+    fn empty_player_id_does_not_parse() {
+        let text = FULL.replace("\"dave\"", "\"\"");
+        let error = Config::parse(&text).unwrap_err();
+        assert!(matches!(error, ConfigError::Parse(_)), "{error:?}");
+        assert!(error.to_string().contains("non-empty agent id"), "{error}");
     }
 
     #[test]
-    fn empty_moderator_id() {
-        let mut config = valid();
-        config.moderator = AgentId::new("");
-        let error = config.validate().unwrap_err();
-        assert!(matches!(error, ConfigError::EmptyAgentId), "{error:?}");
+    fn empty_moderator_id_does_not_parse() {
+        let text = FULL.replace("\"narrator\"", "\"\"");
+        let error = Config::parse(&text).unwrap_err();
+        assert!(matches!(error, ConfigError::Parse(_)), "{error:?}");
+        assert!(error.to_string().contains("non-empty agent id"), "{error}");
     }
 
     #[test]
@@ -569,7 +582,7 @@ mod tests {
             matches!(&error, ConfigError::DuplicatePlayer(who) if who.as_str() == "bob"),
             "{error:?}"
         );
-        assert!(error.to_string().contains("\"bob\""));
+        assert_eq!(error.to_string(), "player \"bob\" is listed more than once");
     }
 
     #[test]
@@ -581,7 +594,35 @@ mod tests {
             matches!(&error, ConfigError::PlayerIsModerator(who) if who.as_str() == "narrator"),
             "{error:?}"
         );
-        assert!(error.to_string().contains("moderator"));
+        assert_eq!(
+            error.to_string(),
+            "player \"narrator\" has the moderator's id"
+        );
+    }
+
+    #[test]
+    fn a_player_may_not_be_named_for_a_reserved_seed_stream() {
+        // Such a player's policy would draw from the deal's generator, or
+        // the moderator's, and the streams would not be independent.
+        for reserved in seed::RESERVED {
+            let mut config = valid();
+            config.players[2] = AgentId::new(reserved);
+            let error = config.validate().unwrap_err();
+            assert!(
+                matches!(&error, ConfigError::ReservedPlayer(who) if who.as_str() == reserved),
+                "{error:?}"
+            );
+            let text = error.to_string();
+            assert!(text.contains(&format!("{reserved:?}")), "{text}");
+            assert!(
+                text.contains("\"assignment\" and \"moderator:ties\""),
+                "{text}"
+            );
+        }
+        // The moderator has no policy stream, so its name is free.
+        let mut config = valid();
+        config.moderator = AgentId::new(seed::TIES);
+        config.validate().unwrap();
     }
 
     #[test]
@@ -629,7 +670,8 @@ mod tests {
 
     #[test]
     fn the_effective_config_is_written_beside_the_trajectory_and_loads() {
-        let trajectory = TempPath::new("jsonl");
+        let dir = TempDir::new();
+        let trajectory = dir.join("werewolf.jsonl");
         let written = write_effective(&valid(), &trajectory).unwrap();
         assert_eq!(written, effective_path(&trajectory));
         assert_eq!(
@@ -639,7 +681,6 @@ mod tests {
                 ..valid()
             }
         );
-        fs::remove_file(written).unwrap();
     }
 
     #[test]

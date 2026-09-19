@@ -27,19 +27,19 @@ mod support;
 
 use std::fs;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use social_deception::AgentId;
 use social_deception::werewolf::config::{DEFAULT_MAX_ROUNDS, DEFAULT_MODERATOR};
 use social_deception::werewolf::{self, Config, Faction, RoleCounts, Transcript, config};
-use support::TempFile;
+use support::TempDir;
 
 /// A seven-player game played to a village win, with its effective config
 /// and its expected rendering beside it.
 const FIXTURE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/werewolf.jsonl");
 
-/// The example configuration at the repository root, the one the README
-/// says to play.
+/// The example configuration at the repository root, the one the README's
+/// "Playing Werewolf" section says to play.
 const EXAMPLE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../examples/werewolf.toml");
 
 /// The `werewolf` binary, as built for these tests.
@@ -101,13 +101,14 @@ fn read(path: &Path, config: &Config) -> Transcript {
 /// one the moderator announced in world: the announcement is the record of
 /// truth, and the channel must agree.
 fn run(config: &Config) -> Transcript {
-    let file = TempFile::new("werewolf");
+    let dir = TempDir::new();
+    let file = dir.join("werewolf.jsonl");
     let config = Config {
-        trajectory: Some(file.0.clone()),
+        trajectory: Some(file.clone()),
         ..config.clone()
     };
     let outcome = werewolf::run(&config).unwrap();
-    let transcript = read(&file.0, &config);
+    let transcript = read(&file, &config);
     assert_eq!(
         transcript.outcome, outcome,
         "the channel agrees with the announcement"
@@ -254,11 +255,10 @@ fn a_run_is_reproduced_from_its_artifacts() {
     // whole recipe, then play the effective config the run wrote beside its
     // trajectory. The second game must be the first: a run is reproducible
     // from what it left behind, whatever flags produced it.
-    let original = TempFile::new("werewolf");
-    let effective_path = config::effective_path(&original.0);
-    let _effective = TempFile(effective_path.clone());
-    let rerun = TempFile::new("werewolf");
-    let _rerun_effective = TempFile(config::effective_path(&rerun.0));
+    let dir = TempDir::new();
+    let original = dir.join("original.jsonl");
+    let effective_path = config::effective_path(&original);
+    let rerun = dir.join("rerun.jsonl");
     let seed = SEED.to_string();
     let played = werewolf(&[
         "play",
@@ -266,7 +266,7 @@ fn a_run_is_reproduced_from_its_artifacts() {
         "--seed",
         &seed,
         "--trajectory",
-        original.0.to_str().unwrap(),
+        original.to_str().unwrap(),
     ]);
 
     let effective = config::load(&effective_path).unwrap();
@@ -276,7 +276,7 @@ fn a_run_is_reproduced_from_its_artifacts() {
     );
     assert_eq!(effective.trajectory, None, "and names no trajectory");
 
-    let transcript = read(&original.0, &effective);
+    let transcript = read(&original, &effective);
     let winner = match transcript.outcome.winner {
         Some(winner) => winner.to_string(),
         None => "nobody, a stalemate at the round cap".to_owned(),
@@ -287,7 +287,7 @@ fn a_run_is_reproduced_from_its_artifacts() {
     );
     assert!(played.contains(&format!("effective config: {}\n", effective_path.display())));
 
-    let replayed = werewolf(&["replay", original.0.to_str().unwrap()]);
+    let replayed = werewolf(&["replay", original.to_str().unwrap()]);
     assert!(replayed.starts_with(&format!(
         "Werewolf \u{2014} seed {SEED}, {} players",
         effective.players.len()
@@ -298,7 +298,26 @@ fn a_run_is_reproduced_from_its_artifacts() {
         "play",
         effective_path.to_str().unwrap(),
         "--trajectory",
-        rerun.0.to_str().unwrap(),
+        rerun.to_str().unwrap(),
     ]);
-    assert_eq!(read(&rerun.0, &effective), transcript);
+    assert_eq!(read(&rerun, &effective), transcript);
+}
+
+#[test]
+fn a_reader_that_stops_early_is_not_an_error() {
+    // `werewolf replay run.jsonl | head` closes the pipe before the
+    // transcript is fully written. That is the reader's business, and the
+    // command exits quietly rather than panicking on the broken pipe. The
+    // pipe is closed before the child has had time to write, in practice
+    // every time; when it has not, the test proves nothing and passes.
+    let mut child = Command::new(WEREWOLF)
+        .args(["replay", FIXTURE])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(child.stdout.take());
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "");
 }

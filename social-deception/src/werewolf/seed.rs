@@ -20,13 +20,31 @@
 use rand::RngExt;
 use rand_chacha::ChaCha8Rng;
 
+/// The label the role deal's generator is seeded under.
+pub const ASSIGNMENT: &str = "assignment";
+
+/// The label the moderator's tie-break generator is seeded under.
+pub const TIES: &str = "moderator:ties";
+
+/// The labels that are not an agent's: [`ASSIGNMENT`] and [`TIES`].
+///
+/// A player's policy is seeded under its own id, so a player with one of
+/// these names would share its generator with the deal or with the
+/// tie-breaks, and the streams would not be independent. A configuration
+/// naming such a player is rejected
+/// ([`ConfigError::ReservedPlayer`](super::config::ConfigError::ReservedPlayer)),
+/// which is what keeps the guarantee below true for every run.
+pub const RESERVED: [&str; 2] = [ASSIGNMENT, TIES];
+
 /// Mixes a master seed with a label into a stable per-stream seed.
 ///
 /// FNV-1a over the master seed's little-endian bytes followed by the label's
 /// bytes, finished with the splitmix64 mixer so that nearby inputs give
-/// unrelated outputs. Labels in use: `"assignment"` for the role deal, an
-/// agent's own id for its policy, and `"moderator:ties"` for the moderator's
-/// tie-breaks.
+/// unrelated outputs. Labels in use: [`ASSIGNMENT`] for the role deal, an
+/// agent's own id for its policy, and [`TIES`] for the moderator's
+/// tie-breaks. Distinct labels give distinct streams, and the reserved
+/// labels are not valid player ids, so no two streams in a run share a
+/// generator.
 #[must_use]
 pub fn seed_for(master: u64, label: &str) -> u64 {
     const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
@@ -94,8 +112,8 @@ mod tests {
     /// The labels the epic uses, plus a few that differ from them only
     /// slightly.
     const LABELS: [&str; 8] = [
-        "assignment",
-        "moderator:ties",
+        ASSIGNMENT,
+        TIES,
         "alice",
         "Alice",
         "alice ",
@@ -129,6 +147,12 @@ mod tests {
     #[test]
     fn labels_are_case_sensitive() {
         assert_ne!(seed_for(7, "alice"), seed_for(7, "Alice"));
+    }
+
+    #[test]
+    fn the_reserved_labels_are_the_ones_in_use() {
+        assert_eq!(RESERVED, [ASSIGNMENT, TIES]);
+        assert_eq!(RESERVED.iter().collect::<BTreeSet<_>>().len(), 2);
     }
 
     #[test]

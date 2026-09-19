@@ -57,7 +57,11 @@
 //! somebody else, or takes an action outside the request's action space is a
 //! bug in a player, not a condition the game can continue from: the game
 //! cannot vouch for a state built on it. Each panics with a message naming
-//! the agent and the request.
+//! the agent and the request. The action space a response is checked
+//! against is [`roles::action_space`], the same function the role types
+//! compute theirs with, so the game holds every player to exactly the rules
+//! the roles apply to themselves, including the doctor's: for that the game
+//! remembers whom each doctor protected last night, as the doctor does.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::mem;
@@ -71,10 +75,8 @@ use crate::werewolf::message::{
     Action, Cause, Narration, Outcome, Phase, Request, RequestId, RequestKind, Response, Round,
 };
 use crate::werewolf::role::{Faction, Role};
-use crate::werewolf::seed::{pick, seed_for};
-
-/// The label under which the tie-break generator is seeded.
-const TIES: &str = "moderator:ties";
+use crate::werewolf::roles;
+use crate::werewolf::seed::{TIES, pick, seed_for};
 
 /// What the game wants said, in the order it wants it said.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,6 +116,10 @@ pub struct Game {
     /// This phase's answers so far, by the agent that gave them: what it
     /// was asked, and what it did.
     answers: BTreeMap<AgentId, (RequestKind, Action)>,
+    /// Whom each doctor protected last night, for doctors that protected
+    /// someone: the state the doctor's own rule constrains its next
+    /// `Protect` with.
+    last_protected: BTreeMap<AgentId, AgentId>,
     outcome: Option<Outcome>,
 }
 
@@ -147,6 +153,7 @@ impl Game {
             issued: 0,
             outstanding: BTreeMap::new(),
             answers: BTreeMap::new(),
+            last_protected: BTreeMap::new(),
             outcome: None,
         }
     }
@@ -187,9 +194,11 @@ impl Game {
     /// # Panics
     ///
     /// If the response arrives after the game has ended, names a request
-    /// that is not outstanding or was asked of another agent, abstains
-    /// where the request's kind does not permit it, or targets the
-    /// responder itself or a player who is not living. Each is a bug in a
+    /// that is not outstanding or was asked of another agent, or takes an
+    /// action outside the request's action space as [`roles::action_space`]
+    /// computes it: an abstention where the kind permits none, a target
+    /// that is the responder itself or not living, or a doctor's protection
+    /// of the player it protected the night before. Each is a bug in a
     /// player.
     pub fn record(&mut self, from: &AgentId, response: &Response) -> Vec<Directive> {
         let RequestId(id) = response.request;
@@ -204,16 +213,15 @@ impl Game {
             to == *from,
             "{from} answered request {id}, which was asked of {to}"
         );
-        match &response.action {
-            Action::Abstain => assert!(
-                kind.may_abstain(),
-                "{from} abstained from request {id}, which is outside the action space of {kind:?}"
-            ),
-            Action::Target(target) => assert!(
-                target != from && self.living.contains(target),
-                "{from} targeted {target} in request {id}, which is outside its action space"
-            ),
-        }
+        let space = roles::action_space(from, &self.living, kind, self.last_protected.get(from));
+        assert!(
+            space.contains(&response.action),
+            "{from} {} request {id}, which is outside its action space for {kind:?}",
+            match &response.action {
+                Action::Abstain => "abstained from".to_owned(),
+                Action::Target(target) => format!("targeted {target} in"),
+            }
+        );
         self.answers.insert(to, (kind, response.action.clone()));
         if !self.outstanding.is_empty() {
             return Vec::new();
@@ -285,6 +293,10 @@ impl Game {
                 }
                 RequestKind::Protect => {
                     protected.extend(action.target().cloned());
+                    match action.target() {
+                        Some(target) => self.last_protected.insert(who, target.clone()),
+                        None => self.last_protected.remove(&who),
+                    };
                 }
                 RequestKind::Investigate => {
                     if let Some(target) = action.target() {
@@ -1318,7 +1330,7 @@ mod tests {
 
     #[test]
     #[should_panic(
-        expected = "bob abstained from request 1, which is outside the action space of Devour"
+        expected = "bob abstained from request 1, which is outside its action space for Devour"
     )]
     fn an_abstention_where_none_is_permitted_panics() {
         let mut game = game(village());
@@ -1327,15 +1339,123 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "dave targeted dave in request 3, which is outside its action space")]
+    #[should_panic(
+        expected = "dave targeted dave in request 3, which is outside its action space for Protect"
+    )]
     fn a_doctor_protecting_itself_panics() {
         let mut game = game(village());
         game.begin();
         respond(&mut game, "dave", 3, target("dave"));
     }
 
+    /// In the village, alice is devoured while the doctor protects erin,
+    /// then carol is lynched, so that the second night asks bob (request
+    /// 8) and dave (request 9) again.
+    fn doctor_protected_erin() -> Vec<Answers> {
+        vec![
+            answers(&[("bob", "alice"), ("carol", "bob"), ("dave", "erin")]),
+            answers(&[
+                ("bob", "carol"),
+                ("carol", "bob"),
+                ("dave", "carol"),
+                ("erin", "carol"),
+            ]),
+        ]
+    }
+
     #[test]
-    #[should_panic(expected = "bob targeted alice in request 4, which is outside its action space")]
+    #[should_panic(
+        expected = "dave targeted erin in request 9, which is outside its action space for Protect"
+    )]
+    fn a_doctor_protecting_the_same_player_two_nights_running_panics() {
+        let mut game = game(village());
+        play(&mut game, &doctor_protected_erin());
+        respond(&mut game, "dave", 9, target("erin"));
+    }
+
+    /// Nine players and two werewolves, bob and frank; carol is the seer
+    /// and dave the doctor. Big enough for three nights.
+    fn hamlet() -> Assignment {
+        Assignment::new([
+            ("alice", Villager),
+            ("bob", Werewolf),
+            ("carol", Seer),
+            ("dave", Doctor),
+            ("erin", Villager),
+            ("frank", Werewolf),
+            ("grace", Villager),
+            ("heidi", Villager),
+            ("ivan", Villager),
+        ])
+    }
+
+    #[test]
+    fn the_doctor_may_return_to_a_player_after_a_night_off() {
+        // In the hamlet, dave protects erin on the first night, then on
+        // the second either abstains or protects carol, and on the third
+        // may protect erin again: the constraint is last night's protection
+        // alone. The requests of the third night are 23 to 26, and dave's
+        // is 25.
+        for second_night in ["-", "carol"] {
+            let mut game = game(hamlet());
+            play(
+                &mut game,
+                &[
+                    answers(&[
+                        ("bob", "grace"),
+                        ("carol", "bob"),
+                        ("dave", "erin"),
+                        ("frank", "grace"),
+                    ]),
+                    answers(&[
+                        ("alice", "ivan"),
+                        ("bob", "alice"),
+                        ("carol", "alice"),
+                        ("dave", "alice"),
+                        ("erin", "alice"),
+                        ("frank", "alice"),
+                        ("heidi", "alice"),
+                        ("ivan", "alice"),
+                    ]),
+                    answers(&[
+                        ("bob", "heidi"),
+                        ("carol", "frank"),
+                        ("dave", second_night),
+                        ("frank", "heidi"),
+                    ]),
+                    answers(&[
+                        ("bob", "ivan"),
+                        ("carol", "ivan"),
+                        ("dave", "ivan"),
+                        ("erin", "ivan"),
+                        ("frank", "ivan"),
+                        ("ivan", "erin"),
+                    ]),
+                ],
+            );
+            assert_eq!(
+                *game.living(),
+                ids(["bob", "carol", "dave", "erin", "frank"])
+            );
+            assert_eq!(game.outstanding.len(), 4, "the third night is under way");
+            let permitted = roles::action_space(
+                &id("dave"),
+                game.living(),
+                RequestKind::Protect,
+                game.last_protected.get(&id("dave")),
+            );
+            assert!(
+                permitted.contains(&target("erin")),
+                "{second_night}: {permitted:?}"
+            );
+            respond(&mut game, "dave", 25, target("erin"));
+        }
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "bob targeted alice in request 4, which is outside its action space for Nominate"
+    )]
     fn targeting_a_dead_player_panics() {
         let mut game = game(village());
         play(

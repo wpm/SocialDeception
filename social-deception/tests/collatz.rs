@@ -14,7 +14,7 @@ use std::fs;
 
 use serde_json::Value;
 use social_deception::{Episode, Writer};
-use support::TempFile;
+use support::TempDir;
 use support::collatz::Collatz;
 
 /// A ring of agents: each passes to the next in the list, and the last to
@@ -65,8 +65,9 @@ fn expected_chains(ring: &Ring) -> BTreeMap<u64, Vec<u64>> {
 /// returned, so that a malformed log fails by the name of the invariant it
 /// breaks rather than by a lookup that misses in the Collatz checks below.
 fn run(ring: &Ring) -> Vec<Value> {
-    let file = TempFile::new("collatz");
-    let (records, writer) = Writer::create(&file.0).unwrap();
+    let dir = TempDir::new();
+    let file = dir.join("collatz.jsonl");
+    let (records, writer) = Writer::create(&file).unwrap();
     let mut episode = Episode::new(records);
     for (i, (name, opens)) in ring.iter().enumerate() {
         let agent = opens
@@ -78,7 +79,7 @@ fn run(ring: &Ring) -> Vec<Value> {
     }
     episode.run().unwrap();
     writer.join().unwrap();
-    let lines = support::parse(&fs::read(&file.0).unwrap());
+    let lines = support::parse(&fs::read(&file).unwrap());
     support::check(&lines);
     lines
 }

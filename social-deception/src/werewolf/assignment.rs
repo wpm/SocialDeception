@@ -18,11 +18,8 @@ use rand_chacha::ChaCha8Rng;
 
 use super::config::Config;
 use super::role::{Faction, Role};
-use super::seed::seed_for;
+use super::seed::{ASSIGNMENT, seed_for};
 use crate::event::AgentId;
-
-/// The label the deal's generator is seeded under.
-const LABEL: &str = "assignment";
 
 /// Which player holds which role.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,7 +33,7 @@ impl Assignment {
     ///
     /// The role multiset is built in a fixed order, werewolves then seers
     /// then doctors then villagers, and shuffled with a
-    /// [`ChaCha8Rng`] seeded from [`seed_for`]`(config.seed, "assignment")`
+    /// [`ChaCha8Rng`] seeded from [`seed_for`]`(config.seed, `[`ASSIGNMENT`]`)`
     /// against the players *sorted*, so reordering the players in the file
     /// does not change the deal. Adding or removing a player does reshuffle
     /// the whole deal, which is expected: unlike a player's own choice
@@ -59,7 +56,7 @@ impl Assignment {
             .chain(repeat_n(Role::Doctor, counts.doctors))
             .chain(repeat_n(Role::Villager, villagers))
             .collect();
-        let mut rng = ChaCha8Rng::seed_from_u64(seed_for(config.seed, LABEL));
+        let mut rng = ChaCha8Rng::seed_from_u64(seed_for(config.seed, ASSIGNMENT));
         // `ChaCha8Rng` and `seed_from_u64` are value-stable across `rand`
         // releases; `shuffle` is not, so a `rand` bump can change the deal
         // for the same seed. The golden test below is what catches that. If

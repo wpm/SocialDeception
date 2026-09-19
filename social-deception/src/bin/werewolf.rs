@@ -23,12 +23,13 @@
 //! the seed is unknown, and the moderator's id is `--moderator`.
 //!
 //! Configuration, trajectory and I/O errors go to stderr with a non-zero
-//! exit; usage errors are clap's.
+//! exit; usage errors are clap's. A reader that closes the pipe early, as
+//! `werewolf replay run.jsonl | head` does, is not an error.
 
 use std::error::Error;
 use std::fmt;
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -88,7 +89,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             trajectory,
         } => {
             let played = play(&config, seed, trajectory)?;
-            print!("{played}");
+            print(&played.to_string())?;
             Ok(())
         }
         Command::Replay {
@@ -113,9 +114,22 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                     replay.moderator
                 );
             }
-            print!("{replay}");
+            print(&replay.to_string())?;
             Ok(())
         }
+    }
+}
+
+/// Writes `text` to stdout. A closed pipe is not an error: the reader has
+/// seen all it wants, and the command is done.
+fn print(text: &str) -> io::Result<()> {
+    let mut stdout = io::stdout().lock();
+    match stdout
+        .write_all(text.as_bytes())
+        .and_then(|()| stdout.flush())
+    {
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        written => written,
     }
 }
 
@@ -268,15 +282,18 @@ fn load(
     Ok(config)
 }
 
+/// The test helper shared with the library's and the integration tests.
+#[cfg(test)]
+#[path = "../../tests/support/temp.rs"]
+mod temp;
+
 #[cfg(test)]
 mod tests {
-    use std::process;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
     use clap::CommandFactory;
     use clap::error::ErrorKind;
 
     use super::*;
+    use crate::temp::TempDir;
 
     /// The example configuration at the repository root.
     fn example() -> PathBuf {
@@ -392,60 +409,31 @@ mod tests {
         assert_eq!(overridden.players, from_file.players);
     }
 
-    /// A directory of one test's own under the temp dir, removed with
-    /// everything in it when this is dropped, so that a failing test leaves
-    /// nothing behind.
-    struct TempDir(PathBuf);
-
-    impl TempDir {
-        fn new() -> Self {
-            static COUNTER: AtomicUsize = AtomicUsize::new(0);
-            let path = std::env::temp_dir().join(format!(
-                "social-deception-werewolf-{}-{}",
-                process::id(),
-                COUNTER.fetch_add(1, Ordering::Relaxed)
-            ));
-            fs::create_dir_all(&path).unwrap();
-            Self(path)
-        }
-
-        /// A path in the directory.
-        fn path(&self, name: &str) -> PathBuf {
-            self.0.join(name)
-        }
-
-        /// Writes a file in the directory and returns its path.
-        fn file(&self, name: &str, contents: &str) -> PathBuf {
-            let path = self.path(name);
-            fs::write(&path, contents).unwrap();
-            path
-        }
-
-        /// Writes a five-player configuration file whose trajectory, if
-        /// any, is in the directory too. The path is written as a TOML
-        /// literal string, so it needs no escaping whatever the platform.
-        fn config(&self, name: &str, trajectory: Option<&str>) -> PathBuf {
-            let trajectory = trajectory.map_or_else(String::new, |trajectory| {
-                format!("trajectory = '{}'\n", self.path(trajectory).display())
-            });
-            let text = format!(
-                "seed = 3\nplayers = [\"alice\", \"bob\", \"carol\", \"dave\", \"erin\"]\n\
-                 {trajectory}[roles]\nwerewolves = 1\nseers = 1\ndoctors = 1\n"
-            );
-            self.file(name, &text)
-        }
+    /// Writes a file in `dir` and returns its path.
+    fn file(dir: &TempDir, name: &str, contents: &str) -> PathBuf {
+        let path = dir.join(name);
+        fs::write(&path, contents).unwrap();
+        path
     }
 
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
+    /// Writes a five-player configuration file in `dir` whose trajectory, if
+    /// any, is in the directory too. The path is written as a TOML literal
+    /// string, so it needs no escaping whatever the platform.
+    fn config(dir: &TempDir, name: &str, trajectory: Option<&str>) -> PathBuf {
+        let trajectory = trajectory.map_or_else(String::new, |trajectory| {
+            format!("trajectory = '{}'\n", dir.join(trajectory).display())
+        });
+        let text = format!(
+            "seed = 3\nplayers = [\"alice\", \"bob\", \"carol\", \"dave\", \"erin\"]\n\
+             {trajectory}[roles]\nwerewolves = 1\nseers = 1\ndoctors = 1\n"
+        );
+        file(dir, name, &text)
     }
 
     #[test]
     fn play_plays_a_game_and_prints_how_it_ended() {
         let dir = TempDir::new();
-        let trajectory = dir.path("out.jsonl");
+        let trajectory = dir.join("out.jsonl");
         let played = play(&example(), Some(7), Some(trajectory.clone())).unwrap();
         assert_eq!(played.config.seed, 7);
         assert!(played.outcome.winner.is_some(), "{played:?}");
@@ -466,7 +454,7 @@ mod tests {
     #[test]
     fn play_writes_the_effective_config_beside_the_trajectory() {
         let dir = TempDir::new();
-        let trajectory = dir.path("out.jsonl");
+        let trajectory = dir.join("out.jsonl");
         let played = play(&example(), Some(7), Some(trajectory.clone())).unwrap();
         assert!(fs::metadata(&trajectory).unwrap().len() > 0);
         let effective = config::load(config::effective_path(&trajectory)).unwrap();
@@ -483,10 +471,10 @@ mod tests {
     #[test]
     fn play_without_a_trajectory_writes_nothing() {
         let dir = TempDir::new();
-        let config = dir.config("game.toml", None);
+        let config = config(&dir, "game.toml", None);
         let played = play(&config, None, None).unwrap();
         assert!(played.to_string().ends_with("trajectory: none\n"));
-        let mut entries = fs::read_dir(&dir.0).unwrap();
+        let mut entries = fs::read_dir(&*dir).unwrap();
         assert_eq!(
             entries.next().unwrap().unwrap().path(),
             config,
@@ -498,11 +486,11 @@ mod tests {
     #[test]
     fn the_effective_config_reproduces_the_run() {
         let dir = TempDir::new();
-        let first = dir.path("first.jsonl");
+        let first = dir.join("first.jsonl");
         let original = play(&example(), Some(7), Some(first.clone())).unwrap();
         // The whole reproduction recipe: the effective config, and a
         // trajectory of the reproduction's own.
-        let second = dir.path("second.jsonl");
+        let second = dir.join("second.jsonl");
         let reproduced = play(&config::effective_path(&first), None, Some(second.clone())).unwrap();
         assert_eq!(reproduced.outcome, original.outcome);
         assert_eq!(reproduced.config.seed, 7);
@@ -518,18 +506,18 @@ mod tests {
         // trajectory `game.jsonl`, so replacing the trajectory's extension
         // would land on the configuration. Appending does not.
         let dir = TempDir::new();
-        let config = dir.config("game.toml", Some("game.jsonl"));
+        let config = config(&dir, "game.toml", Some("game.jsonl"));
         let before = fs::read_to_string(&config).unwrap();
         play(&config, Some(4), None).unwrap();
         assert_eq!(fs::read_to_string(&config).unwrap(), before);
-        let effective = dir.path("game.jsonl.toml");
+        let effective = dir.join("game.jsonl.toml");
         assert_eq!(config::load(&effective).unwrap().seed, 4);
     }
 
     #[test]
     fn an_effective_config_that_cannot_be_written_is_an_error_naming_it() {
         let dir = TempDir::new();
-        let trajectory = dir.path("no-such-directory/out.jsonl");
+        let trajectory = dir.join("no-such-directory/out.jsonl");
         let error = play(&example(), None, Some(trajectory)).unwrap_err();
         assert!(
             error
@@ -544,7 +532,7 @@ mod tests {
         // The effective config beside the trajectory is written first, so a
         // trajectory that is a directory is what makes the run itself fail.
         let dir = TempDir::new();
-        let trajectory = dir.path("out");
+        let trajectory = dir.join("out");
         fs::create_dir(&trajectory).unwrap();
         let error = play(&example(), None, Some(trajectory.clone())).unwrap_err();
         assert!(config::effective_path(&trajectory).exists());
@@ -606,7 +594,7 @@ mod tests {
     #[test]
     fn replay_without_the_effective_config_falls_back_to_the_flag() {
         let dir = TempDir::new();
-        let alone = dir.file("alone.jsonl", &fs::read_to_string(fixture()).unwrap());
+        let alone = file(&dir, "alone.jsonl", &fs::read_to_string(fixture()).unwrap());
         assert!(!config::effective_path(&alone).exists());
 
         let replayed = replay(&alone, None).unwrap();
@@ -638,7 +626,7 @@ mod tests {
     #[test]
     fn a_corrupt_trajectory_is_an_error_naming_the_line() {
         let dir = TempDir::new();
-        let corrupt = dir.file("corrupt.jsonl", "not json\n");
+        let corrupt = file(&dir, "corrupt.jsonl", "not json\n");
         let error = replay(&corrupt, None).unwrap_err();
         assert!(
             error.to_string().starts_with("line 1 is not JSON"),
@@ -649,7 +637,7 @@ mod tests {
     #[test]
     fn a_broken_effective_config_is_an_error() {
         let dir = TempDir::new();
-        let trajectory = dir.file("empty.jsonl", "");
+        let trajectory = file(&dir, "empty.jsonl", "");
         fs::write(config::effective_path(&trajectory), "seed = 26\n").unwrap();
         let error = replay(&trajectory, None).unwrap_err();
         assert!(
