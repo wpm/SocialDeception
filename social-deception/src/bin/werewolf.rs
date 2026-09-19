@@ -91,8 +91,22 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             moderator,
         } => {
             let replay = replay(&trajectory, moderator.as_deref())?;
-            for note in &replay.notes {
-                eprintln!("werewolf: {note}");
+            let effective_path = config::effective_path(&trajectory);
+            if let Some(given) = &replay.overridden {
+                eprintln!(
+                    "werewolf: --moderator {given} disagrees with {}, which names {}; using {}",
+                    effective_path.display(),
+                    replay.moderator,
+                    replay.moderator
+                );
+            }
+            if replay.effective.is_none() {
+                eprintln!(
+                    "werewolf: no effective config at {}; the seed is unknown and the moderator \
+                     is taken to be {}",
+                    effective_path.display(),
+                    replay.moderator
+                );
             }
             print!("{replay}");
             Ok(())
@@ -103,54 +117,47 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
 /// A trajectory read back as a game, with what the header needs.
 #[derive(Debug)]
 struct Replay {
-    /// The seed the run was played from, if its effective config was found.
-    seed: Option<u64>,
-    /// What the reader had to decide on the way, for stderr.
-    notes: Vec<String>,
+    /// The effective config found beside the trajectory, if there was one.
+    effective: Option<Config>,
+    /// The moderator whose records were read.
+    moderator: AgentId,
+    /// The `--moderator` that was ignored because the effective config
+    /// named someone else.
+    overridden: Option<String>,
     transcript: Transcript,
 }
 
 /// Reads a trajectory and the effective config beside it, if there is one.
 ///
 /// The effective config is the record of what actually ran, so where it
-/// exists it names the moderator; a `--moderator` that disagrees with it is
-/// noted and ignored. Where it does not, the moderator is `--moderator` or
-/// the default, and the seed is unknown.
+/// exists it names the moderator, and a `--moderator` that disagrees with
+/// it is overridden. Where it does not, the moderator is `--moderator` or
+/// the default.
 fn replay(trajectory: &Path, moderator: Option<&str>) -> Result<Replay, Box<dyn Error>> {
     let text = fs::read_to_string(trajectory)
         .map_err(|error| format!("cannot read {}: {error}", trajectory.display()))?;
-    let effective_path = config::effective_path(trajectory);
-    let effective = match config::load(&effective_path) {
+    let effective = match config::load(config::effective_path(trajectory)) {
         Ok(config) => Some(config),
         Err(ConfigError::Read { source, .. }) if source.kind() == io::ErrorKind::NotFound => None,
         Err(error) => return Err(error.into()),
     };
-    let mut notes = Vec::new();
-    let moderator = match (&effective, moderator) {
-        (Some(effective), Some(given)) if given != effective.moderator.as_str() => {
-            notes.push(format!(
-                "--moderator {given} disagrees with {}, which names {}; using {}",
-                effective_path.display(),
-                effective.moderator,
-                effective.moderator
-            ));
-            effective.moderator.clone()
-        }
-        (Some(effective), _) => effective.moderator.clone(),
-        (None, given) => {
-            let moderator = AgentId::new(given.unwrap_or(config::DEFAULT_MODERATOR));
-            notes.push(format!(
-                "no effective config at {}; the seed is unknown and the moderator is taken to be \
-                 {moderator}",
-                effective_path.display()
-            ));
+    let (moderator, overridden) = match &effective {
+        Some(effective) => (
+            effective.moderator.clone(),
             moderator
-        }
+                .filter(|given| *given != effective.moderator.as_str())
+                .map(str::to_owned),
+        ),
+        None => (
+            AgentId::new(moderator.unwrap_or(config::DEFAULT_MODERATOR)),
+            None,
+        ),
     };
     let transcript = Transcript::read(&transcript::lines(&text)?, &moderator)?;
     Ok(Replay {
-        seed: effective.map(|config| config.seed),
-        notes,
+        effective,
+        moderator,
+        overridden,
         transcript,
     })
 }
@@ -159,8 +166,8 @@ impl fmt::Display for Replay {
     /// The header, a blank line, then the transcript.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Werewolf \u{2014} seed ")?;
-        match self.seed {
-            Some(seed) => write!(f, "{seed}")?,
+        match &self.effective {
+            Some(config) => write!(f, "{}", config.seed)?,
             None => write!(f, "unknown")?,
         }
         let roles = &self.transcript.assignment;
@@ -389,38 +396,45 @@ mod tests {
         ))
     }
 
-    /// A copy of a file in the temp dir, removed when this is dropped.
-    struct TempCopy(PathBuf);
+    /// A trajectory in the temp dir with the given contents, removed along
+    /// with any effective config beside it when this is dropped, so that a
+    /// failing test leaves nothing behind.
+    struct TempTrajectory(PathBuf);
 
-    impl TempCopy {
-        fn of(source: &Path, name: &str) -> Self {
+    impl TempTrajectory {
+        fn with(contents: &str) -> Self {
             static COUNTER: AtomicUsize = AtomicUsize::new(0);
             let path = std::env::temp_dir().join(format!(
-                "social-deception-werewolf-{}-{}-{name}",
+                "social-deception-werewolf-{}-{}.jsonl",
                 process::id(),
                 COUNTER.fetch_add(1, Ordering::Relaxed)
             ));
-            fs::copy(source, &path).unwrap();
+            fs::write(&path, contents).unwrap();
             Self(path)
         }
     }
 
-    impl Drop for TempCopy {
+    impl Drop for TempTrajectory {
         fn drop(&mut self) {
             let _ = fs::remove_file(&self.0);
+            let _ = fs::remove_file(config::effective_path(&self.0));
         }
+    }
+
+    fn seed(replay: &Replay) -> Option<u64> {
+        replay.effective.as_ref().map(|config| config.seed)
     }
 
     #[test]
     fn replay_with_the_effective_config_uses_its_seed_and_moderator() {
         let replayed = replay(&fixture(), None).unwrap();
-        assert_eq!(replayed.seed, Some(26));
-        assert!(replayed.notes.is_empty(), "{:?}", replayed.notes);
+        assert_eq!(seed(&replayed), Some(26));
+        assert_eq!(replayed.moderator, AgentId::new("moderator"));
+        assert_eq!(replayed.overridden, None);
         assert_eq!(replayed.transcript.rounds.len(), 3);
-        let text = replayed.to_string();
         let golden = fs::read_to_string(fixture().with_extension("txt")).unwrap();
         assert_eq!(
-            text,
+            replayed.to_string(),
             format!(
                 "Werewolf \u{2014} seed 26, 7 players (2 werewolves, 1 seer, 1 doctor)\n\n{golden}"
             )
@@ -430,28 +444,24 @@ mod tests {
     #[test]
     fn the_effective_config_wins_over_a_disagreeing_moderator_flag() {
         let disagreeing = replay(&fixture(), Some("narrator")).unwrap();
-        assert_eq!(disagreeing.seed, Some(26));
-        let notes = &disagreeing.notes;
-        assert_eq!(notes.len(), 1, "{notes:?}");
-        assert!(notes[0].contains("--moderator narrator"), "{notes:?}");
-        assert!(notes[0].contains("using moderator"), "{notes:?}");
+        assert_eq!(seed(&disagreeing), Some(26));
+        assert_eq!(disagreeing.moderator, AgentId::new("moderator"));
+        assert_eq!(disagreeing.overridden.as_deref(), Some("narrator"));
         assert_eq!(disagreeing.transcript.rounds.len(), 3);
-        // The same flag, agreeing, is not worth a note.
+        // The same flag, agreeing, is not overridden.
         let agreeing = replay(&fixture(), Some("moderator")).unwrap();
-        assert!(agreeing.notes.is_empty(), "{:?}", agreeing.notes);
+        assert_eq!(agreeing.overridden, None);
     }
 
     #[test]
     fn replay_without_the_effective_config_falls_back_to_the_flag() {
-        let alone = TempCopy::of(&fixture(), "alone.jsonl");
+        let alone = TempTrajectory::with(&fs::read_to_string(fixture()).unwrap());
         assert!(!config::effective_path(&alone.0).exists());
 
         let replayed = replay(&alone.0, None).unwrap();
-        assert_eq!(replayed.seed, None);
-        let notes = &replayed.notes;
-        assert_eq!(notes.len(), 1, "{notes:?}");
-        assert!(notes[0].contains("seed is unknown"), "{notes:?}");
-        assert!(notes[0].contains("taken to be moderator"), "{notes:?}");
+        assert_eq!(seed(&replayed), None);
+        assert_eq!(replayed.moderator, AgentId::new("moderator"));
+        assert_eq!(replayed.overridden, None);
         assert_eq!(replayed.transcript.rounds.len(), 3);
         assert!(
             replayed
@@ -459,7 +469,7 @@ mod tests {
                 .starts_with("Werewolf \u{2014} seed unknown, 7 players")
         );
 
-        // The wrong moderator finds no game, and says so.
+        // The flag names the moderator, and the wrong one finds no game.
         let error = replay(&alone.0, Some("narrator")).unwrap_err();
         assert!(
             error.to_string().contains("never announced an outcome"),
@@ -476,10 +486,7 @@ mod tests {
 
     #[test]
     fn a_corrupt_trajectory_is_an_error_naming_the_line() {
-        let corrupt = TempCopy::of(&fixture(), "corrupt.jsonl");
-        let mut text = fs::read_to_string(&corrupt.0).unwrap();
-        text.insert_str(0, "not json\n");
-        fs::write(&corrupt.0, text).unwrap();
+        let corrupt = TempTrajectory::with("not json\n");
         let error = replay(&corrupt.0, None).unwrap_err();
         assert!(
             error.to_string().starts_with("line 1 is not JSON"),
@@ -489,11 +496,9 @@ mod tests {
 
     #[test]
     fn a_broken_effective_config_is_an_error() {
-        let trajectory = TempCopy::of(&fixture(), "broken.jsonl");
-        let effective = config::effective_path(&trajectory.0);
-        fs::write(&effective, "seed = 26\n").unwrap();
+        let trajectory = TempTrajectory::with("");
+        fs::write(config::effective_path(&trajectory.0), "seed = 26\n").unwrap();
         let error = replay(&trajectory.0, None).unwrap_err();
-        fs::remove_file(&effective).unwrap();
         assert!(
             error.to_string().contains("invalid configuration"),
             "{error}"

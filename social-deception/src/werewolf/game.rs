@@ -293,10 +293,10 @@ impl Game {
                     votes.insert(who, action);
                 }
                 RequestKind::Protect => {
-                    protected.extend(target(&action).cloned());
+                    protected.extend(action.target().cloned());
                 }
                 RequestKind::Investigate => {
-                    if let Some(target) = target(&action) {
+                    if let Some(target) = action.target() {
                         findings.push(Directive::Narrate {
                             to: [who].into(),
                             narration: Narration::Investigated {
@@ -436,14 +436,6 @@ impl Game {
     }
 }
 
-/// The player an action targets, if it is not an abstention.
-fn target(action: &Action) -> Option<&AgentId> {
-    match action {
-        Action::Target(who) => Some(who),
-        Action::Abstain => None,
-    }
-}
-
 /// The most-targeted player among some actions, ignoring abstentions, or
 /// `None` if nothing was targeted.
 ///
@@ -454,7 +446,7 @@ fn plurality<'a>(
     ties: &mut ChaCha8Rng,
 ) -> Option<AgentId> {
     let mut counts: BTreeMap<&AgentId, usize> = BTreeMap::new();
-    for who in actions.into_iter().filter_map(target) {
+    for who in actions.into_iter().filter_map(Action::target) {
         *counts.entry(who).or_default() += 1;
     }
     let most = *counts.values().max()?;

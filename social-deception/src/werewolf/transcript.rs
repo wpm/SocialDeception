@@ -41,8 +41,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
-use std::fmt::{self, Write as _};
+use std::fmt;
 
+use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use super::message::{
@@ -170,9 +171,9 @@ pub enum TranscriptError {
         /// The request it named.
         request: RequestId,
     },
-    /// A record belongs to a phase, but no phase has begun: a response, an
+    /// A record belongs to a phase that has not begun: a response, an
     /// investigation or an elimination before the first night, or a day
-    /// with no night before it.
+    /// whose night has not begun or that has begun already.
     NoPhase {
         /// The line.
         line: usize,
@@ -360,14 +361,12 @@ fn message(record: &Map<String, Value>, line: usize) -> Result<Option<Record>, T
     let payload = event
         .get("payload")
         .ok_or_else(|| malformed(line, "no payload"))?;
-    let message: Message = serde_json::from_value(payload.clone())
+    let message = Message::deserialize(payload)
         .map_err(|source| TranscriptError::Payload { line, source })?;
-    if [&sender]
-        .into_iter()
-        .chain(&recipients)
-        .chain(named(&message))
-        .any(|id| id.as_str().is_empty())
-    {
+    // The only strings in a message event besides its tags are agent ids,
+    // and no tag is empty, so an empty string anywhere in it is an empty id,
+    // wherever a future field puts one.
+    if event.values().any(has_empty_string) {
         return Err(TranscriptError::EmptyAgentId { line });
     }
     Ok(Some(Record {
@@ -379,33 +378,13 @@ fn message(record: &Map<String, Value>, line: usize) -> Result<Option<Record>, T
     }))
 }
 
-/// Every agent id a message names.
-fn named(message: &Message) -> Vec<&AgentId> {
-    match message {
-        Message::Narration(narration) => match narration {
-            Narration::Assigned { pack, .. } => pack.iter().collect(),
-            Narration::PhaseBegan { living, .. } | Narration::Outcome(Outcome { living, .. }) => {
-                living.iter().collect()
-            }
-            Narration::Investigated { target, .. } => vec![target],
-            Narration::Tally { votes, .. } => votes
-                .iter()
-                .flat_map(|(who, action)| [Some(who), target(action)])
-                .flatten()
-                .collect(),
-            Narration::Eliminated { who, .. } => vec![who],
-            Narration::NoDeath { .. } => Vec::new(),
-        },
-        Message::Request(_) => Vec::new(),
-        Message::Response(Response { action, .. }) => target(action).into_iter().collect(),
-    }
-}
-
-/// The player an action targets, if it is not an abstention.
-fn target(action: &Action) -> Option<&AgentId> {
-    match action {
-        Action::Target(who) => Some(who),
-        Action::Abstain => None,
+/// Whether an empty string appears anywhere in a JSON value.
+fn has_empty_string(value: &Value) -> bool {
+    match value {
+        Value::String(text) => text.is_empty(),
+        Value::Array(items) => items.iter().any(has_empty_string),
+        Value::Object(fields) => fields.values().any(has_empty_string),
+        Value::Null | Value::Bool(_) | Value::Number(_) => false,
     }
 }
 
@@ -442,8 +421,7 @@ fn decode<T: serde::de::DeserializeOwned>(
     let value = object
         .get(key)
         .ok_or_else(|| malformed(line, &format!("no {key}")))?;
-    serde_json::from_value(value.clone())
-        .map_err(|error| malformed(line, &format!("{key}: {error}")))
+    T::deserialize(value).map_err(|error| malformed(line, &format!("{key}: {error}")))
 }
 
 /// The game so far, as a fold over the moderator's records.
@@ -474,7 +452,7 @@ impl Reader {
                 Ok(())
             }
             (Direction::Arrived, Message::Response(response)) => {
-                self.answered(line, sender, &response)
+                self.answered(line, sender, response)
             }
             _ => Err(TranscriptError::Misdirected { line }),
         }
@@ -502,20 +480,19 @@ impl Reader {
                 day: None,
             }),
             Narration::PhaseBegan {
+                round,
                 phase: Phase::Day,
                 living,
-                ..
-            } => {
-                let round = self
-                    .rounds
-                    .last_mut()
-                    .ok_or(TranscriptError::NoPhase { line })?;
-                round.day = Some(PhaseRecord::begun(living));
-            }
+            } => match self.rounds.last_mut() {
+                Some(latest) if latest.round == round && latest.day.is_none() => {
+                    latest.day = Some(PhaseRecord::begun(living));
+                }
+                _ => return Err(TranscriptError::NoPhase { line }),
+            },
+            // A finding is addressed to the one seer.
             Narration::Investigated { target, faction } => {
-                let phase = self.current(line)?;
-                for seer in recipients {
-                    phase.investigation = Some((seer, target.clone(), faction));
+                if let Some(seer) = recipients.into_iter().next() {
+                    self.current(line)?.investigation = Some((seer, target, faction));
                 }
             }
             Narration::Eliminated {
@@ -529,8 +506,9 @@ impl Reader {
         Ok(())
     }
 
+    /// A request is addressed to the one agent asked.
     fn asked(&mut self, recipients: BTreeSet<AgentId>, request: &Request) {
-        for who in recipients {
+        if let Some(who) = recipients.into_iter().next() {
             self.outstanding.insert(request.id, (who, request.kind));
         }
     }
@@ -539,10 +517,11 @@ impl Reader {
         &mut self,
         line: usize,
         from: AgentId,
-        response: &Response,
+        response: Response,
     ) -> Result<(), TranscriptError> {
-        let kind = match self.outstanding.get(&response.request) {
-            Some((asked, kind)) if *asked == from => *kind,
+        // A mismatch ends the read, so removing before checking loses nothing.
+        let kind = match self.outstanding.remove(&response.request) {
+            Some((asked, kind)) if asked == from => kind,
             _ => {
                 return Err(TranscriptError::UnknownRequest {
                     line,
@@ -551,10 +530,9 @@ impl Reader {
                 });
             }
         };
-        self.outstanding.remove(&response.request);
         self.current(line)?
             .actions
-            .insert(from, (kind, response.action.clone()));
+            .insert(from, (kind, response.action));
         Ok(())
     }
 
@@ -613,10 +591,11 @@ impl fmt::Display for Transcript {
         }
         let plural = if rounds == 1 { "" } else { "s" };
         write!(f, " after {rounds} round{plural}.  Survivors: ")?;
-        if self.outcome.living.is_empty() {
+        let survivors: Vec<&str> = self.outcome.living.iter().map(AgentId::as_str).collect();
+        if survivors.is_empty() {
             writeln!(f, "none")
         } else {
-            writeln!(f, "{}", list(&self.outcome.living))
+            writeln!(f, "{}", survivors.join(", "))
         }
     }
 }
@@ -643,7 +622,7 @@ fn phase(
             format!(
                 "{:<width$} -> {:<width$}",
                 who.as_str(),
-                target(action).map_or("no one", AgentId::as_str)
+                action.target().map_or("no one", AgentId::as_str)
             )
         }),
     )?;
@@ -654,7 +633,7 @@ fn phase(
             RequestKind::Protect => "protects",
             RequestKind::Nominate => "nominates",
         };
-        let whom = target(action).map_or("no one", AgentId::as_str);
+        let whom = action.target().map_or("no one", AgentId::as_str);
         write!(f, "  {:<width$} {verb} {whom}", who.as_str())?;
         match &record.investigation {
             Some((seer, _, faction)) if seer == who => writeln!(f, "  ->  {faction}")?,
@@ -677,21 +656,8 @@ fn columns(f: &mut fmt::Formatter<'_>, cells: impl Iterator<Item = String>) -> f
     Ok(())
 }
 
-/// Agent ids separated by commas.
-fn list(ids: &BTreeSet<AgentId>) -> String {
-    ids.iter().fold(String::new(), |mut text, who| {
-        if !text.is_empty() {
-            text.push_str(", ");
-        }
-        let _ = write!(text, "{who}");
-        text
-    })
-}
-
 #[cfg(test)]
 mod tests {
-    use std::fs;
-
     use serde_json::json;
 
     use super::*;
@@ -701,9 +667,17 @@ mod tests {
     use crate::werewolf::role::Role::{Doctor, Seer, Villager, Werewolf};
 
     /// The fixture: a seven-player game played to a village win, with its
-    /// effective config and its expected rendering beside it.
-    const FIXTURE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/werewolf.jsonl");
-    const RENDERED: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/werewolf.txt");
+    /// effective config and its expected rendering beside it. It is chosen
+    /// for what it covers: a saved night, a werewolf devoured on its
+    /// packmate's vote, a tie-break, and an abstention.
+    const FIXTURE: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/werewolf.jsonl"
+    ));
+    const RENDERED: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/werewolf.txt"
+    ));
 
     const MODERATOR: &str = "moderator";
 
@@ -711,12 +685,8 @@ mod tests {
         id(MODERATOR)
     }
 
-    fn fixture_text() -> String {
-        fs::read_to_string(FIXTURE).unwrap()
-    }
-
     fn fixture() -> Vec<Value> {
-        lines(&fixture_text()).unwrap()
+        lines(FIXTURE).unwrap()
     }
 
     fn read(lines: &[Value]) -> Result<Transcript, TranscriptError> {
@@ -875,29 +845,13 @@ mod tests {
             assert_eq!(actual.day, expected.day, "day {:?}", actual.round);
         }
         assert_eq!(transcript.outcome, expected.outcome);
-        assert_eq!(transcript, expected);
     }
 
     #[test]
     fn the_fixture_renders_to_the_golden_text() {
-        let rendered = read(&fixture()).unwrap().to_string();
-        let golden = fs::read_to_string(RENDERED).unwrap();
         // Compared exactly, so that a change to the rendering is a
         // deliberate act that updates the golden file.
-        assert_eq!(rendered, golden);
-    }
-
-    #[test]
-    fn a_saved_night_has_no_elimination_and_an_abstention_no_finding() {
-        let transcript = read(&fixture()).unwrap();
-        assert_eq!(transcript.rounds[0].night.eliminated, None);
-        assert!(transcript.rounds[0].night.actions.len() == 4);
-        let last_night = &transcript.rounds[2].night;
-        assert_eq!(
-            last_night.actions[&id("grace")],
-            (RequestKind::Investigate, Action::Abstain)
-        );
-        assert_eq!(last_night.investigation, None);
+        assert_eq!(read(&fixture()).unwrap().to_string(), RENDERED);
     }
 
     #[test]
@@ -982,7 +936,7 @@ mod tests {
 
     #[test]
     fn a_line_that_is_not_json_is_an_error() {
-        let text = fixture_text().replacen('{', "", 1);
+        let text = FIXTURE.replacen('{', "", 1);
         let error = lines(&text).unwrap_err();
         assert!(
             matches!(error, TranscriptError::NotJson { line: 1, .. }),
@@ -1186,15 +1140,24 @@ mod tests {
     }
 
     #[test]
-    fn a_day_with_no_night_before_it_is_an_error() {
+    fn a_day_whose_night_has_not_begun_is_an_error() {
+        let is_phase = |payload: &Value| !payload["Narration"]["PhaseBegan"].is_null();
+        // The first night announced as a day.
         let mut lines = fixture();
-        let index = moderator_record(&lines, |payload| {
-            !payload["Narration"]["PhaseBegan"].is_null()
-        });
+        let index = moderator_record(&lines, is_phase);
         lines[index]["event"]["payload"]["Narration"]["PhaseBegan"]["phase"] = json!("Day");
         let error = read(&lines).unwrap_err();
         assert!(
             matches!(error, TranscriptError::NoPhase { line } if line == index + 1),
+            "{error:?}"
+        );
+        // The first day announced as belonging to a round yet to come.
+        let mut lines = fixture();
+        let day = index + 1 + moderator_record(&lines[index + 1..], is_phase);
+        lines[day]["event"]["payload"]["Narration"]["PhaseBegan"]["round"] = json!(2);
+        let error = read(&lines).unwrap_err();
+        assert!(
+            matches!(error, TranscriptError::NoPhase { line } if line == day + 1),
             "{error:?}"
         );
     }

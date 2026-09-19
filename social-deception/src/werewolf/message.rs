@@ -207,6 +207,17 @@ pub enum Action {
     Abstain,
 }
 
+impl Action {
+    /// The player this action targets, if it is not an abstention.
+    #[must_use]
+    pub const fn target(&self) -> Option<&AgentId> {
+        match self {
+            Self::Target(who) => Some(who),
+            Self::Abstain => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::{Value, json};
@@ -372,6 +383,15 @@ mod tests {
             json!({"Target": "alice"})
         );
         assert_eq!(json(&Action::Abstain), json!("Abstain"));
+    }
+
+    #[test]
+    fn only_a_target_names_a_player() {
+        assert_eq!(
+            Action::Target(AgentId::new("alice")).target(),
+            Some(&AgentId::new("alice"))
+        );
+        assert_eq!(Action::Abstain.target(), None);
     }
 
     #[test]
