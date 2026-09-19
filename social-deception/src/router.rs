@@ -155,6 +155,7 @@ mod tests {
     use crossbeam_channel::{Receiver, unbounded};
 
     use super::*;
+    use crate::testing::id;
 
     fn world(names: &[&str]) -> (Router<u64>, BTreeMap<AgentId, Receiver<Delivery<u64>>>) {
         let mut senders = BTreeMap::new();
@@ -165,10 +166,6 @@ mod tests {
             receivers.insert(AgentId::new(*name), receiver);
         }
         (Router::new(senders, Clock::start()), receivers)
-    }
-
-    fn id(name: &str) -> AgentId {
-        AgentId::new(name)
     }
 
     #[test]

@@ -1,0 +1,13 @@
+# The effective configuration of the fixture trajectory beside it,
+# werewolf.jsonl: the configuration the run was played from, after any
+# overrides, with no trajectory field so that replaying it cannot truncate
+# the file it describes.
+seed = 26
+players = ["alice", "bob", "carol", "dave", "erin", "frank", "grace"]
+max_rounds = 100
+moderator = "moderator"
+
+[roles]
+werewolves = 2
+seers = 1
+doctors = 1

@@ -15,6 +15,18 @@
 //!   through a [`Handler`], and records what it saw and sent;
 //! - [`router`]: the [`Router`] from agent ids to their channels;
 //! - [`episode`]: the [`Episode`] that runs a roster from start to stop.
+//!
+//! On top of that runtime sits one environment, [`werewolf`]: the roles,
+//! phases and the [`Message`](werewolf::Message) payload that travels over
+//! [`Event`] in a game of Werewolf, the [`Knowledge`](werewolf::Knowledge)
+//! a player folds those events into, the [`Policy`](werewolf::Policy) that
+//! picks its actions, the roles ([`werewolf::roles`]) whose rules say which
+//! actions it may pick from and the [`Seat`](werewolf::Seat) that plays one
+//! as an agent, the [`Game`](werewolf::Game) whose rules decide what is said
+//! to whom, and the [`Moderator`](werewolf::Moderator) that runs it as an
+//! agent in the roster. [`werewolf::run`] plays one episode of it from a
+//! [`Config`](werewolf::Config), and the `werewolf` binary is the command
+//! line for that.
 
 pub mod agent;
 pub mod clock;
@@ -25,6 +37,7 @@ pub mod router;
 mod testing;
 pub mod timer;
 pub mod trajectory;
+pub mod werewolf;
 
 pub use agent::{Agent, CycleDispatch, Delivery, Error, Handler, Outgoing, Recipients, Wiring};
 pub use clock::{Clock, Timestamp};

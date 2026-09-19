@@ -1,16 +1,21 @@
 //! Helpers shared by the integration tests: the [`collatz`] environment,
-//! reading a trajectory file back, and checking the invariants every
-//! trajectory satisfies whatever the environment.
+//! a [`TempDir`] to write a trajectory in, reading a trajectory file back,
+//! checking the invariants every trajectory satisfies whatever the
+//! environment, and, in [`werewolf`], the invariants a trajectory of
+//! Werewolf satisfies on top of them.
 //!
 //! The checks here are properties of the log, not of any environment. They
 //! are meant to run unchanged against episodes where no independent check on
 //! the content is available.
 
 pub mod collatz;
+mod temp;
+pub mod werewolf;
 
 use std::collections::HashMap;
 
 use serde_json::Value;
+pub use temp::TempDir;
 
 /// Parses a trajectory file into one JSON value per line.
 ///
