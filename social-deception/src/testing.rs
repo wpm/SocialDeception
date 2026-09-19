@@ -5,6 +5,7 @@ use std::collections::BTreeSet;
 use serde_json::Value;
 
 use crate::event::AgentId;
+use crate::werewolf::Action;
 
 /// Parses a trajectory file into one JSON value per line.
 ///
@@ -37,4 +38,10 @@ pub(crate) fn id(name: &str) -> AgentId {
 /// A set of agent ids, for tests that name agents by string literal.
 pub(crate) fn ids<const N: usize>(names: [&str; N]) -> BTreeSet<AgentId> {
     names.map(AgentId::new).into()
+}
+
+/// An action targeting the named agent, for tests that name agents by
+/// string literal.
+pub(crate) fn target(name: &str) -> Action {
+    Action::Target(id(name))
 }

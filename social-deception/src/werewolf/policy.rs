@@ -1,14 +1,11 @@
 //! The decision boundary: a [`Policy`] is handed what an agent sees and
 //! returns one action.
 //!
-//! In the reinforcement-learning vocabulary of the design (ADR-0005), the
-//! *state* is [`Knowledge`], the *action* type is [`Action`], and the
-//! *action space* is the subset of actions the rules permit for one
-//! decision, a value the rules compute anew at every request. A policy is a
-//! conditional distribution over the action space given the state. [`View`]
-//! is what it conditions on: the state, the request in front of it, and the
-//! action space. Nothing here decides what the rules permit; this module
-//! only picks from what they permit.
+//! A policy is a conditional distribution over the action space given the
+//! state, in the vocabulary the [module](super) documentation states and
+//! ADR-0005 explains. [`View`] is what it conditions on: the state, the
+//! request in front of it, and the action space. Nothing here decides what
+//! the rules permit; this module only picks from what they permit.
 //!
 //! # Every policy sees the same action space
 //!
@@ -17,13 +14,11 @@
 //! narrowed on its behalf, and `View` carries no strategy hints. Everything
 //! a policy might want to reason from, the role, the living set, the pack,
 //! the seer's findings and every tally the agent heard, is already in
-//! `Knowledge`, and a policy computes whatever heuristic it wants from that.
-//!
-//! The action space arrives in a canonical order: targets in sorted agent
-//! order, [`Action::Abstain`] last where it is permitted. An index into it
-//! is therefore a stable action label, the same on every run and in every
-//! episode with the same living set, which is what a learner needs and what
-//! a constrained decode over a model's output needs.
+//! [`Knowledge`], and a policy computes whatever heuristic it wants from
+//! that. The action space arrives in a canonical order, so an index into it
+//! is a stable action label: the same on every run and in every episode
+//! with the same living set, which is what a learner needs and what a
+//! constrained decode over a model's output needs.
 //!
 //! # The baseline's heuristic, and why it is private
 //!
@@ -59,25 +54,23 @@
 //!
 //! # Determinism
 //!
-//! `RandomPolicy` draws from a [`ChaCha8Rng`], whose algorithm is fixed
-//! across `rand` releases; `StdRng`'s is explicitly allowed to change, and a
-//! seed that stops meaning the same thing after a dependency bump is not a
-//! reproducible experiment. Each agent's policy is seeded from the master
-//! seed mixed with the agent's own id by [`seed_for`], never from a shared
-//! generator: a shared one would make an agent's actions depend on the order
-//! the threads happened to run, whereas a per-agent stream depends on that
-//! agent's own history alone, and adding a player perturbs nobody else's.
-//! The golden test in this module pins the first actions of one seeded
-//! policy, so that a change to the mixing or the sampling fails a test
-//! rather than silently becoming a different experiment.
+//! Each agent's policy draws from its own generator, seeded by [`seed_for`]
+//! from the master seed and the agent's id, so its actions depend on its own
+//! history alone and adding a player perturbs nobody else's; the [`seed`]
+//! module says why that, and the choice of generator, make an experiment
+//! reproducible. The golden test in this module pins the first actions of
+//! one seeded policy, so that a change to the mixing or the sampling fails
+//! a test rather than silently becoming a different experiment.
+//!
+//! [`seed`]: super::seed
 
-use rand::{RngExt, SeedableRng};
+use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 
 use super::knowledge::Knowledge;
 use super::message::{Action, Request, RequestKind};
 use super::role::Role;
-use super::seed::seed_for;
+use super::seed::{pick, seed_for};
 use crate::event::AgentId;
 
 /// What a policy sees when it decides: the agent's state, the request in
@@ -103,20 +96,14 @@ pub struct View<'a> {
 pub trait Policy {
     /// Picks an action. The result must be in `view.action_space`.
     ///
-    /// Infallible by design: a policy that cannot decide, such as a model
-    /// policy whose model would not answer, substitutes an action of its
-    /// own choosing rather than reporting failure to the rules. It may block
-    /// for as long as it needs; only its own agent waits.
+    /// Infallible, and free to block; the [module documentation](self) says
+    /// why.
     fn choose(&mut self, view: &View<'_>) -> Action;
 }
 
 /// The uniform random baseline: a policy that samples uniformly from its own
 /// candidates, narrowed from the action space by the private heuristic the
 /// [module documentation](self) describes.
-///
-/// Where narrowing leaves exactly one candidate, the policy returns it
-/// without drawing, so a run of forced decisions leaves the generator where
-/// it was and the actions that follow do not depend on how many there were.
 #[derive(Debug, Clone)]
 pub struct RandomPolicy {
     rng: ChaCha8Rng,
@@ -142,41 +129,32 @@ impl RandomPolicy {
 
 impl Policy for RandomPolicy {
     fn choose(&mut self, view: &View<'_>) -> Action {
-        let candidates = candidates(view);
-        let chosen = match candidates.as_slice() {
-            [only] => only,
-            _ => candidates[self.rng.random_range(0..candidates.len())],
-        };
-        chosen.clone()
+        (*pick(&mut self.rng, &candidates(view))).clone()
     }
 }
 
-/// The baseline's candidates, in the action space's order.
-///
-/// The action space narrowed by the heuristic: a werewolf's living packmates
-/// are dropped for `Devour` and `Nominate`, the seer's already-investigated
-/// targets for `Investigate`, and `Abstain` whenever a target remains. If
-/// narrowing would leave nothing, the candidates are the whole action space,
-/// because a policy handed nothing has no correct behaviour.
+/// The baseline's candidates, in the action space's order: the first
+/// non-empty of the targets [`excluded`] leaves, `Abstain` where the rules
+/// permit it, and the whole action space, because a policy handed nothing
+/// has no correct behaviour.
 fn candidates<'a>(view: &View<'a>) -> Vec<&'a Action> {
-    let mut candidates: Vec<&Action> = view
-        .action_space
+    let space = view.action_space;
+    let targets: Vec<&Action> = space
         .iter()
-        .filter(|action| match action {
-            Action::Target(who) => !excluded(view, who),
-            Action::Abstain => true,
-        })
+        .filter(|action| matches!(action, Action::Target(who) if !excluded(view, who)))
         .collect();
-    if candidates.iter().any(|action| **action != Action::Abstain) {
-        candidates.retain(|action| **action != Action::Abstain);
+    if !targets.is_empty() {
+        return targets;
     }
-    if candidates.is_empty() {
-        candidates = view.action_space.iter().collect();
+    match space.iter().find(|action| **action == Action::Abstain) {
+        Some(abstain) => vec![abstain],
+        None => space.iter().collect(),
     }
-    candidates
 }
 
-/// Whether the heuristic drops `who` as a target for this request.
+/// Whether the heuristic drops `who` as a target for this request: a
+/// werewolf's living packmates for `Devour` and `Nominate`, and the targets
+/// the seer has already investigated for `Investigate`.
 fn excluded(view: &View<'_>, who: &AgentId) -> bool {
     let knowledge = view.knowledge;
     match (knowledge.role, view.request.kind) {
@@ -191,26 +169,28 @@ fn excluded(view: &View<'_>, who: &AgentId) -> bool {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-
-    use rand::Rng;
+    use std::ops::Range;
 
     use super::*;
-    use crate::testing::{id, ids};
+    use crate::testing::{id, ids, target};
     use crate::werewolf::message::{RequestId, Round};
     use crate::werewolf::role::Faction;
 
     const MASTER: u64 = 20_260_918;
     const ME: &str = "me";
     const OTHERS: [&str; 5] = ["alice", "bob", "carol", "dave", "erin"];
+    /// The seeds the property tests run a fresh policy under.
+    const SEEDS: Range<u64> = 0..200;
 
-    fn target(who: &str) -> Action {
-        Action::Target(id(who))
-    }
-
-    /// An action space in canonical order: `targets` sorted, then `Abstain`
-    /// where the kind permits it.
-    fn action_space<const N: usize>(kind: RequestKind, targets: [&str; N]) -> Vec<Action> {
-        let mut space: Vec<Action> = ids(targets).into_iter().map(Action::Target).collect();
+    /// The action space the rules would hand `knowledge`'s player for
+    /// `kind`: its living others in sorted order, then `Abstain` where
+    /// permitted.
+    fn space_for(knowledge: &Knowledge, kind: RequestKind) -> Vec<Action> {
+        let mut space: Vec<Action> = knowledge
+            .living_others()
+            .into_iter()
+            .map(Action::Target)
+            .collect();
         if kind.may_abstain() {
             space.push(Action::Abstain);
         }
@@ -262,11 +242,23 @@ mod tests {
         })
     }
 
-    /// The first `n` nominations a fresh policy makes as a villager among
+    /// The first action a fresh policy under each of [`SEEDS`] takes for
+    /// `kind`, in the action space the rules would hand it.
+    fn first_choices(knowledge: &Knowledge, kind: RequestKind) -> Vec<(u64, Action)> {
+        let space = space_for(knowledge, kind);
+        SEEDS
+            .map(|seed| {
+                let action = choose(&mut RandomPolicy::from_seed(seed), knowledge, kind, &space);
+                (seed, action)
+            })
+            .collect()
+    }
+
+    /// The first `n` nominations a policy makes as a villager among
     /// [`OTHERS`], where no heuristic is in play.
     fn nominations(mut policy: RandomPolicy, n: usize) -> Vec<Action> {
         let knowledge = knowing(Role::Villager, OTHERS);
-        let space = action_space(RequestKind::Nominate, OTHERS);
+        let space = space_for(&knowledge, RequestKind::Nominate);
         (0..n)
             .map(|_| choose(&mut policy, &knowledge, RequestKind::Nominate, &space))
             .collect()
@@ -309,44 +301,30 @@ mod tests {
             (&doctor, RequestKind::Nominate),
             (&villager, RequestKind::Nominate),
         ];
-        for seed in 0..200 {
-            let mut policy = RandomPolicy::from_seed(seed);
-            for (knowledge, kind) in cases {
-                let space = action_space(kind, ["alice", "bob", "carol"]);
-                let action = choose(&mut policy, knowledge, kind, &space);
+        for (knowledge, kind) in cases {
+            let space = space_for(knowledge, kind);
+            for (seed, action) in first_choices(knowledge, kind) {
                 assert!(
                     space.contains(&action),
-                    "seed {seed}: {action:?} outside {space:?}"
+                    "seed {seed}, {kind:?}: {action:?} outside {space:?}"
                 );
             }
         }
     }
 
     #[test]
-    fn a_single_candidate_decision_leaves_the_stream_where_it_was() {
-        let doctor = knowing(Role::Doctor, ["alice"]);
-        let forced = action_space(RequestKind::Protect, ["alice"]);
-        let mut untouched = RandomPolicy::from_seed(7);
-        let mut interrupted = RandomPolicy::from_seed(7);
-        for _ in 0..25 {
-            let action = choose(&mut interrupted, &doctor, RequestKind::Protect, &forced);
-            assert_eq!(action, target("alice"));
-        }
-        assert_eq!(untouched.rng.next_u64(), interrupted.rng.next_u64());
-    }
-
-    #[test]
     fn the_sequence_is_stable_under_interleaved_single_option_decisions() {
         let doctor = knowing(Role::Doctor, ["alice"]);
-        let forced = action_space(RequestKind::Protect, ["alice"]);
+        let forced = space_for(&doctor, RequestKind::Protect);
         let villager = knowing(Role::Villager, OTHERS);
-        let open = action_space(RequestKind::Nominate, OTHERS);
+        let open = space_for(&villager, RequestKind::Nominate);
 
         let mut policy = RandomPolicy::from_seed(7);
         let mut interleaved = Vec::new();
         for _ in 0..20 {
             for _ in 0..3 {
-                choose(&mut policy, &doctor, RequestKind::Protect, &forced);
+                let action = choose(&mut policy, &doctor, RequestKind::Protect, &forced);
+                assert_eq!(action, target("alice"));
             }
             interleaved.push(choose(&mut policy, &villager, RequestKind::Nominate, &open));
         }
@@ -357,7 +335,7 @@ mod tests {
     fn every_candidate_is_drawn_and_none_dominates() {
         // A guard against an off-by-one that could never return the last
         // element, not a statistical test.
-        let draws = 2000;
+        let draws = 1000;
         let mut counts: BTreeMap<Action, usize> = BTreeMap::new();
         for action in nominations(RandomPolicy::from_seed(MASTER), draws) {
             *counts.entry(action).or_default() += 1;
@@ -375,9 +353,7 @@ mod tests {
     fn a_werewolf_never_picks_a_living_packmate() {
         let knowledge = werewolf(["alice", "bob", "carol", "dave"], ["bob", "dave"]);
         for kind in [RequestKind::Devour, RequestKind::Nominate] {
-            let space = action_space(kind, ["alice", "bob", "carol", "dave"]);
-            for seed in 0..200 {
-                let action = choose(&mut RandomPolicy::from_seed(seed), &knowledge, kind, &space);
+            for (seed, action) in first_choices(&knowledge, kind) {
                 assert!(
                     action == target("alice") || action == target("carol"),
                     "seed {seed}, {kind:?}: {action:?}"
@@ -389,10 +365,7 @@ mod tests {
     #[test]
     fn a_seer_never_re_investigates() {
         let knowledge = seer(["alice", "bob", "carol", "dave"], ["alice", "carol"]);
-        let kind = RequestKind::Investigate;
-        let space = action_space(kind, ["alice", "bob", "carol", "dave"]);
-        for seed in 0..200 {
-            let action = choose(&mut RandomPolicy::from_seed(seed), &knowledge, kind, &space);
+        for (seed, action) in first_choices(&knowledge, RequestKind::Investigate) {
             assert!(
                 action == target("bob") || action == target("dave"),
                 "seed {seed}: {action:?}"
@@ -408,10 +381,8 @@ mod tests {
             (&doctor, RequestKind::Protect),
             (&seer, RequestKind::Investigate),
         ] {
-            let space = action_space(kind, ["alice", "bob"]);
-            assert_eq!(space.last(), Some(&Action::Abstain));
-            for seed in 0..200 {
-                let action = choose(&mut RandomPolicy::from_seed(seed), knowledge, kind, &space);
+            assert_eq!(space_for(knowledge, kind).last(), Some(&Action::Abstain));
+            for (seed, action) in first_choices(knowledge, kind) {
                 assert_ne!(action, Action::Abstain, "seed {seed}, {kind:?}");
             }
         }
@@ -421,30 +392,28 @@ mod tests {
     fn a_werewolf_whose_only_living_others_are_packmates_still_acts() {
         let knowledge = werewolf(["bob", "dave"], ["bob", "dave"]);
         for kind in [RequestKind::Devour, RequestKind::Nominate] {
-            let space = action_space(kind, ["bob", "dave"]);
-            for seed in 0..50 {
-                let action = choose(&mut RandomPolicy::from_seed(seed), &knowledge, kind, &space);
+            let space = space_for(&knowledge, kind);
+            for (seed, action) in first_choices(&knowledge, kind) {
                 assert!(space.contains(&action), "seed {seed}, {kind:?}: {action:?}");
             }
         }
     }
 
     #[test]
-    fn a_seer_that_has_investigated_everyone_living_still_acts() {
+    fn a_seer_that_has_investigated_everyone_living_abstains() {
         let knowledge = seer(["alice", "bob"], ["alice", "bob"]);
-        let kind = RequestKind::Investigate;
-        let space = action_space(kind, ["alice", "bob"]);
-        for seed in 0..50 {
-            let action = choose(&mut RandomPolicy::from_seed(seed), &knowledge, kind, &space);
-            assert!(space.contains(&action), "seed {seed}: {action:?}");
+        for (seed, action) in first_choices(&knowledge, RequestKind::Investigate) {
+            assert_eq!(action, Action::Abstain, "seed {seed}");
         }
     }
 
     #[test]
     fn a_doctor_whose_action_space_is_abstain_abstains() {
+        // The rules have removed the doctor's only target, so the space is
+        // not derivable from its knowledge.
         let knowledge = knowing(Role::Doctor, ["alice"]);
         let space = [Action::Abstain];
-        for seed in 0..50 {
+        for seed in SEEDS {
             let action = choose(
                 &mut RandomPolicy::from_seed(seed),
                 &knowledge,

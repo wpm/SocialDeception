@@ -1,17 +1,24 @@
-//! Deriving one stream's seed from the episode's master seed.
+//! Deriving one stream's seed from the episode's master seed, and drawing
+//! from the generator it seeds.
 //!
 //! Every source of randomness in an episode draws from a generator of its
 //! own: the role deal, each player's policy, the moderator's tie-breaks. Each
 //! generator is seeded with the master seed mixed with a label naming the
 //! stream, so that one stream can be recomputed without the others and so
 //! that a player's own choices do not depend on how many other players there
-//! are.
+//! are. A shared generator would instead make every stream depend on the
+//! order the agents' threads happened to run.
 //!
 //! The mix is written out here rather than borrowed from `std`'s
-//! `DefaultHasher`, whose output is not guaranteed stable across releases. A
-//! seed that stops meaning the same thing after a dependency bump is not a
-//! reproducible experiment, so the golden values in this module's tests are
-//! part of the contract.
+//! `DefaultHasher`, whose output is not guaranteed stable across releases,
+//! and every generator is a [`ChaCha8Rng`], whose algorithm is fixed, rather
+//! than `StdRng`, whose algorithm is allowed to change between `rand`
+//! releases. A seed that stops meaning the same thing after a dependency
+//! bump is not a reproducible experiment, so the golden values in this
+//! module's tests are part of the contract.
+
+use rand::RngExt;
+use rand_chacha::ChaCha8Rng;
 
 /// Mixes a master seed with a label into a stable per-stream seed.
 ///
@@ -32,6 +39,20 @@ pub fn seed_for(master: u64, label: &str) -> u64 {
     splitmix64(hash)
 }
 
+/// One of `among`, drawn uniformly from `rng`, which is touched only when
+/// there is an actual choice: a single element is returned without a draw,
+/// so a run of forced decisions leaves the generator where it was.
+///
+/// # Panics
+///
+/// If `among` is empty.
+pub(crate) fn pick<'a, T>(rng: &mut ChaCha8Rng, among: &'a [T]) -> &'a T {
+    match among {
+        [only] => only,
+        _ => &among[rng.random_range(0..among.len())],
+    }
+}
+
 /// The splitmix64 output function: a bijection on `u64` that spreads every
 /// input bit across the output.
 fn splitmix64(z: u64) -> u64 {
@@ -45,7 +66,30 @@ fn splitmix64(z: u64) -> u64 {
 mod tests {
     use std::collections::BTreeSet;
 
+    use rand::{Rng, SeedableRng};
+
     use super::*;
+
+    #[test]
+    fn pick_draws_only_when_there_is_a_choice() {
+        let fresh = || ChaCha8Rng::seed_from_u64(1);
+        let mut untouched = fresh();
+        assert_eq!(pick(&mut untouched, &["only"]), &"only");
+        assert_eq!(untouched.next_u64(), fresh().next_u64());
+
+        let mut drawn = fresh();
+        assert!(["a", "b"].contains(pick(&mut drawn, &["a", "b"])));
+        assert_ne!(drawn.next_u64(), fresh().next_u64());
+    }
+
+    #[test]
+    fn pick_reaches_every_element() {
+        let mut rng = ChaCha8Rng::seed_from_u64(20_260_918);
+        let seen: BTreeSet<usize> = (0..200)
+            .map(|_| *pick(&mut rng, &[0, 1, 2, 3, 4]))
+            .collect();
+        assert_eq!(seen, (0..5).collect());
+    }
 
     /// The labels the epic uses, plus a few that differ from them only
     /// slightly.

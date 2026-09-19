@@ -62,7 +62,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::mem;
 
-use rand::{RngExt, SeedableRng};
+use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 
 use crate::event::AgentId;
@@ -71,7 +71,7 @@ use crate::werewolf::message::{
     Action, Cause, Narration, Outcome, Phase, Request, RequestId, RequestKind, Response, Round,
 };
 use crate::werewolf::role::{Faction, Role};
-use crate::werewolf::seed::seed_for;
+use crate::werewolf::seed::{pick, seed_for};
 
 /// The label under which the tie-break generator is seeded.
 const TIES: &str = "moderator:ties";
@@ -447,8 +447,8 @@ fn target(action: &Action) -> Option<&AgentId> {
 /// The most-targeted player among some actions, ignoring abstentions, or
 /// `None` if nothing was targeted.
 ///
-/// A tie is broken by drawing an index into the tied players, in agent
-/// order, from `ties`, which is touched only when there is a tie.
+/// A tie is broken by [`pick`]ing among the tied players, in agent order,
+/// from `ties`, which is touched only when there is a tie.
 fn plurality<'a>(
     actions: impl IntoIterator<Item = &'a Action>,
     ties: &mut ChaCha8Rng,
@@ -463,11 +463,7 @@ fn plurality<'a>(
         .filter(|(_, count)| **count == most)
         .map(|(who, _)| *who)
         .collect();
-    let chosen = match leaders.as_slice() {
-        [only] => only,
-        _ => leaders[ties.random_range(0..leaders.len())],
-    };
-    Some(chosen.clone())
+    Some((*pick(ties, &leaders)).clone())
 }
 
 #[cfg(test)]
@@ -475,15 +471,11 @@ mod tests {
     use rand::Rng;
 
     use super::*;
-    use crate::testing::{id, ids};
+    use crate::testing::{id, ids, target};
     use crate::werewolf::role::Role::{Doctor, Seer, Villager, Werewolf};
 
     const SEED: u64 = 20_260_918;
     const MAX_ROUNDS: u32 = 100;
-
-    fn target(name: &str) -> Action {
-        Action::Target(id(name))
-    }
 
     /// One phase of a script: every request's answer, keyed by the agent
     /// asked, in the order the answers are to be recorded.
