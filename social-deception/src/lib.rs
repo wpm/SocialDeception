@@ -18,7 +18,8 @@
 //!
 //! On top of that runtime sits one environment, [`werewolf`]: the roles,
 //! phases and the [`Message`](werewolf::Message) payload that travels over
-//! [`Event`] in a game of Werewolf.
+//! [`Event`] in a game of Werewolf, and the [`Knowledge`](werewolf::Knowledge)
+//! a player folds those events into.
 
 pub mod agent;
 pub mod clock;

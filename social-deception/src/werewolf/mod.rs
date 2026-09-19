@@ -43,6 +43,12 @@
 //! Every narration is true. Player-to-player dialogue, which may be false,
 //! would be a fourth kind of message and is not defined here.
 //!
+//! # What a player knows
+//!
+//! [`Knowledge`] is the state a player carries between passes: the fold of
+//! every observation it has received, and what a policy conditions on. It
+//! records only what the moderator said, so nothing in it can be false.
+//!
 //! # What no message carries
 //!
 //! No message carries the episode's seed, and no type here has a field that
@@ -66,12 +72,14 @@
 
 pub mod assignment;
 pub mod config;
+pub mod knowledge;
 pub mod message;
 pub mod role;
 pub mod seed;
 
 pub use assignment::Assignment;
 pub use config::{Config, ConfigError, RoleCounts};
+pub use knowledge::{Death, Heard, Knowledge};
 pub use message::{
     Action, Cause, Message, Narration, Outcome, Phase, Request, RequestId, RequestKind, Response,
     Round,
