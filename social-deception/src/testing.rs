@@ -1,6 +1,10 @@
 //! Helpers shared by the crate's unit tests.
 
+use std::collections::BTreeSet;
+
 use serde_json::Value;
+
+use crate::event::AgentId;
 
 /// Parses a trajectory file into one JSON value per line.
 ///
@@ -23,4 +27,14 @@ pub(crate) fn parse_lines(bytes: &[u8]) -> Vec<Value> {
 /// If the value cannot be serialized.
 pub(crate) fn json<T: serde::Serialize>(value: &T) -> Value {
     serde_json::to_value(value).unwrap()
+}
+
+/// An agent id, for tests that name agents by string literal.
+pub(crate) fn id(name: &str) -> AgentId {
+    AgentId::new(name)
+}
+
+/// A set of agent ids, for tests that name agents by string literal.
+pub(crate) fn ids<const N: usize>(names: [&str; N]) -> BTreeSet<AgentId> {
+    names.map(AgentId::new).into()
 }
