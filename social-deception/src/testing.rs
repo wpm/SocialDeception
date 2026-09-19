@@ -15,3 +15,12 @@ pub(crate) fn parse_lines(bytes: &[u8]) -> Vec<Value> {
         .map(|line| serde_json::from_str(line).unwrap())
         .collect()
 }
+
+/// Serializes a value to a JSON value, for asserting on its shape.
+///
+/// # Panics
+///
+/// If the value cannot be serialized.
+pub(crate) fn json<T: serde::Serialize>(value: &T) -> Value {
+    serde_json::to_value(value).unwrap()
+}

@@ -15,6 +15,10 @@
 //!   through a [`Handler`], and records what it saw and sent;
 //! - [`router`]: the [`Router`] from agent ids to their channels;
 //! - [`episode`]: the [`Episode`] that runs a roster from start to stop.
+//!
+//! On top of that runtime sits one environment, [`werewolf`]: the roles,
+//! phases and the [`Message`](werewolf::Message) payload that travels over
+//! [`Event`] in a game of Werewolf.
 
 pub mod agent;
 pub mod clock;
@@ -25,6 +29,7 @@ pub mod router;
 mod testing;
 pub mod timer;
 pub mod trajectory;
+pub mod werewolf;
 
 pub use agent::{Agent, CycleDispatch, Delivery, Error, Handler, Outgoing, Recipients, Wiring};
 pub use clock::{Clock, Timestamp};
