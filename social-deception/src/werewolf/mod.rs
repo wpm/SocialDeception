@@ -1,10 +1,12 @@
 //! Werewolf: the types every part of the game is written against.
 //!
-//! This module holds vocabulary only, no rules: the [`Role`]s a player can be
-//! dealt, the [`Faction`]s they play for, the [`Round`] and [`Phase`] that
-//! locate a moment in a game, and [`Message`], the one payload type that
-//! travels over the runtime's [`Event`](crate::Event) between the moderator
-//! and the players.
+//! This module holds vocabulary: the [`Role`]s a player can be dealt, the
+//! [`Faction`]s they play for, the [`Round`] and [`Phase`] that locate a
+//! moment in a game, and [`Message`], the one payload type that travels over
+//! the runtime's [`Event`](crate::Event) between the moderator and the
+//! players. The only facts it states are properties of a request kind
+//! itself, such as which phase it belongs to; every rule that depends on who
+//! is alive lives with the moderator and the roles, not here.
 //!
 //! # Three kinds of message
 //!
@@ -24,13 +26,12 @@
 //!
 //! # Narration is addressed, not broadcast
 //!
-//! A narration goes to one player, to the living, or to the pack, and that
-//! choice of recipients is the whole hidden-information mechanism. No message
-//! naming the pack is ever addressed to a non-werewolf; the night's
-//! [`Tally`](Narration::Tally) goes to the living werewolves alone; only the
-//! final [`Outcome`] goes to everyone. A player observes many narrations but
-//! acts only on a request, which is what gives an agent in a turnless runtime
-//! its decision points.
+//! No message here names its recipients, because that is the moderator's
+//! decision: a narration goes to one player, to the living, or to the pack,
+//! and that choice of recipients is the whole hidden-information mechanism
+//! (see ADR-0004). A player observes many narrations but acts only on a
+//! request, which is what gives an agent in a turnless runtime its decision
+//! points.
 //!
 //! Every narration is true. Player-to-player dialogue, which may be false,
 //! would be a fourth kind of message and is not defined here.
@@ -48,6 +49,13 @@
 //! payloads can be read back as typed data. Collections are `BTreeMap` and
 //! `BTreeSet`, so serialization is in a canonical order and two runs of the
 //! same seed produce byte-identical payloads.
+//!
+//! The payload uses serde's defaults: enums are externally tagged with the
+//! variant name as written, and newtypes are transparent. The runtime's
+//! envelope, [`Event`](crate::Event) and its records, is internally tagged
+//! and snake-cased instead, because its field names are a contract with
+//! whatever reads a trajectory back; the payload's shape belongs to the
+//! environment alone.
 
 pub mod message;
 pub mod role;

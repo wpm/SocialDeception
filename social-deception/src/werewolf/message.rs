@@ -26,10 +26,9 @@ pub enum Phase {
 
 /// The identity of one [`Request`], echoed by the [`Response`] to it.
 ///
-/// The moderator keeps a table of the ids it is waiting for and resolves a
-/// phase exactly when the table empties, so whether a response is legitimate
-/// is an exact check rather than an inferred one. Serializes as a bare
-/// integer.
+/// The id makes "is this response an answer to something asked?" an exact
+/// check rather than an inferred one, and lets late and duplicate responses
+/// be recognized once a policy can be slow. Serializes as a bare integer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct RequestId(pub u64);
@@ -214,14 +213,7 @@ mod tests {
 
     use super::*;
     use crate::event::Payload;
-
-    fn json<T: Serialize>(value: &T) -> Value {
-        serde_json::to_value(value).unwrap()
-    }
-
-    fn ids<const N: usize>(names: [&str; N]) -> BTreeSet<AgentId> {
-        names.into_iter().map(AgentId::new).collect()
-    }
+    use crate::testing::json;
 
     /// Every narration variant, each with the JSON shape it serializes to.
     fn every_narration() -> Vec<(Narration, Value)> {
@@ -229,7 +221,7 @@ mod tests {
             (
                 Narration::Assigned {
                     role: Role::Werewolf,
-                    pack: ids(["wanda", "wolfgang"]),
+                    pack: ["wanda", "wolfgang"].map(AgentId::new).into(),
                 },
                 json!({"Assigned": {"role": "Werewolf", "pack": ["wanda", "wolfgang"]}}),
             ),
@@ -237,7 +229,7 @@ mod tests {
                 Narration::PhaseBegan {
                     round: Round(1),
                     phase: Phase::Night,
-                    living: ids(["alice", "bob"]),
+                    living: ["alice", "bob"].map(AgentId::new).into(),
                 },
                 json!({"PhaseBegan": {"round": 1, "phase": "Night", "living": ["alice", "bob"]}}),
             ),
@@ -280,7 +272,7 @@ mod tests {
                 Narration::Outcome(Outcome {
                     winner: Some(Faction::Werewolves),
                     rounds: Round(3),
-                    living: ids(["wanda"]),
+                    living: ["wanda"].map(AgentId::new).into(),
                 }),
                 json!({"Outcome": {"winner": "Werewolves", "rounds": 3, "living": ["wanda"]}}),
             ),
@@ -288,7 +280,7 @@ mod tests {
                 Narration::Outcome(Outcome {
                     winner: None,
                     rounds: Round(9),
-                    living: ids(["alice", "wanda"]),
+                    living: ["alice", "wanda"].map(AgentId::new).into(),
                 }),
                 json!({"Outcome": {"winner": null, "rounds": 9, "living": ["alice", "wanda"]}}),
             ),
@@ -357,8 +349,8 @@ mod tests {
 
     #[test]
     fn every_message_round_trips() {
-        for (message, _) in every_message() {
-            let back: Message = serde_json::from_value(json(&message)).unwrap();
+        for (message, shape) in every_message() {
+            let back: Message = serde_json::from_value(shape).unwrap();
             assert_eq!(back, message);
         }
     }
@@ -423,8 +415,6 @@ mod tests {
         let alice = AgentId::new("alice");
         assert_eq!(json(&alice), json!("alice"));
         let back: AgentId = serde_json::from_value(json!("alice")).unwrap();
-        assert_eq!(back, alice);
-        let back: AgentId = serde_json::from_value(json(&alice)).unwrap();
         assert_eq!(back, alice);
     }
 }

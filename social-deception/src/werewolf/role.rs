@@ -46,6 +46,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::testing::json;
 
     #[test]
     fn only_a_werewolf_is_on_the_werewolves_side() {
@@ -57,11 +58,8 @@ mod tests {
 
     #[test]
     fn roles_and_factions_serialize_as_their_names() {
-        assert_eq!(serde_json::to_value(Role::Seer).unwrap(), json!("Seer"));
-        assert_eq!(
-            serde_json::to_value(Faction::Werewolves).unwrap(),
-            json!("Werewolves")
-        );
+        assert_eq!(json(&Role::Seer), json!("Seer"));
+        assert_eq!(json(&Faction::Werewolves), json!("Werewolves"));
         let role: Role = serde_json::from_value(json!("Doctor")).unwrap();
         assert_eq!(role, Role::Doctor);
     }

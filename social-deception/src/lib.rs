@@ -14,9 +14,11 @@
 //! - [`agent`]: the [`Agent`] thread that drains its inbox, folds the batch
 //!   through a [`Handler`], and records what it saw and sent;
 //! - [`router`]: the [`Router`] from agent ids to their channels;
-//! - [`episode`]: the [`Episode`] that runs a roster from start to stop;
-//! - [`werewolf`]: the Werewolf environment's vocabulary: roles, phases and
-//!   the [`Message`](werewolf::Message) payload that travels over [`Event`].
+//! - [`episode`]: the [`Episode`] that runs a roster from start to stop.
+//!
+//! On top of that runtime sits one environment, [`werewolf`]: the roles,
+//! phases and the [`Message`](werewolf::Message) payload that travels over
+//! [`Event`] in a game of Werewolf.
 
 pub mod agent;
 pub mod clock;
