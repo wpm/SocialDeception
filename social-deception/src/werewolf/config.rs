@@ -18,6 +18,12 @@
 //! came from it has passed every check [`ConfigError`] names and a bad file
 //! never reaches a thread. A key the schema does not know is a parse error,
 //! so a misspelled optional key cannot silently take its default.
+//!
+//! A configuration also writes back out, as the *effective configuration* of
+//! a run: [`Config::effective`] is the TOML that [`load`] reads back to the
+//! same value, and [`write_effective`] puts it beside a trajectory, at
+//! [`effective_path`], so that a run can be reproduced from its artifacts
+//! alone.
 
 use std::collections::BTreeSet;
 use std::error::Error;
@@ -26,7 +32,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::event::AgentId;
 
@@ -40,7 +46,11 @@ pub const DEFAULT_MODERATOR: &str = "moderator";
 ///
 /// A `Config` built by hand can be invalid; [`Config::validate`] is the check
 /// that [`load`] and [`Config::parse`] apply.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+///
+/// It serializes with the same field names and defaults [`load`] reads, so
+/// what is written back reads back to an equal `Config`; an unset
+/// `trajectory` is left out rather than written as nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     /// The master seed every generator in the episode is derived from.
@@ -51,7 +61,7 @@ pub struct Config {
     /// How many of each special role to deal. The rest are villagers.
     pub roles: RoleCounts,
     /// Where to write the trajectory, if anywhere.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trajectory: Option<PathBuf>,
     /// The round after which an unfinished game is a stalemate.
     #[serde(default = "default_max_rounds")]
@@ -63,7 +73,7 @@ pub struct Config {
 }
 
 /// How many of each special role a game has.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RoleCounts {
     /// The pack. At least one.
@@ -104,6 +114,13 @@ pub enum ConfigError {
     },
     /// The text is not a configuration.
     Parse(toml::de::Error),
+    /// The effective configuration could not be written.
+    Write {
+        /// The file.
+        path: PathBuf,
+        /// What went wrong.
+        source: io::Error,
+    },
     /// `roles.werewolves` is zero: a game with no werewolves is over before
     /// it starts.
     NoWerewolves,
@@ -141,6 +158,7 @@ impl fmt::Display for ConfigError {
         match self {
             Self::Read { path, .. } => write!(f, "cannot read {}", path.display()),
             Self::Parse(error) => write!(f, "invalid configuration: {error}"),
+            Self::Write { path, .. } => write!(f, "cannot write {}", path.display()),
             Self::NoWerewolves => f.write_str("roles.werewolves must be at least 1"),
             Self::WerewolfParity {
                 werewolves,
@@ -170,7 +188,7 @@ impl fmt::Display for ConfigError {
 impl Error for ConfigError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Read { source, .. } => Some(source),
+            Self::Read { source, .. } | Self::Write { source, .. } => Some(source),
             Self::Parse(source) => Some(source),
             _ => None,
         }
@@ -192,6 +210,21 @@ pub fn effective_path(trajectory: &Path) -> PathBuf {
     let mut path = trajectory.as_os_str().to_owned();
     path.push(".toml");
     PathBuf::from(path)
+}
+
+/// Writes the effective configuration of a run played from `config` beside
+/// its trajectory, at [`effective_path`], and returns where it was written.
+///
+/// # Errors
+///
+/// [`ConfigError::Write`] if the file cannot be written.
+pub fn write_effective(config: &Config, trajectory: &Path) -> Result<PathBuf, ConfigError> {
+    let path = effective_path(trajectory);
+    fs::write(&path, config.effective()).map_err(|source| ConfigError::Write {
+        path: path.clone(),
+        source,
+    })?;
+    Ok(path)
 }
 
 /// Reads and validates a configuration file.
@@ -279,11 +312,35 @@ impl Config {
         }
         Ok(())
     }
+
+    /// The effective configuration of a run played from this one: the same
+    /// configuration as TOML, without its `trajectory` field.
+    ///
+    /// It is a valid configuration file in the schema [`load`] reads, and
+    /// reads back as this configuration with no trajectory. That is what
+    /// makes reproducing a run `werewolf play <trajectory>.toml --trajectory
+    /// <elsewhere>`: the trajectory is omitted so that replaying the file
+    /// cannot truncate the very trajectory it describes, and a reproduction
+    /// names its own output.
+    ///
+    /// # Panics
+    ///
+    /// Never for a configuration [`load`] accepted; a configuration is plain
+    /// data that TOML can always represent.
+    #[must_use]
+    pub fn effective(&self) -> String {
+        let effective = Self {
+            trajectory: None,
+            ..self.clone()
+        };
+        toml::to_string(&effective).expect("a configuration is representable as TOML")
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::TempPath;
 
     /// The example configuration, as committed at the repository root.
     const EXAMPLE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../examples/werewolf.toml");
@@ -534,6 +591,70 @@ mod tests {
         let error = config.validate().unwrap_err();
         assert!(matches!(error, ConfigError::NoRounds), "{error:?}");
         assert!(error.to_string().contains("max_rounds"));
+    }
+
+    #[test]
+    fn the_effective_config_reads_back_as_the_config_without_its_trajectory() {
+        let config = valid();
+        let text = config.effective();
+        assert!(!text.contains("trajectory"), "{text}");
+        assert_eq!(
+            Config::parse(&text).unwrap(),
+            Config {
+                trajectory: None,
+                ..config
+            }
+        );
+    }
+
+    #[test]
+    fn the_effective_config_writes_the_defaults_out_in_full() {
+        // What was defaulted on the way in is explicit on the way out, so the
+        // file says what ran even if a default changes later.
+        let text = Config::parse(MINIMAL).unwrap().effective();
+        assert!(
+            text.contains(&format!("max_rounds = {DEFAULT_MAX_ROUNDS}")),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("moderator = \"{DEFAULT_MODERATOR}\"")),
+            "{text}"
+        );
+        assert!(text.contains("seers = 0"), "{text}");
+        assert_eq!(
+            Config::parse(&text).unwrap(),
+            Config::parse(MINIMAL).unwrap()
+        );
+    }
+
+    #[test]
+    fn the_effective_config_is_written_beside_the_trajectory_and_loads() {
+        let trajectory = TempPath::new("jsonl");
+        let written = write_effective(&valid(), &trajectory).unwrap();
+        assert_eq!(written, effective_path(&trajectory));
+        assert_eq!(
+            load(&written).unwrap(),
+            Config {
+                trajectory: None,
+                ..valid()
+            }
+        );
+        fs::remove_file(written).unwrap();
+    }
+
+    #[test]
+    fn an_unwritable_effective_config_is_a_write_error_naming_it() {
+        let trajectory = Path::new("/no-such-directory/werewolf.jsonl");
+        let error = write_effective(&valid(), trajectory).unwrap_err();
+        assert!(
+            matches!(&error, ConfigError::Write { path, .. } if *path == effective_path(trajectory)),
+            "{error:?}"
+        );
+        assert!(error.source().is_some());
+        assert_eq!(
+            error.to_string(),
+            "cannot write /no-such-directory/werewolf.jsonl.toml"
+        );
     }
 
     #[test]

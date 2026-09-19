@@ -13,8 +13,7 @@
 //! The setup is a [`Config`] read from a TOML file ([`config`]), the
 //! [`Assignment`] of roles dealt from its seed ([`assignment`]), and
 //! [`seed_for`], which derives every generator's seed from the master seed
-//! ([`seed`]). The `werewolf` binary loads a configuration, deals the roles
-//! and prints the result.
+//! ([`seed`]).
 //!
 //! The rules live in [`Game`] ([`game`]), which takes an [`Assignment`] and
 //! plays the game as a fold over players' responses, producing
@@ -22,6 +21,12 @@
 //! ([`moderator`]) is the agent that runs a game: the thin
 //! [`Handler`](crate::Handler) that folds the events on its inbox into the
 //! game and sends the directives as messages.
+//!
+//! The seam with the runtime is [`setup`]: [`episode`] builds a populated
+//! [`Episode`](crate::Episode) from a [`Config`], seating every player and
+//! the moderator, and [`run`] runs one to its [`Outcome`] or a [`RunError`].
+//! The `werewolf` binary's `play` is that, with the effective configuration
+//! written beside the trajectory.
 //!
 //! A trajectory written by a run reads back as a [`Transcript`]
 //! ([`transcript`]): the logical game, with the timestamps and the
@@ -109,6 +114,7 @@ pub mod policy;
 pub mod role;
 pub mod roles;
 pub mod seed;
+pub mod setup;
 pub mod transcript;
 
 pub use assignment::Assignment;
@@ -125,4 +131,5 @@ pub use policy::{Policy, RandomPolicy, View};
 pub use role::{Faction, Role};
 pub use roles::{Doctor, Seer, Villager, Werewolf};
 pub use seed::seed_for;
+pub use setup::{RunError, episode, run};
 pub use transcript::{PhaseRecord, RoundRecord, Transcript, TranscriptError};
