@@ -71,10 +71,7 @@ impl Assignment {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn id(name: &str) -> AgentId {
-        AgentId::new(name)
-    }
+    use crate::testing::id;
 
     fn assignment() -> Assignment {
         Assignment::new([

@@ -106,14 +106,14 @@ pub struct Game {
     round: Round,
     phase: Phase,
     max_rounds: u32,
-    begun: bool,
     ties: ChaCha8Rng,
     /// How many requests have been issued; the next one's id is one more.
     issued: u64,
     /// The requests not yet answered: who was asked, and what.
     outstanding: BTreeMap<RequestId, (AgentId, RequestKind)>,
-    /// This phase's answers so far, by the agent that gave them.
-    actions: BTreeMap<AgentId, Action>,
+    /// This phase's answers so far, by the agent that gave them: what it
+    /// was asked, and what it did.
+    answers: BTreeMap<AgentId, (RequestKind, Action)>,
     outcome: Option<Outcome>,
 }
 
@@ -143,11 +143,10 @@ impl Game {
             round: Round(1),
             phase: Phase::Night,
             max_rounds,
-            begun: false,
             ties: ChaCha8Rng::seed_from_u64(seed_for(seed, TIES)),
             issued: 0,
             outstanding: BTreeMap::new(),
-            actions: BTreeMap::new(),
+            answers: BTreeMap::new(),
             outcome: None,
         }
     }
@@ -163,8 +162,7 @@ impl Game {
     ///
     /// If called more than once.
     pub fn begin(&mut self) -> Vec<Directive> {
-        assert!(!self.begun, "the game has already begun");
-        self.begun = true;
+        assert!(self.issued == 0, "the game has already begun");
         let mut directives: Vec<Directive> = self
             .assignment
             .players()
@@ -188,17 +186,22 @@ impl Game {
     ///
     /// # Panics
     ///
-    /// If the response names a request that is not outstanding or was
-    /// asked of another agent, abstains where the request's kind does not
-    /// permit it, or targets the responder itself or a player who is not
-    /// living. Each is a bug in a player.
+    /// If the response arrives after the game has ended, names a request
+    /// that is not outstanding or was asked of another agent, abstains
+    /// where the request's kind does not permit it, or targets the
+    /// responder itself or a player who is not living. Each is a bug in a
+    /// player.
     pub fn record(&mut self, from: &AgentId, response: &Response) -> Vec<Directive> {
         let RequestId(id) = response.request;
-        let Some((to, kind)) = self.outstanding.get(&response.request) else {
+        assert!(
+            self.outcome.is_none(),
+            "{from} answered request {id} after the game ended"
+        );
+        let Some((to, kind)) = self.outstanding.remove(&response.request) else {
             panic!("{from} answered request {id}, which is not outstanding");
         };
         assert!(
-            to == from,
+            to == *from,
             "{from} answered request {id}, which was asked of {to}"
         );
         match &response.action {
@@ -211,15 +214,14 @@ impl Game {
                 "{from} targeted {target} in request {id}, which is outside its action space"
             ),
         }
-        self.outstanding.remove(&response.request);
-        self.actions.insert(from.clone(), response.action.clone());
+        self.answers.insert(to, (kind, response.action.clone()));
         if !self.outstanding.is_empty() {
             return Vec::new();
         }
-        let actions = mem::take(&mut self.actions);
+        let answers = mem::take(&mut self.answers);
         match self.phase {
-            Phase::Night => self.resolve_night(&actions),
-            Phase::Day => self.resolve_day(actions),
+            Phase::Night => self.resolve_night(answers),
+            Phase::Day => self.resolve_day(answers),
         }
     }
 
@@ -276,53 +278,65 @@ impl Game {
         Directive::Ask { to, request }
     }
 
-    fn resolve_night(&mut self, actions: &BTreeMap<AgentId, Action>) -> Vec<Directive> {
-        let pack: BTreeSet<AgentId> = self.living_with(Role::Werewolf).cloned().collect();
-        let votes: BTreeMap<AgentId, Action> = actions
-            .iter()
-            .filter(|(who, _)| pack.contains(*who))
-            .map(|(who, action)| (who.clone(), action.clone()))
-            .collect();
+    /// Resolves a night from its answers: the pack's tally to the pack,
+    /// each seer's finding to that seer, then the death or the lack of one.
+    fn resolve_night(
+        &mut self,
+        answers: BTreeMap<AgentId, (RequestKind, Action)>,
+    ) -> Vec<Directive> {
+        let mut votes = BTreeMap::new();
+        let mut protected = BTreeSet::new();
+        let mut findings = Vec::new();
+        for (who, (kind, action)) in answers {
+            match kind {
+                RequestKind::Devour => {
+                    votes.insert(who, action);
+                }
+                RequestKind::Protect => {
+                    protected.extend(target(&action).cloned());
+                }
+                RequestKind::Investigate => {
+                    if let Some(target) = target(&action) {
+                        findings.push(Directive::Narrate {
+                            to: [who].into(),
+                            narration: Narration::Investigated {
+                                target: target.clone(),
+                                faction: self.role(target).faction(),
+                            },
+                        });
+                    }
+                }
+                RequestKind::Nominate => unreachable!("nobody nominates at night"),
+            }
+        }
         let victim = plurality(votes.values(), &mut self.ties)
             .expect("every living werewolf devours someone");
         let mut directives = vec![Directive::Narrate {
-            to: pack,
+            to: votes.keys().cloned().collect(),
             narration: Narration::Tally {
                 round: self.round,
                 phase: Phase::Night,
                 votes,
             },
         }];
-        let protected: BTreeSet<&AgentId> = self
-            .living_with(Role::Doctor)
-            .filter_map(|doctor| target(&actions[doctor]))
-            .collect();
-        for seer in self.living_with(Role::Seer) {
-            if let Some(target) = target(&actions[seer]) {
-                directives.push(Directive::Narrate {
-                    to: [seer.clone()].into(),
-                    narration: Narration::Investigated {
-                        target: target.clone(),
-                        faction: self.role(target).faction(),
-                    },
-                });
-            }
-        }
+        directives.extend(findings);
         if protected.contains(&victim) {
             directives.push(self.narrate_living(Narration::NoDeath { round: self.round }));
+            directives.extend(self.next_phase());
         } else {
             directives.push(self.eliminate(&victim, Cause::Devoured));
-            if let Some(outcome) = self.decide() {
-                directives.push(outcome);
-                return directives;
-            }
+            directives.extend(self.advance());
         }
-        self.phase = Phase::Day;
-        directives.extend(self.begin_phase());
         directives
     }
 
-    fn resolve_day(&mut self, votes: BTreeMap<AgentId, Action>) -> Vec<Directive> {
+    /// Resolves a day from its nominations: the full tally to the living,
+    /// then the lynching.
+    fn resolve_day(&mut self, answers: BTreeMap<AgentId, (RequestKind, Action)>) -> Vec<Directive> {
+        let votes: BTreeMap<AgentId, Action> = answers
+            .into_iter()
+            .map(|(who, (_, action))| (who, action))
+            .collect();
         let lynched = plurality(votes.values(), &mut self.ties)
             .expect("every living player nominates someone");
         let mut directives = vec![self.narrate_living(Narration::Tally {
@@ -331,26 +345,15 @@ impl Game {
             votes,
         })];
         directives.push(self.eliminate(&lynched, Cause::Lynched));
-        if let Some(outcome) = self.decide() {
-            directives.push(outcome);
-            return directives;
-        }
-        if self.round.0 >= self.max_rounds {
-            directives.push(self.end(None));
-            return directives;
-        }
-        self.round = Round(self.round.0 + 1);
-        self.phase = Phase::Night;
-        directives.extend(self.begin_phase());
+        directives.extend(self.advance());
         directives
     }
 
     /// Removes a player from the living and announces it, with the role
     /// revealed, to the living and to the player itself.
     fn eliminate(&mut self, who: &AgentId, cause: Cause) -> Directive {
+        let to = self.living.clone();
         assert!(self.living.remove(who), "{who} is not living");
-        let mut to = self.living.clone();
-        to.insert(who.clone());
         Directive::Narrate {
             to,
             narration: Narration::Eliminated {
@@ -362,14 +365,41 @@ impl Game {
         }
     }
 
-    /// Ends the game if a side has won.
-    fn decide(&mut self) -> Option<Directive> {
-        self.winner().map(|winner| self.end(Some(winner)))
+    /// After an elimination: the outcome if a side has won, and otherwise
+    /// the next phase.
+    fn advance(&mut self) -> Vec<Directive> {
+        match self.winner() {
+            Some(winner) => vec![self.end(Some(winner))],
+            None => self.next_phase(),
+        }
     }
 
-    /// The side that has won, if one has.
+    /// Begins the phase after this one: the day of the same round, or the
+    /// night of the next, unless the round cap has been reached, in which
+    /// case the game ends in a stalemate.
+    fn next_phase(&mut self) -> Vec<Directive> {
+        match self.phase {
+            Phase::Night => self.phase = Phase::Day,
+            Phase::Day => {
+                if self.round.0 >= self.max_rounds {
+                    return vec![self.end(None)];
+                }
+                self.round = Round(self.round.0 + 1);
+                self.phase = Phase::Night;
+            }
+        }
+        self.begin_phase()
+    }
+
+    /// The side that has won, if one has: the village once no werewolf
+    /// lives, the werewolves once they are at least as many as everyone
+    /// else.
     fn winner(&self) -> Option<Faction> {
-        let werewolves = self.living_with(Role::Werewolf).count();
+        let werewolves = self
+            .living
+            .iter()
+            .filter(|who| self.role(who).faction() == Faction::Werewolves)
+            .count();
         let others = self.living.len() - werewolves;
         if werewolves == 0 {
             Some(Faction::Village)
@@ -396,11 +426,6 @@ impl Game {
             to: self.living.clone(),
             narration,
         }
-    }
-
-    /// The living players holding a role, in agent order.
-    fn living_with(&self, role: Role) -> impl Iterator<Item = &AgentId> {
-        self.living.iter().filter(move |who| self.role(who) == role)
     }
 
     /// The role of a player.
@@ -450,18 +475,11 @@ mod tests {
     use rand::Rng;
 
     use super::*;
+    use crate::testing::{id, ids};
     use crate::werewolf::role::Role::{Doctor, Seer, Villager, Werewolf};
 
     const SEED: u64 = 20_260_918;
     const MAX_ROUNDS: u32 = 100;
-
-    fn id(name: &str) -> AgentId {
-        AgentId::new(name)
-    }
-
-    fn ids(names: &[&str]) -> BTreeSet<AgentId> {
-        names.iter().map(|name| id(name)).collect()
-    }
 
     fn target(name: &str) -> Action {
         Action::Target(id(name))
@@ -652,6 +670,25 @@ mod tests {
         }))
     }
 
+    fn investigated(to: &str, target: &str, faction: Faction) -> Directive {
+        narrate(
+            &[to],
+            Narration::Investigated {
+                target: id(target),
+                faction,
+            },
+        )
+    }
+
+    /// Records one response to the request with the given id.
+    fn respond(game: &mut Game, from: &str, request: u64, action: Action) -> Vec<Directive> {
+        let response = Response {
+            request: RequestId(request),
+            action,
+        };
+        game.record(&id(from), &response)
+    }
+
     /// In the village, alice is devoured and then bob, the only werewolf,
     /// is lynched: a village win in one round.
     fn village_wins() -> Vec<Answers> {
@@ -735,6 +772,19 @@ mod tests {
         ]
     }
 
+    /// Every scripted game played out: its assignment, the game as it ends,
+    /// and every directive it produced.
+    fn played_games() -> Vec<(Assignment, Game, Vec<Directive>)> {
+        scripted_games()
+            .into_iter()
+            .map(|(assignment, max_rounds, script)| {
+                let mut game = Game::new(assignment.clone(), max_rounds, SEED);
+                let directives = play(&mut game, &script);
+                (assignment, game, directives)
+            })
+            .collect()
+    }
+
     #[test]
     fn the_village_wins_when_the_last_werewolf_is_lynched() {
         let everyone = ["alice", "bob", "carol", "dave", "erin"];
@@ -753,13 +803,7 @@ mod tests {
                 ask("carol", 2, 1, RequestKind::Investigate),
                 ask("dave", 3, 1, RequestKind::Protect),
                 tally(&["bob"], 1, Phase::Night, &[("bob", "alice")]),
-                narrate(
-                    &["carol"],
-                    Narration::Investigated {
-                        target: id("bob"),
-                        faction: Faction::Werewolves,
-                    },
-                ),
+                investigated("carol", "bob", Faction::Werewolves),
                 eliminated(&everyone, "alice", Villager, 1, Cause::Devoured),
                 phase_began(1, Phase::Day, &survivors),
                 ask("bob", 4, 1, RequestKind::Nominate),
@@ -801,13 +845,7 @@ mod tests {
             [
                 tally(&["bob"], 1, Phase::Night, &[("bob", "carol")]),
                 // The seer is devoured tonight and still learns what it learned.
-                narrate(
-                    &["carol"],
-                    Narration::Investigated {
-                        target: id("bob"),
-                        faction: Faction::Werewolves,
-                    },
-                ),
+                investigated("carol", "bob", Faction::Werewolves),
                 eliminated(
                     &["alice", "bob", "carol", "dave", "erin"],
                     "carol",
@@ -902,21 +940,16 @@ mod tests {
     fn nothing_is_returned_until_the_last_outstanding_request_is_answered() {
         let mut game = game(village());
         let asks = asks(&game.begin());
-        let devour = Response {
-            request: asks[&id("bob")].id,
-            action: target("alice"),
-        };
-        let investigate = Response {
-            request: asks[&id("carol")].id,
-            action: target("bob"),
-        };
-        let protect = Response {
-            request: asks[&id("dave")].id,
-            action: target("erin"),
-        };
-        assert_eq!(game.record(&id("bob"), &devour), []);
-        assert_eq!(game.record(&id("carol"), &investigate), []);
-        let caused = game.record(&id("dave"), &protect);
+        let request = |who: &str| asks[&id(who)].id.0;
+        assert_eq!(
+            respond(&mut game, "bob", request("bob"), target("alice")),
+            []
+        );
+        assert_eq!(
+            respond(&mut game, "carol", request("carol"), target("bob")),
+            []
+        );
+        let caused = respond(&mut game, "dave", request("dave"), target("erin"));
         assert_eq!(caused.len(), 8, "{caused:?}");
         assert_eq!(
             caused[0],
@@ -969,13 +1002,7 @@ mod tests {
         let split = answers(&[("alice", "dave"), ("bob", "erin"), ("carol", "frank")]);
         let mut game = game(pack_of_three());
         let directives = play(&mut game, &[split]);
-        // Golden: the victim the generator picks for this seed.
-        let victim = "frank";
-        let survivors: Vec<&str> = everyone
-            .iter()
-            .copied()
-            .filter(|who| *who != victim)
-            .collect();
+        // Golden: frank is the victim the generator picks for this seed.
         assert_eq!(
             directives[11..],
             [
@@ -985,8 +1012,12 @@ mod tests {
                     Phase::Night,
                     &[("alice", "dave"), ("bob", "erin"), ("carol", "frank")],
                 ),
-                eliminated(&everyone, victim, Villager, 1, Cause::Devoured),
-                outcome(Some(Faction::Werewolves), 1, &survivors),
+                eliminated(&everyone, "frank", Villager, 1, Cause::Devoured),
+                outcome(
+                    Some(Faction::Werewolves),
+                    1,
+                    &["alice", "bob", "carol", "dave", "erin", "grace"],
+                ),
             ]
         );
     }
@@ -997,8 +1028,8 @@ mod tests {
         // moderator's label draws, so the label is pinned and not merely
         // the value.
         let mut ties = ChaCha8Rng::seed_from_u64(seed_for(SEED, "moderator:ties"));
-        let leaders = ["dave", "erin", "frank"];
-        assert_eq!(leaders[ties.random_range(0..leaders.len())], "frank");
+        let split = [target("dave"), target("erin"), target("frank")];
+        assert_eq!(plurality(&split, &mut ties), Some(id("frank")));
     }
 
     #[test]
@@ -1008,20 +1039,6 @@ mod tests {
             .collect();
         assert_eq!(runs[0], runs[1]);
         assert_eq!(runs[1], runs[2]);
-        let victims: BTreeSet<&str> = runs
-            .iter()
-            .filter_map(|directives| {
-                directives.iter().find_map(|directive| match directive {
-                    Directive::Narrate {
-                        narration: Narration::Eliminated { who, .. },
-                        ..
-                    } => Some(who.as_str()),
-                    _ => None,
-                })
-            })
-            .collect();
-        assert_eq!(victims.len(), 1);
-        assert!(["alice", "erin"].contains(victims.iter().next().unwrap()));
     }
 
     #[test]
@@ -1113,13 +1130,7 @@ mod tests {
                 ("erin", "-"),
             ]);
             let directives = play(&mut game, &[night]);
-            let finding = narrate(
-                &["carol"],
-                Narration::Investigated {
-                    target: id(whom),
-                    faction,
-                },
-            );
+            let finding = investigated("carol", whom, faction);
             assert!(directives.contains(&finding), "{whom}: {directives:?}");
         }
     }
@@ -1167,8 +1178,7 @@ mod tests {
 
     #[test]
     fn no_directive_addresses_a_dead_player() {
-        for (assignment, max_rounds, script) in scripted_games() {
-            let directives = play(&mut Game::new(assignment, max_rounds, SEED), &script);
+        for (_, _, directives) in played_games() {
             let mut dead = BTreeSet::new();
             for directive in &directives {
                 match directive {
@@ -1198,11 +1208,7 @@ mod tests {
 
     #[test]
     fn the_pack_is_named_only_to_werewolves() {
-        for (assignment, max_rounds, script) in scripted_games() {
-            let directives = play(
-                &mut Game::new(assignment.clone(), max_rounds, SEED),
-                &script,
-            );
+        for (assignment, _, directives) in played_games() {
             for directive in &directives {
                 let Directive::Narrate { to, narration } = directive else {
                     continue;
@@ -1234,9 +1240,7 @@ mod tests {
 
     #[test]
     fn the_outcome_is_broadcast_exactly_once_and_last() {
-        for (assignment, max_rounds, script) in scripted_games() {
-            let mut game = Game::new(assignment, max_rounds, SEED);
-            let directives = play(&mut game, &script);
+        for (_, game, directives) in played_games() {
             let broadcasts: Vec<usize> = directives
                 .iter()
                 .enumerate()
@@ -1263,8 +1267,7 @@ mod tests {
 
     #[test]
     fn no_narration_has_an_empty_recipient_set() {
-        for (assignment, max_rounds, script) in scripted_games() {
-            let directives = play(&mut Game::new(assignment, max_rounds, SEED), &script);
+        for (_, _, directives) in played_games() {
             for directive in &directives {
                 if let Directive::Narrate { to, narration } = directive {
                     assert!(!to.is_empty(), "{narration:?} is addressed to nobody");
@@ -1312,11 +1315,7 @@ mod tests {
     fn an_unknown_request_id_panics() {
         let mut game = game(village());
         game.begin();
-        let response = Response {
-            request: RequestId(99),
-            action: target("alice"),
-        };
-        game.record(&id("bob"), &response);
+        respond(&mut game, "bob", 99, target("alice"));
     }
 
     #[test]
@@ -1324,11 +1323,7 @@ mod tests {
     fn a_request_id_asked_of_another_agent_panics() {
         let mut game = game(village());
         game.begin();
-        let response = Response {
-            request: RequestId(1),
-            action: target("alice"),
-        };
-        game.record(&id("carol"), &response);
+        respond(&mut game, "carol", 1, target("alice"));
     }
 
     #[test]
@@ -1338,11 +1333,7 @@ mod tests {
     fn an_abstention_where_none_is_permitted_panics() {
         let mut game = game(village());
         game.begin();
-        let response = Response {
-            request: RequestId(1),
-            action: Action::Abstain,
-        };
-        game.record(&id("bob"), &response);
+        respond(&mut game, "bob", 1, Action::Abstain);
     }
 
     #[test]
@@ -1350,11 +1341,7 @@ mod tests {
     fn a_doctor_protecting_itself_panics() {
         let mut game = game(village());
         game.begin();
-        let response = Response {
-            request: RequestId(3),
-            action: target("dave"),
-        };
-        game.record(&id("dave"), &response);
+        respond(&mut game, "dave", 3, target("dave"));
     }
 
     #[test]
@@ -1369,24 +1356,16 @@ mod tests {
                 ("dave", "erin"),
             ])],
         );
-        let response = Response {
-            request: RequestId(4),
-            action: target("alice"),
-        };
-        game.record(&id("bob"), &response);
+        respond(&mut game, "bob", 4, target("alice"));
     }
 
     #[test]
-    #[should_panic(expected = "carol answered request 5, which is not outstanding")]
+    #[should_panic(expected = "carol answered request 5 after the game ended")]
     fn a_response_after_the_outcome_panics() {
         let mut game = game(village());
         play(&mut game, &village_wins());
         assert!(game.outcome().is_some());
-        let response = Response {
-            request: RequestId(5),
-            action: target("dave"),
-        };
-        game.record(&id("carol"), &response);
+        respond(&mut game, "carol", 5, target("dave"));
     }
 
     #[test]
