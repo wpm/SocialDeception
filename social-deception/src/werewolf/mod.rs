@@ -1,12 +1,17 @@
-//! Werewolf: the types every part of the game is written against.
+//! Werewolf: the types every part of the game is written against, and the
+//! rules of the game as a pure state machine.
 //!
-//! This module holds vocabulary: the [`Role`]s a player can be dealt, the
-//! [`Faction`]s they play for, the [`Round`] and [`Phase`] that locate a
-//! moment in a game, and [`Message`], the one payload type that travels over
-//! the runtime's [`Event`](crate::Event) between the moderator and the
-//! players. The only facts it states are properties of a request kind
-//! itself, such as which phase it belongs to; every rule that depends on who
-//! is alive lives with the moderator and the roles, not here.
+//! The vocabulary is the [`Role`]s a player can be dealt, the [`Faction`]s
+//! they play for, the [`Round`] and [`Phase`] that locate a moment in a
+//! game, and [`Message`], the one payload type that travels over the
+//! runtime's [`Event`](crate::Event) between the moderator and the players.
+//! The only facts the vocabulary states are properties of a request kind
+//! itself, such as which phase it belongs to.
+//!
+//! The rules live in [`Game`], which takes an [`Assignment`] of roles and
+//! plays the game as a fold over players' responses, producing
+//! [`Directive`]s that say what to tell whom. Everything that draws at
+//! random is seeded through [`seed_for`].
 //!
 //! # Three kinds of message
 //!
@@ -57,11 +62,17 @@
 //! whatever reads a trajectory back; the payload's shape belongs to the
 //! environment alone.
 
+pub mod assignment;
+pub mod game;
 pub mod message;
 pub mod role;
+pub mod seed;
 
+pub use assignment::Assignment;
+pub use game::{Directive, Game};
 pub use message::{
     Action, Cause, Message, Narration, Outcome, Phase, Request, RequestId, RequestKind, Response,
     Round,
 };
 pub use role::{Faction, Role};
+pub use seed::seed_for;
