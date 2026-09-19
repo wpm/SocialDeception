@@ -77,6 +77,35 @@ impl Assignment {
         Self { roles, pack }
     }
 
+    /// An assignment giving each player the role paired with it, for a deal
+    /// decided by something other than the seed, such as a test.
+    ///
+    /// The pack is every player assigned [`Role::Werewolf`].
+    ///
+    /// # Panics
+    ///
+    /// If a player appears more than once.
+    pub fn new<I, A>(roles: I) -> Self
+    where
+        I: IntoIterator<Item = (A, Role)>,
+        A: Into<AgentId>,
+    {
+        let mut dealt = BTreeMap::new();
+        for (who, role) in roles {
+            let who = who.into();
+            assert!(
+                dealt.insert(who.clone(), role).is_none(),
+                "player {who} is assigned more than one role"
+            );
+        }
+        let pack = dealt
+            .iter()
+            .filter(|(_, role)| role.faction() == Faction::Werewolves)
+            .map(|(who, _)| who.clone())
+            .collect();
+        Self { roles: dealt, pack }
+    }
+
     /// The role dealt to `who`, or `None` if `who` is not a player.
     #[must_use]
     pub fn role(&self, who: &AgentId) -> Option<Role> {

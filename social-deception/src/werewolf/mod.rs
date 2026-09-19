@@ -1,5 +1,6 @@
-//! Werewolf: the types every part of the game is written against, and the
-//! setup that happens before an episode runs.
+//! Werewolf: the types every part of the game is written against, the
+//! setup that happens before an episode runs, and the rules of the game as
+//! a pure state machine.
 //!
 //! The vocabulary is the [`Role`]s a player can be dealt, the [`Faction`]s
 //! they play for, the [`Round`] and [`Phase`] that locate a moment in a
@@ -14,6 +15,10 @@
 //! [`seed_for`], which derives every generator's seed from the master seed
 //! ([`seed`]). The `werewolf` binary loads a configuration, deals the roles
 //! and prints the result.
+//!
+//! The rules live in [`Game`] ([`game`]), which takes an [`Assignment`] and
+//! plays the game as a fold over players' responses, producing
+//! [`Directive`]s that say what to tell whom.
 //!
 //! # Three kinds of message
 //!
@@ -72,6 +77,7 @@
 
 pub mod assignment;
 pub mod config;
+pub mod game;
 pub mod knowledge;
 pub mod message;
 pub mod role;
@@ -79,6 +85,7 @@ pub mod seed;
 
 pub use assignment::Assignment;
 pub use config::{Config, ConfigError, RoleCounts};
+pub use game::{Directive, Game};
 pub use knowledge::{Death, Heard, Knowledge};
 pub use message::{
     Action, Cause, Message, Narration, Outcome, Phase, Request, RequestId, RequestKind, Response,
