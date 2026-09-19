@@ -6,12 +6,11 @@
 
 ## Context
 
-The runtime can already run an environment end to end: an episode is a fixed
-roster of agents, each a thread folding over its own event stream, exchanging
-messages through a router that delivers to explicit recipient sets, and
-shutting down when it goes quiescent — when every delivery has been handled
-and nothing new has been sent. A Collatz ring exercises all of that in the
-test suite.
+The runtime of [ADR-0001](0001-single-process-thread-per-agent.md) can
+already run an environment end to end: a fixed roster of agents, each a
+thread folding over its own event stream, a router delivering to explicit
+recipient sets, and an episode that stops when it goes quiescent. A Collatz
+ring exercises all of that in the test suite.
 
 Werewolf is the first environment with rules, and it brings four things the
 Collatz ring does not have:
@@ -27,8 +26,7 @@ Collatz ring does not have:
   every agent's trajectory exists to carry.
 
 The question is where the game lives: who owns the phase, who decides what an
-agent may do, and what the runtime has to learn about games in order to run
-this one.
+agent may do, and what the runtime has to learn about games.
 
 ## Decision
 
@@ -40,16 +38,12 @@ configuration and hands back a populated episode. `Episode`, `Agent`,
 
 ### The game is a pure fold and the moderator is a thin shell around it
 
-`Game` holds the rules and nothing else. It has no channels and spawns no
-threads. `begin` produces the opening narrations and requests; `record`
-takes one player's response and produces whatever that response caused;
-`outcome` reports the winner once there is one. Because it touches no
-transport, the whole of the rules is testable by calling functions with
-values and asserting on the values that come back.
-
-`Moderator` is the `Handler<Message>` around `Game`: it turns arriving events
-into calls on the fold and sends what the fold returns. It contains no rule
-of its own.
+`Game` holds the rules and nothing else: no channels, no threads. `begin`
+produces the opening narrations and requests; `record` takes one player's
+response and produces whatever that response caused; `outcome` reports the
+winner once there is one. `Moderator` is the `Handler<Message>` around it,
+turning arriving events into calls on the fold and sending what the fold
+returns.
 
 ### Roles are assigned at setup, not dealt at runtime
 
@@ -60,9 +54,9 @@ typed players and the moderator are built from that one assignment.
 
 The moderator still narrates `Assigned` to each player on `Control::Start`.
 The agent's own event stream is what training consumes and what a future LLM
-policy will read its role from, so the assignment must appear there. Each
-player asserts that what it is told matches the type it is, so that a wiring
-bug fails loudly instead of playing a quiet, wrong game.
+policy will read its role from, so the assignment must appear there. The
+narrated role and the player's type must agree; a mismatch is a wiring bug
+and fails loudly rather than playing a quiet, wrong game.
 
 ### The moderator never broadcasts, except once
 
@@ -70,9 +64,7 @@ bug fails loudly instead of playing a quiet, wrong game.
 broadcast would reach dead players and, at night, villagers who must not
 hear. Every moderator message therefore carries an explicit recipient set —
 one player, the living, or the pack — and that choice of recipients is the
-whole of the hidden-information mechanism. A villager cannot learn who the
-werewolves are because no message carrying that fact is ever addressed to a
-villager.
+whole of the hidden-information mechanism.
 
 The single exception is the final `Outcome`, broadcast on purpose. It is the
 reward signal, and a dead werewolf whose pack went on to win needs to observe
@@ -85,37 +77,17 @@ could not act on.
 ### The game ends by silence
 
 When the win condition is met the moderator announces the outcome and says
-nothing more. The players reply nothing. The episode's count of unhandled
-deliveries falls to zero, the quiescence detector fires, and the episode
-stops and joins its threads. No new shutdown mechanism is needed.
-
-The corollary failure mode is a game that goes quiescent *without* an
-outcome: some player failed to respond, so the moderator is waiting for a
-reply that never comes, and nothing is in flight. That is a truncated game,
-and it presents as a short trajectory rather than a hang. Episode assembly
-treats a missing outcome as an error, and the end-to-end test asserts that
-every trajectory's last narration is an `Outcome`.
+nothing more. The players reply nothing, the episode goes quiescent, and it
+stops and joins its threads. No new shutdown mechanism is needed. Episode
+assembly treats an episode that goes quiescent without an outcome as an
+error.
 
 ### Resolution is order-independent
 
 The moderator advances exactly when no request is outstanding. It
 accumulates responses into a map keyed by the responding agent and resolves
-the phase in a canonical order over that map. Which player's thread answered
-first therefore has no effect on the result, and that order-independence is
-what makes a deterministic game possible on threads that are not
-deterministic.
-
-```mermaid
-stateDiagram-v2
-    [*] --> Night: begin — Assigned to each player
-    Night --> Resolving: every night request answered
-    Resolving --> Day: tally to the pack, result to the seer, death or no death to the living
-    Day --> Lynching: every nomination received
-    Lynching --> Night: tally and lynching to the living
-    Resolving --> Ended: a side has won
-    Lynching --> Ended: a side has won
-    Ended --> [*]: Outcome to everyone, then silence
-```
+the phase in a canonical order over that map, so which thread answered first
+has no effect on the result.
 
 ### The outcome reaches the caller on a channel
 
@@ -123,29 +95,27 @@ stateDiagram-v2
 moderator's final state is unrecoverable from it. The moderator is built with
 a `Sender<Outcome>` and publishes there as well as announcing in world; the
 caller holds the receiver. This is an observation channel, not a control
-channel: the in-world announcement stays the record of truth, and the
-end-to-end test asserts the two agree.
+channel: the in-world announcement stays the record of truth, and the value
+on the channel must equal it.
 
-### One `Faction`, not an `Alignment` beside it
+### One `Faction` serves both investigation and victory
 
 What a seer learns about a player and what a winning side is are the same
-partition of the roster, so they are one type. Two extensions would split
-them, and either is the moment to introduce a second type, not before:
-
-- a **solo-win role** such as a Tanner, who wins by being lynched, at which
-  point winning sides and investigation results stop being the same set;
-- a **falsely-investigating role** such as a Lycan, who reads as a werewolf
-  to the seer, at which point an investigation becomes a report rather than a
-  fact.
-
-### The moderator shares the players' namespace
-
-The moderator's id is an agent id like any other. Configuration validation
-rejects a player with that name.
+partition of the roster, so they are one type.
 
 ### The rules of this Werewolf
 
-Several of these are choices among standard variants, so they are recorded.
+Several of these are choices among standard variants.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Night: Assigned to each player
+    Night --> Day: every night request answered and resolved
+    Day --> Night: every nomination received and resolved
+    Night --> Ended: a side has won
+    Day --> Ended: a side has won
+    Ended --> [*]: Outcome to everyone, then silence
+```
 
 - **Night first.** Phases alternate Night 1, Day 1, Night 2, Day 2, and so
   on.
@@ -161,10 +131,10 @@ Several of these are choices among standard variants, so they are recorded.
 - **Plurality with a seeded tie-break.** Ties are broken by the moderator's
   own seeded generator among the tied, drawn only when there is actually a
   tie.
-- **No self-targeting.** No action targets the agent taking it.
-- **The doctor's bans.** The doctor may not protect itself, nor the same
-  player two nights running. That is private state constraining what the
-  doctor may do, which is why the role is in the first version.
+- **No action targets the agent taking it.**
+- **The doctor may not protect itself, nor the same player two nights
+  running.** That is private state constraining what the doctor may do,
+  which is why the role is in the first version.
 - **A death reveals the role.**
 - **The day's tally is public; the night's goes to the pack.** The full day
   tally is narrated to the living; the night tally to the living werewolves
@@ -176,9 +146,8 @@ Several of these are choices among standard variants, so they are recorded.
   least as many as living non-werewolves; the village wins when no werewolf
   lives. Checked after every elimination. Parity rather than annihilation,
   because from parity onward the werewolves cannot lose.
-- **A round cap** guards against a future stalling policy. It is a guard, not
-  part of the game: termination is already guaranteed by the day always
-  eliminating someone.
+- **A round cap** guards against a future stalling policy; the day's
+  elimination already guarantees termination.
 
 ## Alternatives considered
 
@@ -211,9 +180,15 @@ environment.
 
 ### An `Alignment` type beside `Faction`
 
-Considered and rejected for the reasons above: nothing in this version
-distinguishes them, and a type with one use and no difference is a
-speculative generalization.
+A second type could distinguish what an investigation reports from which side
+a player wins with. Rejected because nothing in this version distinguishes
+them. Two extensions would, and either is the moment to split the type:
+
+- a **solo-win role** such as a Tanner, who wins by being lynched, at which
+  point winning sides and investigation results stop being the same set;
+- a **falsely-investigating role** such as a Lycan, who reads as a werewolf
+  to the seer, at which point an investigation becomes a report rather than a
+  fact.
 
 ## Consequences
 
@@ -223,24 +198,26 @@ speculative generalization.
 - **The rules are unit-testable.** A test of the night resolution is a call
   to `record` with values and an assertion on values; no thread, channel or
   episode is involved.
-- **Determinism rests on two things.** The moderator resolves in canonical
-  order over a map, so thread scheduling cannot change a result; and a player
-  never observes another player's response while its own is open, so no
-  player's observations depend on which thread answered first.
-- **A truncated game is a short trajectory, not a hang.** That is the failure
-  mode to look for when something goes wrong, and it is why episode assembly
-  treats a missing outcome as an error.
-- **Every moderator message is addressed.** Adding a message kind means
-  deciding who receives it, and "everyone" is never the default.
-- **`Faction` will split when a Tanner or a Lycan arrives.** That is recorded
-  here so the change is recognized as expected when it comes.
+- **No player's observations depend on which thread answered first,**
+  because a player never observes another player's response while its own is
+  open. Together with canonical-order resolution, that is what lets
+  [ADR-0005](0005-policy-separates-decisions-from-rules.md) claim a
+  deterministic transcript on threads that are not deterministic.
+- **A truncated game is a short trajectory, not a hang.** Some player failed
+  to respond, the moderator is waiting for a reply that never comes, and
+  nothing is in flight. That is the failure mode to look for, and a checker
+  can assert that every trajectory's last narration is an `Outcome`.
+- **A new message kind must name its recipients.** There is no default.
+- **The moderator's id shares the players' namespace,** so configuration
+  validation rejects a player with that name.
 
 ## Deliberately deferred
 
-**Timers and quiescence are currently mutually exclusive.** `Episode::run`
-hard-codes `think_every: None` for every agent, and an agent that wakes on
-its own would keep an episode from ever going quiescent. Deterministic
-Werewolf needs no timers. Real-time dialogue will, and at that point "when is
-the episode over?" needs a different answer, most likely the moderator
-declaring it. That belongs to the record that introduces timers into an
-episode, and is noted here so it is not rediscovered.
+Named so that it is not mistaken for an oversight. Not decided here.
+
+1. **Timers and quiescence.** They are currently mutually exclusive:
+   `Episode::run` hard-codes `think_every: None` for every agent, and an
+   agent that wakes on its own would keep an episode from ever going
+   quiescent. Deterministic Werewolf needs no timers. Real-time dialogue
+   will, and at that point "when is the episode over?" needs a different
+   answer, most likely the moderator declaring it.
