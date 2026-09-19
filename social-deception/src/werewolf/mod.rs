@@ -24,7 +24,7 @@
 //!
 //! The seam with the runtime is [`setup`]: [`episode`] builds a populated
 //! [`Episode`](crate::Episode) from a [`Config`], seating every player and
-//! the moderator, and [`run`] runs one to its [`Outcome`] or an [`Error`].
+//! the moderator, and [`run`] runs one to its [`Outcome`] or a [`RunError`].
 //! The `werewolf` binary's `play` is that, with the effective configuration
 //! written beside the trajectory.
 //!
@@ -131,5 +131,5 @@ pub use policy::{Policy, RandomPolicy, View};
 pub use role::{Faction, Role};
 pub use roles::{Doctor, Seer, Villager, Werewolf};
 pub use seed::seed_for;
-pub use setup::{Error, episode, run};
+pub use setup::{RunError, episode, run};
 pub use transcript::{PhaseRecord, RoundRecord, Transcript, TranscriptError};

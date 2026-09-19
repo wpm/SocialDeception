@@ -24,7 +24,7 @@
 //! game stopped mid-way and the trajectory is simply short. There is no hang
 //! to notice, so this is the only place it can be caught: [`run`] takes the
 //! outcome from the moderator's channel, and finding none there is
-//! [`Error::Truncated`].
+//! [`RunError::Truncated`].
 //!
 //! # The seed never enters the game
 //!
@@ -60,7 +60,7 @@ use crate::trajectory::{LogRecord, Writer};
 
 /// Why a run did not end with an outcome.
 #[derive(Debug)]
-pub enum Error {
+pub enum RunError {
     /// The trajectory could not be created or written.
     Io {
         /// Where it was being written, or `None` if it was going nowhere.
@@ -75,7 +75,7 @@ pub enum Error {
     Truncated,
 }
 
-impl fmt::Display for Error {
+impl fmt::Display for RunError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io {
@@ -94,7 +94,7 @@ impl fmt::Display for Error {
     }
 }
 
-impl error::Error for Error {
+impl error::Error for RunError {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
         match self {
             Self::Io { source, .. } => Some(source),
@@ -104,7 +104,7 @@ impl error::Error for Error {
     }
 }
 
-impl From<EpisodeError> for Error {
+impl From<EpisodeError> for RunError {
     fn from(error: EpisodeError) -> Self {
         Self::Episode(error)
     }
@@ -197,19 +197,19 @@ fn add(
 ///
 /// # Errors
 ///
-/// [`Error::Io`] if the trajectory cannot be created or written,
-/// [`Error::Episode`] if the episode did not run cleanly, and
-/// [`Error::Truncated`] if it ran to quiescence without the moderator
+/// [`RunError::Io`] if the trajectory cannot be created or written,
+/// [`RunError::Episode`] if the episode did not run cleanly, and
+/// [`RunError::Truncated`] if it ran to quiescence without the moderator
 /// announcing an outcome.
 ///
 /// # Panics
 ///
 /// If the configuration would not pass [`Config::validate`]; see
 /// [`episode`].
-pub fn run(config: &Config) -> Result<Outcome, Error> {
+pub fn run(config: &Config) -> Result<Outcome, RunError> {
     let trajectory = config.trajectory.as_deref();
     let sink: Box<dyn Write + Send> = match trajectory {
-        Some(path) => Box::new(File::create(path).map_err(|source| Error::Io {
+        Some(path) => Box::new(File::create(path).map_err(|source| RunError::Io {
             trajectory: Some(path.to_path_buf()),
             source,
         })?),
@@ -228,20 +228,20 @@ fn play<W: Write + Send + 'static>(
     outcomes: &Receiver<Outcome>,
     writer: Writer<W>,
     trajectory: Option<&Path>,
-) -> Result<Outcome, Error> {
+) -> Result<Outcome, RunError> {
     let ran = episode.run();
     // The episode drops every sender to the writer on its way out, whether
     // or not it ran cleanly, so the writer can be joined now for the whole
     // trajectory. A failed run is the more informative error of the two.
     let written = writer.join();
     ran?;
-    written.map_err(|source| Error::Io {
+    written.map_err(|source| RunError::Io {
         trajectory: trajectory.map(Path::to_path_buf),
         source,
     })?;
     // The moderator's sender went with its handler when the episode joined
     // it, so the receiver holds the outcome now or never will.
-    outcomes.try_recv().map_err(|_| Error::Truncated)
+    outcomes.try_recv().map_err(|_| RunError::Truncated)
 }
 
 #[cfg(test)]
@@ -408,7 +408,7 @@ mod tests {
         config.trajectory = Some(path.to_path_buf());
         let error = run(&config).unwrap_err();
         assert!(
-            matches!(&error, Error::Io { trajectory: Some(t), .. } if t == path),
+            matches!(&error, RunError::Io { trajectory: Some(t), .. } if t == path),
             "{error:?}"
         );
         assert!(
@@ -448,7 +448,7 @@ mod tests {
         let outcomes = moderate(&mut episode, &config, assignment);
 
         let error = play(episode, &outcomes, writer, None).unwrap_err();
-        assert!(matches!(error, Error::Truncated), "{error:?}");
+        assert!(matches!(error, RunError::Truncated), "{error:?}");
         assert!(error.to_string().contains("without an outcome"));
     }
 }
