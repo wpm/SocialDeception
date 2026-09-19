@@ -36,3 +36,5 @@ from the earlier attempt at the project are not part of its history.
 | [0001](0001-single-process-thread-per-agent.md) | A single process per episode, one thread per agent | Accepted |
 | [0002](0002-jsonl-trajectory-format.md) | Trajectories are JSON Lines of event and cycle records | Accepted |
 | [0003](0003-event-record-stamps.md) | An event record stamps its time as arrived, sent or due | Accepted |
+| [0004](0004-moderator-agent-runs-the-game.md) | A moderator agent runs the game, and the seam with the episode is construction | Accepted |
+| [0005](0005-policy-separates-decisions-from-rules.md) | A policy separates decisions from rules | Accepted |
