@@ -221,7 +221,7 @@ impl Knowledge {
 mod tests {
     use super::*;
     use crate::event::Control;
-    use crate::testing::{id, ids};
+    use crate::testing::{id, ids, target};
     use crate::werewolf::message::{Request, RequestId, RequestKind, Response};
 
     const ME: &str = "me";
@@ -231,10 +231,6 @@ mod tests {
             .into_iter()
             .map(|(who, action)| (id(who), action))
             .collect()
-    }
-
-    fn target(who: &str) -> Action {
-        Action::Target(id(who))
     }
 
     /// A narration from the moderator to this agent, as it arrives on the
