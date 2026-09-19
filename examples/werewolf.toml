@@ -1,0 +1,30 @@
+# A seven-player game of Werewolf.
+#
+# Run it with:
+#
+#     cargo run --bin werewolf -- play examples/werewolf.toml
+
+# The master seed. Every generator in the episode is derived from it, so a
+# run is reproducible from this file alone.
+seed = 20260918
+
+# The players. Their order here does not affect the deal.
+players = ["alice", "bob", "carol", "dave", "erin", "frank", "grace"]
+
+# Where to write the trajectory. Optional: leave it out to write nothing.
+trajectory = "werewolf.jsonl"
+
+# The round after which an unfinished game is a stalemate. Optional,
+# default 100.
+max_rounds = 100
+
+# The moderator's agent id. Optional, default "moderator". No player may
+# share it.
+moderator = "moderator"
+
+# How many of each special role to deal. Villagers are whatever is left over.
+# Seers and doctors are optional, default 0, and at most one of each.
+[roles]
+werewolves = 2
+seers = 1
+doctors = 1
