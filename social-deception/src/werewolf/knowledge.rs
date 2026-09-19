@@ -7,11 +7,8 @@
 //! on. It is one type for every role, because every role needs the same
 //! public picture (the round and phase, who is living, who is dead and what
 //! they turned out to be, the tallies it heard) and differs only in what it
-//! holds privately: a werewolf its pack, the seer its investigations.
-//!
-//! It is not the observation space, and there is no function computing one:
-//! the observation space is combinatorial and nothing would enumerate it,
-//! unlike the action space, which is computed at every decision.
+//! holds privately: a werewolf its pack, the seer its investigations. The
+//! vocabulary, and the reasons for it, are in ADR-0005.
 //!
 //! # A state, not a belief
 //!
@@ -56,10 +53,9 @@ pub struct Knowledge {
     /// This agent's role, fixed at construction. The `Assigned` narration
     /// must agree with it.
     pub role: Role,
-    /// The current round. `Round(0)` until the first phase begins.
+    /// The current round.
     pub round: Round,
-    /// The current phase. `Day` until the first phase begins, so that the
-    /// first announcement, Night 1, advances from it like every other.
+    /// The current phase.
     pub phase: Phase,
     /// Everyone still in the game, as last announced and kept current
     /// between announcements.
@@ -101,6 +97,10 @@ pub struct Heard {
 
 impl Knowledge {
     /// The state of a player that has observed nothing yet.
+    ///
+    /// Until the first [`Narration::PhaseBegan`], `round` is `Round(0)` and
+    /// `phase` is `Day`: the moment before any phase, which the first
+    /// announcement replaces.
     #[must_use]
     pub fn new(me: AgentId, role: Role) -> Self {
         Self {
@@ -122,13 +122,10 @@ impl Knowledge {
     /// Total: every event has a defined effect, and most have none. Only a
     /// narration changes the state. A request tells the agent nothing the
     /// phase's announcement did not, and answering it is the role's job; a
-    /// response is what a player sends, and a player never receives one; a
-    /// control event or a think wake-up is the runtime's business, not the
-    /// game's. None of them is an error, so the state stays a total function
-    /// of whatever arrives, whether or not timers are ever turned on.
-    ///
-    /// The event's sender and recipients carry no meaning here: what the
-    /// moderator said is folded, and nothing about who was told.
+    /// response is what a player sends and never receives; a control event
+    /// or a think wake-up is the runtime's business. None of them is an
+    /// error, so the state stays a total function of whatever arrives,
+    /// whether or not timers are ever turned on.
     ///
     /// # Panics
     ///
@@ -170,8 +167,7 @@ impl Knowledge {
                 self.phase = *phase;
                 self.living.clone_from(living);
             }
-            // A faction never changes, so a repeated target keeps its first
-            // answer.
+            // A repeated target keeps its first answer.
             Narration::Investigated { target, faction } => {
                 self.investigations
                     .entry(target.clone())
@@ -233,17 +229,10 @@ impl Knowledge {
 mod tests {
     use super::*;
     use crate::event::Control;
+    use crate::testing::{id, ids};
     use crate::werewolf::message::{Request, RequestId, RequestKind, Response};
 
     const ME: &str = "me";
-
-    fn id(who: &str) -> AgentId {
-        AgentId::new(who)
-    }
-
-    fn ids<const N: usize>(who: [&str; N]) -> BTreeSet<AgentId> {
-        who.map(AgentId::new).into()
-    }
 
     fn votes<const N: usize>(votes: [(&str, Action); N]) -> BTreeMap<AgentId, Action> {
         votes
@@ -298,8 +287,16 @@ mod tests {
         })
     }
 
+    fn death(round: u32, cause: Cause, role: Role) -> Death {
+        Death {
+            round: Round(round),
+            cause,
+            role,
+        }
+    }
+
     /// A fresh state for this agent with every event folded in, in order.
-    fn folded(role: Role, events: &[Event<Message>]) -> Knowledge {
+    fn folded<'a>(role: Role, events: impl IntoIterator<Item = &'a Event<Message>>) -> Knowledge {
         let mut knowledge = Knowledge::new(id(ME), role);
         for event in events {
             knowledge.observe(event);
@@ -307,14 +304,18 @@ mod tests {
         knowledge
     }
 
-    /// A seer's whole game, from the deal to the werewolves' win.
-    fn a_seers_game() -> Vec<Event<Message>> {
-        let day_votes = votes([
+    /// The one day vote in [`a_seers_game`].
+    fn day_votes() -> BTreeMap<AgentId, Action> {
+        votes([
             ("bob", target("carol")),
             ("carol", target("bob")),
             (ME, target("wolfgang")),
             ("wolfgang", target("carol")),
-        ]);
+        ])
+    }
+
+    /// A seer's whole game, from the deal to the werewolves' win.
+    fn a_seers_game() -> Vec<Event<Message>> {
         vec![
             assigned(Role::Seer, BTreeSet::new()),
             phase_began(
@@ -325,7 +326,7 @@ mod tests {
             investigated("wolfgang", Faction::Werewolves),
             eliminated("alice", Role::Villager, 1, Cause::Devoured),
             phase_began(1, Phase::Day, ids(["bob", "carol", ME, "wolfgang"])),
-            tally(1, Phase::Day, day_votes),
+            tally(1, Phase::Day, day_votes()),
             eliminated("carol", Role::Doctor, 1, Cause::Lynched),
             phase_began(2, Phase::Night, ids(["bob", ME, "wolfgang"])),
             investigated("bob", Faction::Village),
@@ -339,33 +340,8 @@ mod tests {
     }
 
     #[test]
-    fn a_fresh_state_has_observed_nothing() {
-        let knowledge = Knowledge::new(id(ME), Role::Doctor);
-        assert_eq!(
-            knowledge,
-            Knowledge {
-                me: id(ME),
-                role: Role::Doctor,
-                round: Round(0),
-                phase: Phase::Day,
-                living: BTreeSet::new(),
-                dead: BTreeMap::new(),
-                pack: BTreeSet::new(),
-                investigations: BTreeMap::new(),
-                tallies: Vec::new(),
-                outcome: None,
-            }
-        );
-    }
-
-    #[test]
     fn a_scripted_game_produces_exactly_the_expected_state() {
         let knowledge = folded(Role::Seer, &a_seers_game());
-        let death = |round, cause, role| Death {
-            round: Round(round),
-            cause,
-            role,
-        };
         assert_eq!(
             knowledge,
             Knowledge {
@@ -387,12 +363,7 @@ mod tests {
                 tallies: vec![Heard {
                     round: Round(1),
                     phase: Phase::Day,
-                    votes: votes([
-                        ("bob", target("carol")),
-                        ("carol", target("bob")),
-                        (ME, target("wolfgang")),
-                        ("wolfgang", target("carol")),
-                    ]),
+                    votes: day_votes(),
                 }],
                 outcome: Some(Outcome {
                     winner: Some(Faction::Werewolves),
@@ -405,14 +376,16 @@ mod tests {
 
     #[test]
     fn living_follows_announcements_authoritatively_and_eliminations_between_them() {
-        let mut knowledge = folded(
-            Role::Villager,
-            &[phase_began(
-                1,
-                Phase::Night,
-                ids(["alice", "bob", "carol", ME]),
-            )],
-        );
+        let mut knowledge = Knowledge::new(id(ME), Role::Villager);
+        assert_eq!((knowledge.round, knowledge.phase), (Round(0), Phase::Day));
+        assert!(knowledge.living.is_empty());
+
+        knowledge.observe(&phase_began(
+            1,
+            Phase::Night,
+            ids(["alice", "bob", "carol", ME]),
+        ));
+        assert_eq!((knowledge.round, knowledge.phase), (Round(1), Phase::Night));
         assert_eq!(knowledge.living, ids(["alice", "bob", "carol", ME]));
 
         knowledge.observe(&eliminated("alice", Role::Seer, 1, Cause::Devoured));
@@ -421,9 +394,8 @@ mod tests {
         assert!(knowledge.is_living(&id("bob")));
 
         // The announcement agrees with the elimination, and changes nothing.
-        let before = knowledge.clone();
         knowledge.observe(&phase_began(1, Phase::Day, ids(["bob", "carol", ME])));
-        assert_eq!(knowledge.living, before.living);
+        assert_eq!(knowledge.living, ids(["bob", "carol", ME]));
 
         // The announcement is authoritative even where no elimination
         // preceded it.
@@ -448,14 +420,7 @@ mod tests {
         assert_eq!(knowledge.living, ids(["alice", ME]));
         assert_eq!(
             knowledge.dead,
-            BTreeMap::from([(
-                id("wanda"),
-                Death {
-                    round: Round(1),
-                    cause: Cause::Lynched,
-                    role: Role::Werewolf,
-                }
-            )])
+            BTreeMap::from([(id("wanda"), death(1, Cause::Lynched, Role::Werewolf))])
         );
     }
 
@@ -481,7 +446,7 @@ mod tests {
     }
 
     #[test]
-    fn events_that_are_not_narration_change_nothing() {
+    fn events_with_nothing_to_record_change_nothing() {
         let knowledge = folded(Role::Seer, &a_seers_game()[..8]);
         let no_ops = [
             Event::Think,
@@ -562,15 +527,9 @@ mod tests {
             eliminated("carol", Role::Villager, 1, Cause::Devoured),
             eliminated("dave", Role::Doctor, 1, Cause::Lynched),
         ];
-        let forwards: Vec<_> = opening.iter().chain(&independent).cloned().collect();
-        let backwards: Vec<_> = opening
-            .iter()
-            .chain(independent.iter().rev())
-            .cloned()
-            .collect();
         assert_eq!(
-            folded(Role::Seer, &forwards),
-            folded(Role::Seer, &backwards)
+            folded(Role::Seer, opening.iter().chain(&independent)),
+            folded(Role::Seer, opening.iter().chain(independent.iter().rev()))
         );
     }
 
@@ -584,17 +543,13 @@ mod tests {
             votes: votes([(who, target(whom))]),
         };
 
-        let forwards = folded(Role::Villager, &[first.clone(), second.clone()]);
         assert_eq!(
-            forwards.tallies,
+            folded(Role::Villager, [&first, &second]).tallies,
             [heard(1, "alice", "bob"), heard(2, "bob", "alice")]
         );
-
-        let backwards = folded(Role::Villager, &[second, first]);
         assert_eq!(
-            backwards.tallies,
+            folded(Role::Villager, [&second, &first]).tallies,
             [heard(2, "bob", "alice"), heard(1, "alice", "bob")]
         );
-        assert_ne!(forwards, backwards);
     }
 }
