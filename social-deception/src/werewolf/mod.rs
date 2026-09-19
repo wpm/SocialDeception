@@ -23,6 +23,12 @@
 //! [`Handler`](crate::Handler) that folds the events on its inbox into the
 //! game and sends the directives as messages.
 //!
+//! A trajectory written by a run reads back as a [`Transcript`]
+//! ([`transcript`]): the logical game, with the timestamps and the
+//! interleaving of agents' records projected out, so that two transcripts
+//! are equal exactly when the same game was played. The `werewolf` binary's
+//! `replay` renders one.
+//!
 //! # Three kinds of message
 //!
 //! | Message | Direction | Is |
@@ -92,6 +98,7 @@ pub mod moderator;
 pub mod policy;
 pub mod role;
 pub mod seed;
+pub mod transcript;
 
 pub use assignment::Assignment;
 pub use config::{Config, ConfigError, RoleCounts};
@@ -105,3 +112,4 @@ pub use moderator::Moderator;
 pub use policy::{Policy, RandomPolicy, View};
 pub use role::{Faction, Role};
 pub use seed::seed_for;
+pub use transcript::{PhaseRecord, RoundRecord, Transcript, TranscriptError};

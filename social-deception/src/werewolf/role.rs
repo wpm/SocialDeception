@@ -44,6 +44,16 @@ impl fmt::Display for Role {
     }
 }
 
+impl fmt::Display for Faction {
+    /// The faction's name as written, the same spelling it serializes as.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Village => "Village",
+            Self::Werewolves => "Werewolves",
+        })
+    }
+}
+
 impl Role {
     /// The side this role plays for. Only a werewolf is on the werewolves'.
     #[must_use]
@@ -74,6 +84,13 @@ mod tests {
     fn a_role_displays_as_its_name() {
         for role in [Role::Villager, Role::Werewolf, Role::Seer, Role::Doctor] {
             assert_eq!(json(&role), json!(role.to_string()), "{role:?}");
+        }
+    }
+
+    #[test]
+    fn a_faction_displays_as_its_name() {
+        for faction in [Faction::Village, Faction::Werewolves] {
+            assert_eq!(json(&faction), json!(faction.to_string()), "{faction:?}");
         }
     }
 
