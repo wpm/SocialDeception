@@ -9,20 +9,18 @@
 //! For the same reason, when a trajectory is written the *effective
 //! configuration* is written beside it, at the trajectory's path with
 //! `.toml` appended: the configuration the game was played from, after
-//! overrides, without its `trajectory` field. It is a configuration file in
-//! its own right, so reproducing a run is
-//! `werewolf play run.jsonl.toml --trajectory rerun.jsonl`, whatever flags
-//! produced the original. The seed is never in the trajectory itself, since
-//! with it anyone could recompute every piece of hidden information in the
-//! game, and this file is where a run's seed is kept.
+//! overrides, without its `trajectory` field. The seed is never in the
+//! trajectory itself (see [`werewolf::setup`]), and this file is where a
+//! run's seed is kept. It is a configuration file in its own right, so
+//! reproducing a run is `werewolf play run.jsonl.toml --trajectory
+//! rerun.jsonl`, whatever flags produced the original.
 //!
 //! `replay` reads a trajectory written by an earlier run back as a
-//! [`Transcript`] and prints it, under a header naming the seed. The seed is
-//! not in the trajectory: it comes from the effective configuration the run
-//! wrote beside it, at the trajectory's path with `.toml` appended, which
-//! also names the moderator whose records are the game. Without that file
-//! the trajectory is still a game, just not a reproducible one: the header
-//! says the seed is unknown, and the moderator's id is `--moderator`.
+//! [`Transcript`] and prints it, under a header naming the seed, which it
+//! takes from the effective configuration beside the trajectory, along with
+//! the moderator whose records are the game. Without that file the
+//! trajectory is still a game, just not a reproducible one: the header says
+//! the seed is unknown, and the moderator's id is `--moderator`.
 //!
 //! Configuration, trajectory and I/O errors go to stderr with a non-zero
 //! exit; usage errors are clap's.
@@ -121,15 +119,14 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
     }
 }
 
-/// A game played to its end, with what was written where.
+/// A game played to its end.
 #[derive(Debug)]
 struct Played {
-    /// The effective configuration: the file's, after overrides.
+    /// The effective configuration: the file's, after overrides. Its
+    /// trajectory, if any, is where the trajectory was written, with the
+    /// effective configuration beside it.
     config: Config,
     outcome: Outcome,
-    /// The trajectory and the effective config written beside it, when a
-    /// trajectory was written at all.
-    written: Option<(PathBuf, PathBuf)>,
 }
 
 /// Plays one episode from the configuration at `path`, with the overrides
@@ -145,21 +142,11 @@ fn play(
     trajectory: Option<PathBuf>,
 ) -> Result<Played, Box<dyn Error>> {
     let config = load(path, seed, trajectory)?;
-    let written = match &config.trajectory {
-        Some(trajectory) => {
-            let effective = config::effective_path(trajectory);
-            fs::write(&effective, config.effective())
-                .map_err(|error| format!("cannot write {}: {error}", effective.display()))?;
-            Some((trajectory.clone(), effective))
-        }
-        None => None,
-    };
+    if let Some(trajectory) = &config.trajectory {
+        config::write_effective(&config, trajectory)?;
+    }
     let outcome = werewolf::run(&config)?;
-    Ok(Played {
-        config,
-        outcome,
-        written,
-    })
+    Ok(Played { config, outcome })
 }
 
 impl fmt::Display for Played {
@@ -173,10 +160,14 @@ impl fmt::Display for Played {
         writeln!(f, "rounds: {}", self.outcome.rounds.0)?;
         let survivors: Vec<&str> = self.outcome.living.iter().map(AgentId::as_str).collect();
         writeln!(f, "survivors: {}", survivors.join(", "))?;
-        match &self.written {
-            Some((trajectory, effective)) => {
+        match &self.config.trajectory {
+            Some(trajectory) => {
                 writeln!(f, "trajectory: {}", trajectory.display())?;
-                writeln!(f, "effective config: {}", effective.display())
+                writeln!(
+                    f,
+                    "effective config: {}",
+                    config::effective_path(trajectory).display()
+                )
             }
             None => writeln!(f, "trajectory: none"),
         }
@@ -430,15 +421,15 @@ mod tests {
             path
         }
 
-        /// Writes a configuration file whose trajectory, if any, is in the
-        /// directory too. The path is written as a TOML literal string, so
-        /// it needs no escaping whatever the platform.
-        fn config(&self, name: &str, seed: u64, trajectory: Option<&str>) -> PathBuf {
+        /// Writes a five-player configuration file whose trajectory, if
+        /// any, is in the directory too. The path is written as a TOML
+        /// literal string, so it needs no escaping whatever the platform.
+        fn config(&self, name: &str, trajectory: Option<&str>) -> PathBuf {
             let trajectory = trajectory.map_or_else(String::new, |trajectory| {
                 format!("trajectory = '{}'\n", self.path(trajectory).display())
             });
             let text = format!(
-                "seed = {seed}\nplayers = [\"alice\", \"bob\", \"carol\", \"dave\", \"erin\"]\n\
+                "seed = 3\nplayers = [\"alice\", \"bob\", \"carol\", \"dave\", \"erin\"]\n\
                  {trajectory}[roles]\nwerewolves = 1\nseers = 1\ndoctors = 1\n"
             );
             self.file(name, &text)
@@ -492,9 +483,8 @@ mod tests {
     #[test]
     fn play_without_a_trajectory_writes_nothing() {
         let dir = TempDir::new();
-        let config = dir.config("game.toml", 3, None);
+        let config = dir.config("game.toml", None);
         let played = play(&config, None, None).unwrap();
-        assert_eq!(played.written, None);
         assert!(played.to_string().ends_with("trajectory: none\n"));
         let mut entries = fs::read_dir(&dir.0).unwrap();
         assert_eq!(
@@ -528,21 +518,42 @@ mod tests {
         // trajectory `game.jsonl`, so replacing the trajectory's extension
         // would land on the configuration. Appending does not.
         let dir = TempDir::new();
-        let config = dir.config("game.toml", 3, Some("game.jsonl"));
+        let config = dir.config("game.toml", Some("game.jsonl"));
         let before = fs::read_to_string(&config).unwrap();
-        let played = play(&config, Some(4), None).unwrap();
+        play(&config, Some(4), None).unwrap();
         assert_eq!(fs::read_to_string(&config).unwrap(), before);
-        let (_, effective) = played.written.unwrap();
-        assert_eq!(effective, dir.path("game.jsonl.toml"));
+        let effective = dir.path("game.jsonl.toml");
         assert_eq!(config::load(&effective).unwrap().seed, 4);
     }
 
     #[test]
-    fn a_trajectory_in_a_missing_directory_is_an_error_not_a_panic() {
+    fn an_effective_config_that_cannot_be_written_is_an_error_naming_it() {
         let dir = TempDir::new();
         let trajectory = dir.path("no-such-directory/out.jsonl");
+        let error = play(&example(), None, Some(trajectory)).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .ends_with("no-such-directory/out.jsonl.toml"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_trajectory_that_cannot_be_written_is_an_error_naming_it() {
+        // The effective config beside the trajectory is written first, so a
+        // trajectory that is a directory is what makes the run itself fail.
+        let dir = TempDir::new();
+        let trajectory = dir.path("out");
+        fs::create_dir(&trajectory).unwrap();
         let error = play(&example(), None, Some(trajectory.clone())).unwrap_err();
-        assert!(error.to_string().contains("no-such-directory"), "{error}");
+        assert!(config::effective_path(&trajectory).exists());
+        assert!(
+            error
+                .to_string()
+                .starts_with(&format!("cannot write {}: ", trajectory.display())),
+            "{error}"
+        );
     }
 
     #[test]

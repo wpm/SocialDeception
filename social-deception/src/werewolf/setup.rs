@@ -40,6 +40,7 @@ use std::error;
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
 
@@ -61,7 +62,12 @@ use crate::trajectory::{LogRecord, Writer};
 #[derive(Debug)]
 pub enum Error {
     /// The trajectory could not be created or written.
-    Io(io::Error),
+    Io {
+        /// Where it was being written, or `None` if it was going nowhere.
+        trajectory: Option<PathBuf>,
+        /// What went wrong.
+        source: io::Error,
+    },
     /// The episode did not run cleanly.
     Episode(EpisodeError),
     /// The episode ended without the moderator announcing an outcome: some
@@ -72,7 +78,14 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Io(error) => write!(f, "cannot write the trajectory: {error}"),
+            Self::Io {
+                trajectory: Some(path),
+                source,
+            } => write!(f, "cannot write {}: {source}", path.display()),
+            Self::Io {
+                trajectory: None,
+                source,
+            } => write!(f, "cannot write the trajectory: {source}"),
             Self::Episode(error) => error.fmt(f),
             Self::Truncated => f.write_str(
                 "the episode ended without an outcome: a player did not answer a request",
@@ -84,16 +97,10 @@ impl fmt::Display for Error {
 impl error::Error for Error {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
         match self {
-            Self::Io(error) => Some(error),
+            Self::Io { source, .. } => Some(source),
             Self::Episode(error) => Some(error),
             Self::Truncated => None,
         }
-    }
-}
-
-impl From<io::Error> for Error {
-    fn from(error: io::Error) -> Self {
-        Self::Io(error)
     }
 }
 
@@ -125,14 +132,21 @@ pub fn episode(
     for (who, role) in assignment.players() {
         seat(&mut episode, config, who, role);
     }
+    let outcomes = moderate(&mut episode, config, assignment);
+    (episode, outcomes)
+}
+
+/// Seats the moderator in the roster, running a game over `assignment`.
+/// The receiver yields the outcome once it has been announced.
+fn moderate(
+    episode: &mut Episode<Message>,
+    config: &Config,
+    assignment: Assignment,
+) -> Receiver<Outcome> {
     let (outcome, outcomes) = unbounded();
     let game = Game::new(assignment, config.max_rounds, config.seed);
-    add(
-        &mut episode,
-        &config.moderator,
-        Moderator::new(game, outcome),
-    );
-    (episode, outcomes)
+    add(episode, &config.moderator, Moderator::new(game, outcome));
+    outcomes
 }
 
 /// Seats `who` in the roster as its role, with a policy seeded for it.
@@ -193,21 +207,27 @@ fn add(
 /// If the configuration would not pass [`Config::validate`]; see
 /// [`episode`].
 pub fn run(config: &Config) -> Result<Outcome, Error> {
-    let sink: Box<dyn Write + Send> = match &config.trajectory {
-        Some(path) => Box::new(File::create(path)?),
+    let trajectory = config.trajectory.as_deref();
+    let sink: Box<dyn Write + Send> = match trajectory {
+        Some(path) => Box::new(File::create(path).map_err(|source| Error::Io {
+            trajectory: Some(path.to_path_buf()),
+            source,
+        })?),
         None => Box::new(io::sink()),
     };
     let (records, writer) = Writer::spawn(sink);
     let (episode, outcomes) = episode(config, records);
-    play(episode, &outcomes, writer)
+    play(episode, &outcomes, writer, trajectory)
 }
 
-/// Runs an assembled episode, joins its trajectory writer, and takes the
-/// outcome off the moderator's channel.
+/// Runs an assembled episode, joins its writer, which is writing the
+/// trajectory to `trajectory` if anywhere, and takes the outcome off the
+/// moderator's channel.
 fn play<W: Write + Send + 'static>(
     episode: Episode<Message>,
     outcomes: &Receiver<Outcome>,
     writer: Writer<W>,
+    trajectory: Option<&Path>,
 ) -> Result<Outcome, Error> {
     let ran = episode.run();
     // The episode drops every sender to the writer on its way out, whether
@@ -215,7 +235,10 @@ fn play<W: Write + Send + 'static>(
     // trajectory. A failed run is the more informative error of the two.
     let written = writer.join();
     ran?;
-    written?;
+    written.map_err(|source| Error::Io {
+        trajectory: trajectory.map(Path::to_path_buf),
+        source,
+    })?;
     // The moderator's sender went with its handler when the episode joined
     // it, so the receiver holds the outcome now or never will.
     outcomes.try_recv().map_err(|_| Error::Truncated)
@@ -225,15 +248,13 @@ fn play<W: Write + Send + 'static>(
 mod tests {
     use std::collections::BTreeSet;
     use std::fs;
-    use std::path::PathBuf;
-    use std::process;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::path::Path;
 
     use super::*;
     use crate::agent::Outgoing;
     use crate::event::Event;
-    use crate::testing::{id, ids};
-    use crate::werewolf::config::RoleCounts;
+    use crate::testing::{TempPath, id, ids, parse_lines};
+    use crate::werewolf::config::{DEFAULT_MAX_ROUNDS, DEFAULT_MODERATOR, RoleCounts};
     use crate::werewolf::message::Round;
     use crate::werewolf::transcript::{self, Transcript};
 
@@ -256,8 +277,8 @@ mod tests {
                 doctors,
             },
             trajectory: None,
-            max_rounds: 100,
-            moderator: id("moderator"),
+            max_rounds: DEFAULT_MAX_ROUNDS,
+            moderator: id(DEFAULT_MODERATOR),
         };
         config.validate().unwrap();
         config
@@ -273,25 +294,10 @@ mod tests {
         )
     }
 
-    /// A path in the temp dir for one test's trajectory, removed when this
-    /// is dropped so that a failing test leaves nothing behind.
-    struct TempTrajectory(PathBuf);
-
-    impl TempTrajectory {
-        fn new() -> Self {
-            static COUNTER: AtomicUsize = AtomicUsize::new(0);
-            Self(std::env::temp_dir().join(format!(
-                "social-deception-setup-{}-{}.jsonl",
-                process::id(),
-                COUNTER.fetch_add(1, Ordering::Relaxed)
-            )))
-        }
-    }
-
-    impl Drop for TempTrajectory {
-        fn drop(&mut self) {
-            let _ = fs::remove_file(&self.0);
-        }
+    /// Reads the trajectory at `path` back as the game it records.
+    fn transcript(path: &Path, config: &Config) -> Transcript {
+        let text = fs::read_to_string(path).unwrap();
+        Transcript::read(&transcript::lines(&text).unwrap(), &config.moderator).unwrap()
     }
 
     /// Asserts that `outcome` is a finished game among `config`'s players.
@@ -341,19 +347,17 @@ mod tests {
     }
 
     #[test]
-    fn the_smallest_game_runs_to_an_outcome() {
-        let config = config(["alice", "bob", "carol"], 1, 0, 0);
-        let outcome = run(&config).unwrap();
-        check(&config, &outcome);
-        assert!(outcome.winner.is_some(), "{outcome:?}");
-    }
-
-    #[test]
     fn a_game_with_no_seer_and_no_doctor_runs_to_an_outcome() {
-        let config = config(["alice", "bob", "carol", "dave", "erin"], 1, 0, 0);
-        let outcome = run(&config).unwrap();
-        check(&config, &outcome);
-        assert!(outcome.winner.is_some(), "{outcome:?}");
+        // Three players and one werewolf is the smallest game the
+        // configuration allows.
+        for config in [
+            config(["alice", "bob", "carol"], 1, 0, 0),
+            config(["alice", "bob", "carol", "dave", "erin"], 1, 0, 0),
+        ] {
+            let outcome = run(&config).unwrap();
+            check(&config, &outcome);
+            assert!(outcome.winner.is_some(), "{outcome:?}");
+        }
     }
 
     #[test]
@@ -371,48 +375,47 @@ mod tests {
 
     #[test]
     fn the_trajectory_is_written_and_agrees_with_the_outcome() {
-        let trajectory = TempTrajectory::new();
+        let trajectory = TempPath::new("jsonl");
         let mut config = town();
-        config.trajectory = Some(trajectory.0.clone());
+        config.trajectory = Some(trajectory.to_path_buf());
         let outcome = run(&config).unwrap();
 
-        let text = fs::read_to_string(&trajectory.0).unwrap();
-        assert!(!text.is_empty());
-        assert!(text.ends_with('\n'), "{text:?}");
-        let last: serde_json::Value = serde_json::from_str(text.lines().last().unwrap()).unwrap();
-        assert!(last.is_object(), "{last}");
+        let lines = parse_lines(&fs::read(&*trajectory).unwrap());
+        assert!(!lines.is_empty());
 
         // The outcome on the channel and the one the moderator announced in
         // world are the same game's; if they ever diverge, the side channel
         // and the record of truth have parted company.
-        let transcript =
-            Transcript::read(&transcript::lines(&text).unwrap(), &config.moderator).unwrap();
-        assert_eq!(transcript.outcome, outcome);
+        assert_eq!(transcript(&trajectory, &config).outcome, outcome);
     }
 
     #[test]
-    fn the_trajectory_is_the_same_game_as_the_outcome_across_runs() {
-        let first = TempTrajectory::new();
-        let second = TempTrajectory::new();
+    fn the_trajectory_is_the_same_game_across_runs() {
+        let first = TempPath::new("jsonl");
+        let second = TempPath::new("jsonl");
         let mut config = town();
-        config.trajectory = Some(first.0.clone());
+        config.trajectory = Some(first.to_path_buf());
         run(&config).unwrap();
-        config.trajectory = Some(second.0.clone());
+        config.trajectory = Some(second.to_path_buf());
         run(&config).unwrap();
-        let read = |path: &PathBuf| {
-            let text = fs::read_to_string(path).unwrap();
-            Transcript::read(&transcript::lines(&text).unwrap(), &config.moderator).unwrap()
-        };
-        assert_eq!(read(&first.0), read(&second.0));
+        assert_eq!(transcript(&first, &config), transcript(&second, &config));
     }
 
     #[test]
-    fn a_trajectory_that_cannot_be_created_is_an_io_error() {
+    fn a_trajectory_that_cannot_be_created_is_an_io_error_naming_it() {
         let mut config = town();
-        config.trajectory = Some(PathBuf::from("/no-such-directory/werewolf.jsonl"));
+        let path = Path::new("/no-such-directory/werewolf.jsonl");
+        config.trajectory = Some(path.to_path_buf());
         let error = run(&config).unwrap_err();
-        assert!(matches!(error, Error::Io(_)), "{error:?}");
-        assert!(error.to_string().starts_with("cannot write the trajectory"));
+        assert!(
+            matches!(&error, Error::Io { trajectory: Some(t), .. } if t == path),
+            "{error:?}"
+        );
+        assert!(
+            error
+                .to_string()
+                .starts_with("cannot write /no-such-directory/werewolf.jsonl: ")
+        );
         assert!(error::Error::source(&error).is_some());
     }
 
@@ -442,15 +445,9 @@ mod tests {
                 seat(&mut episode, &config, who, role);
             }
         }
-        let (outcome, outcomes) = unbounded();
-        let game = Game::new(assignment, config.max_rounds, config.seed);
-        add(
-            &mut episode,
-            &config.moderator,
-            Moderator::new(game, outcome),
-        );
+        let outcomes = moderate(&mut episode, &config, assignment);
 
-        let error = play(episode, &outcomes, writer).unwrap_err();
+        let error = play(episode, &outcomes, writer, None).unwrap_err();
         assert!(matches!(error, Error::Truncated), "{error:?}");
         assert!(error.to_string().contains("without an outcome"));
     }

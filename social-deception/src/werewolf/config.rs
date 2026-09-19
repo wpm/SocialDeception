@@ -21,8 +21,8 @@
 //!
 //! A configuration also writes back out, as the *effective configuration* of
 //! a run: [`Config::effective`] is the TOML that [`load`] reads back to the
-//! same value, and the `werewolf` binary writes it beside every trajectory,
-//! at [`effective_path`], so that a run can be reproduced from its artifacts
+//! same value, and [`write_effective`] puts it beside a trajectory, at
+//! [`effective_path`], so that a run can be reproduced from its artifacts
 //! alone.
 
 use std::collections::BTreeSet;
@@ -114,6 +114,13 @@ pub enum ConfigError {
     },
     /// The text is not a configuration.
     Parse(toml::de::Error),
+    /// The effective configuration could not be written.
+    Write {
+        /// The file.
+        path: PathBuf,
+        /// What went wrong.
+        source: io::Error,
+    },
     /// `roles.werewolves` is zero: a game with no werewolves is over before
     /// it starts.
     NoWerewolves,
@@ -151,6 +158,7 @@ impl fmt::Display for ConfigError {
         match self {
             Self::Read { path, .. } => write!(f, "cannot read {}", path.display()),
             Self::Parse(error) => write!(f, "invalid configuration: {error}"),
+            Self::Write { path, .. } => write!(f, "cannot write {}", path.display()),
             Self::NoWerewolves => f.write_str("roles.werewolves must be at least 1"),
             Self::WerewolfParity {
                 werewolves,
@@ -180,7 +188,7 @@ impl fmt::Display for ConfigError {
 impl Error for ConfigError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Read { source, .. } => Some(source),
+            Self::Read { source, .. } | Self::Write { source, .. } => Some(source),
             Self::Parse(source) => Some(source),
             _ => None,
         }
@@ -202,6 +210,21 @@ pub fn effective_path(trajectory: &Path) -> PathBuf {
     let mut path = trajectory.as_os_str().to_owned();
     path.push(".toml");
     PathBuf::from(path)
+}
+
+/// Writes the effective configuration of a run played from `config` beside
+/// its trajectory, at [`effective_path`], and returns where it was written.
+///
+/// # Errors
+///
+/// [`ConfigError::Write`] if the file cannot be written.
+pub fn write_effective(config: &Config, trajectory: &Path) -> Result<PathBuf, ConfigError> {
+    let path = effective_path(trajectory);
+    fs::write(&path, config.effective()).map_err(|source| ConfigError::Write {
+        path: path.clone(),
+        source,
+    })?;
+    Ok(path)
 }
 
 /// Reads and validates a configuration file.
@@ -317,6 +340,7 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::TempPath;
 
     /// The example configuration, as committed at the repository root.
     const EXAMPLE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../examples/werewolf.toml");
@@ -588,12 +612,48 @@ mod tests {
         // What was defaulted on the way in is explicit on the way out, so the
         // file says what ran even if a default changes later.
         let text = Config::parse(MINIMAL).unwrap().effective();
-        assert!(text.contains("max_rounds = 100"), "{text}");
-        assert!(text.contains("moderator = \"moderator\""), "{text}");
+        assert!(
+            text.contains(&format!("max_rounds = {DEFAULT_MAX_ROUNDS}")),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("moderator = \"{DEFAULT_MODERATOR}\"")),
+            "{text}"
+        );
         assert!(text.contains("seers = 0"), "{text}");
         assert_eq!(
             Config::parse(&text).unwrap(),
             Config::parse(MINIMAL).unwrap()
+        );
+    }
+
+    #[test]
+    fn the_effective_config_is_written_beside_the_trajectory_and_loads() {
+        let trajectory = TempPath::new("jsonl");
+        let written = write_effective(&valid(), &trajectory).unwrap();
+        assert_eq!(written, effective_path(&trajectory));
+        assert_eq!(
+            load(&written).unwrap(),
+            Config {
+                trajectory: None,
+                ..valid()
+            }
+        );
+        fs::remove_file(written).unwrap();
+    }
+
+    #[test]
+    fn an_unwritable_effective_config_is_a_write_error_naming_it() {
+        let trajectory = Path::new("/no-such-directory/werewolf.jsonl");
+        let error = write_effective(&valid(), trajectory).unwrap_err();
+        assert!(
+            matches!(&error, ConfigError::Write { path, .. } if *path == effective_path(trajectory)),
+            "{error:?}"
+        );
+        assert!(error.source().is_some());
+        assert_eq!(
+            error.to_string(),
+            "cannot write /no-such-directory/werewolf.jsonl.toml"
         );
     }
 

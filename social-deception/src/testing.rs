@@ -1,6 +1,11 @@
 //! Helpers shared by the crate's unit tests.
 
 use std::collections::BTreeSet;
+use std::fs;
+use std::ops::Deref;
+use std::path::{Path, PathBuf};
+use std::process;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde_json::Value;
 
@@ -12,6 +17,37 @@ use crate::werewolf::{
 
 /// The agent whose point of view a werewolf unit test takes.
 pub(crate) const ME: &str = "me";
+
+/// A path of one test's own under the temp dir, with the given extension,
+/// unique across tests and processes. The file, if the test made one, is
+/// removed when this is dropped, so that a failing test leaves nothing
+/// behind. Derefs to the [`Path`].
+pub(crate) struct TempPath(PathBuf);
+
+impl TempPath {
+    pub(crate) fn new(extension: &str) -> Self {
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        Self(std::env::temp_dir().join(format!(
+            "social-deception-{}-{}.{extension}",
+            process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        )))
+    }
+}
+
+impl Deref for TempPath {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempPath {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
 
 /// Parses a trajectory file into one JSON value per line.
 ///
