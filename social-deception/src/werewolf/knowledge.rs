@@ -162,11 +162,8 @@ impl Knowledge {
                 self.moment = Some((*round, *phase));
                 self.living.clone_from(living);
             }
-            // A repeated target keeps its first answer.
             Narration::Investigated { target, faction } => {
-                self.investigations
-                    .entry(target.clone())
-                    .or_insert(*faction);
+                self.investigations.insert(target.clone(), *faction);
             }
             Narration::Tally {
                 round,
@@ -419,12 +416,15 @@ mod tests {
     }
 
     #[test]
-    fn investigations_accumulate_and_keep_the_first_answer() {
-        let mut knowledge = folded(
+    fn investigations_accumulate_by_target() {
+        // The seer may look at the same player twice, and learns the same
+        // thing each time; the state records what is known, not how often.
+        let knowledge = folded(
             Role::Seer,
             &[
                 investigated("alice", Faction::Village),
                 investigated("bob", Faction::Werewolves),
+                investigated("alice", Faction::Village),
             ],
         );
         assert_eq!(
@@ -434,9 +434,6 @@ mod tests {
                 (id("bob"), Faction::Werewolves),
             ])
         );
-
-        knowledge.observe(&investigated("alice", Faction::Werewolves));
-        assert_eq!(knowledge.investigations[&id("alice")], Faction::Village);
     }
 
     #[test]
