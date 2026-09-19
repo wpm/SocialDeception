@@ -221,10 +221,8 @@ impl Knowledge {
 mod tests {
     use super::*;
     use crate::event::Control;
-    use crate::testing::{id, ids, target};
+    use crate::testing::{ME, id, ids, narrated, phase_began, target};
     use crate::werewolf::message::{Request, RequestId, RequestKind, Response};
-
-    const ME: &str = "me";
 
     fn votes<const N: usize>(votes: [(&str, Action); N]) -> BTreeMap<AgentId, Action> {
         votes
@@ -233,22 +231,8 @@ mod tests {
             .collect()
     }
 
-    /// A narration from the moderator to this agent, as it arrives on the
-    /// receiver.
-    fn narrated(narration: Narration) -> Event<Message> {
-        Event::message("moderator", [ME], Message::Narration(narration))
-    }
-
     fn assigned(role: Role, pack: BTreeSet<AgentId>) -> Event<Message> {
         narrated(Narration::Assigned { role, pack })
-    }
-
-    fn phase_began(round: u32, phase: Phase, living: BTreeSet<AgentId>) -> Event<Message> {
-        narrated(Narration::PhaseBegan {
-            round: Round(round),
-            phase,
-            living,
-        })
     }
 
     fn investigated(target: &str, faction: Faction) -> Event<Message> {

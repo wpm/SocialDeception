@@ -172,62 +172,13 @@ mod tests {
     use std::ops::Range;
 
     use super::*;
-    use crate::testing::{id, ids, target};
-    use crate::werewolf::message::{RequestId, Round};
-    use crate::werewolf::role::Faction;
+    use crate::testing::{id, knowing, request, seer_knowing, target, werewolf_knowing};
+    use crate::werewolf::roles::base_action_space;
 
     const MASTER: u64 = 20_260_918;
-    const ME: &str = "me";
     const OTHERS: [&str; 5] = ["alice", "bob", "carol", "dave", "erin"];
     /// The seeds the property tests run a fresh policy under.
     const SEEDS: Range<u64> = 0..200;
-
-    /// The action space the rules would hand `knowledge`'s player for
-    /// `kind`: its living others in sorted order, then `Abstain` where
-    /// permitted.
-    fn space_for(knowledge: &Knowledge, kind: RequestKind) -> Vec<Action> {
-        let mut space: Vec<Action> = knowledge
-            .living_others()
-            .into_iter()
-            .map(Action::Target)
-            .collect();
-        if kind.may_abstain() {
-            space.push(Action::Abstain);
-        }
-        space
-    }
-
-    fn request(kind: RequestKind) -> Request {
-        Request {
-            id: RequestId(1),
-            round: Round(1),
-            kind,
-        }
-    }
-
-    /// The knowledge of a player of `role` whose living others are `others`.
-    fn knowing<const N: usize>(role: Role, others: [&str; N]) -> Knowledge {
-        let mut knowledge = Knowledge::new(id(ME), role);
-        knowledge.living = ids(others);
-        knowledge.living.insert(id(ME));
-        knowledge
-    }
-
-    fn werewolf<const L: usize, const P: usize>(others: [&str; L], pack: [&str; P]) -> Knowledge {
-        let mut knowledge = knowing(Role::Werewolf, others);
-        knowledge.pack = ids(pack);
-        knowledge.pack.insert(id(ME));
-        knowledge
-    }
-
-    fn seer<const L: usize, const I: usize>(others: [&str; L], seen: [&str; I]) -> Knowledge {
-        let mut knowledge = knowing(Role::Seer, others);
-        knowledge.investigations = ids(seen)
-            .into_iter()
-            .map(|who| (who, Faction::Village))
-            .collect();
-        knowledge
-    }
 
     fn choose(
         policy: &mut RandomPolicy,
@@ -245,7 +196,7 @@ mod tests {
     /// The first action a fresh policy under each of [`SEEDS`] takes for
     /// `kind`, in the action space the rules would hand it.
     fn first_choices(knowledge: &Knowledge, kind: RequestKind) -> Vec<(u64, Action)> {
-        let space = space_for(knowledge, kind);
+        let space = base_action_space(knowledge, &request(kind));
         SEEDS
             .map(|seed| {
                 let action = choose(&mut RandomPolicy::from_seed(seed), knowledge, kind, &space);
@@ -258,7 +209,7 @@ mod tests {
     /// [`OTHERS`], where no heuristic is in play.
     fn nominations(mut policy: RandomPolicy, n: usize) -> Vec<Action> {
         let knowledge = knowing(Role::Villager, OTHERS);
-        let space = space_for(&knowledge, RequestKind::Nominate);
+        let space = base_action_space(&knowledge, &request(RequestKind::Nominate));
         (0..n)
             .map(|_| choose(&mut policy, &knowledge, RequestKind::Nominate, &space))
             .collect()
@@ -288,8 +239,8 @@ mod tests {
 
     #[test]
     fn a_returned_action_is_always_in_the_action_space() {
-        let werewolf = werewolf(["alice", "bob", "carol"], ["alice"]);
-        let seer = seer(["alice", "bob", "carol"], ["alice"]);
+        let werewolf = werewolf_knowing(["alice", "bob", "carol"], ["alice"]);
+        let seer = seer_knowing(["alice", "bob", "carol"], ["alice"]);
         let doctor = knowing(Role::Doctor, ["alice", "bob", "carol"]);
         let villager = knowing(Role::Villager, ["alice", "bob", "carol"]);
         let cases = [
@@ -302,7 +253,7 @@ mod tests {
             (&villager, RequestKind::Nominate),
         ];
         for (knowledge, kind) in cases {
-            let space = space_for(knowledge, kind);
+            let space = base_action_space(knowledge, &request(kind));
             for (seed, action) in first_choices(knowledge, kind) {
                 assert!(
                     space.contains(&action),
@@ -315,9 +266,9 @@ mod tests {
     #[test]
     fn the_sequence_is_stable_under_interleaved_single_option_decisions() {
         let doctor = knowing(Role::Doctor, ["alice"]);
-        let forced = space_for(&doctor, RequestKind::Protect);
+        let forced = base_action_space(&doctor, &request(RequestKind::Protect));
         let villager = knowing(Role::Villager, OTHERS);
-        let open = space_for(&villager, RequestKind::Nominate);
+        let open = base_action_space(&villager, &request(RequestKind::Nominate));
 
         let mut policy = RandomPolicy::from_seed(7);
         let mut interleaved = Vec::new();
@@ -351,7 +302,7 @@ mod tests {
 
     #[test]
     fn a_werewolf_never_picks_a_living_packmate() {
-        let knowledge = werewolf(["alice", "bob", "carol", "dave"], ["bob", "dave"]);
+        let knowledge = werewolf_knowing(["alice", "bob", "carol", "dave"], ["bob", "dave"]);
         for kind in [RequestKind::Devour, RequestKind::Nominate] {
             for (seed, action) in first_choices(&knowledge, kind) {
                 assert!(
@@ -364,7 +315,7 @@ mod tests {
 
     #[test]
     fn a_seer_never_re_investigates() {
-        let knowledge = seer(["alice", "bob", "carol", "dave"], ["alice", "carol"]);
+        let knowledge = seer_knowing(["alice", "bob", "carol", "dave"], ["alice", "carol"]);
         for (seed, action) in first_choices(&knowledge, RequestKind::Investigate) {
             assert!(
                 action == target("bob") || action == target("dave"),
@@ -376,12 +327,15 @@ mod tests {
     #[test]
     fn abstain_is_never_chosen_while_a_target_is_available() {
         let doctor = knowing(Role::Doctor, ["alice", "bob"]);
-        let seer = seer(["alice", "bob"], []);
+        let seer = seer_knowing(["alice", "bob"], []);
         for (knowledge, kind) in [
             (&doctor, RequestKind::Protect),
             (&seer, RequestKind::Investigate),
         ] {
-            assert_eq!(space_for(knowledge, kind).last(), Some(&Action::Abstain));
+            assert_eq!(
+                base_action_space(knowledge, &request(kind)).last(),
+                Some(&Action::Abstain)
+            );
             for (seed, action) in first_choices(knowledge, kind) {
                 assert_ne!(action, Action::Abstain, "seed {seed}, {kind:?}");
             }
@@ -390,9 +344,9 @@ mod tests {
 
     #[test]
     fn a_werewolf_whose_only_living_others_are_packmates_still_acts() {
-        let knowledge = werewolf(["bob", "dave"], ["bob", "dave"]);
+        let knowledge = werewolf_knowing(["bob", "dave"], ["bob", "dave"]);
         for kind in [RequestKind::Devour, RequestKind::Nominate] {
-            let space = space_for(&knowledge, kind);
+            let space = base_action_space(&knowledge, &request(kind));
             for (seed, action) in first_choices(&knowledge, kind) {
                 assert!(space.contains(&action), "seed {seed}, {kind:?}: {action:?}");
             }
@@ -401,7 +355,7 @@ mod tests {
 
     #[test]
     fn a_seer_that_has_investigated_everyone_living_abstains() {
-        let knowledge = seer(["alice", "bob"], ["alice", "bob"]);
+        let knowledge = seer_knowing(["alice", "bob"], ["alice", "bob"]);
         for (seed, action) in first_choices(&knowledge, RequestKind::Investigate) {
             assert_eq!(action, Action::Abstain, "seed {seed}");
         }

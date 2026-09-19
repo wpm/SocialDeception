@@ -1,45 +1,19 @@
-//! A player as an agent: the rules of its role, the policy that decides for
-//! it, and the one handler body every role shares.
+//! A player as an agent: a role's rules, the policy that decides for it, and
+//! the one handler body every role shares.
 //!
 //! A player's turn is a fold, the same as any agent's: every event that
 //! arrives is folded into its [`Knowledge`], and every [`Request`] among them
-//! is answered with one [`Response`] to the moderator. The two halves of that
-//! are kept apart on purpose, and the reasons are in ADR-0005.
+//! is answered with one [`Response`] to the moderator. The two halves of
+//! answering are kept apart, and ADR-0005 says why: a [`Player`] is a role,
+//! and computes the action space the rules permit it and nothing else; a
+//! [`Policy`] is the strategy, and picks one action from that space. The
+//! roles are in [`roles`](super::roles), the baseline policy in
+//! [`policy`](super::policy).
 //!
-//! - A **role** is the rules. [`Player`] is what a role contributes: its
-//!   state, and the action space the rules permit it for a request. It
-//!   computes that space and nothing else: no strategic filtering, no
-//!   preference ordering, no advice. A werewolf eating its own packmate is in
-//!   the action space; whether to do it is the policy's business.
-//! - A **policy** is the strategy. [`Policy`] is handed the state and the
-//!   action space and picks one action. Every strategic judgement lives
-//!   there, so that the action space is the same for every policy, which
-//!   is what lets trajectories from one policy be training data for
-//!   another.
-//!
-//! [`Seat`] joins the two: a role, the policy deciding for it, and the
-//! moderator it answers to. It is the [`Handler`] the episode runs, once for
-//! every role, and it is where an action outside the action space is caught.
-//!
-//! # The action space, and its order
-//!
-//! Every action space starts from the same base, [`base_action_space`]: a
-//! target for each living player other than the agent itself, in sorted
-//! agent order, then [`Action::Abstain`] exactly where
-//! [`RequestKind::may_abstain`] permits it. The two universal rules fall out
-//! of that base: the target must be living, and no action may target the
-//! agent taking it. Neither is strategy; nothing can do them.
-//!
-//! The order is canonical and load-bearing. An index into the vector is a
-//! stable action label, the same on every run and in every episode with the
-//! same living set, which is what a learned policy needs and what a
-//! constrained decode over a model's output needs. That is why the action
-//! space is a `Vec<Action>` and not a set.
-//!
-//! The action space is never empty when a request is legitimately issued:
-//! `Nominate` and `Devour` are only asked while at least one valid target
-//! lives, since the game would be over otherwise, and `Protect` and
-//! `Investigate` always have `Abstain`.
+//! [`Seat`] joins the two. It is the [`Handler`] the episode runs, the same
+//! for every role, and it is where an action outside the action space is
+//! caught: a policy that returns one has a bug, and the game cannot
+//! continue from it.
 //!
 //! # Players only ever address the moderator
 //!
@@ -49,7 +23,7 @@
 //! learn of it only from the tally the moderator narrates.
 
 use super::knowledge::Knowledge;
-use super::message::{Action, Message, Request, RequestKind, Response};
+use super::message::{Action, Message, Request, Response};
 use super::policy::{Policy, View};
 use crate::agent::{Handler, Outgoing};
 use crate::event::{AgentId, Event};
@@ -68,8 +42,9 @@ pub trait Player {
     fn knowledge_mut(&mut self) -> &mut Knowledge;
 
     /// The action space for this request, in canonical order: targets in
-    /// sorted agent order, [`Action::Abstain`] last where permitted. Never
-    /// empty for a request the rules legitimately issue.
+    /// sorted agent order, [`Action::Abstain`] last where permitted, so
+    /// that an index into it is a stable action label. Never empty for a
+    /// request the rules legitimately issue.
     ///
     /// # Panics
     ///
@@ -80,23 +55,6 @@ pub trait Player {
     /// Called after an action is chosen, so that a role can remember it.
     /// Most roles have nothing to remember.
     fn chose(&mut self, _request: &Request, _action: &Action) {}
-}
-
-/// The action space every role starts from for a request of `kind`: a
-/// target for each living player other than the agent itself, in sorted
-/// agent order, then [`Action::Abstain`] if and only if the kind
-/// [may be abstained from](RequestKind::may_abstain).
-#[must_use]
-pub fn base_action_space(knowledge: &Knowledge, kind: RequestKind) -> Vec<Action> {
-    let mut space: Vec<Action> = knowledge
-        .living_others()
-        .into_iter()
-        .map(Action::Target)
-        .collect();
-    if kind.may_abstain() {
-        space.push(Action::Abstain);
-    }
-    space
 }
 
 /// A player as an agent in the episode: a role, the policy that decides for
@@ -182,12 +140,11 @@ mod tests {
     use super::*;
     use crate::agent::Recipients;
     use crate::event::Control;
-    use crate::testing::{id, ids, target};
-    use crate::werewolf::message::{Cause, Narration, Phase, RequestId, Round};
+    use crate::testing::{ME, id, ids, narrated, phase_began, target};
+    use crate::werewolf::message::{Cause, Narration, Phase, RequestId, RequestKind, Round};
     use crate::werewolf::role::Role;
     use crate::werewolf::roles::{Doctor, Villager};
 
-    const ME: &str = "me";
     const MODERATOR: &str = "moderator";
 
     /// Picks the first action in the action space.
@@ -215,18 +172,6 @@ mod tests {
         fn choose(&mut self, _: &View<'_>) -> Action {
             target("nobody")
         }
-    }
-
-    fn narrated(narration: Narration) -> Event<Message> {
-        Event::message(MODERATOR, [ME], Message::Narration(narration))
-    }
-
-    fn phase_began(round: u32, phase: Phase, living: BTreeSet<AgentId>) -> Event<Message> {
-        narrated(Narration::PhaseBegan {
-            round: Round(round),
-            phase,
-            living,
-        })
     }
 
     fn eliminated(who: &str, round: u32) -> Event<Message> {
@@ -270,7 +215,7 @@ mod tests {
     }
 
     #[test]
-    fn a_batch_with_two_requests_produces_two_responses_in_request_order() {
+    fn each_request_in_a_batch_is_answered_in_order_from_the_state_before_it() {
         let mut seat = villager(Last);
         let batch = [
             Event::Control(Control::Start),
@@ -278,20 +223,6 @@ mod tests {
                 role: Role::Villager,
                 pack: BTreeSet::new(),
             }),
-            phase_began(1, Phase::Day, ids(["alice", "bob", ME])),
-            request(1, 1, RequestKind::Nominate),
-            request(2, 1, RequestKind::Nominate),
-        ];
-        assert_eq!(
-            seat.handle(&batch),
-            [response(1, target("bob")), response(2, target("bob"))]
-        );
-    }
-
-    #[test]
-    fn a_request_is_answered_from_the_state_the_events_before_it_produced() {
-        let mut seat = villager(Last);
-        let batch = [
             phase_began(1, Phase::Day, ids(["alice", "bob", ME])),
             request(1, 1, RequestKind::Nominate),
             eliminated("bob", 1),

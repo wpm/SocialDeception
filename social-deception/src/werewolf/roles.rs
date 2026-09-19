@@ -1,47 +1,77 @@
 //! One type per role, each enforcing its own rules: which requests it
 //! answers, and the action space it permits for each.
 //!
-//! Each type is a [`Player`]: its state is a [`Knowledge`] constructed for
+//! Each type is a [`Player`] whose state is a [`Knowledge`] constructed for
 //! its role, so that the `Assigned` narration the moderator later sends is
 //! checked against the type that was built, and a miswired roster fails at
 //! the start of the episode rather than producing a plausible game. A
 //! werewolf takes nothing extra at construction: its pack arrives in that
 //! same narration and lands in its knowledge.
 //!
-//! Every action space is the [`base_action_space`], and the roles differ
-//! only in which requests they may be asked:
+//! # The action space, and its order
 //!
-//! | Role | Answers |
-//! |---|---|
-//! | [`Villager`] | `Nominate` |
-//! | [`Werewolf`] | `Nominate`, `Devour` |
-//! | [`Seer`] | `Nominate`, `Investigate` |
-//! | [`Doctor`] | `Nominate`, `Protect` |
+//! Every role's action space is [`base_action_space`]: a target for each
+//! living player other than the agent itself, in sorted agent order, then
+//! [`Action::Abstain`] exactly where [`RequestKind::may_abstain`] permits
+//! it. The two universal rules fall out of that base, since the target must
+//! be living and no action may target the agent taking it; neither is
+//! strategy, and nothing can do them. The order is canonical and
+//! load-bearing: an index into the vector is a stable action label, the
+//! same on every run and in every episode with the same living set, which
+//! is why the action space is a `Vec<Action>` and not a set.
 //!
-//! A request of any other kind is a bug in the moderator, and the role
-//! panics naming itself and the kind. The one role-specific rule in the
-//! game is the doctor's: it may not protect the same player on two
-//! consecutive nights, so its `Protect` action space also excludes whoever
-//! it protected last night. That is a rule of the variant, not advice, and
-//! it is why `Abstain` has to be in that action space: with few players
-//! living, the base set minus last night's target can be empty.
+//! Which requests a role answers is [`Role::asked_in`]'s to say, and a
+//! request of any other kind is a bug in the moderator: the role panics
+//! naming itself and the kind. The one role-specific rule in the game is
+//! the doctor's: it may not protect the same player on two consecutive
+//! nights, so its `Protect` action space also excludes whoever it protected
+//! last night. That is a rule of the variant, not advice, and it is why
+//! `Abstain` has to be in that action space: with few players living, the
+//! base set minus last night's target can be empty.
+//!
+//! The action space is never empty when a request is legitimately issued:
+//! `Nominate` and `Devour` are only asked while at least one valid target
+//! lives, since the game would be over otherwise, and `Protect` and
+//! `Investigate` always have `Abstain`.
 //!
 //! Nothing here narrows an action space for strategic reasons. A werewolf's
 //! `Devour` includes its living packmates, and a seer's `Investigate`
 //! includes players it has already seen; whether to pick them is the
-//! policy's judgement, and the tests in this module assert that it stays
-//! that way.
+//! policy's judgement (ADR-0005), and the tests in this module assert that
+//! it stays that way.
 
 use super::knowledge::Knowledge;
 use super::message::{Action, Request, RequestKind};
-use super::player::{Player, base_action_space};
+use super::player::Player;
 use super::role::Role;
 use crate::event::AgentId;
 
-/// The action space for a request of a kind `role` is never asked: a bug in
-/// the moderator.
-fn never_asked(role: Role, kind: RequestKind) -> ! {
-    panic!("a {role} is never asked to {kind:?}")
+/// The action space every role starts from for `request`: a target for each
+/// living player other than the agent itself, in sorted agent order, then
+/// [`Action::Abstain`] if and only if the request's kind
+/// [may be abstained from](RequestKind::may_abstain).
+///
+/// # Panics
+///
+/// If the request is of a kind the player's role is never asked, by
+/// [`Role::asked_in`]: a bug in the moderator, not a runtime condition.
+#[must_use]
+pub fn base_action_space(knowledge: &Knowledge, request: &Request) -> Vec<Action> {
+    let kind = request.kind;
+    assert!(
+        knowledge.role.asked_in(kind.phase()) == Some(kind),
+        "a {} is never asked to {kind:?}",
+        knowledge.role
+    );
+    let mut space: Vec<Action> = knowledge
+        .living_others()
+        .into_iter()
+        .map(Action::Target)
+        .collect();
+    if kind.may_abstain() {
+        space.push(Action::Abstain);
+    }
+    space
 }
 
 /// A player with no power beyond the day vote.
@@ -70,10 +100,7 @@ impl Player for Villager {
     }
 
     fn action_space(&self, request: &Request) -> Vec<Action> {
-        match request.kind {
-            RequestKind::Nominate => base_action_space(&self.knowledge, request.kind),
-            kind => never_asked(Role::Villager, kind),
-        }
+        base_action_space(&self.knowledge, request)
     }
 }
 
@@ -106,12 +133,7 @@ impl Player for Werewolf {
     /// Eating a packmate is in the action space; see the
     /// [module documentation](self).
     fn action_space(&self, request: &Request) -> Vec<Action> {
-        match request.kind {
-            RequestKind::Nominate | RequestKind::Devour => {
-                base_action_space(&self.knowledge, request.kind)
-            }
-            kind => never_asked(Role::Werewolf, kind),
-        }
+        base_action_space(&self.knowledge, request)
     }
 }
 
@@ -143,12 +165,7 @@ impl Player for Seer {
     /// Re-investigating someone is in the action space: permitted but
     /// pointless, and "pointless" is the policy's judgement to make.
     fn action_space(&self, request: &Request) -> Vec<Action> {
-        match request.kind {
-            RequestKind::Nominate | RequestKind::Investigate => {
-                base_action_space(&self.knowledge, request.kind)
-            }
-            kind => never_asked(Role::Seer, kind),
-        }
+        base_action_space(&self.knowledge, request)
     }
 }
 
@@ -186,18 +203,11 @@ impl Player for Doctor {
     /// For `Protect`, the base action space minus whoever it protected last
     /// night. `Abstain` is always there, so the space is never empty.
     fn action_space(&self, request: &Request) -> Vec<Action> {
-        let space = base_action_space(&self.knowledge, request.kind);
-        match request.kind {
-            RequestKind::Nominate => space,
-            RequestKind::Protect => {
-                let repeat = self.last_protected.clone().map(Action::Target);
-                space
-                    .into_iter()
-                    .filter(|action| Some(action) != repeat.as_ref())
-                    .collect()
-            }
-            kind => never_asked(Role::Doctor, kind),
+        let mut space = base_action_space(&self.knowledge, request);
+        if let (RequestKind::Protect, Some(last)) = (request.kind, &self.last_protected) {
+            space.retain(|action: &Action| action.target() != Some(last));
         }
+        space
     }
 
     /// Remembers the target of a `Protect`, and forgets it on an abstain,
@@ -212,51 +222,28 @@ impl Player for Doctor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{id, ids, target};
-    use crate::werewolf::message::{RequestId, Round};
-    use crate::werewolf::role::Faction;
+    use crate::testing::{ME, id, knowing, request, seer_knowing, target, werewolf_knowing};
 
-    const ME: &str = "me";
-
-    fn request(kind: RequestKind) -> Request {
-        Request {
-            id: RequestId(1),
-            round: Round(1),
-            kind,
-        }
-    }
-
-    /// `player`, with `others` and itself living. Sorted on purpose out of
-    /// order, so that the order of the action space is the rules' doing.
-    fn among<R: Player, const N: usize>(mut player: R, others: [&str; N]) -> R {
-        let knowledge = player.knowledge_mut();
-        knowledge.living = ids(others);
-        knowledge.living.insert(id(ME));
+    /// `player` with `knowledge` in place of what it was constructed with.
+    fn with<R: Player>(mut player: R, knowledge: Knowledge) -> R {
+        *player.knowledge_mut() = knowledge;
         player
     }
 
     fn villager<const N: usize>(others: [&str; N]) -> Villager {
-        among(Villager::new(id(ME)), others)
+        with(Villager::new(id(ME)), knowing(Role::Villager, others))
     }
 
     fn werewolf<const N: usize, const P: usize>(others: [&str; N], pack: [&str; P]) -> Werewolf {
-        let mut werewolf = among(Werewolf::new(id(ME)), others);
-        werewolf.knowledge.pack = ids(pack);
-        werewolf.knowledge.pack.insert(id(ME));
-        werewolf
+        with(Werewolf::new(id(ME)), werewolf_knowing(others, pack))
     }
 
-    fn seer<const N: usize, const S: usize>(others: [&str; N], investigated: [&str; S]) -> Seer {
-        let mut seer = among(Seer::new(id(ME)), others);
-        seer.knowledge.investigations = ids(investigated)
-            .into_iter()
-            .map(|who| (who, Faction::Village))
-            .collect();
-        seer
+    fn seer<const N: usize, const I: usize>(others: [&str; N], investigated: [&str; I]) -> Seer {
+        with(Seer::new(id(ME)), seer_knowing(others, investigated))
     }
 
     fn doctor<const N: usize>(others: [&str; N]) -> Doctor {
-        among(Doctor::new(id(ME)), others)
+        with(Doctor::new(id(ME)), knowing(Role::Doctor, others))
     }
 
     /// Answers a `Protect` with `action`, the way a seat would.
@@ -275,6 +262,7 @@ mod tests {
 
     #[test]
     fn the_action_space_is_every_living_other_in_order_then_abstain_where_permitted() {
+        // Given out of order, so that the order is the rules' doing.
         let others = ["carol", "alice", "bob"];
         let targets = || ["alice", "bob", "carol"].map(target).to_vec();
         let with_abstain = || {
@@ -420,18 +408,6 @@ mod tests {
             doctor.action_space(&request(RequestKind::Protect)),
             [target("alice"), target("bob"), Action::Abstain]
         );
-    }
-
-    #[test]
-    fn choosing_is_nothing_to_remember_for_the_other_roles() {
-        let mut villager = villager(["alice"]);
-        let mut werewolf = werewolf(["alice"], []);
-        let mut seer = seer(["alice"], []);
-        let before = (villager.clone(), werewolf.clone(), seer.clone());
-        villager.chose(&request(RequestKind::Nominate), &target("alice"));
-        werewolf.chose(&request(RequestKind::Devour), &target("alice"));
-        seer.chose(&request(RequestKind::Investigate), &target("alice"));
-        assert_eq!((villager, werewolf, seer), before);
     }
 
     #[test]

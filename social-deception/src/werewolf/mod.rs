@@ -120,7 +120,7 @@ pub use message::{
     Round,
 };
 pub use moderator::Moderator;
-pub use player::{Player, Seat, base_action_space};
+pub use player::{Player, Seat};
 pub use policy::{Policy, RandomPolicy, View};
 pub use role::{Faction, Role};
 pub use roles::{Doctor, Seer, Villager, Werewolf};

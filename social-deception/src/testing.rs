@@ -4,8 +4,14 @@ use std::collections::BTreeSet;
 
 use serde_json::Value;
 
-use crate::event::AgentId;
-use crate::werewolf::Action;
+use crate::event::{AgentId, Event};
+use crate::werewolf::{
+    Action, Faction, Knowledge, Message, Narration, Phase, Request, RequestId, RequestKind, Role,
+    Round,
+};
+
+/// The agent whose point of view a werewolf unit test takes.
+pub(crate) const ME: &str = "me";
 
 /// Parses a trajectory file into one JSON value per line.
 ///
@@ -44,4 +50,62 @@ pub(crate) fn ids<const N: usize>(names: [&str; N]) -> BTreeSet<AgentId> {
 /// string literal.
 pub(crate) fn target(name: &str) -> Action {
     Action::Target(id(name))
+}
+
+/// A request of `kind`, for tests where its id and round do not matter.
+pub(crate) fn request(kind: RequestKind) -> Request {
+    Request {
+        id: RequestId(1),
+        round: Round(1),
+        kind,
+    }
+}
+
+/// A narration from the moderator to [`ME`], as it arrives on the receiver.
+pub(crate) fn narrated(narration: Narration) -> Event<Message> {
+    Event::message("moderator", [ME], Message::Narration(narration))
+}
+
+/// The moderator announcing a phase to [`ME`].
+pub(crate) fn phase_began(round: u32, phase: Phase, living: BTreeSet<AgentId>) -> Event<Message> {
+    narrated(Narration::PhaseBegan {
+        round: Round(round),
+        phase,
+        living,
+    })
+}
+
+/// The knowledge of [`ME`] playing `role`, with `others` and itself living
+/// and nothing else known. The others need not be sorted.
+pub(crate) fn knowing<const N: usize>(role: Role, others: [&str; N]) -> Knowledge {
+    let mut knowledge = Knowledge::new(id(ME), role);
+    knowledge.living = ids(others);
+    knowledge.living.insert(id(ME));
+    knowledge
+}
+
+/// The knowledge of [`ME`] as a werewolf among `others`, whose pack is
+/// `pack` and itself.
+pub(crate) fn werewolf_knowing<const N: usize, const P: usize>(
+    others: [&str; N],
+    pack: [&str; P],
+) -> Knowledge {
+    let mut knowledge = knowing(Role::Werewolf, others);
+    knowledge.pack = ids(pack);
+    knowledge.pack.insert(id(ME));
+    knowledge
+}
+
+/// The knowledge of [`ME`] as the seer among `others`, having found each
+/// of `investigated` to be a villager.
+pub(crate) fn seer_knowing<const N: usize, const I: usize>(
+    others: [&str; N],
+    investigated: [&str; I],
+) -> Knowledge {
+    let mut knowledge = knowing(Role::Seer, others);
+    knowledge.investigations = ids(investigated)
+        .into_iter()
+        .map(|who| (who, Faction::Village))
+        .collect();
+    knowledge
 }

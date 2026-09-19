@@ -1,8 +1,11 @@
-//! The roles a player can hold, and the sides of the game they belong to.
+//! The roles a player can hold, the sides of the game they belong to, and
+//! what each role is asked to do.
 
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
+
+use super::message::{Phase, RequestKind};
 
 /// A player's role, dealt at the start of an episode and revealed at death.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -63,6 +66,24 @@ impl Role {
             Self::Villager | Self::Seer | Self::Doctor => Faction::Village,
         }
     }
+
+    /// The request a living player of this role is asked in `phase`, if
+    /// any: everyone nominates by day; at night a werewolf devours, the
+    /// seer investigates, the doctor protects, and a villager sleeps.
+    ///
+    /// The one statement of who is asked what. The moderator issues its
+    /// requests from it, and a role checks the requests it receives against
+    /// it, so the two cannot disagree.
+    #[must_use]
+    pub const fn asked_in(self, phase: Phase) -> Option<RequestKind> {
+        match (phase, self) {
+            (Phase::Day, _) => Some(RequestKind::Nominate),
+            (Phase::Night, Self::Werewolf) => Some(RequestKind::Devour),
+            (Phase::Night, Self::Seer) => Some(RequestKind::Investigate),
+            (Phase::Night, Self::Doctor) => Some(RequestKind::Protect),
+            (Phase::Night, Self::Villager) => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -78,6 +99,30 @@ mod tests {
         for role in [Role::Villager, Role::Seer, Role::Doctor] {
             assert_eq!(role.faction(), Faction::Village, "{role:?}");
         }
+    }
+
+    #[test]
+    fn everyone_nominates_by_day_and_each_power_acts_at_night() {
+        for role in [Role::Villager, Role::Werewolf, Role::Seer, Role::Doctor] {
+            assert_eq!(
+                role.asked_in(Phase::Day),
+                Some(RequestKind::Nominate),
+                "{role:?}"
+            );
+        }
+        assert_eq!(Role::Villager.asked_in(Phase::Night), None);
+        assert_eq!(
+            Role::Werewolf.asked_in(Phase::Night),
+            Some(RequestKind::Devour)
+        );
+        assert_eq!(
+            Role::Seer.asked_in(Phase::Night),
+            Some(RequestKind::Investigate)
+        );
+        assert_eq!(
+            Role::Doctor.asked_in(Phase::Night),
+            Some(RequestKind::Protect)
+        );
     }
 
     #[test]
