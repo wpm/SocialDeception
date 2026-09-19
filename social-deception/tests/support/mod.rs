@@ -1,16 +1,46 @@
 //! Helpers shared by the integration tests: the [`collatz`] environment,
-//! reading a trajectory file back, and checking the invariants every
-//! trajectory satisfies whatever the environment.
+//! a [`TempFile`] to write a trajectory to, reading a trajectory file back,
+//! checking the invariants every trajectory satisfies whatever the
+//! environment, and, in [`werewolf`], the invariants a trajectory of
+//! Werewolf satisfies on top of them.
 //!
 //! The checks here are properties of the log, not of any environment. They
 //! are meant to run unchanged against episodes where no independent check on
 //! the content is available.
 
 pub mod collatz;
+pub mod werewolf;
 
 use std::collections::HashMap;
+use std::fs;
+use std::path::PathBuf;
+use std::process;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde_json::Value;
+
+/// A file of one test's own in the temp dir, removed when this is dropped
+/// so that a failing test leaves nothing behind.
+pub struct TempFile(pub PathBuf);
+
+impl TempFile {
+    /// A path under the temp dir, unique across tests and processes, named
+    /// for the test that uses it. Nothing is created.
+    pub fn new(name: &str) -> Self {
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        Self(std::env::temp_dir().join(format!(
+            "social-deception-{name}-{}-{}.jsonl",
+            process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        )))
+    }
+}
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
 
 /// Parses a trajectory file into one JSON value per line.
 ///
