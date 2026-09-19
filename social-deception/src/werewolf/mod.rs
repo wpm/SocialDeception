@@ -48,11 +48,16 @@
 //! Every narration is true. Player-to-player dialogue, which may be false,
 //! would be a fourth kind of message and is not defined here.
 //!
-//! # What a player knows
+//! # What a player knows, and how it decides
 //!
 //! [`Knowledge`] is the state a player carries between passes: the fold of
 //! every observation it has received, and what a policy conditions on. It
 //! records only what the moderator said, so nothing in it can be false.
+//!
+//! A [`Policy`] is handed a [`View`] of that state, the request in front of
+//! it and the action space, and returns one [`Action`]. [`RandomPolicy`] is
+//! the uniform random baseline; a language-model policy is the same trait
+//! ([`policy`]).
 //!
 //! # What no message carries
 //!
@@ -80,6 +85,7 @@ pub mod config;
 pub mod game;
 pub mod knowledge;
 pub mod message;
+pub mod policy;
 pub mod role;
 pub mod seed;
 
@@ -91,5 +97,6 @@ pub use message::{
     Action, Cause, Message, Narration, Outcome, Phase, Request, RequestId, RequestKind, Response,
     Round,
 };
+pub use policy::{Policy, RandomPolicy, View};
 pub use role::{Faction, Role};
 pub use seed::seed_for;
