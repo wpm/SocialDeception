@@ -248,16 +248,7 @@ impl Game {
         let asked: Vec<(AgentId, RequestKind)> = self
             .living
             .iter()
-            .filter_map(|who| {
-                let kind = match (self.phase, self.role(who)) {
-                    (Phase::Day, _) => RequestKind::Nominate,
-                    (Phase::Night, Role::Werewolf) => RequestKind::Devour,
-                    (Phase::Night, Role::Seer) => RequestKind::Investigate,
-                    (Phase::Night, Role::Doctor) => RequestKind::Protect,
-                    (Phase::Night, Role::Villager) => return None,
-                };
-                Some((who.clone(), kind))
-            })
+            .filter_map(|who| Some((who.clone(), self.role(who).asked_in(self.phase)?)))
             .collect();
         for (who, kind) in asked {
             directives.push(self.ask(who, kind));

@@ -3,6 +3,8 @@
 **Status:** Accepted
 **Date:** 2026-09-18
 **Deciders:** Bill McNeill
+**Refined by:** [ADR-0006](0006-knowledge-holds-what-the-agent-did-in-secret.md),
+which adds the agent's own secret actions to what `Knowledge` folds
 
 ## Context
 
