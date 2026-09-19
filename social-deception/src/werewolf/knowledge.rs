@@ -53,10 +53,11 @@ pub struct Knowledge {
     /// This agent's role, fixed at construction. The `Assigned` narration
     /// must agree with it.
     pub role: Role,
-    /// The current round.
-    pub round: Round,
-    /// The current phase.
-    pub phase: Phase,
+    /// The current round and phase: `None` until the first phase begins.
+    ///
+    /// One field rather than two, because the moderator announces the two
+    /// together and a state with one but not the other is impossible.
+    pub moment: Option<(Round, Phase)>,
     /// Everyone still in the game, as last announced and kept current
     /// between announcements.
     pub living: BTreeSet<AgentId>,
@@ -97,17 +98,12 @@ pub struct Heard {
 
 impl Knowledge {
     /// The state of a player that has observed nothing yet.
-    ///
-    /// Until the first [`Narration::PhaseBegan`], `round` is `Round(0)` and
-    /// `phase` is `Day`: the moment before any phase, which the first
-    /// announcement replaces.
     #[must_use]
     pub fn new(me: AgentId, role: Role) -> Self {
         Self {
             me,
             role,
-            round: Round(0),
-            phase: Phase::Day,
+            moment: None,
             living: BTreeSet::new(),
             dead: BTreeMap::new(),
             pack: BTreeSet::new(),
@@ -163,8 +159,7 @@ impl Knowledge {
                 phase,
                 living,
             } => {
-                self.round = *round;
-                self.phase = *phase;
+                self.moment = Some((*round, *phase));
                 self.living.clone_from(living);
             }
             // A repeated target keeps its first answer.
@@ -347,8 +342,7 @@ mod tests {
             Knowledge {
                 me: id(ME),
                 role: Role::Seer,
-                round: Round(2),
-                phase: Phase::Night,
+                moment: Some((Round(2), Phase::Night)),
                 living: ids([ME, "wolfgang"]),
                 dead: BTreeMap::from([
                     (id("alice"), death(1, Cause::Devoured, Role::Villager)),
@@ -377,7 +371,7 @@ mod tests {
     #[test]
     fn living_follows_announcements_authoritatively_and_eliminations_between_them() {
         let mut knowledge = Knowledge::new(id(ME), Role::Villager);
-        assert_eq!((knowledge.round, knowledge.phase), (Round(0), Phase::Day));
+        assert_eq!(knowledge.moment, None);
         assert!(knowledge.living.is_empty());
 
         knowledge.observe(&phase_began(
@@ -385,7 +379,7 @@ mod tests {
             Phase::Night,
             ids(["alice", "bob", "carol", ME]),
         ));
-        assert_eq!((knowledge.round, knowledge.phase), (Round(1), Phase::Night));
+        assert_eq!(knowledge.moment, Some((Round(1), Phase::Night)));
         assert_eq!(knowledge.living, ids(["alice", "bob", "carol", ME]));
 
         knowledge.observe(&eliminated("alice", Role::Seer, 1, Cause::Devoured));
@@ -401,7 +395,7 @@ mod tests {
         // preceded it.
         knowledge.observe(&phase_began(2, Phase::Night, ids(["bob", ME])));
         assert_eq!(knowledge.living, ids(["bob", ME]));
-        assert_eq!((knowledge.round, knowledge.phase), (Round(2), Phase::Night));
+        assert_eq!(knowledge.moment, Some((Round(2), Phase::Night)));
     }
 
     #[test]
