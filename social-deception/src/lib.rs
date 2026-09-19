@@ -20,8 +20,9 @@
 //! phases and the [`Message`](werewolf::Message) payload that travels over
 //! [`Event`] in a game of Werewolf, the [`Knowledge`](werewolf::Knowledge)
 //! a player folds those events into, the [`Policy`](werewolf::Policy) that
-//! picks its actions, and the [`Game`](werewolf::Game) whose rules decide
-//! what is said to whom.
+//! picks its actions, the [`Game`](werewolf::Game) whose rules decide what
+//! is said to whom, and the [`Moderator`](werewolf::Moderator) that runs it
+//! as an agent in the roster.
 
 pub mod agent;
 pub mod clock;
