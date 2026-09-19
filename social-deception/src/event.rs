@@ -9,7 +9,7 @@
 use std::collections::BTreeSet;
 use std::fmt;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// What the runtime requires of an environment's message payload:
 /// `Serialize`, `Send`, `Clone` and `'static`.
@@ -23,7 +23,7 @@ impl<P: Serialize + Send + Clone + 'static> Payload for P {}
 /// The name of an agent within an episode.
 ///
 /// Agent ids are strings. Application code addresses agents by id.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct AgentId(String);
 

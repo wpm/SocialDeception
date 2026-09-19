@@ -14,7 +14,9 @@
 //! - [`agent`]: the [`Agent`] thread that drains its inbox, folds the batch
 //!   through a [`Handler`], and records what it saw and sent;
 //! - [`router`]: the [`Router`] from agent ids to their channels;
-//! - [`episode`]: the [`Episode`] that runs a roster from start to stop.
+//! - [`episode`]: the [`Episode`] that runs a roster from start to stop;
+//! - [`werewolf`]: the Werewolf environment's vocabulary: roles, phases and
+//!   the [`Message`](werewolf::Message) payload that travels over [`Event`].
 
 pub mod agent;
 pub mod clock;
@@ -25,6 +27,7 @@ pub mod router;
 mod testing;
 pub mod timer;
 pub mod trajectory;
+pub mod werewolf;
 
 pub use agent::{Agent, CycleDispatch, Delivery, Error, Handler, Outgoing, Recipients, Wiring};
 pub use clock::{Clock, Timestamp};
