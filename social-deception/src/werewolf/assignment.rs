@@ -17,7 +17,7 @@ use rand::seq::SliceRandom;
 use rand_chacha::ChaCha8Rng;
 
 use super::config::Config;
-use super::role::Role;
+use super::role::{Faction, Role};
 use super::seed::seed_for;
 use crate::event::AgentId;
 
@@ -64,7 +64,7 @@ impl Assignment {
         let roles: BTreeMap<AgentId, Role> = players.into_iter().cloned().zip(roles).collect();
         let pack = roles
             .iter()
-            .filter(|(_, role)| **role == Role::Werewolf)
+            .filter(|(_, role)| role.faction() == Faction::Werewolves)
             .map(|(who, _)| who.clone())
             .collect();
         Self { roles, pack }
@@ -99,7 +99,7 @@ mod tests {
     use super::*;
     use crate::werewolf::config::RoleCounts;
 
-    fn config(seed: u64, players: &[&str], roles: RoleCounts) -> Config {
+    fn game(seed: u64, players: &[&str], roles: RoleCounts) -> Config {
         let config = Config {
             seed,
             players: players.iter().copied().map(AgentId::new).collect(),
@@ -128,33 +128,32 @@ mod tests {
 
     #[test]
     fn the_same_seed_gives_the_same_deal() {
-        let config = config(20_260_918, &SEVEN, FULL_HOUSE);
+        let config = game(20_260_918, &SEVEN, FULL_HOUSE);
         let first = Assignment::deal(&config);
         assert_eq!(Assignment::deal(&config), first, "repeated call");
-        let rebuilt = self::config(20_260_918, &SEVEN, FULL_HOUSE);
+        let rebuilt = game(20_260_918, &SEVEN, FULL_HOUSE);
         assert_eq!(Assignment::deal(&rebuilt), first, "rebuilt config");
     }
 
     #[test]
     fn a_different_seed_gives_a_different_deal() {
-        let one = Assignment::deal(&config(1, &SEVEN, FULL_HOUSE));
-        let two = Assignment::deal(&config(2, &SEVEN, FULL_HOUSE));
+        let one = Assignment::deal(&game(1, &SEVEN, FULL_HOUSE));
+        let two = Assignment::deal(&game(2, &SEVEN, FULL_HOUSE));
         assert_ne!(one, two);
     }
 
     #[test]
     fn reordering_the_players_does_not_change_the_deal() {
-        let written = config(20_260_918, &SEVEN, FULL_HOUSE);
+        let written = game(20_260_918, &SEVEN, FULL_HOUSE);
         let reversed: Vec<&str> = SEVEN.iter().rev().copied().collect();
-        let reordered = config(20_260_918, &reversed, FULL_HOUSE);
+        let reordered = game(20_260_918, &reversed, FULL_HOUSE);
         assert_eq!(Assignment::deal(&written), Assignment::deal(&reordered));
     }
 
     #[test]
     fn the_counts_match_the_config_and_the_pack_is_the_werewolves() {
         for seed in 0..50 {
-            let config = config(seed, &SEVEN, FULL_HOUSE);
-            let assignment = Assignment::deal(&config);
+            let assignment = Assignment::deal(&game(seed, &SEVEN, FULL_HOUSE));
             assert_eq!(assignment.count(Role::Werewolf), 2, "seed {seed}");
             assert_eq!(assignment.count(Role::Seer), 1, "seed {seed}");
             assert_eq!(assignment.count(Role::Doctor), 1, "seed {seed}");
@@ -166,19 +165,12 @@ mod tests {
                 .map(|(who, _)| who.clone())
                 .collect();
             assert_eq!(*assignment.pack(), werewolves, "seed {seed}");
-            for who in &config.players {
-                assert_eq!(
-                    assignment.role(who) == Some(Role::Werewolf),
-                    assignment.pack().contains(who),
-                    "seed {seed}, {who}"
-                );
-            }
         }
     }
 
     #[test]
     fn every_player_has_a_role_and_nobody_else_does() {
-        let assignment = Assignment::deal(&config(3, &SEVEN, FULL_HOUSE));
+        let assignment = Assignment::deal(&game(3, &SEVEN, FULL_HOUSE));
         for who in SEVEN {
             assert!(assignment.role(&AgentId::new(who)).is_some(), "{who}");
         }
@@ -193,7 +185,7 @@ mod tests {
             seers: 1,
             doctors: 1,
         };
-        let assignment = Assignment::deal(&config(9, &["alice", "bob", "carol"], counts));
+        let assignment = Assignment::deal(&game(9, &["alice", "bob", "carol"], counts));
         assert_eq!(assignment.count(Role::Villager), 0);
         assert_eq!(assignment.players().count(), 3);
     }
@@ -201,7 +193,7 @@ mod tests {
     #[test]
     fn golden_deal() {
         // Change the shuffle, the generator or `seed_for` and this changes.
-        let assignment = Assignment::deal(&config(20_260_918, &SEVEN, FULL_HOUSE));
+        let assignment = Assignment::deal(&game(20_260_918, &SEVEN, FULL_HOUSE));
         assert_eq!(
             roster(&assignment),
             [

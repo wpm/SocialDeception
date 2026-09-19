@@ -11,8 +11,8 @@
 //! errors are clap's.
 
 use std::error::Error;
-use std::fmt::Write as _;
-use std::path::PathBuf;
+use std::fmt;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
@@ -45,7 +45,7 @@ enum Command {
         /// The JSON Lines trajectory to read.
         trajectory: PathBuf,
         /// The moderator's agent id in that trajectory.
-        #[arg(long, default_value = "moderator")]
+        #[arg(long, default_value = config::DEFAULT_MODERATOR)]
         moderator: String,
     },
 }
@@ -69,7 +69,9 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         } => {
             let config = load(&config, seed, trajectory)?;
             let assignment = Assignment::deal(&config);
-            print!("{}", describe(&config, &assignment));
+            let mut text = String::new();
+            describe(&mut text, &config, &assignment)?;
+            print!("{text}");
             Ok(())
         }
         Command::Replay { .. } => Err("replay is not implemented yet".into()),
@@ -77,9 +79,10 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
 }
 
 /// Loads the configuration and applies the command line's overrides, so the
-/// run has one source of truth.
+/// run has one source of truth. The result is validated after the overrides,
+/// so an override cannot let through what the file could not.
 fn load(
-    path: &PathBuf,
+    path: &Path,
     seed: Option<u64>,
     trajectory: Option<PathBuf>,
 ) -> Result<Config, config::ConfigError> {
@@ -90,46 +93,41 @@ fn load(
     if let Some(trajectory) = trajectory {
         config.trajectory = Some(trajectory);
     }
+    config.validate()?;
     Ok(config)
 }
 
-/// The effective configuration and the deal, as printed by `play`.
-fn describe(config: &Config, assignment: &Assignment) -> String {
-    let mut out = String::new();
-    let _ = writeln!(out, "seed: {}", config.seed);
-    let _ = writeln!(out, "moderator: {}", config.moderator);
+/// Writes the effective configuration and the deal, as printed by `play`.
+fn describe(out: &mut impl fmt::Write, config: &Config, assignment: &Assignment) -> fmt::Result {
+    writeln!(out, "seed: {}", config.seed)?;
+    writeln!(out, "moderator: {}", config.moderator)?;
     match &config.trajectory {
-        Some(path) => {
-            let _ = writeln!(out, "trajectory: {}", path.display());
-        }
-        None => out.push_str("trajectory: none\n"),
+        Some(path) => writeln!(out, "trajectory: {}", path.display())?,
+        None => writeln!(out, "trajectory: none")?,
     }
-    let _ = writeln!(out, "max_rounds: {}", config.max_rounds);
-    out.push('\n');
+    writeln!(out, "max_rounds: {}", config.max_rounds)?;
+    writeln!(out)?;
     let width = assignment
         .players()
         .map(|(who, _)| who.as_str().len())
         .max()
         .unwrap_or(0);
     for (who, role) in assignment.players() {
-        let _ = writeln!(out, "{:<width$}  {role:?}", who.as_str());
+        writeln!(out, "{:<width$}  {role}", who.as_str())?;
     }
-    out.push('\n');
-    let _ = writeln!(
+    writeln!(out)?;
+    writeln!(
         out,
         "werewolves: {}, seers: {}, doctors: {}, villagers: {}",
         assignment.count(Role::Werewolf),
         assignment.count(Role::Seer),
         assignment.count(Role::Doctor),
         assignment.count(Role::Villager),
-    );
-    out
+    )
 }
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-
     use clap::CommandFactory;
     use clap::error::ErrorKind;
 
@@ -143,10 +141,6 @@ mod tests {
         ))
     }
 
-    fn parse<const N: usize>(args: [&str; N]) -> Result<Cli, clap::Error> {
-        Cli::try_parse_from(args)
-    }
-
     #[test]
     fn the_command_line_is_well_formed() {
         Cli::command().debug_assert();
@@ -154,7 +148,7 @@ mod tests {
 
     #[test]
     fn play_with_only_its_config() {
-        let cli = parse(["werewolf", "play", "x.toml"]).unwrap();
+        let cli = Cli::try_parse_from(["werewolf", "play", "x.toml"]).unwrap();
         assert!(matches!(
             cli.command,
             Command::Play { config, seed: None, trajectory: None }
@@ -164,7 +158,7 @@ mod tests {
 
     #[test]
     fn play_with_every_flag() {
-        let cli = parse([
+        let cli = Cli::try_parse_from([
             "werewolf",
             "play",
             "x.toml",
@@ -183,7 +177,7 @@ mod tests {
 
     #[test]
     fn replay_with_only_its_trajectory() {
-        let cli = parse(["werewolf", "replay", "run.jsonl"]).unwrap();
+        let cli = Cli::try_parse_from(["werewolf", "replay", "run.jsonl"]).unwrap();
         assert!(matches!(
             cli.command,
             Command::Replay { trajectory, moderator }
@@ -193,7 +187,9 @@ mod tests {
 
     #[test]
     fn replay_with_a_moderator() {
-        let cli = parse(["werewolf", "replay", "run.jsonl", "--moderator", "narrator"]).unwrap();
+        let cli =
+            Cli::try_parse_from(["werewolf", "replay", "run.jsonl", "--moderator", "narrator"])
+                .unwrap();
         assert!(matches!(
             cli.command,
             Command::Replay { moderator, .. } if moderator == "narrator"
@@ -202,9 +198,9 @@ mod tests {
 
     #[test]
     fn a_missing_argument_is_a_usage_error() {
-        let error = parse(["werewolf", "play"]).unwrap_err();
+        let error = Cli::try_parse_from(["werewolf", "play"]).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
-        let error = parse(["werewolf"]).unwrap_err();
+        let error = Cli::try_parse_from(["werewolf"]).unwrap_err();
         assert_eq!(
             error.kind(),
             ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
@@ -213,24 +209,26 @@ mod tests {
 
     #[test]
     fn an_unknown_flag_is_a_usage_error() {
-        let error = parse(["werewolf", "play", "x.toml", "--players", "3"]).unwrap_err();
+        let error =
+            Cli::try_parse_from(["werewolf", "play", "x.toml", "--players", "3"]).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::UnknownArgument);
     }
 
     #[test]
     fn a_seed_that_is_not_a_number_is_a_usage_error() {
-        let error = parse(["werewolf", "play", "x.toml", "--seed", "lucky"]).unwrap_err();
+        let error =
+            Cli::try_parse_from(["werewolf", "play", "x.toml", "--seed", "lucky"]).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::ValueValidation);
     }
 
     #[test]
     fn help_and_version_are_wired() {
-        let help = parse(["werewolf", "--help"]).unwrap_err();
+        let help = Cli::try_parse_from(["werewolf", "--help"]).unwrap_err();
         assert_eq!(help.kind(), ErrorKind::DisplayHelp);
         let text = help.to_string();
         assert!(text.contains("play"), "{text}");
         assert!(text.contains("replay"), "{text}");
-        let version = parse(["werewolf", "--version"]).unwrap_err();
+        let version = Cli::try_parse_from(["werewolf", "--version"]).unwrap_err();
         assert_eq!(version.kind(), ErrorKind::DisplayVersion);
         assert!(
             version.to_string().contains(env!("CARGO_PKG_VERSION")),
@@ -250,22 +248,16 @@ mod tests {
     }
 
     #[test]
-    fn a_seed_override_changes_the_deal() {
-        let from_file = load(&example(), None, None).unwrap();
-        let overridden = load(&example(), Some(7), None).unwrap();
-        assert_ne!(Assignment::deal(&from_file), Assignment::deal(&overridden));
-    }
-
-    #[test]
     fn play_prints_the_effective_seed_the_roster_and_the_counts() {
         let config = load(&example(), Some(7), None).unwrap();
         let assignment = Assignment::deal(&config);
-        let text = describe(&config, &assignment);
+        let mut text = String::new();
+        describe(&mut text, &config, &assignment).unwrap();
         assert!(text.starts_with("seed: 7\n"), "{text}");
         assert!(text.contains("trajectory: werewolf.jsonl\n"), "{text}");
         for (who, role) in assignment.players() {
             assert!(
-                text.contains(&format!("{:<5}  {role:?}\n", who.as_str())),
+                text.contains(&format!("{:<5}  {role}\n", who.as_str())),
                 "{text}"
             );
         }
@@ -277,14 +269,14 @@ mod tests {
 
     #[test]
     fn a_bad_config_is_an_error_not_a_panic() {
-        let cli = parse(["werewolf", "play", "no-such-file.toml"]).unwrap();
+        let cli = Cli::try_parse_from(["werewolf", "play", "no-such-file.toml"]).unwrap();
         let error = run(cli).unwrap_err();
         assert!(error.to_string().contains("no-such-file.toml"), "{error}");
     }
 
     #[test]
     fn replay_is_not_implemented() {
-        let cli = parse(["werewolf", "replay", "run.jsonl"]).unwrap();
+        let cli = Cli::try_parse_from(["werewolf", "replay", "run.jsonl"]).unwrap();
         let error = run(cli).unwrap_err();
         assert!(error.to_string().contains("not implemented"), "{error}");
     }

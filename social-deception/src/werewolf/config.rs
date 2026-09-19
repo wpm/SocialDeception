@@ -217,6 +217,7 @@ impl Config {
             doctors,
         } = self.roles;
         let players = self.players.len();
+        let special = self.roles.special();
         if werewolves == 0 {
             return Err(ConfigError::NoWerewolves);
         }
@@ -226,9 +227,12 @@ impl Config {
                 players,
             });
         }
-        if self.roles.special() > players {
+        // Implied by the parity check and the caps on seers and doctors, so
+        // it only ever fires alongside one of those; kept, and checked
+        // before the caps, as the general rule the caps are cases of.
+        if special > players {
             return Err(ConfigError::TooManyRoles {
-                roles: self.roles.special(),
+                roles: special,
                 players,
             });
         }
@@ -265,11 +269,10 @@ mod tests {
     use super::*;
 
     /// The example configuration, as committed at the repository root.
-    pub(crate) const EXAMPLE: &str =
-        concat!(env!("CARGO_MANIFEST_DIR"), "/../examples/werewolf.toml");
+    const EXAMPLE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../examples/werewolf.toml");
 
     /// A configuration with every field present.
-    pub(crate) const FULL: &str = r#"
+    const FULL: &str = r#"
         seed = 20260918
         players = ["alice", "bob", "carol", "dave", "erin", "frank", "grace"]
         trajectory = "werewolf.jsonl"

@@ -8,10 +8,10 @@
 //! are.
 //!
 //! The mix is written out here rather than borrowed from `std`'s
-//! `DefaultHasher` or from `rand`, both of which are allowed to change their
-//! output between releases. A seed that stops meaning the same thing after a
-//! dependency bump is not a reproducible experiment, so the golden values in
-//! this module's tests are part of the contract.
+//! `DefaultHasher`, whose output is not guaranteed stable across releases. A
+//! seed that stops meaning the same thing after a dependency bump is not a
+//! reproducible experiment, so the golden values in this module's tests are
+//! part of the contract.
 
 /// Mixes a master seed with a label into a stable per-stream seed.
 ///
