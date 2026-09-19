@@ -68,6 +68,15 @@
 //! the uniform random baseline; a language-model policy is the same trait
 //! ([`policy`]).
 //!
+//! The action space is the rules' to compute, and the rules are a role's:
+//! [`Villager`], [`Werewolf`], [`Seer`] and [`Doctor`] ([`roles`]) each
+//! carry their own [`Knowledge`] and say which actions a request permits
+//! them, and nothing else. A [`Seat`] ([`player`]) pairs a role with the
+//! policy that decides for it and is the agent the episode runs: it folds
+//! every event into the role's state, answers each request with the
+//! policy's choice from the role's action space, and addresses nobody but
+//! the moderator.
+//!
 //! # What no message carries
 //!
 //! No message carries the episode's seed, and no type here has a field that
@@ -95,8 +104,10 @@ pub mod game;
 pub mod knowledge;
 pub mod message;
 pub mod moderator;
+pub mod player;
 pub mod policy;
 pub mod role;
+pub mod roles;
 pub mod seed;
 pub mod transcript;
 
@@ -109,7 +120,9 @@ pub use message::{
     Round,
 };
 pub use moderator::Moderator;
+pub use player::{Player, Seat, base_action_space};
 pub use policy::{Policy, RandomPolicy, View};
 pub use role::{Faction, Role};
+pub use roles::{Doctor, Seer, Villager, Werewolf};
 pub use seed::seed_for;
 pub use transcript::{PhaseRecord, RoundRecord, Transcript, TranscriptError};
