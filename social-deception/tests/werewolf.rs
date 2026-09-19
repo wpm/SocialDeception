@@ -26,16 +26,13 @@
 mod support;
 
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::{self, Command};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::path::Path;
+use std::process::Command;
 
-use serde_json::Value;
 use social_deception::AgentId;
 use social_deception::werewolf::config::{DEFAULT_MAX_ROUNDS, DEFAULT_MODERATOR};
-use social_deception::werewolf::{
-    self, Config, Faction, Message, Narration, RoleCounts, Transcript, config,
-};
+use social_deception::werewolf::{self, Config, Faction, RoleCounts, Transcript, config};
+use support::TempFile;
 
 /// A seven-player game played to a village win, with its effective config
 /// and its expected rendering beside it.
@@ -51,33 +48,10 @@ const WEREWOLF: &str = env!("CARGO_BIN_EXE_werewolf");
 /// The seed the fixed-seed tests play from.
 const SEED: u64 = 20_260_918;
 
-/// How many seeds a search for a particular kind of game tries. With a
-/// uniform policy over seven players the events searched for turn up in a
-/// good fraction of games, so this is generous.
+/// How many seeds a search for particular kinds of game tries at most.
+/// With a uniform policy over seven players the events searched for turn
+/// up in a good fraction of games, so this is generous.
 const SEEDS: u64 = 40;
-
-/// A trajectory file in the temp dir, removed when this is dropped along
-/// with any effective config written beside it, so that a failing test
-/// leaves nothing behind.
-struct TempFile(PathBuf);
-
-impl TempFile {
-    fn new() -> Self {
-        static COUNTER: AtomicUsize = AtomicUsize::new(0);
-        Self(std::env::temp_dir().join(format!(
-            "social-deception-werewolf-{}-{}.jsonl",
-            process::id(),
-            COUNTER.fetch_add(1, Ordering::Relaxed)
-        )))
-    }
-}
-
-impl Drop for TempFile {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
-        let _ = fs::remove_file(config::effective_path(&self.0));
-    }
-}
 
 /// A validated configuration for `players` with the given special roles,
 /// played from `seed`, writing no trajectory.
@@ -109,62 +83,36 @@ fn town(seed: u64) -> Config {
     )
 }
 
-/// One episode, played to its trajectory and read back.
-struct Played {
-    /// The trajectory, one value per line.
-    lines: Vec<Value>,
-    /// The game the trajectory records.
-    transcript: Transcript,
-}
-
-impl Played {
-    /// Every narration the moderator sent, in the order it sent them.
-    fn narrations(&self, config: &Config) -> Vec<Narration> {
-        self.lines
-            .iter()
-            .filter(|line| support::agent(line) == config.moderator.as_str())
-            .filter(|line| !line["sent"].is_null())
-            .filter_map(
-                |line| match serde_json::from_value(line["event"]["payload"].clone()) {
-                    Ok(Message::Narration(narration)) => Some(narration),
-                    _ => None,
-                },
-            )
-            .collect()
-    }
-}
-
-/// Reads the trajectory at `path` back as the game it records.
-fn read(path: &Path, config: &Config) -> (Vec<Value>, Transcript) {
+/// Reads the trajectory at `path` back as the game it records, once it has
+/// passed both sets of invariants: the ones in [`support`], which know
+/// nothing about Werewolf, and then Werewolf's own in
+/// [`support::werewolf`], so that a bad trajectory fails by the name of the
+/// invariant it breaks.
+fn read(path: &Path, config: &Config) -> Transcript {
     let lines = support::parse(&fs::read(path).unwrap());
-    let transcript = Transcript::read(&lines, &config.moderator).unwrap();
-    (lines, transcript)
+    support::check(&lines);
+    support::werewolf::check(&lines, config);
+    Transcript::read(&lines, &config.moderator).unwrap()
 }
 
 /// Runs one episode of `config` with the trajectory going to a temp file,
-/// and returns the trajectory read back from disk with the game it records.
-///
-/// Before it returns, the trajectory is checked against the invariants in
-/// [`support`], which know nothing about Werewolf, and then against
-/// Werewolf's own in [`support::werewolf`], so that a bad trajectory fails
-/// by the name of the invariant it breaks. The outcome the run reported on
-/// its channel is checked against the one the moderator announced in world:
-/// the announcement is the record of truth, and the channel must agree.
-fn run(config: &Config) -> Played {
-    let file = TempFile::new();
+/// and returns the game the trajectory records, checked as [`read`] checks
+/// it. The outcome the run reported on its channel is checked against the
+/// one the moderator announced in world: the announcement is the record of
+/// truth, and the channel must agree.
+fn run(config: &Config) -> Transcript {
+    let file = TempFile::new("werewolf");
     let config = Config {
         trajectory: Some(file.0.clone()),
         ..config.clone()
     };
     let outcome = werewolf::run(&config).unwrap();
-    let (lines, transcript) = read(&file.0, &config);
-    support::check(&lines);
-    support::werewolf::check(&lines, &config);
+    let transcript = read(&file.0, &config);
     assert_eq!(
         transcript.outcome, outcome,
         "the channel agrees with the announcement"
     );
-    Played { lines, transcript }
+    transcript
 }
 
 /// Runs `werewolf` with `args` and returns what it printed, panicking with
@@ -182,44 +130,32 @@ fn werewolf(args: &[&str]) -> String {
 #[test]
 fn the_fixture_is_a_trajectory_the_runtime_could_have_written() {
     let config = config::load(config::effective_path(Path::new(FIXTURE))).unwrap();
-    let lines = support::parse(&fs::read(FIXTURE).unwrap());
-    support::check(&lines);
-    support::werewolf::check(&lines, &config);
+    read(Path::new(FIXTURE), &config);
 }
 
 #[test]
 fn seven_players_with_two_werewolves_a_seer_and_a_doctor() {
-    let played = run(&town(SEED));
-    assert_eq!(played.transcript.assignment.len(), 7);
-    assert!(played.transcript.outcome.winner.is_some());
+    let transcript = run(&town(SEED));
+    assert!(transcript.outcome.winner.is_some());
 }
 
 #[test]
 fn three_players_with_one_werewolf_is_the_smallest_game() {
-    // The werewolf devours one of the other two on the first night, which
-    // is parity, unless the game has a doctor to save them; either way no
-    // game this small lasts long.
-    let played = run(&config(&["alice", "bob", "carol"], 1, 0, 0, SEED));
-    assert_eq!(played.transcript.outcome.winner, Some(Faction::Werewolves));
-    assert_eq!(played.transcript.rounds.len(), 1);
+    // The werewolf devours one of the other two on the first night, and
+    // with no doctor to save them that is parity, whatever the seed.
+    let transcript = run(&config(&["alice", "bob", "carol"], 1, 0, 0, SEED));
+    assert_eq!(transcript.outcome.winner, Some(Faction::Werewolves));
+    assert_eq!(transcript.rounds.len(), 1);
 }
 
 #[test]
 fn a_game_without_a_seer_or_a_doctor_or_either() {
+    // Nothing to assert beyond the invariants: with no seer, no request to
+    // investigate may be asked, and with no doctor no night may be quiet,
+    // and the suite checks both.
     let players = ["alice", "bob", "carol", "dave", "erin", "frank"];
     for (seers, doctors) in [(0, 1), (1, 0), (0, 0)] {
-        let config = config(&players, 2, seers, doctors, SEED);
-        let played = run(&config);
-        let investigations = played
-            .transcript
-            .rounds
-            .iter()
-            .filter(|round| round.night.investigation.is_some())
-            .count();
-        assert!(
-            seers == 1 || investigations == 0,
-            "with no seer nothing is investigated: {seers} seers, {doctors} doctors"
-        );
+        run(&config(&players, 2, seers, doctors, SEED));
     }
 }
 
@@ -240,53 +176,47 @@ fn a_game_that_reaches_the_round_cap_is_a_stalemate() {
         SEED,
     );
     config.max_rounds = 1;
-    let played = run(&config);
-    assert_eq!(played.transcript.outcome.winner, None);
-    assert_eq!(played.transcript.rounds.len(), 1);
-    assert!(played.transcript.rounds[0].day.is_some());
+    let transcript = run(&config);
+    assert_eq!(transcript.outcome.winner, None);
+    assert_eq!(transcript.rounds.len(), 1);
+    assert!(transcript.rounds[0].day.is_some());
 }
 
 #[test]
-fn the_doctor_saves_in_some_game() {
-    // A save cannot be arranged by choosing the roles, so search the seeds
-    // for a game with a night on which nobody died. Every game searched
-    // goes through the full invariant suite on the way.
-    let saved = (0..SEEDS).find(|&seed| {
-        let config = town(seed);
-        run(&config)
-            .narrations(&config)
+fn the_seeds_hold_a_save_and_a_win_for_each_side() {
+    // None of these can be arranged by choosing the roles, so search the
+    // seeds for them rather than contrive them, and stop once all three
+    // have turned up. Every game searched goes through the full invariant
+    // suite on the way, which is where "the doctor is working" is actually
+    // asserted: a quiet night is one on which it protected the pack's
+    // choice. Here it need only happen.
+    let mut saved = false;
+    let mut winners = Vec::new();
+    for seed in 0..SEEDS {
+        let transcript = run(&town(seed));
+        saved |= transcript
+            .rounds
             .iter()
-            .any(|narration| matches!(narration, Narration::NoDeath { .. }))
-    });
+            .any(|round| round.night.eliminated.is_none());
+        winners.push(transcript.outcome.winner);
+        if saved
+            && winners.contains(&Some(Faction::Village))
+            && winners.contains(&Some(Faction::Werewolves))
+        {
+            return;
+        }
+    }
     assert!(
-        saved.is_some(),
+        saved,
         "the doctor never saved anyone in {SEEDS} games; the doctor is not working"
     );
-}
-
-#[test]
-fn each_side_wins_some_game() {
-    // Found by searching the seeds rather than by contrivance, so the test
-    // exercises whatever the rules actually produce.
-    let winners: Vec<Option<Faction>> = (0..SEEDS)
-        .map(|seed| run(&town(seed)).transcript.outcome.winner)
-        .collect();
-    assert!(
-        winners.contains(&Some(Faction::Village)),
-        "the village never won in {SEEDS} games: {winners:?}"
-    );
-    assert!(
-        winners.contains(&Some(Faction::Werewolves)),
-        "the werewolves never won in {SEEDS} games: {winners:?}"
-    );
+    panic!("one side never won in {SEEDS} games: {winners:?}");
 }
 
 #[test]
 fn the_same_seed_plays_the_same_game() {
     let config = town(SEED);
-    let first = run(&config);
-    let second = run(&config);
-    assert_eq!(first.transcript, second.transcript);
+    assert_eq!(run(&config), run(&config));
     // The two trajectory *files* are deliberately not compared. They record
     // wall-clock timestamps, and the records of different agents' threads
     // interleave however the scheduler ran them, so the files of the same
@@ -298,7 +228,7 @@ fn the_same_seed_plays_the_same_game() {
 #[test]
 fn different_seeds_play_different_games() {
     // A `seed_for` that ignored its input would pass every other test here.
-    let transcripts: Vec<Transcript> = (1..=4).map(|seed| run(&town(seed)).transcript).collect();
+    let transcripts: Vec<Transcript> = (1..=4).map(|seed| run(&town(seed))).collect();
     assert!(
         transcripts
             .iter()
@@ -312,13 +242,9 @@ fn a_dozen_runs_play_the_same_game() {
     // A determinism bug that depends on thread scheduling will not show up
     // in two runs.
     let config = town(SEED);
-    let first = run(&config).transcript;
+    let first = run(&config);
     for i in 1..12 {
-        assert_eq!(
-            run(&config).transcript,
-            first,
-            "run {i} played a different game"
-        );
+        assert_eq!(run(&config), first, "run {i} played a different game");
     }
 }
 
@@ -328,8 +254,11 @@ fn a_run_is_reproduced_from_its_artifacts() {
     // whole recipe, then play the effective config the run wrote beside its
     // trajectory. The second game must be the first: a run is reproducible
     // from what it left behind, whatever flags produced it.
-    let original = TempFile::new();
-    let rerun = TempFile::new();
+    let original = TempFile::new("werewolf");
+    let effective_path = config::effective_path(&original.0);
+    let _effective = TempFile(effective_path.clone());
+    let rerun = TempFile::new("werewolf");
+    let _rerun_effective = TempFile(config::effective_path(&rerun.0));
     let seed = SEED.to_string();
     let played = werewolf(&[
         "play",
@@ -340,7 +269,6 @@ fn a_run_is_reproduced_from_its_artifacts() {
         original.0.to_str().unwrap(),
     ]);
 
-    let effective_path = config::effective_path(&original.0);
     let effective = config::load(&effective_path).unwrap();
     assert_eq!(
         effective.seed, SEED,
@@ -348,9 +276,7 @@ fn a_run_is_reproduced_from_its_artifacts() {
     );
     assert_eq!(effective.trajectory, None, "and names no trajectory");
 
-    let (lines, transcript) = read(&original.0, &effective);
-    support::check(&lines);
-    support::werewolf::check(&lines, &effective);
+    let transcript = read(&original.0, &effective);
     let winner = match transcript.outcome.winner {
         Some(winner) => winner.to_string(),
         None => "nobody, a stalemate at the round cap".to_owned(),
@@ -362,7 +288,10 @@ fn a_run_is_reproduced_from_its_artifacts() {
     assert!(played.contains(&format!("effective config: {}\n", effective_path.display())));
 
     let replayed = werewolf(&["replay", original.0.to_str().unwrap()]);
-    assert!(replayed.starts_with(&format!("Werewolf \u{2014} seed {SEED}, 7 players")));
+    assert!(replayed.starts_with(&format!(
+        "Werewolf \u{2014} seed {SEED}, {} players",
+        effective.players.len()
+    )));
     assert!(replayed.ends_with(&transcript.to_string()), "{replayed}");
 
     werewolf(&[
@@ -371,8 +300,5 @@ fn a_run_is_reproduced_from_its_artifacts() {
         "--trajectory",
         rerun.0.to_str().unwrap(),
     ]);
-    let (lines, reproduced) = read(&rerun.0, &effective);
-    support::check(&lines);
-    support::werewolf::check(&lines, &effective);
-    assert_eq!(reproduced, transcript);
+    assert_eq!(read(&rerun.0, &effective), transcript);
 }

@@ -11,12 +11,10 @@ mod support;
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
-use std::path::PathBuf;
-use std::process;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde_json::Value;
 use social_deception::{Episode, Writer};
+use support::TempFile;
 use support::collatz::Collatz;
 
 /// A ring of agents: each passes to the next in the list, and the last to
@@ -51,27 +49,6 @@ fn passes_to<'a>(ring: &Ring<'a>, i: usize) -> &'a str {
     ring[(i + 1) % ring.len()].0
 }
 
-/// A trajectory file in the temp dir, removed when this is dropped so that a
-/// failing test does not leave it behind.
-struct TempFile(PathBuf);
-
-impl TempFile {
-    fn new() -> Self {
-        static COUNTER: AtomicUsize = AtomicUsize::new(0);
-        Self(std::env::temp_dir().join(format!(
-            "social-deception-collatz-{}-{}.jsonl",
-            process::id(),
-            COUNTER.fetch_add(1, Ordering::Relaxed)
-        )))
-    }
-}
-
-impl Drop for TempFile {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
-    }
-}
-
 /// The chains a ring opens, each named by its start, with the sequence each
 /// one should pass.
 fn expected_chains(ring: &Ring) -> BTreeMap<u64, Vec<u64>> {
@@ -88,7 +65,7 @@ fn expected_chains(ring: &Ring) -> BTreeMap<u64, Vec<u64>> {
 /// returned, so that a malformed log fails by the name of the invariant it
 /// breaks rather than by a lookup that misses in the Collatz checks below.
 fn run(ring: &Ring) -> Vec<Value> {
-    let file = TempFile::new();
+    let file = TempFile::new("collatz");
     let (records, writer) = Writer::create(&file.0).unwrap();
     let mut episode = Episode::new(records);
     for (i, (name, opens)) in ring.iter().enumerate() {
