@@ -1,5 +1,7 @@
 //! The roles a player can hold, and the sides of the game they belong to.
 
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
 /// A player's role, dealt at the start of an episode and revealed at death.
@@ -30,6 +32,18 @@ pub enum Faction {
     Werewolves,
 }
 
+impl fmt::Display for Role {
+    /// The role's name as written, the same spelling it serializes as.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Villager => "Villager",
+            Self::Werewolf => "Werewolf",
+            Self::Seer => "Seer",
+            Self::Doctor => "Doctor",
+        })
+    }
+}
+
 impl Role {
     /// The side this role plays for. Only a werewolf is on the werewolves'.
     #[must_use]
@@ -53,6 +67,13 @@ mod tests {
         assert_eq!(Role::Werewolf.faction(), Faction::Werewolves);
         for role in [Role::Villager, Role::Seer, Role::Doctor] {
             assert_eq!(role.faction(), Faction::Village, "{role:?}");
+        }
+    }
+
+    #[test]
+    fn a_role_displays_as_its_name() {
+        for role in [Role::Villager, Role::Werewolf, Role::Seer, Role::Doctor] {
+            assert_eq!(json(&role), json!(role.to_string()), "{role:?}");
         }
     }
 

@@ -18,11 +18,16 @@ crossbeam-channel = "0.5"
 # Trajectory records.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# Seeded generators for everything a game draws at random: the deal, each
-# player's policy, and the moderator's tie-break. `ChaCha8Rng` rather than
-# `StdRng`, whose algorithm may change between `rand` releases.
-rand = "0.10"
+# Configuration files.
+toml = "1"
+# Seeded generators: `rand` for the traits and the shuffle, `rand_chacha` for
+# a generator whose algorithm is fixed across releases. `rand`'s default
+# features bring in the operating system's randomness, which nothing here
+# may use: every generator is seeded from the configuration.
+rand = { version = "0.10", default-features = false }
 rand_chacha = "0.10"
+# Command-line parsing for the binaries.
+clap = { version = "4", features = ["derive"] }
 
 # Lint configuration lives here, in one place, and is inherited by every
 # workspace member through `[lints] workspace = true`. Do not configure lints

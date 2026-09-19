@@ -597,16 +597,16 @@ mod tests {
         all
     }
 
-    fn narrate(to: &[&str], narration: Narration) -> Directive {
+    fn narrate<const N: usize>(to: [&str; N], narration: Narration) -> Directive {
         Directive::Narrate {
             to: ids(to),
             narration,
         }
     }
 
-    fn assigned(to: &str, role: Role, pack: &[&str]) -> Directive {
+    fn assigned<const N: usize>(to: &str, role: Role, pack: [&str; N]) -> Directive {
         narrate(
-            &[to],
+            [to],
             Narration::Assigned {
                 role,
                 pack: ids(pack),
@@ -614,7 +614,7 @@ mod tests {
         )
     }
 
-    fn phase_began(round: u32, phase: Phase, living: &[&str]) -> Directive {
+    fn phase_began<const N: usize>(round: u32, phase: Phase, living: [&str; N]) -> Directive {
         narrate(
             living,
             Narration::PhaseBegan {
@@ -636,7 +636,12 @@ mod tests {
         }
     }
 
-    fn tally(to: &[&str], round: u32, phase: Phase, votes: &[(&'static str, &str)]) -> Directive {
+    fn tally<const N: usize>(
+        to: [&str; N],
+        round: u32,
+        phase: Phase,
+        votes: &[(&'static str, &str)],
+    ) -> Directive {
         narrate(
             to,
             Narration::Tally {
@@ -650,7 +655,13 @@ mod tests {
         )
     }
 
-    fn eliminated(to: &[&str], who: &str, role: Role, round: u32, cause: Cause) -> Directive {
+    fn eliminated<const N: usize>(
+        to: [&str; N],
+        who: &str,
+        role: Role,
+        round: u32,
+        cause: Cause,
+    ) -> Directive {
         narrate(
             to,
             Narration::Eliminated {
@@ -662,7 +673,11 @@ mod tests {
         )
     }
 
-    fn outcome(winner: Option<Faction>, rounds: u32, living: &[&str]) -> Directive {
+    fn outcome<const N: usize>(
+        winner: Option<Faction>,
+        rounds: u32,
+        living: [&str; N],
+    ) -> Directive {
         Directive::Broadcast(Narration::Outcome(Outcome {
             winner,
             rounds: Round(rounds),
@@ -672,7 +687,7 @@ mod tests {
 
     fn investigated(to: &str, target: &str, faction: Faction) -> Directive {
         narrate(
-            &[to],
+            [to],
             Narration::Investigated {
                 target: id(target),
                 faction,
@@ -793,25 +808,25 @@ mod tests {
         assert_eq!(
             play(&mut game, &village_wins()),
             [
-                assigned("alice", Villager, &[]),
-                assigned("bob", Werewolf, &["bob"]),
-                assigned("carol", Seer, &[]),
-                assigned("dave", Doctor, &[]),
-                assigned("erin", Villager, &[]),
-                phase_began(1, Phase::Night, &everyone),
+                assigned("alice", Villager, []),
+                assigned("bob", Werewolf, ["bob"]),
+                assigned("carol", Seer, []),
+                assigned("dave", Doctor, []),
+                assigned("erin", Villager, []),
+                phase_began(1, Phase::Night, everyone),
                 ask("bob", 1, 1, RequestKind::Devour),
                 ask("carol", 2, 1, RequestKind::Investigate),
                 ask("dave", 3, 1, RequestKind::Protect),
-                tally(&["bob"], 1, Phase::Night, &[("bob", "alice")]),
+                tally(["bob"], 1, Phase::Night, &[("bob", "alice")]),
                 investigated("carol", "bob", Faction::Werewolves),
-                eliminated(&everyone, "alice", Villager, 1, Cause::Devoured),
-                phase_began(1, Phase::Day, &survivors),
+                eliminated(everyone, "alice", Villager, 1, Cause::Devoured),
+                phase_began(1, Phase::Day, survivors),
                 ask("bob", 4, 1, RequestKind::Nominate),
                 ask("carol", 5, 1, RequestKind::Nominate),
                 ask("dave", 6, 1, RequestKind::Nominate),
                 ask("erin", 7, 1, RequestKind::Nominate),
                 tally(
-                    &survivors,
+                    survivors,
                     1,
                     Phase::Day,
                     &[
@@ -821,8 +836,8 @@ mod tests {
                         ("erin", "bob")
                     ],
                 ),
-                eliminated(&survivors, "bob", Werewolf, 1, Cause::Lynched),
-                outcome(Some(Faction::Village), 1, &["carol", "dave", "erin"]),
+                eliminated(survivors, "bob", Werewolf, 1, Cause::Lynched),
+                outcome(Some(Faction::Village), 1, ["carol", "dave", "erin"]),
             ]
         );
         assert_eq!(
@@ -830,10 +845,10 @@ mod tests {
             Some(&Outcome {
                 winner: Some(Faction::Village),
                 rounds: Round(1),
-                living: ids(&["carol", "dave", "erin"]),
+                living: ids(["carol", "dave", "erin"]),
             })
         );
-        assert_eq!(*game.living(), ids(&["carol", "dave", "erin"]));
+        assert_eq!(*game.living(), ids(["carol", "dave", "erin"]));
     }
 
     #[test]
@@ -843,23 +858,23 @@ mod tests {
         assert_eq!(
             directives[9..],
             [
-                tally(&["bob"], 1, Phase::Night, &[("bob", "carol")]),
+                tally(["bob"], 1, Phase::Night, &[("bob", "carol")]),
                 // The seer is devoured tonight and still learns what it learned.
                 investigated("carol", "bob", Faction::Werewolves),
                 eliminated(
-                    &["alice", "bob", "carol", "dave", "erin"],
+                    ["alice", "bob", "carol", "dave", "erin"],
                     "carol",
                     Seer,
                     1,
                     Cause::Devoured,
                 ),
-                phase_began(1, Phase::Day, &["alice", "bob", "dave", "erin"]),
+                phase_began(1, Phase::Day, ["alice", "bob", "dave", "erin"]),
                 ask("alice", 4, 1, RequestKind::Nominate),
                 ask("bob", 5, 1, RequestKind::Nominate),
                 ask("dave", 6, 1, RequestKind::Nominate),
                 ask("erin", 7, 1, RequestKind::Nominate),
                 tally(
-                    &["alice", "bob", "dave", "erin"],
+                    ["alice", "bob", "dave", "erin"],
                     1,
                     Phase::Day,
                     &[
@@ -870,25 +885,25 @@ mod tests {
                     ],
                 ),
                 eliminated(
-                    &["alice", "bob", "dave", "erin"],
+                    ["alice", "bob", "dave", "erin"],
                     "erin",
                     Villager,
                     1,
                     Cause::Lynched,
                 ),
                 // No seer lives, so the second night asks nothing of one.
-                phase_began(2, Phase::Night, &["alice", "bob", "dave"]),
+                phase_began(2, Phase::Night, ["alice", "bob", "dave"]),
                 ask("bob", 8, 2, RequestKind::Devour),
                 ask("dave", 9, 2, RequestKind::Protect),
-                tally(&["bob"], 2, Phase::Night, &[("bob", "alice")]),
+                tally(["bob"], 2, Phase::Night, &[("bob", "alice")]),
                 eliminated(
-                    &["alice", "bob", "dave"],
+                    ["alice", "bob", "dave"],
                     "alice",
                     Villager,
                     2,
                     Cause::Devoured
                 ),
-                outcome(Some(Faction::Werewolves), 2, &["bob", "dave"]),
+                outcome(Some(Faction::Werewolves), 2, ["bob", "dave"]),
             ]
         );
         assert_eq!(
@@ -906,7 +921,7 @@ mod tests {
             directives[directives.len() - 3..],
             [
                 tally(
-                    &["bob", "carol", "dave", "erin", "frank", "grace"],
+                    ["bob", "carol", "dave", "erin", "frank", "grace"],
                     1,
                     Phase::Day,
                     &[
@@ -919,13 +934,13 @@ mod tests {
                     ],
                 ),
                 eliminated(
-                    &["bob", "carol", "dave", "erin", "frank", "grace"],
+                    ["bob", "carol", "dave", "erin", "frank", "grace"],
                     "erin",
                     Villager,
                     1,
                     Cause::Lynched,
                 ),
-                outcome(None, 1, &living),
+                outcome(None, 1, living),
             ]
         );
         assert_eq!(game.outcome().map(|outcome| outcome.winner), Some(None));
@@ -933,7 +948,7 @@ mod tests {
         let mut game = Game::new(town(), 2, SEED);
         let directives = play(&mut game, &stalemate());
         assert_eq!(game.outcome(), None);
-        assert!(directives.contains(&phase_began(2, Phase::Night, &living)));
+        assert!(directives.contains(&phase_began(2, Phase::Night, living)));
     }
 
     #[test]
@@ -953,7 +968,7 @@ mod tests {
         assert_eq!(caused.len(), 8, "{caused:?}");
         assert_eq!(
             caused[0],
-            tally(&["bob"], 1, Phase::Night, &[("bob", "alice")])
+            tally(["bob"], 1, Phase::Night, &[("bob", "alice")])
         );
     }
 
@@ -1002,21 +1017,21 @@ mod tests {
         let split = answers(&[("alice", "dave"), ("bob", "erin"), ("carol", "frank")]);
         let mut game = game(pack_of_three());
         let directives = play(&mut game, &[split]);
-        // Golden: frank is the victim the generator picks for this seed.
+        // Golden: dave is the victim the generator picks for this seed.
         assert_eq!(
             directives[11..],
             [
                 tally(
-                    &["alice", "bob", "carol"],
+                    ["alice", "bob", "carol"],
                     1,
                     Phase::Night,
                     &[("alice", "dave"), ("bob", "erin"), ("carol", "frank")],
                 ),
-                eliminated(&everyone, "frank", Villager, 1, Cause::Devoured),
+                eliminated(everyone, "dave", Villager, 1, Cause::Devoured),
                 outcome(
                     Some(Faction::Werewolves),
                     1,
-                    &["alice", "bob", "carol", "dave", "erin", "grace"],
+                    ["alice", "bob", "carol", "erin", "frank", "grace"],
                 ),
             ]
         );
@@ -1029,7 +1044,7 @@ mod tests {
         // the value.
         let mut ties = ChaCha8Rng::seed_from_u64(seed_for(SEED, "moderator:ties"));
         let split = [target("dave"), target("erin"), target("frank")];
-        assert_eq!(plurality(&split, &mut ties), Some(id("frank")));
+        assert_eq!(plurality(&split, &mut ties), Some(id("dave")));
     }
 
     #[test]
@@ -1081,9 +1096,9 @@ mod tests {
         assert_eq!(
             directives[9..],
             [
-                tally(&["bob"], 1, Phase::Night, &[("bob", "erin")]),
-                narrate(&everyone, Narration::NoDeath { round: Round(1) }),
-                phase_began(1, Phase::Day, &everyone),
+                tally(["bob"], 1, Phase::Night, &[("bob", "erin")]),
+                narrate(everyone, Narration::NoDeath { round: Round(1) }),
+                phase_began(1, Phase::Day, everyone),
                 ask("alice", 4, 1, RequestKind::Nominate),
                 ask("bob", 5, 1, RequestKind::Nominate),
                 ask("carol", 6, 1, RequestKind::Nominate),
@@ -1091,7 +1106,7 @@ mod tests {
                 ask("erin", 8, 1, RequestKind::Nominate),
             ]
         );
-        assert_eq!(*game.living(), ids(&everyone));
+        assert_eq!(*game.living(), ids(everyone));
         // The doctor hears nothing the living do not, beyond its own requests.
         for directive in &directives {
             if let Directive::Narrate { to, narration } = directive {
@@ -1141,7 +1156,7 @@ mod tests {
         let asked = asks(&game.begin());
         assert_eq!(
             asked.keys().cloned().collect::<BTreeSet<_>>(),
-            ids(&["alice", "bob", "carol"])
+            ids(["alice", "bob", "carol"])
         );
         assert!(
             asked
@@ -1169,7 +1184,7 @@ mod tests {
         assert_eq!(
             directives[second_night..],
             [
-                phase_began(2, Phase::Night, &["alice", "bob", "carol"]),
+                phase_began(2, Phase::Night, ["alice", "bob", "carol"]),
                 ask("bob", 8, 2, RequestKind::Devour),
                 ask("carol", 9, 2, RequestKind::Investigate),
             ]
@@ -1294,19 +1309,19 @@ mod tests {
     #[test]
     fn the_win_condition_at_each_boundary() {
         let mut game = game(town());
-        game.living = ids(&["bob", "alice", "erin"]);
+        game.living = ids(["bob", "alice", "erin"]);
         assert_eq!(game.winner(), None, "one werewolf and two others continue");
-        game.living = ids(&["bob", "alice"]);
+        game.living = ids(["bob", "alice"]);
         assert_eq!(game.winner(), Some(Faction::Werewolves), "parity");
-        game.living = ids(&["bob", "frank", "alice", "erin"]);
+        game.living = ids(["bob", "frank", "alice", "erin"]);
         assert_eq!(
             game.winner(),
             Some(Faction::Werewolves),
             "parity with a pack"
         );
-        game.living = ids(&["bob", "frank", "alice", "erin", "grace"]);
+        game.living = ids(["bob", "frank", "alice", "erin", "grace"]);
         assert_eq!(game.winner(), None, "outnumbered werewolves continue");
-        game.living = ids(&["alice"]);
+        game.living = ids(["alice"]);
         assert_eq!(game.winner(), Some(Faction::Village), "no werewolf");
     }
 

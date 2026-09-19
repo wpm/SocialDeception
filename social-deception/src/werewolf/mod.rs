@@ -1,17 +1,24 @@
-//! Werewolf: the types every part of the game is written against, and the
-//! rules of the game as a pure state machine.
+//! Werewolf: the types every part of the game is written against, the
+//! setup that happens before an episode runs, and the rules of the game as
+//! a pure state machine.
 //!
 //! The vocabulary is the [`Role`]s a player can be dealt, the [`Faction`]s
 //! they play for, the [`Round`] and [`Phase`] that locate a moment in a
 //! game, and [`Message`], the one payload type that travels over the
 //! runtime's [`Event`](crate::Event) between the moderator and the players.
-//! The only facts the vocabulary states are properties of a request kind
-//! itself, such as which phase it belongs to.
+//! The only facts it states are properties of a request kind itself, such as
+//! which phase it belongs to; every rule that depends on who is alive lives
+//! with the moderator and the roles, not here.
 //!
-//! The rules live in [`Game`], which takes an [`Assignment`] of roles and
+//! The setup is a [`Config`] read from a TOML file ([`config`]), the
+//! [`Assignment`] of roles dealt from its seed ([`assignment`]), and
+//! [`seed_for`], which derives every generator's seed from the master seed
+//! ([`seed`]). The `werewolf` binary loads a configuration, deals the roles
+//! and prints the result.
+//!
+//! The rules live in [`Game`] ([`game`]), which takes an [`Assignment`] and
 //! plays the game as a fold over players' responses, producing
-//! [`Directive`]s that say what to tell whom. Everything that draws at
-//! random is seeded through [`seed_for`].
+//! [`Directive`]s that say what to tell whom.
 //!
 //! # Three kinds of message
 //!
@@ -41,6 +48,12 @@
 //! Every narration is true. Player-to-player dialogue, which may be false,
 //! would be a fourth kind of message and is not defined here.
 //!
+//! # What a player knows
+//!
+//! [`Knowledge`] is the state a player carries between passes: the fold of
+//! every observation it has received, and what a policy conditions on. It
+//! records only what the moderator said, so nothing in it can be false.
+//!
 //! # What no message carries
 //!
 //! No message carries the episode's seed, and no type here has a field that
@@ -63,13 +76,17 @@
 //! environment alone.
 
 pub mod assignment;
+pub mod config;
 pub mod game;
+pub mod knowledge;
 pub mod message;
 pub mod role;
 pub mod seed;
 
 pub use assignment::Assignment;
+pub use config::{Config, ConfigError, RoleCounts};
 pub use game::{Directive, Game};
+pub use knowledge::{Death, Heard, Knowledge};
 pub use message::{
     Action, Cause, Message, Narration, Outcome, Phase, Request, RequestId, RequestKind, Response,
     Round,

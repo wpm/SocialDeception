@@ -29,12 +29,12 @@ pub(crate) fn json<T: serde::Serialize>(value: &T) -> Value {
     serde_json::to_value(value).unwrap()
 }
 
-/// An agent id from a name.
+/// An agent id, for tests that name agents by string literal.
 pub(crate) fn id(name: &str) -> AgentId {
     AgentId::new(name)
 }
 
-/// A set of agent ids from names.
-pub(crate) fn ids(names: &[&str]) -> BTreeSet<AgentId> {
-    names.iter().map(|name| id(name)).collect()
+/// A set of agent ids, for tests that name agents by string literal.
+pub(crate) fn ids<const N: usize>(names: [&str; N]) -> BTreeSet<AgentId> {
+    names.map(AgentId::new).into()
 }
