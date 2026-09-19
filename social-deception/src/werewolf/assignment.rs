@@ -60,6 +60,13 @@ impl Assignment {
             .chain(repeat_n(Role::Villager, villagers))
             .collect();
         let mut rng = ChaCha8Rng::seed_from_u64(seed_for(config.seed, LABEL));
+        // `ChaCha8Rng` and `seed_from_u64` are value-stable across `rand`
+        // releases; `shuffle` is not, so a `rand` bump can change the deal
+        // for the same seed. The golden test below is what catches that. If
+        // it ever fires for that reason, replace this call with a hand-rolled
+        // Fisher-Yates over `rng.next_u64()`, which pins the permutation by
+        // construction, and keep the golden value that the hand-rolled
+        // version produces.
         roles.shuffle(&mut rng);
         let roles: BTreeMap<AgentId, Role> = players.into_iter().cloned().zip(roles).collect();
         let pack = roles
