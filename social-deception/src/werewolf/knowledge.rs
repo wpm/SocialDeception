@@ -551,6 +551,21 @@ mod tests {
     }
 
     #[test]
+    fn what_the_agent_did_is_part_of_the_same_pure_fold() {
+        let night = |knowledge: &mut Knowledge| {
+            knowledge.observe(&phase_began(1, Phase::Night, ids(["alice", "bob", ME])));
+            knowledge.acted(&request(RequestKind::Protect), &target("alice"));
+            knowledge.observe(&narrated(Narration::NoDeath { round: Round(1) }));
+        };
+        let mut first = Knowledge::new(id(ME), Role::Doctor);
+        let mut second = Knowledge::new(id(ME), Role::Doctor);
+        night(&mut first);
+        night(&mut second);
+        assert_eq!(first, second);
+        assert_eq!(first.last_protected, Some(id("alice")));
+    }
+
+    #[test]
     fn independent_observations_fold_in_any_order() {
         let opening = [
             assigned(Role::Seer, BTreeSet::new()),
