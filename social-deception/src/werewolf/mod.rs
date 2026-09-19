@@ -1,12 +1,19 @@
-//! Werewolf: the types every part of the game is written against.
+//! Werewolf: the types every part of the game is written against, and the
+//! setup that happens before an episode runs.
 //!
-//! This module holds vocabulary: the [`Role`]s a player can be dealt, the
-//! [`Faction`]s they play for, the [`Round`] and [`Phase`] that locate a
-//! moment in a game, and [`Message`], the one payload type that travels over
-//! the runtime's [`Event`](crate::Event) between the moderator and the
-//! players. The only facts it states are properties of a request kind
-//! itself, such as which phase it belongs to; every rule that depends on who
-//! is alive lives with the moderator and the roles, not here.
+//! The vocabulary is the [`Role`]s a player can be dealt, the [`Faction`]s
+//! they play for, the [`Round`] and [`Phase`] that locate a moment in a
+//! game, and [`Message`], the one payload type that travels over the
+//! runtime's [`Event`](crate::Event) between the moderator and the players.
+//! The only facts it states are properties of a request kind itself, such as
+//! which phase it belongs to; every rule that depends on who is alive lives
+//! with the moderator and the roles, not here.
+//!
+//! The setup is a [`Config`] read from a TOML file ([`config`]), the
+//! [`Assignment`] of roles dealt from its seed ([`assignment`]), and
+//! [`seed_for`], which derives every generator's seed from the master seed
+//! ([`seed`]). The `werewolf` binary loads a configuration, deals the roles
+//! and prints the result.
 //!
 //! # Three kinds of message
 //!
@@ -57,11 +64,17 @@
 //! whatever reads a trajectory back; the payload's shape belongs to the
 //! environment alone.
 
+pub mod assignment;
+pub mod config;
 pub mod message;
 pub mod role;
+pub mod seed;
 
+pub use assignment::Assignment;
+pub use config::{Config, ConfigError, RoleCounts};
 pub use message::{
     Action, Cause, Message, Narration, Outcome, Phase, Request, RequestId, RequestKind, Response,
     Round,
 };
 pub use role::{Faction, Role};
+pub use seed::seed_for;
