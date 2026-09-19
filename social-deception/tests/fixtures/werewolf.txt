@@ -1,0 +1,38 @@
+  alice  Villager   bob    Villager   carol  Doctor     dave   Werewolf
+  erin   Werewolf   frank  Villager   grace  Seer
+
+Night 1  (7 living)
+  carol protects alice
+  dave  devours alice
+  erin  devours bob
+  grace investigates bob  ->  Village
+  no one died
+
+Day 1  (7 living)
+  alice -> frank   bob   -> carol   carol -> bob     dave  -> alice
+  erin  -> alice   frank -> grace   grace -> erin
+  alice is lynched   (Villager)
+
+Night 2  (6 living)
+  carol protects frank
+  dave  devours erin
+  erin  devours carol
+  grace investigates erin  ->  Werewolves
+  erin is devoured   (Werewolf)
+
+Day 2  (5 living)
+  bob   -> grace   carol -> frank   dave  -> bob     frank -> grace
+  grace -> frank
+  frank is lynched   (Villager)
+
+Night 3  (4 living)
+  carol protects dave
+  dave  devours carol
+  grace investigates no one
+  carol is devoured   (Doctor)
+
+Day 3  (3 living)
+  bob   -> dave    dave  -> bob     grace -> dave
+  dave is lynched   (Werewolf)
+
+Village wins after 3 rounds.  Survivors: bob, grace

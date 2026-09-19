@@ -20,6 +20,12 @@
 //! plays the game as a fold over players' responses, producing
 //! [`Directive`]s that say what to tell whom.
 //!
+//! A trajectory written by a run reads back as a [`Transcript`]
+//! ([`transcript`]): the logical game, with the timestamps and the
+//! interleaving of agents' records projected out, so that two transcripts
+//! are equal exactly when the same game was played. The `werewolf` binary's
+//! `replay` renders one.
+//!
 //! # Three kinds of message
 //!
 //! | Message | Direction | Is |
@@ -82,6 +88,7 @@ pub mod knowledge;
 pub mod message;
 pub mod role;
 pub mod seed;
+pub mod transcript;
 
 pub use assignment::Assignment;
 pub use config::{Config, ConfigError, RoleCounts};
@@ -93,3 +100,4 @@ pub use message::{
 };
 pub use role::{Faction, Role};
 pub use seed::seed_for;
+pub use transcript::{PhaseRecord, RoundRecord, Transcript, TranscriptError};

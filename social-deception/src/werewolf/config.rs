@@ -177,6 +177,23 @@ impl Error for ConfigError {
     }
 }
 
+/// Where the effective configuration of a run is written, beside its
+/// trajectory: the trajectory's path with `.toml` appended, so
+/// `werewolf.jsonl` has `werewolf.jsonl.toml` beside it.
+///
+/// The effective configuration is the [`Config`] a run was played from after
+/// any command-line overrides, without its `trajectory` field. It exists
+/// because the seed never appears in a trajectory, and a run has to be
+/// reproducible from its artifacts. Appending the extension rather than
+/// replacing it means the file can never collide with the configuration the
+/// run was started from, however the two are named.
+#[must_use]
+pub fn effective_path(trajectory: &Path) -> PathBuf {
+    let mut path = trajectory.as_os_str().to_owned();
+    path.push(".toml");
+    PathBuf::from(path)
+}
+
 /// Reads and validates a configuration file.
 ///
 /// # Errors
@@ -346,6 +363,24 @@ mod tests {
         let config = load(EXAMPLE).unwrap();
         assert_eq!(config.players.len(), 7);
         assert_eq!(config.roles.werewolves, 2);
+    }
+
+    #[test]
+    fn the_effective_config_sits_beside_the_trajectory() {
+        assert_eq!(
+            effective_path(Path::new("werewolf.jsonl")),
+            PathBuf::from("werewolf.jsonl.toml")
+        );
+        assert_eq!(
+            effective_path(Path::new("runs/first.jsonl")),
+            PathBuf::from("runs/first.jsonl.toml")
+        );
+        // The extension is appended, never replaced, so a trajectory named
+        // like a configuration cannot have its configuration overwritten.
+        assert_eq!(
+            effective_path(Path::new("werewolf.toml")),
+            PathBuf::from("werewolf.toml.toml")
+        );
     }
 
     #[test]
