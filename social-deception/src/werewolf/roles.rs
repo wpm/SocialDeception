@@ -24,10 +24,10 @@
 //! request of any other kind is a bug in the moderator: the role panics
 //! naming itself and the kind. The one role-specific rule in the game is
 //! the doctor's: it may not protect the same player on two consecutive
-//! nights, so its `Protect` action space also excludes whoever it protected
-//! last night. That is a rule of the variant, not advice, and it is why
-//! `Abstain` has to be in that action space: with few players living, the
-//! base set minus last night's target can be empty.
+//! nights, so its `Protect` action space also excludes
+//! [`Knowledge::last_protected`]. That is a rule of the variant, not
+//! advice, and it is why `Abstain` has to be in that action space: with few
+//! players living, the base set minus last night's target can be empty.
 //!
 //! The action space is never empty when a request is legitimately issued:
 //! `Nominate` and `Devour` are only asked while at least one valid target
@@ -174,9 +174,6 @@ impl Player for Seer {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Doctor {
     knowledge: Knowledge,
-    /// Whom the doctor protected last night, if anyone: the one player its
-    /// `Protect` action space excludes tonight.
-    last_protected: Option<AgentId>,
 }
 
 impl Doctor {
@@ -186,7 +183,6 @@ impl Doctor {
     pub fn new(me: AgentId) -> Self {
         Self {
             knowledge: Knowledge::new(me, Role::Doctor),
-            last_protected: None,
         }
     }
 }
@@ -204,18 +200,10 @@ impl Player for Doctor {
     /// night. `Abstain` is always there, so the space is never empty.
     fn action_space(&self, request: &Request) -> Vec<Action> {
         let mut space = base_action_space(&self.knowledge, request);
-        if let (RequestKind::Protect, Some(last)) = (request.kind, &self.last_protected) {
+        if let (RequestKind::Protect, Some(last)) = (request.kind, &self.knowledge.last_protected) {
             space.retain(|action: &Action| action.target() != Some(last));
         }
         space
-    }
-
-    /// Remembers the target of a `Protect`, and forgets it on an abstain,
-    /// since there was no protection to repeat.
-    fn chose(&mut self, request: &Request, action: &Action) {
-        if request.kind == RequestKind::Protect {
-            self.last_protected = action.target().cloned();
-        }
     }
 }
 
@@ -248,7 +236,9 @@ mod tests {
 
     /// Answers a `Protect` with `action`, the way a seat would.
     fn protected(doctor: &mut Doctor, action: &Action) {
-        doctor.chose(&request(RequestKind::Protect), action);
+        doctor
+            .knowledge_mut()
+            .acted(&request(RequestKind::Protect), action);
     }
 
     #[test]
@@ -396,17 +386,6 @@ mod tests {
         assert_eq!(
             doctor.action_space(&request(RequestKind::Nominate)),
             [target("alice"), target("bob")]
-        );
-    }
-
-    #[test]
-    fn only_a_protect_is_remembered() {
-        let mut doctor = doctor(["alice", "bob"]);
-        doctor.chose(&request(RequestKind::Nominate), &target("alice"));
-        assert_eq!(doctor.last_protected, None);
-        assert_eq!(
-            doctor.action_space(&request(RequestKind::Protect)),
-            [target("alice"), target("bob"), Action::Abstain]
         );
     }
 

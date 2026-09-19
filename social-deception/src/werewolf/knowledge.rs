@@ -28,6 +28,15 @@
 //! line between that type and this one is drawn here, so that it can be added
 //! without touching this one.
 //!
+//! The one thing here that the moderator never said is what the agent itself
+//! did in secret. What a player has done is still knowledge, and it is true
+//! for the same reason: the player was there. Almost all of it reaches the
+//! state by narration anyway, since a nomination or a devour comes back in
+//! a tally and an investigation comes back as its result. The doctor's
+//! protection is the exception, announced to nobody, and the rules need it
+//! the next night, so [`Knowledge::acted`] folds it in beside the
+//! observations.
+//!
 //! # Purity
 //!
 //! A `Knowledge` is a pure function of the observations folded into it. The
@@ -38,7 +47,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::message::{Action, Cause, Message, Narration, Outcome, Phase, Round};
+use super::message::{
+    Action, Cause, Message, Narration, Outcome, Phase, Request, RequestKind, Round,
+};
 use super::role::{Faction, Role};
 use crate::event::{AgentId, Event};
 
@@ -68,6 +79,10 @@ pub struct Knowledge {
     pub pack: BTreeSet<AgentId>,
     /// What the seer has learned, by target. Empty unless it is the seer.
     pub investigations: BTreeMap<AgentId, Faction>,
+    /// Whom the doctor protected last night, if anyone: the one player the
+    /// rules keep it from protecting again tonight. `None` unless it is the
+    /// doctor and its last protection was not an abstention.
+    pub last_protected: Option<AgentId>,
     /// Every tally this agent was told, oldest first.
     pub tallies: Vec<Heard>,
     /// Set once the game is over.
@@ -108,8 +123,24 @@ impl Knowledge {
             dead: BTreeMap::new(),
             pack: BTreeSet::new(),
             investigations: BTreeMap::new(),
+            last_protected: None,
             tallies: Vec::new(),
             outcome: None,
+        }
+    }
+
+    /// Folds one of this agent's own actions into the state: the answer it
+    /// gave to `request`.
+    ///
+    /// Total, like [`observe`](Self::observe), and almost always a no-op,
+    /// because the moderator narrates the consequences of nearly every
+    /// action back to the agent. The one exception is a `Protect`, which is
+    /// announced to nobody: its target is remembered as
+    /// [`last_protected`](Self::last_protected), and an abstention clears
+    /// it, since there was no protection to repeat.
+    pub fn acted(&mut self, request: &Request, action: &Action) {
+        if request.kind == RequestKind::Protect {
+            self.last_protected = action.target().cloned();
         }
     }
 
@@ -221,8 +252,8 @@ impl Knowledge {
 mod tests {
     use super::*;
     use crate::event::Control;
-    use crate::testing::{ME, id, ids, narrated, phase_began, target};
-    use crate::werewolf::message::{Request, RequestId, RequestKind, Response};
+    use crate::testing::{ME, id, ids, narrated, phase_began, request, target};
+    use crate::werewolf::message::{RequestId, Response};
 
     fn votes<const N: usize>(votes: [(&str, Action); N]) -> BTreeMap<AgentId, Action> {
         votes
@@ -331,6 +362,7 @@ mod tests {
                     (id("wolfgang"), Faction::Werewolves),
                     (id("bob"), Faction::Village),
                 ]),
+                last_protected: None,
                 tallies: vec![Heard {
                     round: Round(1),
                     phase: Phase::Day,
@@ -446,6 +478,38 @@ mod tests {
             let mut after = knowledge.clone();
             after.observe(event);
             assert_eq!(after, knowledge, "{event:?}");
+        }
+    }
+
+    #[test]
+    fn a_protection_is_remembered_until_the_next_one_and_forgotten_on_an_abstain() {
+        let mut knowledge = Knowledge::new(id(ME), Role::Doctor);
+        let protect = request(RequestKind::Protect);
+        assert_eq!(knowledge.last_protected, None);
+
+        knowledge.acted(&protect, &target("alice"));
+        assert_eq!(knowledge.last_protected, Some(id("alice")));
+
+        knowledge.acted(&protect, &target("bob"));
+        assert_eq!(knowledge.last_protected, Some(id("bob")));
+
+        knowledge.acted(&protect, &Action::Abstain);
+        assert_eq!(knowledge.last_protected, None);
+    }
+
+    #[test]
+    fn only_a_protection_is_remembered() {
+        // Every other action comes back to the agent by narration, so the
+        // state has nothing to record when it is taken.
+        let before = folded(Role::Seer, &a_seers_game()[..8]);
+        for kind in [
+            RequestKind::Nominate,
+            RequestKind::Devour,
+            RequestKind::Investigate,
+        ] {
+            let mut after = before.clone();
+            after.acted(&request(kind), &target("alice"));
+            assert_eq!(after, before, "{kind:?}");
         }
     }
 

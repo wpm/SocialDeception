@@ -51,10 +51,6 @@ pub trait Player {
     /// If the request is of a kind this role is never asked, which is a bug
     /// in the moderator rather than a runtime condition.
     fn action_space(&self, request: &Request) -> Vec<Action>;
-
-    /// Called after an action is chosen, so that a role can remember it.
-    /// Most roles have nothing to remember.
-    fn chose(&mut self, _request: &Request, _action: &Action) {}
 }
 
 /// A player as an agent in the episode: a role, the policy that decides for
@@ -83,7 +79,7 @@ impl<R: Player, P: Policy> Seat<R, P> {
     }
 
     /// The response to one request: the policy's choice from the role's
-    /// action space, checked against it and remembered by the role.
+    /// action space, checked against it and folded into the role's state.
     fn answer(&mut self, request: &Request) -> Response {
         let action_space = self.player.action_space(request);
         let action = self.policy.choose(&View {
@@ -96,7 +92,7 @@ impl<R: Player, P: Policy> Seat<R, P> {
             "{}'s policy chose {action:?}, which is outside the action space {action_space:?}",
             self.player.knowledge().me
         );
-        self.player.chose(request, &action);
+        self.player.knowledge_mut().acted(request, &action);
         Response {
             request: request.id,
             action,
@@ -273,9 +269,9 @@ mod tests {
     }
 
     #[test]
-    fn a_role_remembers_what_was_chosen_for_it() {
+    fn what_was_chosen_is_folded_into_the_state() {
         // The doctor may not protect the same player two nights running,
-        // and it is the seat that tells it what it chose.
+        // and it is the seat that folds each protection into its knowledge.
         let mut seat = doctor(First);
         let night = |round| {
             [
