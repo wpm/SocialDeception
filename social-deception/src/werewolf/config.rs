@@ -18,6 +18,12 @@
 //! came from it has passed every check [`ConfigError`] names and a bad file
 //! never reaches a thread. A key the schema does not know is a parse error,
 //! so a misspelled optional key cannot silently take its default.
+//!
+//! A configuration also writes back out, as the *effective configuration* of
+//! a run: [`Config::effective`] is the TOML that [`load`] reads back to the
+//! same value, and the `werewolf` binary writes it beside every trajectory,
+//! at [`effective_path`], so that a run can be reproduced from its artifacts
+//! alone.
 
 use std::collections::BTreeSet;
 use std::error::Error;
@@ -26,7 +32,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::event::AgentId;
 
@@ -40,7 +46,11 @@ pub const DEFAULT_MODERATOR: &str = "moderator";
 ///
 /// A `Config` built by hand can be invalid; [`Config::validate`] is the check
 /// that [`load`] and [`Config::parse`] apply.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+///
+/// It serializes with the same field names and defaults [`load`] reads, so
+/// what is written back reads back to an equal `Config`; an unset
+/// `trajectory` is left out rather than written as nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     /// The master seed every generator in the episode is derived from.
@@ -51,7 +61,7 @@ pub struct Config {
     /// How many of each special role to deal. The rest are villagers.
     pub roles: RoleCounts,
     /// Where to write the trajectory, if anywhere.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trajectory: Option<PathBuf>,
     /// The round after which an unfinished game is a stalemate.
     #[serde(default = "default_max_rounds")]
@@ -63,7 +73,7 @@ pub struct Config {
 }
 
 /// How many of each special role a game has.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RoleCounts {
     /// The pack. At least one.
@@ -278,6 +288,29 @@ impl Config {
             return Err(ConfigError::NoRounds);
         }
         Ok(())
+    }
+
+    /// The effective configuration of a run played from this one: the same
+    /// configuration as TOML, without its `trajectory` field.
+    ///
+    /// It is a valid configuration file in the schema [`load`] reads, and
+    /// reads back as this configuration with no trajectory. That is what
+    /// makes reproducing a run `werewolf play <trajectory>.toml --trajectory
+    /// <elsewhere>`: the trajectory is omitted so that replaying the file
+    /// cannot truncate the very trajectory it describes, and a reproduction
+    /// names its own output.
+    ///
+    /// # Panics
+    ///
+    /// Never for a configuration [`load`] accepted; a configuration is plain
+    /// data that TOML can always represent.
+    #[must_use]
+    pub fn effective(&self) -> String {
+        let effective = Self {
+            trajectory: None,
+            ..self.clone()
+        };
+        toml::to_string(&effective).expect("a configuration is representable as TOML")
     }
 }
 
@@ -534,6 +567,34 @@ mod tests {
         let error = config.validate().unwrap_err();
         assert!(matches!(error, ConfigError::NoRounds), "{error:?}");
         assert!(error.to_string().contains("max_rounds"));
+    }
+
+    #[test]
+    fn the_effective_config_reads_back_as_the_config_without_its_trajectory() {
+        let config = valid();
+        let text = config.effective();
+        assert!(!text.contains("trajectory"), "{text}");
+        assert_eq!(
+            Config::parse(&text).unwrap(),
+            Config {
+                trajectory: None,
+                ..config
+            }
+        );
+    }
+
+    #[test]
+    fn the_effective_config_writes_the_defaults_out_in_full() {
+        // What was defaulted on the way in is explicit on the way out, so the
+        // file says what ran even if a default changes later.
+        let text = Config::parse(MINIMAL).unwrap().effective();
+        assert!(text.contains("max_rounds = 100"), "{text}");
+        assert!(text.contains("moderator = \"moderator\""), "{text}");
+        assert!(text.contains("seers = 0"), "{text}");
+        assert_eq!(
+            Config::parse(&text).unwrap(),
+            Config::parse(MINIMAL).unwrap()
+        );
     }
 
     #[test]

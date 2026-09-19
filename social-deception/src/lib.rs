@@ -24,7 +24,9 @@
 //! actions it may pick from and the [`Seat`](werewolf::Seat) that plays one
 //! as an agent, the [`Game`](werewolf::Game) whose rules decide what is said
 //! to whom, and the [`Moderator`](werewolf::Moderator) that runs it as an
-//! agent in the roster.
+//! agent in the roster. [`werewolf::run`] plays one episode of it from a
+//! [`Config`](werewolf::Config), and the `werewolf` binary is the command
+//! line for that.
 
 pub mod agent;
 pub mod clock;
