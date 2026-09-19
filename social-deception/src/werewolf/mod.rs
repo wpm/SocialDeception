@@ -18,7 +18,10 @@
 //!
 //! The rules live in [`Game`] ([`game`]), which takes an [`Assignment`] and
 //! plays the game as a fold over players' responses, producing
-//! [`Directive`]s that say what to tell whom.
+//! [`Directive`]s that say what to tell whom. The [`Moderator`]
+//! ([`moderator`]) is the agent that runs a game: the thin
+//! [`Handler`](crate::Handler) that folds the events on its inbox into the
+//! game and sends the directives as messages.
 //!
 //! # Three kinds of message
 //!
@@ -80,6 +83,7 @@ pub mod config;
 pub mod game;
 pub mod knowledge;
 pub mod message;
+pub mod moderator;
 pub mod role;
 pub mod seed;
 
@@ -91,5 +95,6 @@ pub use message::{
     Action, Cause, Message, Narration, Outcome, Phase, Request, RequestId, RequestKind, Response,
     Round,
 };
+pub use moderator::Moderator;
 pub use role::{Faction, Role};
 pub use seed::seed_for;
