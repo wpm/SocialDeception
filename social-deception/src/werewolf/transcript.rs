@@ -1276,15 +1276,11 @@ mod tests {
     /// would record, with nobody else's records and made-up stamps.
     struct Scribe {
         lines: Vec<Value>,
-        players: BTreeSet<AgentId>,
     }
 
     impl Scribe {
-        fn new(assignment: &Assignment) -> Self {
-            Self {
-                lines: Vec::new(),
-                players: assignment.players().map(|(who, _)| who.clone()).collect(),
-            }
+        fn new() -> Self {
+            Self { lines: Vec::new() }
         }
 
         /// One record of the moderator's, of the given type, with stamps
@@ -1320,9 +1316,6 @@ mod tests {
                 let (to, payload) = match directive {
                     Directive::Narrate { to, narration } => (to, Message::Narration(narration)),
                     Directive::Ask { to, request } => ([to].into(), Message::Request(request)),
-                    Directive::Broadcast(narration) => {
-                        (self.players.clone(), Message::Narration(narration))
-                    }
                 };
                 self.record("action", MODERATOR, &to, &payload);
             }
@@ -1341,7 +1334,7 @@ mod tests {
     /// Plays `script`, one phase's answers per entry, through a game over
     /// `assignment`, and returns the moderator's records.
     fn scripted(assignment: Assignment, script: &[Vec<(&str, Move)>]) -> Vec<Value> {
-        let mut scribe = Scribe::new(&assignment);
+        let mut scribe = Scribe::new();
         let mut game = Game::new(assignment, 1);
         let mut latest = game.begin();
         scribe.directives(latest.clone());
@@ -1350,7 +1343,7 @@ mod tests {
                 .iter()
                 .filter_map(|directive| match directive {
                     Directive::Ask { to, request } => Some((to.clone(), request.id)),
-                    _ => None,
+                    Directive::Narrate { .. } => None,
                 })
                 .collect();
             for (who, chosen) in answers {

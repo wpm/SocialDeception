@@ -18,6 +18,7 @@
 //! | [`Domain`] | the types one game contributes: its payload and its reward |
 //! | cycle | one turn of an agent's loop: pop, hand to the handler, send |
 //! | [`Cancel`] | the handler's view of whether its cycle has been preempted |
+//! | [`Environment`] | the one agent per episode that starts and stops the others |
 //!
 //! [`Observation`] and [`Action`] are relative to an agent; on the wire
 //! there are only events and controls. The same [`Event`] is the sent action
@@ -43,9 +44,12 @@
 //!   [`Observation`]s through a [`Handler`], and records what it saw and
 //!   sent;
 //! - [`router`]: the [`Router`] from agent ids to their channels;
-//! - [`episode`]: the [`Episode`] that runs a roster from start to stop.
+//! - [`environment`]: the [`Environment`], the one agent per episode whose
+//!   cycle may produce a [`Control`] as well as an [`Action`];
+//! - [`episode`]: the [`Episode`] that runs a roster and its environment
+//!   from start to stop.
 //!
-//! On top of that runtime sits one environment, [`werewolf`], whose
+//! On top of that runtime sits one game, [`werewolf`], whose
 //! [`WerewolfDomain`](werewolf::WerewolfDomain) names its types: the roles,
 //! phases and the [`Message`](werewolf::Message) payload that travels over
 //! [`Event`] in a game of Werewolf, the [`Knowledge`](werewolf::Knowledge)
@@ -53,14 +57,16 @@
 //! that picks its moves, the roles ([`werewolf::roles`]) whose rules say
 //! which moves it may pick from and the [`Seat`](werewolf::Seat) that plays
 //! one as an agent, the [`Game`](werewolf::Game) whose rules decide what is
-//! said to whom, and the [`Moderator`](werewolf::Moderator) that runs it as
-//! an agent in the roster. [`werewolf::run`] plays one episode of it from a
+//! said to whom, and the [`Moderator`](werewolf::Moderator), Werewolf's
+//! [`Environment`], which runs the game and starts and stops the players.
+//! [`werewolf::run`] plays one episode of it from a
 //! [`Config`](werewolf::Config), and the `werewolf` binary is the command
 //! line for that.
 
 pub mod agent;
 pub mod cancel;
 pub mod clock;
+pub mod environment;
 pub mod episode;
 pub mod event;
 pub mod router;
@@ -75,6 +81,7 @@ pub use agent::{
 };
 pub use cancel::{Arm, Cancel, ControlSender, Never, Signal};
 pub use clock::{Clock, Created, Timestamp, Timestamped};
+pub use environment::{Effect, Environment};
 pub use episode::{Episode, EpisodeError, Failure};
 pub use event::{AgentId, Control, Domain, Event, Payload};
 pub use router::{Queues, RouteError, Router};

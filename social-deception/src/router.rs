@@ -23,12 +23,23 @@
 //! it from being a state anything here can produce. See
 //! [`cancel`](crate::cancel).
 //!
+//! # Only the environment commands
+//!
+//! A control is the [`Environment`](crate::Environment)'s to send, and no
+//! ordinary agent's (ADR-0007). The types already say so — a
+//! [`Handler`](crate::Handler) returns [`Action`](crate::Action)s and has
+//! no way to name a control — so the router's check is a backstop against
+//! a hole in the runtime rather than against a game's code:
+//! [`command`](Router::command) refuses a control whose sender is not the
+//! environment the router was built with, with
+//! [`RouteError::NotTheEnvironment`].
+//!
 //! Channels are unbounded. With bounded channels one agent slow to drain its
 //! queues would apply back-pressure through the router to every other agent
 //! in the episode. A slow agent is a normal condition here and must not be
 //! able to stall the world.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 
@@ -53,6 +64,9 @@ pub enum RouteError {
     /// A recipient whose queue has been dropped, so the copy for it could
     /// not be delivered.
     QueueClosed(AgentId),
+    /// A control whose sender is not the episode's environment. Only the
+    /// environment commands; see the [module documentation](self).
+    NotTheEnvironment(AgentId),
 }
 
 impl fmt::Display for RouteError {
@@ -62,6 +76,9 @@ impl fmt::Display for RouteError {
             Self::NoRecipients => f.write_str("an event must have at least one recipient"),
             Self::Loopback(id) => write!(f, "agent {id} addressed itself"),
             Self::QueueClosed(id) => write!(f, "the queue of agent {id} is closed"),
+            Self::NotTheEnvironment(id) => {
+                write!(f, "agent {id} is not the environment and cannot command")
+            }
         }
     }
 }
@@ -105,15 +122,21 @@ impl<D: Domain> Clone for Queues<D> {
 #[derive(Debug)]
 pub struct Router<D: Domain> {
     queues: BTreeMap<AgentId, Queues<D>>,
+    environment: AgentId,
     clock: Clock,
 }
 
 impl<D: Domain> Router<D> {
-    /// A router over the given queues, stamping every control it sends with
-    /// `clock`.
+    /// A router over the given queues, whose `environment` is the one agent
+    /// allowed to [`command`](Router::command), stamping every control it
+    /// sends with `clock`.
     #[must_use]
-    pub fn new(queues: BTreeMap<AgentId, Queues<D>>, clock: Clock) -> Self {
-        Self { queues, clock }
+    pub fn new(queues: BTreeMap<AgentId, Queues<D>>, environment: AgentId, clock: Clock) -> Self {
+        Self {
+            queues,
+            environment,
+            clock,
+        }
     }
 
     /// The ids in the roster, in order.
@@ -167,27 +190,111 @@ impl<D: Domain> Router<D> {
         Ok(deliveries)
     }
 
-    /// Delivers a control to every agent in the roster, stamped with the
-    /// instant it was sent, and returns how many deliveries that was.
+    /// Delivers a control to each of `to`, stamped with the instant it was
+    /// sent, and returns how many deliveries that was.
     ///
     /// Each delivery trips the recipient's current cycle as it lands; see
     /// the [module documentation](self).
     ///
+    /// This is the episode's own way of commanding, and it asks no
+    /// questions about who is sending: the episode starts and stops the
+    /// environment, and is not an agent. What an *agent* asks for goes
+    /// through [`command`](Router::command).
+    ///
+    /// # A `Stop` discards whatever the recipient has not popped
+    ///
+    /// An agent that pops a `Stop` leaves the events still on its queue
+    /// unpopped, because an agent that has stopped did not observe them,
+    /// and a cycle already in progress sends nothing and logs what it
+    /// produced as `dropped`. So a `Stop` sent while anything is in flight
+    /// silently swallows deliveries, and *which* ones depends on the
+    /// scheduler.
+    ///
+    /// A caller that wants an orderly stop must therefore establish that
+    /// nothing is in flight first, as [`Episode`](crate::Episode) does by
+    /// holding a `Stop` back until its count of routed-and-unhandled
+    /// deliveries reads zero (ADR-0007). The episode's other `Stop`, the
+    /// one it sends to abandon an episode that has already failed, does
+    /// not and cannot wait for that: the trajectory it leaves is a record
+    /// of the failure, and may contain `dropped` records because of it.
+    ///
     /// # Errors
     ///
-    /// [`RouteError::QueueClosed`] if some agent's control queue has been
-    /// dropped. Agents before it in the roster have already received the
+    /// [`RouteError::UnknownAgent`] for a recipient not in the roster, and
+    /// [`RouteError::QueueClosed`] if a recipient's control queue has been
+    /// dropped. Recipients before it in the set have already received the
     /// control, and have already been tripped.
-    pub fn control(&self, control: Control) -> Result<usize, RouteError> {
+    pub fn control(&self, to: &BTreeSet<AgentId>, control: Control) -> Result<usize, RouteError> {
         let mut deliveries = 0;
-        for (id, queues) in &self.queues {
-            queues
+        for id in to {
+            self.queues_of(id)?
                 .controls
                 .control(self.clock, control)
                 .map_err(|_| RouteError::QueueClosed(id.clone()))?;
             deliveries += 1;
         }
         Ok(deliveries)
+    }
+
+    /// Delivers a control an agent asked for, having checked that the agent
+    /// is the environment.
+    ///
+    /// # Errors
+    ///
+    /// [`RouteError::NotTheEnvironment`] if `sender` is not the environment
+    /// this router was built with, [`RouteError::Loopback`] if the
+    /// environment addressed itself, and whatever
+    /// [`control`](Router::control) returns. Nothing is delivered when a
+    /// validation fails.
+    pub fn command(
+        &self,
+        sender: &AgentId,
+        to: &BTreeSet<AgentId>,
+        control: Control,
+    ) -> Result<usize, RouteError> {
+        self.validate(sender, to)?;
+        self.control(to, control)
+    }
+
+    /// Whether a control from `sender` to `to` would be accepted, without
+    /// sending it.
+    ///
+    /// This is what [`command`](Router::command) checks before it delivers
+    /// anything. It is public because a caller that has to hold a control
+    /// back — as an [`Episode`](crate::Episode) holds a `Stop` until
+    /// nothing is in flight — should still refuse a bad one where it was
+    /// asked for, rather than long afterwards.
+    ///
+    /// # Errors
+    ///
+    /// [`RouteError::NotTheEnvironment`] if `sender` is not the
+    /// environment, [`RouteError::Loopback`] if it addressed itself, and
+    /// [`RouteError::UnknownAgent`] for a recipient not in the roster.
+    pub fn validate(&self, sender: &AgentId, to: &BTreeSet<AgentId>) -> Result<(), RouteError> {
+        if *sender != self.environment {
+            return Err(RouteError::NotTheEnvironment(sender.clone()));
+        }
+        if to.contains(sender) {
+            return Err(RouteError::Loopback(sender.clone()));
+        }
+        // Every recipient is resolved before anything is sent, for the
+        // reason `route` resolves first: a control addressed to a stranger
+        // preempts nobody rather than everybody named before it.
+        for id in to {
+            self.queues_of(id)?;
+        }
+        Ok(())
+    }
+
+    /// Every agent in the roster but the environment: whom an episode
+    /// starts and stops through its environment.
+    #[must_use]
+    pub fn agents(&self) -> BTreeSet<AgentId> {
+        self.queues
+            .keys()
+            .filter(|id| **id != self.environment)
+            .cloned()
+            .collect()
     }
 
     fn queues_of(&self, id: &AgentId) -> Result<&Queues<D>, RouteError> {
@@ -217,6 +324,8 @@ mod tests {
         arm: Arm,
     }
 
+    /// A world whose agents are `names` and whose environment is the first
+    /// of them, which is the only one allowed to command.
     fn world(names: &[&str]) -> (Router<TestDomain>, BTreeMap<AgentId, Ends>) {
         let mut queues = BTreeMap::new();
         let mut ends = BTreeMap::new();
@@ -239,7 +348,16 @@ mod tests {
                 },
             );
         }
-        (Router::new(queues, Clock::start()), ends)
+        (
+            Router::new(queues, AgentId::new(names[0]), Clock::start()),
+            ends,
+        )
+    }
+
+    /// Every agent of a world, which is what the episode's own controls go
+    /// to.
+    fn all(names: &[&str]) -> BTreeSet<AgentId> {
+        names.iter().map(|name| AgentId::new(*name)).collect()
     }
 
     /// An event from `sender` to `recipients`, created at a time the router
@@ -317,7 +435,10 @@ mod tests {
     fn a_control_goes_to_everyone_stamped_with_when_it_was_sent() {
         let (router, queues) = world(&["a", "b", "c"]);
         let before = router.clock.now();
-        assert_eq!(router.control(Control::Start), Ok(3));
+        assert_eq!(
+            router.control(&all(&["a", "b", "c"]), Control::Start),
+            Ok(3)
+        );
         let after = router.clock.now();
         for ends in queues.values() {
             let delivered = ends.controls.try_recv().expect("a control was delivered");
@@ -343,8 +464,52 @@ mod tests {
             Err(RouteError::QueueClosed(id("b")))
         );
         assert_eq!(
-            router.control(Control::Stop),
+            router.control(&all(&["a", "b"]), Control::Stop),
             Err(RouteError::QueueClosed(id("b")))
+        );
+    }
+
+    #[test]
+    fn only_the_environment_commands() {
+        // The backstop for a hole in the runtime: an ordinary agent's
+        // handler has no way to name a control, so nothing in a game can
+        // reach this, and the check is here so that a future one cannot.
+        let (router, queues) = world(&["env", "a", "b"]);
+        assert_eq!(
+            router.command(&id("a"), &all(&["b"]), Control::Stop),
+            Err(RouteError::NotTheEnvironment(id("a")))
+        );
+        assert!(
+            queues[&id("b")].controls.try_recv().is_err(),
+            "a refused control reaches nobody"
+        );
+        assert_eq!(
+            router.command(&id("env"), &all(&["a", "b"]), Control::Stop),
+            Ok(2)
+        );
+        for name in ["a", "b"] {
+            assert_eq!(
+                queues[&id(name)].controls.try_recv().unwrap().control,
+                Control::Stop
+            );
+        }
+        assert_eq!(router.agents(), all(&["a", "b"]));
+    }
+
+    #[test]
+    fn an_environment_cannot_command_itself_or_a_stranger() {
+        let (router, queues) = world(&["env", "a"]);
+        assert_eq!(
+            router.command(&id("env"), &all(&["env", "a"]), Control::Stop),
+            Err(RouteError::Loopback(id("env")))
+        );
+        assert_eq!(
+            router.command(&id("env"), &all(&["a", "nobody"]), Control::Stop),
+            Err(RouteError::UnknownAgent(id("nobody")))
+        );
+        assert!(
+            queues[&id("a")].controls.try_recv().is_err(),
+            "a refused control reaches nobody, not even the recipients it named first"
         );
     }
 
@@ -359,7 +524,7 @@ mod tests {
             .map(|(who, ends)| (who, ends.arm.arm()))
             .collect();
         assert!(cycles.values().all(|cancel| !cancel.is_cancelled()));
-        router.control(Control::Stop).unwrap();
+        router.control(&all(&["a", "b"]), Control::Stop).unwrap();
         assert!(cycles.values().all(Cancel::is_cancelled));
 
         // Routing an event trips nobody: only a control preempts.
@@ -388,6 +553,10 @@ mod tests {
         assert_eq!(
             RouteError::QueueClosed(id("b")).to_string(),
             "the queue of agent b is closed"
+        );
+        assert_eq!(
+            RouteError::NotTheEnvironment(id("a")).to_string(),
+            "agent a is not the environment and cannot command"
         );
     }
 }

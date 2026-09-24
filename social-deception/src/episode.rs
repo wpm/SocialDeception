@@ -1,31 +1,60 @@
-//! An episode: one run of an environment with a fixed roster of agents, from
-//! coordinated startup to coordinated shutdown.
+//! An episode: one run of a game with a fixed roster of agents and one
+//! [`Environment`], from coordinated startup to coordinated shutdown.
 //!
 //! The episode constructs the roster, wires each agent's queues, dispatch
-//! channel and record channel, spawns one thread per agent, tells every
-//! agent to start, routes what the agents send until the episode is over,
-//! tells every agent to stop, and joins the threads. A [`Control`] is how it
-//! says start and stop, and the episode stamps each one with the instant it
-//! sent it, so that an agent's record of popping it says how long it waited.
+//! channel and record channel, spawns one thread per agent, and then hands
+//! the episode over: it starts the **environment** and nobody else, and
+//! routes what everybody sends until the environment has stopped every
+//! agent. A [`Control`] is how anyone says start and stop, and whoever
+//! sends one stamps it with the instant it was sent, so that an agent's
+//! record of popping it says how long it waited.
 //!
-//! # Quiescence
+//! # The environment controls the episode
 //!
-//! With no deadlines configured, an episode is over when no agent will ever
-//! send again, which for a purely reactive environment is the natural end
-//! of the run. The episode can tell, because it is the only component that
-//! sees both halves of the work in progress: the deliveries it has routed
-//! and the cycles the agents have reported. It keeps one count, of
-//! deliveries routed and not yet reported handled. A cycle in progress is
-//! exactly a set of deliveries taken off a queue and not yet reported, and
-//! an agent dispatches a cycle's deliveries and its outputs together, so the
-//! count never reads zero while a cycle that might still send is under way.
-//! When it reaches zero the episode is quiescent and shutdown begins.
+//! The environment is an agent like any other, with one power: its handler
+//! returns [`Effect`](crate::Effect)s, and an effect may be a control
+//! (ADR-0007). So the sequence is:
+//!
+//! 1. the episode delivers `Start` to the environment alone;
+//! 2. the environment's `start` returns `Start` for the agents it wants
+//!    playing, along with whatever it opens with;
+//! 3. the game runs, the episode routing events and the controls the
+//!    environment asks for, the second always after the first of the same
+//!    cycle, so that an agent stopped in the same breath as it is spoken to
+//!    hears the words first;
+//! 4. the environment ends the episode by sending `Stop` to every agent.
+//!    Once every agent has been sent one and its thread has ended, the
+//!    episode sends `Stop` to the environment and joins it.
+//!
+//! An agent the environment never starts is spawned, blocked on its queues
+//! and silent; it is stopped and joined with everyone else. That is a bug
+//! in the environment, not a state the episode has to rescue.
+//!
+//! # Quiescence, which is now how a stall is detected
+//!
+//! The episode is the only component that sees both halves of the work in
+//! progress: the deliveries it has routed and the cycles the agents have
+//! reported. It keeps one count, of deliveries routed and not yet reported
+//! handled. A cycle in progress is exactly a set of deliveries taken off a
+//! queue and not yet reported, and an agent dispatches a cycle's deliveries
+//! and its outputs together, so the count never reads zero while a cycle
+//! that might still send is under way.
+//!
+//! The count reaching zero used to be how an episode ended. Now that the
+//! environment ends it, a count of zero while some agent has not been sent
+//! `Stop` means nobody will ever speak again and nobody has declared the
+//! episode over: the run is **stalled**, and that is
+//! [`EpisodeError::Stalled`]. The episode stops everyone and joins, so the
+//! trajectory is complete up to the stall, and returns the error. In
+//! Werewolf a stall is a player that did not answer a request.
 //!
 //! In-flight work is counted in **deliveries, not events**: one event
 //! addressed to six agents is six handles that have not happened yet.
 //!
-//! An episode's agents have no timeout: an agent with one keeps waking on
-//! its own, and the episode would never go quiescent.
+//! An episode's agents have no timeout yet. The reason they could not have
+//! one is gone — an agent that wakes on its own no longer keeps an episode
+//! from ending, because quiescence no longer ends it — but giving them one
+//! is another issue's.
 
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
@@ -38,6 +67,7 @@ use crossbeam_channel::{Receiver, Sender, select, unbounded};
 use crate::agent::{self, Action, Agent, CycleDispatch, Handler, Observation, Wiring};
 use crate::cancel::{Cancel, ControlSender};
 use crate::clock::Clock;
+use crate::environment::{Adapter, Commanded, Environment};
 use crate::event::{AgentId, Control, Domain};
 use crate::router::{Queues, RouteError, Router};
 use crate::trajectory::LogRecord;
@@ -61,6 +91,14 @@ impl fmt::Display for Failure {
 }
 
 /// Why an episode could not be built or did not run cleanly.
+///
+/// An episode that ends in any of these but [`Stalled`](Self::Stalled) was
+/// abandoned rather than finished: the episode stops whoever is left so
+/// that the trajectory is complete up to the failure, and it cannot wait
+/// for quiescence to do it, so that `Stop` may preempt a cycle and reach an
+/// agent with events still queued. Such a trajectory may therefore carry
+/// `dropped` records and end with observations nobody made. A `Stalled`
+/// episode is quiescent by definition, so its shutdown is orderly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EpisodeError {
     /// An id was added to the roster twice.
@@ -75,6 +113,13 @@ pub enum EpisodeError {
         agent: AgentId,
         /// What was wrong with it.
         error: RouteError,
+    },
+    /// Nothing is in flight and the environment has not stopped these
+    /// agents, so nobody will ever speak again and nobody has declared the
+    /// episode over. See the [module documentation](self).
+    Stalled {
+        /// The agents still running when everything went quiet, in order.
+        running: BTreeSet<AgentId>,
     },
     /// Some agents' threads did not end cleanly, and why.
     Agents(Vec<(AgentId, Failure)>),
@@ -91,6 +136,13 @@ impl fmt::Display for EpisodeError {
                     "agent {agent} sent an event that could not be routed: {error}"
                 )
             }
+            Self::Stalled { running } => {
+                f.write_str("the episode stalled with these agents still running:")?;
+                for id in running {
+                    write!(f, " {id}")?;
+                }
+                Ok(())
+            }
             Self::Agents(failures) => {
                 f.write_str("agents failed:")?;
                 for (id, failure) in failures {
@@ -106,17 +158,21 @@ impl Error for EpisodeError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Control(error) | Self::Route { error, .. } => Some(error),
-            Self::DuplicateAgent(_) | Self::Agents(_) => None,
+            Self::DuplicateAgent(_) | Self::Stalled { .. } | Self::Agents(_) => None,
         }
     }
 }
 
-/// A roster of handlers and everything needed to run them once.
+/// A roster of handlers, an environment, and everything needed to run them
+/// once.
 ///
-/// Build it with [`Episode::new`], add agents with [`Episode::add`], then
-/// [`Episode::run`] it. The roster is fixed from the moment `run` starts.
+/// Build it with [`Episode::new`], which takes the environment, add agents
+/// with [`Episode::add`], then [`Episode::run`] it. The roster is fixed
+/// from the moment `run` starts.
 pub struct Episode<D: Domain> {
     roster: BTreeMap<AgentId, Box<dyn Handler<D> + Send>>,
+    environment_id: AgentId,
+    environment: Box<dyn Environment<D> + Send>,
     records: Sender<LogRecord<D>>,
     clock: Clock,
 }
@@ -124,24 +180,37 @@ pub struct Episode<D: Domain> {
 impl<D: Domain> fmt::Debug for Episode<D> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Episode")
+            .field("environment", &self.environment_id)
             .field("roster", &self.roster.keys().collect::<Vec<_>>())
             .finish_non_exhaustive()
     }
 }
 
 impl<D: Domain> Episode<D> {
-    /// An empty roster whose trajectory goes to `records`, timed by a
-    /// [`Clock`] started now.
+    /// An episode of `environment`, seated under `environment_id`, with no
+    /// agents yet, whose trajectory goes to `records` and which is timed by
+    /// a [`Clock`] started now.
     #[must_use]
-    pub fn new(records: Sender<LogRecord<D>>) -> Self {
-        Self::with_clock(records, Clock::start())
+    pub fn new(
+        records: Sender<LogRecord<D>>,
+        environment_id: impl Into<AgentId>,
+        environment: impl Environment<D> + Send + 'static,
+    ) -> Self {
+        Self::with_clock(records, environment_id, environment, Clock::start())
     }
 
-    /// An empty roster whose trajectory goes to `records`, timed by `clock`.
+    /// The same, timed by `clock`.
     #[must_use]
-    pub fn with_clock(records: Sender<LogRecord<D>>, clock: Clock) -> Self {
+    pub fn with_clock(
+        records: Sender<LogRecord<D>>,
+        environment_id: impl Into<AgentId>,
+        environment: impl Environment<D> + Send + 'static,
+        clock: Clock,
+    ) -> Self {
         Self {
             roster: BTreeMap::new(),
+            environment_id: environment_id.into(),
+            environment: Box::new(environment),
             records,
             clock,
         }
@@ -151,27 +220,40 @@ impl<D: Domain> Episode<D> {
     ///
     /// # Errors
     ///
-    /// [`EpisodeError::DuplicateAgent`] if `id` is already in the roster.
+    /// [`EpisodeError::DuplicateAgent`] if `id` is already in the roster,
+    /// or is the environment's.
     pub fn add(
         &mut self,
         id: impl Into<AgentId>,
         handler: impl Handler<D> + Send + 'static,
     ) -> Result<(), EpisodeError> {
         let id = id.into();
-        if self.roster.contains_key(&id) {
+        if id == self.environment_id || self.roster.contains_key(&id) {
             return Err(EpisodeError::DuplicateAgent(id));
         }
         self.roster.insert(id, Box::new(handler));
         Ok(())
     }
 
-    /// The ids in the roster, in order.
+    /// The ids in the roster, the environment's among them, in order.
     pub fn ids(&self) -> impl Iterator<Item = &AgentId> {
-        self.roster.keys()
+        self.roster
+            .keys()
+            .chain([&self.environment_id])
+            .collect::<BTreeSet<_>>()
+            .into_iter()
     }
 
-    /// Runs the episode to completion: starts every agent, routes until the
-    /// episode is quiescent, stops every agent, and joins every thread.
+    /// The environment's id.
+    #[must_use]
+    pub const fn environment(&self) -> &AgentId {
+        &self.environment_id
+    }
+
+    /// Runs the episode to completion: starts the environment, routes what
+    /// everybody sends and the controls the environment asks for until every
+    /// agent has been stopped, then stops the environment and joins every
+    /// thread.
     ///
     /// The episode's own sender to the trajectory writer is dropped on the
     /// way, so once this returns the writer has no senders left and can be
@@ -179,27 +261,40 @@ impl<D: Domain> Episode<D> {
     ///
     /// # Errors
     ///
-    /// If a control could not be delivered, an agent sent an event the
-    /// router refused, or an agent's thread ended with an error or a
+    /// If a control could not be delivered, an agent sent an event or asked
+    /// for a control the router refused, the episode stalled
+    /// ([`EpisodeError::Stalled`]), or a thread ended with an error or a
     /// panic. In every case the agents that were running have been stopped
     /// and joined before this returns, so the trajectory is complete up to
     /// the failure.
     pub fn run(self) -> Result<(), EpisodeError> {
         let Self {
             roster,
+            environment_id,
+            environment,
             records,
             clock,
         } = self;
-        let ids: BTreeSet<AgentId> = roster.keys().cloned().collect();
+        let ids: BTreeSet<AgentId> = roster
+            .keys()
+            .cloned()
+            .chain([environment_id.clone()])
+            .collect();
         let (dispatch, dispatches) = unbounded();
         let (obituary, obituaries) = unbounded();
+        let (asked_for, commands) = unbounded();
         let mut queues = BTreeMap::new();
         // Every queue stays open until every thread has been joined, so that
         // a message to an agent that has already stopped is delivered, and
         // never read, rather than failing its sender.
-        let mut held = Vec::with_capacity(roster.len());
-        let mut agents = Vec::with_capacity(roster.len());
-        for (id, handler) in roster {
+        let mut held = Vec::with_capacity(ids.len());
+        let mut agents = Vec::with_capacity(ids.len());
+        let mut handlers: BTreeMap<AgentId, Box<dyn Handler<D> + Send>> = roster;
+        handlers.insert(
+            environment_id.clone(),
+            Box::new(Adapter::new(environment, asked_for)),
+        );
+        for (id, handler) in handlers {
             let (sender, events) = unbounded();
             let (commander, controls, arm) = ControlSender::new();
             held.push((events.clone(), controls.clone()));
@@ -229,14 +324,45 @@ impl<D: Domain> Episode<D> {
             agents.push(Agent::spawn(wiring, watched, clock));
         }
         drop((dispatch, obituary, records));
-        let router = Router::new(queues, clock);
+        let router = Router::new(queues, environment_id.clone(), clock);
 
+        let environment_only = BTreeSet::from([environment_id.clone()]);
+        let mut running = router.agents();
         let outcome = router
-            .control(Control::Start)
+            .control(&environment_only, Control::Start)
             .map_err(|error| Halt::Error(EpisodeError::Control(error)))
-            .and_then(|in_flight| drive(&router, &dispatches, &obituaries, in_flight));
-        let stopped = router.control(Control::Stop).map_err(EpisodeError::Control);
-        let failures = join(agents);
+            .and_then(|in_flight| {
+                drive(
+                    &router,
+                    &environment_id,
+                    &dispatches,
+                    &obituaries,
+                    &commands,
+                    in_flight,
+                    &mut running,
+                )
+            });
+        // Whatever happened, everybody is stopped, and nobody twice: an
+        // agent the environment already stopped is not in `running`, and a
+        // second `Stop` would put a second one in its trajectory, claiming
+        // it was told to stop after it had stopped.
+        //
+        // The environment's own `Stop` comes last, once the agents it was
+        // running have ended, because until then the episode is not over
+        // for it: a cycle it is still in the middle of may yet have
+        // something to say, and its trajectory should say so.
+        let (environment_agent, agents) = split(agents, &environment_id);
+        let stopped = router
+            .control(&running, Control::Stop)
+            .map_err(EpisodeError::Control);
+        let mut failures = join(agents);
+        let stopped = stopped.and_then(|_| {
+            router
+                .control(&environment_only, Control::Stop)
+                .map_err(EpisodeError::Control)
+        });
+        failures.extend(join(environment_agent));
+        failures.sort_by(|(one, _), (other, _)| one.cmp(other));
         drop(held);
 
         match (outcome, stopped) {
@@ -249,31 +375,96 @@ impl<D: Domain> Episode<D> {
     }
 }
 
-/// Why routing stopped before quiescence.
+/// The running agents of an episode: its environment's thread and every
+/// other.
+type Threads<D> = Vec<Agent<Watched<D>>>;
+
+/// Splits the environment's agent out of the roster's, so that the two can
+/// be stopped and joined in their own order.
+fn split<D: Domain>(agents: Threads<D>, environment: &AgentId) -> (Threads<D>, Threads<D>) {
+    agents
+        .into_iter()
+        .partition(|agent| agent.id() == environment)
+}
+
+/// Why routing stopped.
 enum Halt {
     /// An agent's thread has ended, or every agent's has; joining them says
     /// why.
     Departure,
-    /// A control event or a message could not be routed.
+    /// A control event or a message could not be routed, or the episode
+    /// stalled.
     Error(EpisodeError),
 }
 
 use Halt::Departure;
 
-/// Routes what the agents send until nothing is in flight.
+/// Routes what the agents send, and the controls the environment asks for,
+/// until every agent has been stopped.
 ///
 /// `in_flight` is the number of deliveries already made and not yet reported
-/// handled. Each dispatch takes a cycle's deliveries off the count and puts the
-/// deliveries its outputs cause onto it, in that order but as one step, so
-/// the count reads zero only when no agent has anything left to handle or
+/// handled. Each dispatch takes a cycle's deliveries off the count and puts
+/// the deliveries its outputs cause onto it, in that order but as one step,
+/// so the count reads zero only when no agent has anything left to handle or
 /// send.
+///
+/// # When a control the environment asked for is issued
+///
+/// The environment queues a cycle's controls while its handler is running,
+/// which is strictly before its loop sends the dispatch, so by the time a
+/// dispatch of the environment's is in hand every control of that cycle is
+/// already on `commanded` waiting to be drained (see
+/// [`environment::Adapter`](crate::environment::Adapter)). What is left is
+/// *when* to issue each, and the two controls want opposite answers.
+///
+/// A [`Start`](Control::Start) is issued **before** the cycle's events, so
+/// that an agent logs its start before its first observation. The
+/// environment that starts an agent and speaks to it in the same breath
+/// means the start first.
+///
+/// A [`Stop`](Control::Stop) is issued **once nothing is in flight**, which
+/// is to say once everything already said has been handled. It has to be,
+/// and not merely after the cycle's events: an agent that pops a `Stop`
+/// leaves the events still on its queue unpopped, because an agent that has
+/// stopped did not observe them (see [`agent`](crate::agent)). So a `Stop`
+/// racing a delivery would silently swallow it, and which deliveries were
+/// swallowed would depend on the scheduler. Holding the stop back until the
+/// count reads zero makes "an agent hears everything said to it before it
+/// is told to stop" a guarantee rather than a hope, and it is what lets the
+/// moderator narrate an outcome and end the episode in one cycle.
+///
+/// Nothing in flight, no stop waiting to be issued, and some agent still
+/// running is a stall; see the [module documentation](self).
 fn drive<D: Domain>(
     router: &Router<D>,
+    environment: &AgentId,
     dispatches: &Receiver<CycleDispatch<D>>,
     obituaries: &Receiver<AgentId>,
+    commanded: &Receiver<Commanded>,
     mut in_flight: usize,
+    running: &mut BTreeSet<AgentId>,
 ) -> Result<(), Halt> {
-    while in_flight > 0 {
+    let mut held: Vec<BTreeSet<AgentId>> = Vec::new();
+    while !running.is_empty() {
+        if in_flight == 0 {
+            if held.is_empty() {
+                return Err(Halt::Error(EpisodeError::Stalled {
+                    running: running.clone(),
+                }));
+            }
+            for to in held.drain(..) {
+                in_flight += router
+                    .command(environment, &to, Control::Stop)
+                    .map_err(|error| {
+                        Halt::Error(EpisodeError::Route {
+                            agent: environment.clone(),
+                            error,
+                        })
+                    })?;
+                running.retain(|id| !to.contains(id));
+            }
+            continue;
+        }
         let dispatch = select! {
             recv(dispatches) -> dispatch => dispatch.map_err(|_| Departure)?,
             recv(obituaries) -> _ => return Err(Departure),
@@ -281,13 +472,34 @@ fn drive<D: Domain>(
         in_flight = in_flight
             .checked_sub(dispatch.deliveries)
             .expect("an agent reported more deliveries than were routed to it");
+        let refused = |error| {
+            Halt::Error(EpisodeError::Route {
+                agent: dispatch.agent.clone(),
+                error,
+            })
+        };
+        if dispatch.agent == *environment {
+            while let Ok(Commanded { to, control }) = commanded.try_recv() {
+                match control {
+                    Control::Start => {
+                        in_flight += router
+                            .command(&dispatch.agent, &to, control)
+                            .map_err(refused)?;
+                    }
+                    // Validated now, so that a stop addressed to a stranger
+                    // fails the episode where it was asked for rather than
+                    // once everything has gone quiet.
+                    Control::Stop => {
+                        router
+                            .validate(&dispatch.agent, &to)
+                            .map_err(refused)
+                            .map(|()| held.push(to))?;
+                    }
+                }
+            }
+        }
         for event in &dispatch.sent {
-            in_flight += router.route(event).map_err(|error| {
-                Halt::Error(EpisodeError::Route {
-                    agent: dispatch.agent.clone(),
-                    error,
-                })
-            })?;
+            in_flight += router.route(event).map_err(refused)?;
         }
     }
     Ok(())
@@ -356,13 +568,26 @@ mod tests {
     use serde_json::Value;
 
     use super::*;
+    use crate::environment::Effect;
     use crate::testing::parse_lines;
     use crate::trajectory::Writer;
 
-    /// A count, which is all these agents ever say to each other.
+    /// What the agents of the counting games below say.
+    ///
+    /// `Done` is how an agent tells the environment it has nothing more to
+    /// send. Quiescence is no longer how an episode ends, so a purely
+    /// reactive roster needs some way to say that it has finished, and
+    /// saying so in the domain is the way a game does it; Collatz's
+    /// `Finished` is the same idea.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-    #[serde(transparent)]
-    struct Count(u64);
+    enum Count {
+        /// A number, which is all these agents ever say to each other.
+        Say(u64),
+        /// Nothing more is coming from this agent.
+        Done,
+    }
+
+    use Count::{Done, Say};
 
     /// The domain of the counting games below.
     struct Counting;
@@ -372,16 +597,93 @@ mod tests {
         type Reward = i32;
     }
 
-    /// The payloads of a batch of observations.
+    /// The environment of the counting games: it starts the agents it was
+    /// built with and stops them all once each has said [`Done`].
+    ///
+    /// It is the whole of what an environment must do — start the episode
+    /// and end it — and nothing else, which is what makes it the stand-in
+    /// for a game the runtime knows nothing about.
+    struct Referee {
+        agents: BTreeSet<AgentId>,
+        working: BTreeSet<AgentId>,
+    }
+
+    impl Referee {
+        /// A referee over these agents.
+        fn over<const N: usize>(agents: [&str; N]) -> Self {
+            let agents: BTreeSet<AgentId> = agents.map(AgentId::new).into();
+            Self {
+                working: agents.clone(),
+                agents,
+            }
+        }
+    }
+
+    impl Environment<Counting> for Referee {
+        fn start(&mut self) -> Vec<Effect<Counting>> {
+            vec![Effect::control(self.agents.clone(), Control::Start)]
+        }
+
+        fn handle(
+            &mut self,
+            observations: &[Observation<Counting>],
+            _: &Cancel,
+        ) -> Vec<Effect<Counting>> {
+            for observation in observations {
+                if observation.event.payload == Done {
+                    self.working.remove(&observation.event.sender);
+                }
+            }
+            if self.working.is_empty() && !self.agents.is_empty() {
+                let agents = std::mem::take(&mut self.agents);
+                vec![Effect::control(agents, Control::Stop)]
+            } else {
+                Vec::new()
+            }
+        }
+    }
+
+    /// An environment that starts its agents and never stops them, so that
+    /// whatever they do the episode ends by stalling.
+    struct Absent<const N: usize>([&'static str; N]);
+
+    impl<const N: usize> Environment<Counting> for Absent<N> {
+        fn start(&mut self) -> Vec<Effect<Counting>> {
+            vec![Effect::control(self.0, Control::Start)]
+        }
+
+        fn handle(&mut self, _: &[Observation<Counting>], _: &Cancel) -> Vec<Effect<Counting>> {
+            Vec::new()
+        }
+    }
+
+    /// The name the counting games' environment goes by.
+    const REFEREE: &str = "referee";
+
+    /// The numbers among a batch of observations, which is everything a
+    /// counting agent hears that is not a [`Done`].
     fn counts(observations: &[Observation<Counting>]) -> Vec<u64> {
         observations
             .iter()
-            .map(|observation| observation.event.payload.0)
+            .filter_map(|observation| match observation.event.payload {
+                Say(n) => Some(n),
+                Done => None,
+            })
             .collect()
     }
 
+    /// An agent's way of telling the environment it has finished.
+    fn done() -> Action<Counting> {
+        Action::to([REFEREE], Done)
+    }
+
     /// Volleys a count back and forth with `partner` until it reaches
-    /// `limit`, then goes quiet. The one that `serves` opens the rally.
+    /// `limit`, then tells the environment it is done. The one that
+    /// `serves` opens the rally.
+    ///
+    /// Each side is done when it has seen the limit, whether it volleyed it
+    /// or was volleyed it: the side that sends the limit hears nothing back,
+    /// so waiting to be spoken to again would leave it running forever.
     struct Rally {
         partner: AgentId,
         serves: bool,
@@ -390,7 +692,7 @@ mod tests {
 
     impl Rally {
         fn to_partner(&self, n: u64) -> Action<Counting> {
-            Action::to([self.partner.clone()], Count(n))
+            Action::to([self.partner.clone()], Say(n))
         }
     }
 
@@ -408,28 +710,54 @@ mod tests {
             observations: &[Observation<Counting>],
             _: &Cancel,
         ) -> Vec<Action<Counting>> {
-            counts(observations)
-                .into_iter()
-                .filter(|n| *n < self.limit)
+            let heard = counts(observations);
+            let mut actions: Vec<Action<Counting>> = heard
+                .iter()
+                .filter(|n| **n < self.limit)
                 .map(|n| self.to_partner(n + 1))
-                .collect()
+                .collect();
+            let reached =
+                heard.iter().any(|n| *n >= self.limit) || heard.iter().any(|n| n + 1 >= self.limit);
+            if reached {
+                actions.push(done());
+            }
+            actions
         }
     }
 
-    /// Broadcasts once when it starts, and says nothing more.
-    struct Hub;
+    /// Broadcasts once when it starts, then waits to hear from everybody it
+    /// expects before declaring itself done.
+    struct Hub {
+        expects: usize,
+        heard: usize,
+    }
+
+    impl Hub {
+        const fn expecting(expects: usize) -> Self {
+            Self { expects, heard: 0 }
+        }
+    }
 
     impl Handler<Counting> for Hub {
         fn start(&mut self) -> Vec<Action<Counting>> {
-            vec![Action::broadcast(Count(0))]
+            vec![Action::broadcast(Say(0))]
         }
 
-        fn handle(&mut self, _: &[Observation<Counting>], _: &Cancel) -> Vec<Action<Counting>> {
-            Vec::new()
+        fn handle(
+            &mut self,
+            observations: &[Observation<Counting>],
+            _: &Cancel,
+        ) -> Vec<Action<Counting>> {
+            self.heard += counts(observations).len();
+            if self.heard >= self.expects {
+                vec![done()]
+            } else {
+                Vec::new()
+            }
         }
     }
 
-    /// Replies once to whoever sends it anything.
+    /// Replies once to whoever sends it a number, and is then done.
     struct Spoke;
 
     impl Handler<Counting> for Spoke {
@@ -438,10 +766,15 @@ mod tests {
             observations: &[Observation<Counting>],
             _: &Cancel,
         ) -> Vec<Action<Counting>> {
-            observations
+            let mut actions: Vec<Action<Counting>> = observations
                 .iter()
-                .map(|observation| Action::to([observation.event.sender.clone()], Count(1)))
-                .collect()
+                .filter(|observation| matches!(observation.event.payload, Say(_)))
+                .map(|observation| Action::to([observation.event.sender.clone()], Say(1)))
+                .collect();
+            if !actions.is_empty() {
+                actions.push(done());
+            }
+            actions
         }
     }
 
@@ -450,9 +783,18 @@ mod tests {
 
     impl Handler<Counting> for Addresses {
         fn start(&mut self) -> Vec<Action<Counting>> {
-            vec![Action::to([self.0], Count(1))]
+            vec![Action::to([self.0], Say(1))]
         }
 
+        fn handle(&mut self, _: &[Observation<Counting>], _: &Cancel) -> Vec<Action<Counting>> {
+            Vec::new()
+        }
+    }
+
+    /// Says nothing, ever, so an episode of it stalls.
+    struct Mute;
+
+    impl Handler<Counting> for Mute {
         fn handle(&mut self, _: &[Observation<Counting>], _: &Cancel) -> Vec<Action<Counting>> {
             Vec::new()
         }
@@ -474,9 +816,31 @@ mod tests {
         lines.iter().filter(move |line| line["agent"] == agent)
     }
 
-    fn rally(limit: u64) -> (Episode<Counting>, Writer<Vec<u8>>) {
+    /// The controls in `lines`, in order. With an `agent`, that agent's;
+    /// without one, the whole trajectory's. Every agent's reads
+    /// `["start", "stop"]`: the environment starts it and stops it, and
+    /// nothing else is a control.
+    fn controls_of<'a>(lines: &'a [Value], agent: Option<&str>) -> Vec<&'a Value> {
+        lines
+            .iter()
+            .filter(|line| agent.is_none_or(|agent| line["agent"] == agent))
+            .filter(|line| line["type"] == "control")
+            .map(|line| &line["control"])
+            .collect()
+    }
+
+    /// An episode refereed over the named agents, whose trajectory goes to
+    /// the writer returned beside it.
+    fn refereed<const N: usize>(agents: [&str; N]) -> (Episode<Counting>, Writer<Vec<u8>>) {
         let (records, writer) = Writer::spawn(Vec::new());
-        let mut episode = Episode::new(records);
+        (
+            Episode::new(records, REFEREE, Referee::over(agents)),
+            writer,
+        )
+    }
+
+    fn rally(limit: u64) -> (Episode<Counting>, Writer<Vec<u8>>) {
+        let (mut episode, writer) = refereed(["a", "b"]);
         for (me, partner, serves) in [("a", "b", true), ("b", "a", false)] {
             episode
                 .add(
@@ -493,37 +857,44 @@ mod tests {
     }
 
     #[test]
-    fn a_rally_runs_to_quiescence_and_the_writer_flushes() {
+    fn a_rally_runs_to_its_limit_and_the_writer_flushes() {
         let (episode, writer) = rally(20);
         assert_eq!(
             episode.ids().collect::<Vec<_>>(),
-            [&AgentId::new("a"), &AgentId::new("b")]
+            [
+                &AgentId::new("a"),
+                &AgentId::new("b"),
+                &AgentId::new(REFEREE)
+            ]
         );
+        assert_eq!(episode.environment(), &AgentId::new(REFEREE));
         episode.run().unwrap();
 
         // Every sender is gone, so the writer finishes on its own.
         let lines = parse_lines(&writer.join().unwrap());
         // The file interleaves agents in whatever order their records reached
         // the writer; only each agent's own order is promised.
-        let sent = |agent: &str| -> Vec<u64> {
+        let volleyed = |agent: &str| -> Vec<u64> {
             of(&lines, agent)
                 .filter(|line| line["type"] == "action")
-                .map(|line| line["event"]["payload"].as_u64().unwrap())
+                .filter_map(|line| line["event"]["payload"]["Say"].as_u64())
                 .collect()
         };
-        assert_eq!(sent("a"), (1..=19).step_by(2).collect::<Vec<_>>());
-        assert_eq!(sent("b"), (2..=20).step_by(2).collect::<Vec<_>>());
-        for agent in ["a", "b"] {
+        assert_eq!(volleyed("a"), (1..=19).step_by(2).collect::<Vec<_>>());
+        assert_eq!(volleyed("b"), (2..=20).step_by(2).collect::<Vec<_>>());
+        for agent in ["a", "b", REFEREE] {
             let seqs: Vec<u64> = of(&lines, agent)
                 .filter(|line| line["type"] != "cycle")
                 .map(|line| line["seq"].as_u64().unwrap())
                 .collect();
             assert_eq!(seqs, (0..seqs.len() as u64).collect::<Vec<_>>());
-            let controls: Vec<&Value> = of(&lines, agent)
-                .filter(|line| line["type"] == "control")
-                .map(|line| &line["control"])
-                .collect();
-            assert_eq!(controls, ["start", "stop"]);
+            let controls = controls_of(&lines, Some(agent));
+            assert_eq!(
+                controls,
+                ["start", "stop"],
+                "every trajectory, the environment's included, begins with a start and \
+                 ends with a stop"
+            );
             // No agent here has a timeout, so every cycle was woken by
             // something on the queue and none is empty.
             for line in of(&lines, agent).filter(|line| line["type"] == "cycle") {
@@ -534,13 +905,14 @@ mod tests {
                 );
             }
             // Every action lies within the window of the cycle that sent it,
-            // and every observation and control was received at a t_start.
+            // and every observation and control was received at a t_start,
+            // but for a stop that preempted its cycle.
             let starts: BTreeSet<u64> = of(&lines, agent)
                 .filter(|line| line["type"] == "cycle")
                 .map(|line| line["t_start"].as_u64().unwrap())
                 .collect();
             for line in of(&lines, agent).filter(|line| line["type"] != "cycle") {
-                if line["type"] == "action" {
+                if line["type"] == "action" || line["type"] == "dropped" {
                     continue;
                 }
                 let (created, received) = (
@@ -551,6 +923,9 @@ mod tests {
                     created <= received,
                     "nothing arrives before it was sent: {line}"
                 );
+                if line["control"] == "stop" {
+                    continue;
+                }
                 assert!(
                     starts.contains(&received),
                     "everything popped is popped at a cycle's start: {line}"
@@ -597,17 +972,30 @@ mod tests {
 
     #[test]
     fn in_flight_work_is_counted_in_deliveries_not_messages() {
+        let spokes: Vec<String> = (1..=6).map(|spoke| format!("spoke-{spoke}")).collect();
         let (records, writer) = Writer::spawn(Vec::new());
-        let mut episode = Episode::new(records);
-        episode.add("hub", Hub).unwrap();
-        for spoke in 1..=6 {
-            episode.add(format!("spoke-{spoke}"), Spoke).unwrap();
+        let roster: BTreeSet<AgentId> = spokes
+            .iter()
+            .map(AgentId::new)
+            .chain([AgentId::new("hub")])
+            .collect();
+        let mut episode = Episode::new(
+            records,
+            REFEREE,
+            Referee {
+                working: roster.clone(),
+                agents: roster,
+            },
+        );
+        episode.add("hub", Hub::expecting(6)).unwrap();
+        for spoke in &spokes {
+            episode.add(spoke.clone(), Spoke).unwrap();
         }
         episode.run().unwrap();
 
-        // Had the broadcast counted as one delivery, the episode would have
-        // gone quiescent after the first spoke's reply, and the hub would
-        // not have handled all six.
+        // Had the broadcast counted as one delivery, the count could have
+        // reached zero after the first spoke's reply, and the episode would
+        // have called a run in progress a stall.
         let lines = parse_lines(&writer.join().unwrap());
         let replies_seen_by_hub = of(&lines, "hub")
             .filter(|line| line["type"] == "observation")
@@ -618,34 +1006,66 @@ mod tests {
             .expect("the hub recorded its broadcast");
         assert_eq!(
             broadcast["event"]["recipients"].as_array().unwrap().len(),
-            6,
-            "a broadcast is recorded as everyone it went to"
+            7,
+            "a broadcast is recorded as everyone it went to: the six spokes and \
+             the environment"
         );
     }
 
     #[test]
-    fn an_empty_roster_runs_and_writes_nothing() {
+    fn an_environment_with_no_agents_runs_and_writes_only_its_own_controls() {
         let (records, writer) = Writer::spawn(Vec::new());
-        Episode::<Counting>::new(records).run().unwrap();
-        assert!(writer.join().unwrap().is_empty());
+        Episode::new(records, REFEREE, Referee::over([]))
+            .run()
+            .unwrap();
+        let lines = parse_lines(&writer.join().unwrap());
+        let controls = controls_of(&lines, None);
+        assert_eq!(controls, ["start", "stop"]);
+        assert!(lines.iter().all(|line| line["agent"] == REFEREE));
+    }
+
+    #[test]
+    fn an_episode_whose_environment_never_stops_anyone_stalls() {
+        // Nothing is in flight and no agent has been stopped: nobody will
+        // ever speak again and nobody has declared the episode over.
+        let (records, writer) = Writer::spawn(Vec::new());
+        let mut episode = Episode::new(records, REFEREE, Absent(["a", "b"]));
+        episode.add("a", Mute).unwrap();
+        episode.add("b", Mute).unwrap();
+        assert_eq!(
+            episode.run().unwrap_err(),
+            EpisodeError::Stalled {
+                running: [AgentId::new("a"), AgentId::new("b")].into()
+            }
+        );
+        // The trajectory is complete up to the stall: everybody was started,
+        // and everybody, the environment last, was stopped and joined.
+        let lines = parse_lines(&writer.join().unwrap());
+        for agent in ["a", "b", REFEREE] {
+            let controls = controls_of(&lines, Some(agent));
+            assert_eq!(controls, ["start", "stop"], "{agent}");
+        }
     }
 
     #[test]
     fn a_duplicate_id_is_rejected() {
-        let (records, _writer) = Writer::spawn(Vec::new());
-        let mut episode = Episode::new(records);
-        episode.add("a", Hub).unwrap();
+        let (mut episode, _writer) = refereed(["a"]);
+        episode.add("a", Spoke).unwrap();
         assert_eq!(
-            episode.add("a", Hub).unwrap_err(),
+            episode.add("a", Spoke).unwrap_err(),
             EpisodeError::DuplicateAgent(AgentId::new("a"))
         );
-        assert_eq!(episode.ids().count(), 1);
+        assert_eq!(
+            episode.add(REFEREE, Spoke).unwrap_err(),
+            EpisodeError::DuplicateAgent(AgentId::new(REFEREE)),
+            "the environment is in the roster, under its own id"
+        );
+        assert_eq!(episode.ids().count(), 2);
     }
 
     #[test]
     fn a_panicking_handler_fails_the_episode_without_hanging_it() {
-        let (records, writer) = Writer::spawn(Vec::new());
-        let mut episode = Episode::new(records);
+        let (mut episode, writer) = refereed(["a", "b"]);
         episode.add("a", Panics).unwrap();
         episode.add("b", Spoke).unwrap();
         let error = episode.run().unwrap_err();
@@ -657,15 +1077,19 @@ mod tests {
             )])
         );
         assert!(error.to_string().contains("the handler is broken"));
-        // The other agent was still stopped cleanly.
+        // The other agent, and the environment, were still stopped cleanly.
         let lines = parse_lines(&writer.join().unwrap());
-        assert!(of(&lines, "b").any(|line| line["control"] == "stop"));
+        for agent in ["b", REFEREE] {
+            assert!(
+                of(&lines, agent).any(|line| line["control"] == "stop"),
+                "{agent}"
+            );
+        }
     }
 
     #[test]
     fn a_handler_that_addresses_itself_fails_the_episode() {
-        let (records, _writer) = Writer::spawn(Vec::new());
-        let mut episode = Episode::new(records);
+        let (mut episode, _writer) = refereed(["a", "b"]);
         episode.add("a", Addresses("a")).unwrap();
         episode.add("b", Spoke).unwrap();
         assert_eq!(
@@ -679,8 +1103,7 @@ mod tests {
 
     #[test]
     fn a_handler_that_addresses_a_stranger_fails_the_episode() {
-        let (records, _writer) = Writer::spawn(Vec::new());
-        let mut episode = Episode::new(records);
+        let (mut episode, _writer) = refereed(["a", "b"]);
         episode.add("a", Addresses("nobody")).unwrap();
         episode.add("b", Spoke).unwrap();
         assert_eq!(
@@ -693,25 +1116,11 @@ mod tests {
     }
 
     #[test]
-    fn a_broadcast_from_a_roster_of_one_has_nobody_to_go_to() {
-        let (records, _writer) = Writer::spawn(Vec::new());
-        let mut episode = Episode::new(records);
-        episode.add("alone", Hub).unwrap();
-        assert_eq!(
-            episode.run().unwrap_err(),
-            EpisodeError::Route {
-                agent: AgentId::new("alone"),
-                error: RouteError::NoRecipients,
-            }
-        );
-    }
-
-    #[test]
     fn a_vanished_writer_fails_the_episode_without_hanging_it() {
         // Nobody is reading the records, so every agent's first record fails
         // to send.
         let (records, nobody) = unbounded();
-        let mut episode = Episode::new(records);
+        let mut episode = Episode::new(records, REFEREE, Referee::over(["a", "b"]));
         episode.add("a", Spoke).unwrap();
         episode.add("b", Spoke).unwrap();
         drop(nobody);
@@ -746,6 +1155,13 @@ mod tests {
             "agent a sent an event that could not be routed: an event must have at least one recipient"
         );
         assert_eq!(
+            EpisodeError::Stalled {
+                running: [AgentId::new("a"), AgentId::new("b")].into()
+            }
+            .to_string(),
+            "the episode stalled with these agents still running: a b"
+        );
+        assert_eq!(
             EpisodeError::Agents(vec![
                 (
                     AgentId::new("a"),
@@ -761,7 +1177,17 @@ mod tests {
                 .source()
                 .is_some()
         );
+        assert!(
+            EpisodeError::Stalled {
+                running: BTreeSet::new()
+            }
+            .source()
+            .is_none()
+        );
         let (records, _writer) = Writer::<Vec<u8>>::spawn::<Counting>(Vec::new());
-        assert!(format!("{:?}", Episode::new(records)).starts_with("Episode"));
+        assert!(
+            format!("{:?}", Episode::new(records, REFEREE, Referee::over([])))
+                .starts_with("Episode")
+        );
     }
 }

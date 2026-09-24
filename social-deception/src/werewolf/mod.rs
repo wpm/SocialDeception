@@ -19,8 +19,10 @@
 //! plays the game as a fold over players' responses, producing
 //! [`Directive`]s that say what to tell whom. The [`Moderator`]
 //! ([`moderator`]) is the agent that runs a game: the thin
-//! [`Handler`](crate::Handler) that folds the observations it pops into the
-//! game and sends the directives as messages.
+//! [`Environment`](crate::Environment) that folds the observations it pops
+//! into the game, sends the directives as messages, and — being the
+//! episode's environment — starts the players when it begins and stops them
+//! when the game is over.
 //!
 //! The seam with the runtime is [`setup`]: [`episode`] builds a populated
 //! [`Episode`](crate::Episode) from a [`Config`], seating every player and
@@ -59,6 +61,12 @@
 //! (see ADR-0004). A player observes many narrations but acts only on a
 //! request, which is what gives an agent in a turnless runtime its decision
 //! points.
+//!
+//! Nothing is excepted. ADR-0004 broadcast the final [`Outcome`] to every
+//! player, living and dead, because it was a dead player's terminal reward
+//! signal; a reward is now logged rather than said (ADR-0007), so the
+//! outcome is narrated to the living like everything else and a dead
+//! player hears nothing after the announcement of its own death.
 //!
 //! Every narration is true. Player-to-player dialogue, which may be false,
 //! would be a fourth kind of message and is not defined here.

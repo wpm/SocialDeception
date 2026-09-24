@@ -88,6 +88,11 @@ const NOMINATE_DECIDES: () = assert!(
 );
 
 /// What the game wants said, in the order it wants it said.
+///
+/// Every directive names its recipients. There is no broadcast: the choice
+/// of recipients is the whole hidden-information mechanism, and the one
+/// exception ADR-0004 made for the [`Outcome`] is withdrawn (ADR-0007),
+/// which is why the outcome is a `Narrate` to the living like any other.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Directive {
     /// To exactly these agents.
@@ -104,9 +109,6 @@ pub enum Directive {
         /// What it is asked.
         request: Request,
     },
-    /// To every agent, living or dead. Only ever carries
-    /// [`Narration::Outcome`].
-    Broadcast(Narration),
 }
 
 /// A game of Werewolf, from the deal to the outcome.
@@ -247,6 +249,15 @@ impl Game {
     #[must_use]
     pub fn living(&self) -> &BTreeSet<AgentId> {
         &self.living
+    }
+
+    /// Everyone dealt into the game, living and dead, in agent order.
+    ///
+    /// This is the roster the moderator starts and, when the game is over,
+    /// stops. A player leaves the *game* when it is eliminated and the
+    /// *episode* when it is stopped, and those are not the same moment.
+    pub fn players(&self) -> impl Iterator<Item = &AgentId> {
+        self.assignment.players().map(|(who, _)| who)
     }
 
     /// Announces the current phase to the living and issues its requests,
@@ -413,7 +424,13 @@ impl Game {
         }
     }
 
-    /// Ends the game and announces how, to everyone.
+    /// Ends the game and announces how, to the living.
+    ///
+    /// The outcome is narrated like any other narration. It was once
+    /// broadcast to everyone, living and dead, because it was a dead
+    /// player's terminal reward signal; a reward is now logged rather than
+    /// said (ADR-0007), so the exception is withdrawn and no message of
+    /// this game goes to a player after the announcement of its own death.
     fn end(&mut self, winner: Faction) -> Directive {
         let outcome = Outcome {
             winner,
@@ -421,7 +438,7 @@ impl Game {
             living: self.living.clone(),
         };
         self.outcome = Some(outcome.clone());
-        Directive::Broadcast(Narration::Outcome(outcome))
+        self.narrate_living(Narration::Outcome(outcome))
     }
 
     fn narrate_living(&self, narration: Narration) -> Directive {
@@ -539,7 +556,7 @@ mod tests {
             .iter()
             .filter_map(|directive| match directive {
                 Directive::Ask { to, request } => Some((to.clone(), request.clone())),
-                _ => None,
+                Directive::Narrate { .. } => None,
             })
             .collect()
     }
@@ -659,12 +676,17 @@ mod tests {
         )
     }
 
+    /// The outcome as it is announced: to the living, who are exactly the
+    /// survivors it names.
     fn outcome<const N: usize>(winner: Faction, rounds: u32, living: [&str; N]) -> Directive {
-        Directive::Broadcast(Narration::Outcome(Outcome {
-            winner,
-            rounds: Round(rounds),
-            living: ids(living),
-        }))
+        narrate(
+            living,
+            Narration::Outcome(Outcome {
+                winner,
+                rounds: Round(rounds),
+                living: ids(living),
+            }),
+        )
     }
 
     fn investigated(to: &str, target: &str, faction: Faction) -> Directive {
@@ -1191,7 +1213,6 @@ mod tests {
                     Directive::Ask { to, request } => {
                         assert!(!dead.contains(to), "{to} is dead but is asked {request:?}");
                     }
-                    Directive::Broadcast(_) => {}
                 }
             }
         }
@@ -1230,28 +1251,35 @@ mod tests {
     }
 
     #[test]
-    fn the_outcome_is_broadcast_exactly_once_and_last() {
+    fn the_outcome_is_announced_to_the_living_exactly_once_and_last() {
         for (_, game, directives) in played_games() {
-            let broadcasts: Vec<usize> = directives
+            let announcements: Vec<usize> = directives
                 .iter()
                 .enumerate()
-                .filter_map(|(index, directive)| match directive {
-                    Directive::Broadcast(narration) => {
-                        assert!(matches!(narration, Narration::Outcome(_)), "{narration:?}");
-                        Some(index)
-                    }
-                    _ => None,
+                .filter(|(_, directive)| {
+                    matches!(
+                        directive,
+                        Directive::Narrate {
+                            narration: Narration::Outcome(_),
+                            ..
+                        }
+                    )
                 })
+                .map(|(index, _)| index)
                 .collect();
             match game.outcome() {
                 Some(outcome) => {
-                    assert_eq!(broadcasts, [directives.len() - 1]);
+                    assert_eq!(announcements, [directives.len() - 1]);
                     assert_eq!(
                         directives.last(),
-                        Some(&Directive::Broadcast(Narration::Outcome(outcome.clone())))
+                        Some(&Directive::Narrate {
+                            to: outcome.living.clone(),
+                            narration: Narration::Outcome(outcome.clone()),
+                        }),
+                        "the outcome goes to exactly the survivors it names"
                     );
                 }
-                None => assert!(broadcasts.is_empty(), "{broadcasts:?}"),
+                None => assert!(announcements.is_empty(), "{announcements:?}"),
             }
         }
     }

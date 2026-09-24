@@ -108,6 +108,18 @@ Quiescence stops being how an episode ends and becomes how a stalled one is
 detected. An episode that goes quiescent before its environment has sent
 `Stop` is an error.
 
+A `Start` the environment asks for is issued **before** that cycle's events,
+so that an agent logs its start ahead of its first observation. A `Stop` is
+issued **once nothing is in flight**, which is to say once everything
+already said has been handled. It has to be: an agent that pops a `Stop`
+leaves the events still on its queue unpopped, because an agent that has
+stopped did not observe them, so a `Stop` racing a delivery would swallow it
+and which deliveries were swallowed would depend on the scheduler. Holding
+the stop back until the in-flight count reads zero makes "an agent hears
+everything said to it before it is told to stop" a guarantee, and it is what
+lets the moderator narrate an outcome to the living and end the episode in
+one cycle.
+
 Controls are out-of-domain, so the handler does not see them. The loop logs
 every control and acts on it: `Start` makes it call the handler's start
 hook, which returns the agent's opening actions and by default returns
