@@ -210,18 +210,6 @@ where
 
 impl<D: Domain> Eq for Event<D> where D::Payload: Eq {}
 
-impl<D: Domain> Serialize for Event<D> {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeStruct;
-        let mut event = serializer.serialize_struct("Event", 4)?;
-        event.serialize_field("sender", &self.sender)?;
-        event.serialize_field("recipients", &self.recipients)?;
-        event.serialize_field("created", &self.created)?;
-        event.serialize_field("payload", &self.payload)?;
-        event.end()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -250,17 +238,13 @@ mod tests {
     }
 
     #[test]
-    fn an_event_serializes_with_sorted_recipients() {
+    fn an_event_holds_its_recipients_in_canonical_order() {
+        // An event is written to a trajectory by `trajectory::Envelope`,
+        // which is the only wire shape it has, so what is asserted here is
+        // the set itself: the order the envelope will write.
         let event = Event::<TestDomain>::new("a", ["c", "b"], at(40), TestPayload::Step(7));
-        assert_eq!(
-            json(&event),
-            serde_json::json!({
-                "sender": "a",
-                "recipients": ["b", "c"],
-                "created": 40,
-                "payload": {"Step": 7},
-            })
-        );
+        let recipients: Vec<&str> = event.recipients.iter().map(AgentId::as_str).collect();
+        assert_eq!(recipients, ["b", "c"]);
     }
 
     #[test]

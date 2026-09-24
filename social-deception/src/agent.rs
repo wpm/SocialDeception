@@ -119,8 +119,7 @@
 //! assert!(!trajectory.is_empty());
 //! ```
 
-use std::cmp::Reverse;
-use std::collections::{BTreeSet, BinaryHeap};
+use std::collections::BTreeSet;
 use std::fmt;
 use std::panic;
 use std::thread::{self, JoinHandle};
@@ -548,7 +547,6 @@ impl<H> Agent<H> {
             handler,
             timer,
             next_seq: 0,
-            deadlines: BinaryHeap::new(),
             pending: None,
         };
         let thread = thread::Builder::new()
@@ -600,8 +598,7 @@ struct Loop<D: Domain, H, T> {
     timer: T,
     /// The next sequence number to assign.
     next_seq: u64,
-    /// Pending deadlines, earliest first. The timeout keeps at most one here.
-    deadlines: BinaryHeap<Reverse<Timestamp>>,
+
     /// The earliest deadline and the wake channel asked for it, kept across
     /// cycles until it fires.
     pending: Option<(Timestamp, Receiver<Instant>)>,
@@ -615,7 +612,6 @@ where
 {
     fn run(mut self) -> Result<H, Error> {
         loop {
-            self.arm();
             let (mut batch, mut closed) = (Vec::new(), false);
             let woken_by_deadline = match self.wait() {
                 Wake::Delivery(delivery) => {
@@ -638,18 +634,6 @@ where
             }
         }
         Ok(self.handler)
-    }
-
-    /// Makes sure the pending wake channel is for the earliest deadline.
-    fn arm(&mut self) {
-        let earliest = self.deadlines.peek().map(|Reverse(deadline)| *deadline);
-        match (earliest, &self.pending) {
-            (Some(deadline), Some((pending, _))) if *pending == deadline => {}
-            (Some(deadline), _) => {
-                self.pending = Some((deadline, self.timer.wake_at(deadline)));
-            }
-            (None, _) => self.pending = None,
-        }
     }
 
     /// Blocks until something arrives or the pending deadline fires.
@@ -690,14 +674,14 @@ where
     /// Retires the deadline that just fired.
     fn take_deadline(&mut self) {
         self.pending = None;
-        self.deadlines.pop();
     }
 
     /// Schedules the next timeout one interval after `from`, if the agent
     /// has one at all.
     fn schedule_timeout(&mut self, from: Timestamp) {
         if let Some(every) = self.wiring.timeout {
-            self.deadlines.push(Reverse(from + every));
+            let deadline = from + every;
+            self.pending = Some((deadline, self.timer.wake_at(deadline)));
         }
     }
 
@@ -720,7 +704,11 @@ where
                         Control::Start => started = true,
                         Control::Stop => stopped = true,
                     }
-                    inputs.push(self.record_control(control, created, t_start)?);
+                    inputs.push(self.record_control(&Instruction {
+                        control,
+                        created,
+                        received: t_start,
+                    })?);
                 }
                 Delivery::Event(event) => {
                     let observation = Observation {
@@ -830,20 +818,15 @@ where
         Ok(seq)
     }
 
-    fn record_control(
-        &mut self,
-        control: Control,
-        created: Timestamp,
-        received: Timestamp,
-    ) -> Result<Seq, Error> {
+    fn record_control(&mut self, instruction: &Instruction) -> Result<Seq, Error> {
         let seq = self.next_seq();
         self.send_record(
             ControlRecord {
                 agent: self.wiring.id.clone(),
                 seq,
-                created,
-                received,
-                control,
+                created: instruction.created(),
+                received: instruction.received(),
+                control: instruction.control,
             }
             .into(),
         )?;

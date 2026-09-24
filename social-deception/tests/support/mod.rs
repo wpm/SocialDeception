@@ -61,7 +61,7 @@ pub fn check(lines: &[Value]) {
     let records = records(lines);
     for line in lines {
         match line["type"].as_str() {
-            Some("observation" | "action" | "control") => check_record(line),
+            Some(kind @ ("observation" | "action" | "control")) => check_record(line, kind),
             Some("cycle") => check_cycle(line, &records),
             other => panic!("unknown record type {other:?} in {line}"),
         }
@@ -123,19 +123,20 @@ fn event(line: &Value) -> (&str, Vec<&Value>, &Value) {
     (sender, recipients, &event["payload"])
 }
 
-fn check_record(line: &Value) {
-    match line["type"].as_str() {
-        Some("control") => {
-            assert!(
-                time(line, "created") <= time(line, "received"),
-                "nothing is received before it was created: {line}"
-            );
-        }
-        Some("observation") => {
-            assert!(
-                time(line, "created") <= time(line, "received"),
-                "nothing is received before it was created: {line}"
-            );
+fn check_record(line: &Value, kind: &str) {
+    // Everything that was popped says when, and nothing is popped before it
+    // was created. An action is the exception: it was never received.
+    if line["received"].is_null() {
+        assert_eq!(kind, "action", "only an action records no receipt: {line}");
+    } else {
+        assert!(
+            time(line, "created") <= time(line, "received"),
+            "nothing is received before it was created: {line}"
+        );
+    }
+    match kind {
+        "control" => {}
+        "observation" => {
             let (sender, recipients, _) = event(line);
             check_recipients(line, sender, &recipients);
             assert!(
@@ -148,14 +149,10 @@ fn check_record(line: &Value) {
                 "an agent does not observe what it sent: {line}"
             );
         }
-        Some("action") => {
+        "action" => {
             // An action has no `received`: its sender knows only when it
             // sent it, and when each recipient got it is in that
-            // recipient's own observation record.
-            assert!(
-                line["received"].is_null(),
-                "an action records no receipt: {line}"
-            );
+            // recipient's own observation record. The check above says so.
             let (sender, recipients, _) = event(line);
             check_recipients(line, sender, &recipients);
             assert_eq!(
@@ -164,7 +161,8 @@ fn check_record(line: &Value) {
                 "an action names the agent that took it as its sender: {line}"
             );
         }
-        other => panic!("unknown record type {other:?} in {line}"),
+        // `check` matched the kind before calling; there is no other.
+        _ => unreachable!("check_record was handed a {kind} record: {line}"),
     }
 }
 

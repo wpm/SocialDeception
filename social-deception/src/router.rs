@@ -107,7 +107,7 @@ impl<D: Domain> Router<D> {
         {
             return Err(RouteError::UnknownAgent(unknown.clone()));
         }
-        self.deliver(recipients, &Delivery::Event(event.clone()))
+        self.deliver(recipients, || Delivery::Event(event.clone()))
     }
 
     /// Delivers a control to every agent in the roster, stamped with the
@@ -118,13 +118,19 @@ impl<D: Domain> Router<D> {
     /// [`RouteError::InboxClosed`] if some agent's inbox has been dropped.
     /// Agents before it in the roster have already received the control.
     pub fn control(&self, control: Control) -> Result<usize, RouteError> {
-        self.deliver(self.inboxes.keys(), &Delivery::control(self.clock, control))
+        self.deliver(self.inboxes.keys(), || {
+            Delivery::control(self.clock, control)
+        })
     }
 
+    /// `delivery` is called once per recipient rather than cloned from one
+    /// value, so routing to n agents makes exactly n deliveries and not
+    /// n + 1: an event carries its recipients and its payload, so the
+    /// spare copy was not a cheap one.
     fn deliver<'a>(
         &self,
         recipients: impl IntoIterator<Item = &'a AgentId>,
-        delivery: &Delivery<D>,
+        delivery: impl Fn() -> Delivery<D>,
     ) -> Result<usize, RouteError> {
         let mut deliveries = 0;
         for id in recipients {
@@ -133,7 +139,7 @@ impl<D: Domain> Router<D> {
                 .get(id)
                 .ok_or_else(|| RouteError::UnknownAgent(id.clone()))?;
             inbox
-                .send(delivery.clone())
+                .send(delivery())
                 .map_err(|_| RouteError::InboxClosed(id.clone()))?;
             deliveries += 1;
         }
