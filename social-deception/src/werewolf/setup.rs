@@ -32,9 +32,9 @@
 //! and the public algorithm, anyone could recompute the deal and every
 //! agent's random stream, which is to say every piece of hidden information
 //! in the game. So it lies outside every player's observation space: no
-//! [`Message`] has a field that could carry it, and this module never puts
-//! it in one. It is recorded beside the trajectory, in the effective
-//! configuration the `werewolf` binary writes, never in it.
+//! [`Message`](super::Message) has a field that could carry it, and this
+//! module never puts it in one. It is recorded beside the trajectory, in the
+//! effective configuration the `werewolf` binary writes, never in it.
 
 use std::error;
 use std::fmt;
@@ -44,10 +44,11 @@ use std::path::{Path, PathBuf};
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
 
+use super::WerewolfDomain;
 use super::assignment::Assignment;
 use super::config::Config;
 use super::game::Game;
-use super::message::{Message, Outcome};
+use super::message::Outcome;
 use super::moderator::Moderator;
 use super::player::Seat;
 use super::policy::RandomPolicy;
@@ -125,8 +126,8 @@ impl From<EpisodeError> for RunError {
 #[must_use]
 pub fn episode(
     config: &Config,
-    records: Sender<LogRecord<Message>>,
-) -> (Episode<Message>, Receiver<Outcome>) {
+    records: Sender<LogRecord<WerewolfDomain>>,
+) -> (Episode<WerewolfDomain>, Receiver<Outcome>) {
     let assignment = Assignment::deal(config);
     let mut episode = Episode::new(records);
     for (who, role) in assignment.players() {
@@ -139,7 +140,7 @@ pub fn episode(
 /// Seats the moderator in the roster, running a game over `assignment`.
 /// The receiver yields the outcome once it has been announced.
 fn moderate(
-    episode: &mut Episode<Message>,
+    episode: &mut Episode<WerewolfDomain>,
     config: &Config,
     assignment: Assignment,
 ) -> Receiver<Outcome> {
@@ -150,7 +151,7 @@ fn moderate(
 }
 
 /// Seats `who` in the roster as its role, with a policy seeded for it.
-fn seat(episode: &mut Episode<Message>, config: &Config, who: &AgentId, role: Role) {
+fn seat(episode: &mut Episode<WerewolfDomain>, config: &Config, who: &AgentId, role: Role) {
     let policy = RandomPolicy::for_agent(config.seed, who);
     let moderator = config.moderator.clone();
     let me = who.clone();
@@ -177,9 +178,9 @@ fn seat(episode: &mut Episode<Message>, config: &Config, who: &AgentId, role: Ro
 /// is the configuration's check to make, so a failure here is a panic and
 /// not an error of its own.
 fn add(
-    episode: &mut Episode<Message>,
+    episode: &mut Episode<WerewolfDomain>,
     who: &AgentId,
-    handler: impl Handler<Message> + Send + 'static,
+    handler: impl Handler<WerewolfDomain> + Send + 'static,
 ) {
     episode
         .add(who.clone(), handler)
@@ -224,7 +225,7 @@ pub fn run(config: &Config) -> Result<Outcome, RunError> {
 /// trajectory to `trajectory` if anywhere, and takes the outcome off the
 /// moderator's channel.
 fn play<W: Write + Send + 'static>(
-    episode: Episode<Message>,
+    episode: Episode<WerewolfDomain>,
     outcomes: &Receiver<Outcome>,
     writer: Writer<W>,
     trajectory: Option<&Path>,
@@ -251,8 +252,7 @@ mod tests {
     use std::path::Path;
 
     use super::*;
-    use crate::agent::Outgoing;
-    use crate::event::Event;
+    use crate::agent::{Action, Observation};
     use crate::testing::{TempDir, id, ids, parse_lines};
     use crate::werewolf::config::{DEFAULT_MODERATOR, RoleCounts};
     use crate::werewolf::message::Round;
@@ -412,8 +412,8 @@ mod tests {
     /// A player that never answers.
     struct Silent;
 
-    impl Handler<Message> for Silent {
-        fn handle(&mut self, _: &[Event<Message>]) -> Vec<Outgoing<Message>> {
+    impl Handler<WerewolfDomain> for Silent {
+        fn handle(&mut self, _: &[Observation<WerewolfDomain>]) -> Vec<Action<WerewolfDomain>> {
             Vec::new()
         }
     }

@@ -1,17 +1,27 @@
-//! Everything that can happen to an agent.
+//! What travels on the wire: [`Event`] and [`Control`], and the [`Domain`]
+//! that names a game's types.
 //!
-//! An agent has one receiver, and everything that arrives on it is an
-//! [`Event`]: a message from another agent, a control instruction from the
-//! runtime, or the agent's own think wake-up. The message payload type `P`
-//! belongs to the environment; the runtime requires of it only what the
-//! [`Payload`] trait states.
+//! Two kinds of thing reach an agent, and the distinction is the one
+//! ADR-0007 draws. An [`Event`] is *in-domain* data: something an agent said
+//! to other agents, carrying a payload whose meaning belongs entirely to the
+//! game. A [`Control`] is *out-of-domain*: an instruction about the episode
+//! rather than a move within it. Handlers see the first and never the
+//! second, because a handler plays the game and the loop runs the episode.
+//!
+//! An `Event` is a struct rather than an enum because there is now only one
+//! thing it can be. It was an enum when it also had to carry controls and
+//! timer wake-ups; a wake-up is neither in-domain nor out-of-domain nor
+//! anything that traveled, so it is gone, and a timeout now simply runs a
+//! cycle with no observations.
 
 use std::collections::BTreeSet;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-/// What the runtime requires of an environment's message payload:
+use crate::clock::{Created, Timestamp};
+
+/// What the runtime requires of a game's message payload:
 /// `Serialize`, `Send`, `Clone` and `'static`.
 ///
 /// The trait is a name for that bound, nothing more: it is implemented
@@ -19,6 +29,26 @@ use serde::{Deserialize, Serialize};
 pub trait Payload: Serialize + Send + Clone + 'static {}
 
 impl<P: Serialize + Send + Clone + 'static> Payload for P {}
+
+/// The types one game contributes to the runtime.
+///
+/// The runtime is generic over a `Domain` rather than over the payload and
+/// the reward separately. The trait carries no behavior; it names a set of
+/// types, as [`Payload`] names a bound. One trait rather than two type
+/// parameters means a future per-game type is one more associated type here
+/// instead of another parameter on every signature in the crate.
+///
+/// The reward type is only carried and serialized, never added up by the
+/// runtime, so it needs no arithmetic bound. It is named here before
+/// anything logs a reward, so that the generic parameter does not have to
+/// change twice.
+pub trait Domain: 'static {
+    /// What this game's events carry.
+    type Payload: Payload;
+    /// The numeric type of this game's rewards. Integers for a game scored
+    /// in wins and losses, reals for one scored more finely.
+    type Reward: Serialize + Copy + Send + 'static;
+}
 
 /// The name of an agent within an episode.
 ///
@@ -76,60 +106,114 @@ impl From<String> for AgentId {
     }
 }
 
-/// A runtime instruction to an agent.
+/// An out-of-domain instruction to an agent about the episode itself.
+///
+/// A control is not a move in the game and no handler ever sees one. The
+/// loop logs it and acts on it: `Start` makes it call the handler's
+/// [`start`](crate::Handler::start) hook, `Stop` makes it exit after the
+/// cycle that popped it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
-#[serde(tag = "control", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 pub enum Control {
     /// The episode has started; the agent may begin acting.
     Start,
-    /// The episode is over; the agent's loop exits after this event.
+    /// The episode is over; the agent's loop exits after this cycle.
     Stop,
 }
 
-/// Something that happened to an agent.
+/// In-domain data on the wire: what one agent said to others.
 ///
-/// This is the one type that ever arrives on an agent's receiver.
-///
-/// Serializes as an internally tagged object whose `kind` field names the
-/// variant.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum Event<P> {
-    /// Something said in the world.
-    Message {
-        /// The agent that sent it.
-        sender: AgentId,
-        /// The agents it was addressed to, in canonical order.
-        ///
-        /// The set never contains the sender; the router enforces that.
-        recipients: BTreeSet<AgentId>,
-        /// What was said. Its meaning belongs to the environment.
-        payload: P,
-    },
-    /// A runtime instruction.
-    Control(Control),
-    /// The agent's own internal prompting to reconsider, produced by its
-    /// receive deadline firing.
-    Think,
+/// The same value is an [`Action`](crate::Action) of its sender and an
+/// [`Observation`](crate::Observation) of each of its recipients; on the
+/// wire it is only an event. The sender and the creation time are stamped by
+/// the loop as it sends, never by the handler, which is why the value a
+/// handler returns is an `Action` and not this.
+/// `Debug`, `Clone`, equality and `Serialize` are implemented by hand
+/// rather than derived, because a derive would demand each of them of `D`,
+/// the marker type, when what actually has to have them is `D::Payload`.
+pub struct Event<D: Domain> {
+    /// The agent that sent it.
+    pub sender: AgentId,
+    /// The agents it was addressed to, in canonical order.
+    ///
+    /// The set never contains the sender; the router enforces that.
+    pub recipients: BTreeSet<AgentId>,
+    /// The instant the sender sent it.
+    pub created: Timestamp,
+    /// What was said. Its meaning belongs to the game.
+    pub payload: D::Payload,
 }
 
-impl<P> Event<P> {
-    /// Creates a `Message` event.
-    pub fn message<I, A>(sender: impl Into<AgentId>, recipients: I, payload: P) -> Self
+impl<D: Domain> Event<D> {
+    /// An event from `sender` to `recipients`, created at `created`.
+    pub fn new<I, A>(
+        sender: impl Into<AgentId>,
+        recipients: I,
+        created: Timestamp,
+        payload: D::Payload,
+    ) -> Self
     where
         I: IntoIterator<Item = A>,
         A: Into<AgentId>,
     {
-        Self::Message {
+        Self {
             sender: sender.into(),
             recipients: recipients.into_iter().map(Into::into).collect(),
+            created,
             payload,
         }
     }
 }
 
+impl<D: Domain> Created for Event<D> {
+    fn created(&self) -> Timestamp {
+        self.created
+    }
+}
+
+impl<D: Domain> fmt::Debug for Event<D>
+where
+    D::Payload: fmt::Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Event")
+            .field("sender", &self.sender)
+            .field("recipients", &self.recipients)
+            .field("created", &self.created)
+            .field("payload", &self.payload)
+            .finish()
+    }
+}
+
+impl<D: Domain> Clone for Event<D> {
+    fn clone(&self) -> Self {
+        Self {
+            sender: self.sender.clone(),
+            recipients: self.recipients.clone(),
+            created: self.created,
+            payload: self.payload.clone(),
+        }
+    }
+}
+
+impl<D: Domain> PartialEq for Event<D>
+where
+    D::Payload: PartialEq,
+{
+    fn eq(&self, other: &Self) -> bool {
+        self.sender == other.sender
+            && self.recipients == other.recipients
+            && self.created == other.created
+            && self.payload == other.payload
+    }
+}
+
+impl<D: Domain> Eq for Event<D> where D::Payload: Eq {}
+
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -137,37 +221,42 @@ mod tests {
         Step(u64),
     }
 
+    /// A domain whose events carry a [`TestPayload`].
+    struct TestDomain;
+
+    impl Domain for TestDomain {
+        type Payload = TestPayload;
+        type Reward = i32;
+    }
+
+    fn at(nanos: u64) -> Timestamp {
+        Timestamp::from(Duration::from_nanos(nanos))
+    }
+
     fn json<T: Serialize>(value: &T) -> serde_json::Value {
         serde_json::to_value(value).unwrap()
     }
 
     #[test]
-    fn message_serializes_with_sorted_recipients() {
-        let event = Event::message("a", ["c", "b"], TestPayload::Step(7));
-        assert_eq!(
-            json(&event),
-            serde_json::json!({
-                "kind": "message",
-                "sender": "a",
-                "recipients": ["b", "c"],
-                "payload": {"Step": 7},
-            })
-        );
+    fn an_event_holds_its_recipients_in_canonical_order() {
+        // An event is written to a trajectory by `trajectory::Envelope`,
+        // which is the only wire shape it has, so what is asserted here is
+        // the set itself: the order the envelope will write.
+        let event = Event::<TestDomain>::new("a", ["c", "b"], at(40), TestPayload::Step(7));
+        let recipients: Vec<&str> = event.recipients.iter().map(AgentId::as_str).collect();
+        assert_eq!(recipients, ["b", "c"]);
     }
 
     #[test]
-    fn control_serializes_flat() {
-        let event: Event<TestPayload> = Event::Control(Control::Stop);
-        assert_eq!(
-            json(&event),
-            serde_json::json!({"kind": "control", "control": "stop"})
-        );
+    fn an_event_knows_when_it_was_created() {
+        let event = Event::<TestDomain>::new("a", ["b"], at(40), TestPayload::Step(7));
+        assert_eq!(Created::created(&event), at(40));
     }
 
     #[test]
-    fn think_serializes_as_its_tag_alone() {
-        let event: Event<TestPayload> = Event::Think;
-        assert_eq!(json(&event), serde_json::json!({"kind": "think"}));
+    fn a_control_serializes_as_its_name() {
+        assert_eq!(json(&Control::Start), serde_json::json!("start"));
+        assert_eq!(json(&Control::Stop), serde_json::json!("stop"));
     }
 
     #[test]

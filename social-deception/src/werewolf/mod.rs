@@ -104,6 +104,8 @@
 //! whatever reads a trajectory back; the payload's shape belongs to the
 //! environment alone.
 
+use crate::event::Domain;
+
 pub mod assignment;
 pub mod config;
 pub mod game;
@@ -117,6 +119,23 @@ pub mod roles;
 pub mod seed;
 pub mod setup;
 pub mod transcript;
+
+/// Werewolf as a [`Domain`]: the types this game contributes to the
+/// runtime.
+///
+/// Its events carry a [`Message`], and a player's reward is an integer,
+/// because a game of Werewolf is won or lost and nothing finer is scored.
+///
+/// The name is not `Werewolf`, which is the role a player may be dealt. A
+/// domain is the whole game; the role is one thing inside it, and the two
+/// would be hard to tell apart in a signature if they shared a name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct WerewolfDomain;
+
+impl Domain for WerewolfDomain {
+    type Payload = Message;
+    type Reward = i32;
+}
 
 pub use assignment::Assignment;
 pub use config::{Config, ConfigError, RoleCounts};

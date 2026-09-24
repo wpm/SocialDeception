@@ -5,11 +5,12 @@
 //! anyone has tried, it reaches 1. A chain is the sequence of values from a
 //! starting number down to 1.
 //!
-//! Each agent in the environment passes to one other agent. On receiving a
-//! value it computes the next one and sends it on; on receiving 1 it sends
-//! nothing. An agent may also open chains of its own when the episode starts.
-//! Collatz agents never think unprompted, so once every chain has reached 1
-//! nothing is in flight and the episode ends on its own.
+//! Each agent in the environment passes to one other agent. On observing a
+//! value it computes the next one and sends it on; on observing 1 it sends
+//! nothing. An agent may also open chains of its own when it is started,
+//! which is what its start hook is for. Collatz agents have no timeout, so
+//! once every chain has reached 1 nothing is in flight and the episode ends
+//! on its own.
 //!
 //! A chain is named by its starting number, and every step carries the name
 //! of the chain it belongs to. Chains from different starting numbers merge,
@@ -19,11 +20,25 @@
 //! Every value at every step is known in advance, so any difference between
 //! the trajectory an episode writes and the sequence computed independently
 //! is a bug in the runtime, not a model being unpredictable. That is what the
-//! environment is for: it is the first instantiation of the generic
-//! [`Event`], and the runtime's end-to-end test.
+//! environment is for: it is a second [`Domain`] beside Werewolf's, which is
+//! what keeps the runtime honest about being generic, and the runtime's
+//! end-to-end test.
 
 use serde::Serialize;
-use social_deception::{AgentId, Control, Event, Handler, Outgoing};
+use social_deception::{Action, AgentId, Domain, Handler, Observation};
+
+/// The Collatz environment as a [`Domain`].
+///
+/// Its rewards are integers. Nothing assigns one yet: the type is named
+/// because a domain names both of a game's types, and a ring passing numbers
+/// around has no notion of winning to score.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CollatzDomain;
+
+impl Domain for CollatzDomain {
+    type Payload = CollatzPayload;
+    type Reward = i32;
+}
 
 /// What Collatz agents say to each other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
@@ -104,61 +119,87 @@ impl Collatz {
         &self.opens
     }
 
-    /// The steps one event calls for sending.
-    fn reply(&self, event: &Event<CollatzPayload>) -> Vec<CollatzPayload> {
-        match event {
-            Event::Control(Control::Start) => self
-                .opens
-                .iter()
-                .map(|&start| CollatzPayload::Step {
-                    chain: start,
-                    value: start,
-                })
-                .collect(),
-            Event::Message {
-                payload: CollatzPayload::Step { chain, value },
-                ..
-            } => match *value {
-                // A chain that has reached 1 is over.
-                1 => Vec::new(),
-                value => vec![CollatzPayload::Step {
-                    chain: *chain,
-                    value: next(value),
-                }],
-            },
-            Event::Control(Control::Stop) | Event::Think => Vec::new(),
+    /// The steps one observation calls for sending. It depends only on the
+    /// step observed: an agent keeps no state between cycles, because the
+    /// chain's name and value travel with the message.
+    fn reply(observation: &Observation<CollatzDomain>) -> Vec<CollatzPayload> {
+        let CollatzPayload::Step { chain, value } = observation.event.payload;
+        match value {
+            // A chain that has reached 1 is over.
+            1 => Vec::new(),
+            value => vec![CollatzPayload::Step {
+                chain,
+                value: next(value),
+            }],
         }
+    }
+
+    /// One step, addressed to the agent this one passes to.
+    fn pass(&self, step: CollatzPayload) -> Action<CollatzDomain> {
+        Action::to([self.to.clone()], step)
     }
 }
 
-impl Handler<CollatzPayload> for Collatz {
-    fn handle(&mut self, events: &[Event<CollatzPayload>]) -> Vec<Outgoing<CollatzPayload>> {
-        events
+impl Handler<CollatzDomain> for Collatz {
+    /// Opens this agent's own chains, each at its starting value.
+    fn start(&mut self) -> Vec<Action<CollatzDomain>> {
+        self.opens
             .iter()
-            .flat_map(|event| self.reply(event))
-            .map(|step| Outgoing::to([self.to.clone()], step))
+            .map(|&start| {
+                self.pass(CollatzPayload::Step {
+                    chain: start,
+                    value: start,
+                })
+            })
+            .collect()
+    }
+
+    fn handle(
+        &mut self,
+        observations: &[Observation<CollatzDomain>],
+    ) -> Vec<Action<CollatzDomain>> {
+        observations
+            .iter()
+            .flat_map(Self::reply)
+            .map(|step| self.pass(step))
             .collect()
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use social_deception::{Event, Timestamp};
+
     use super::*;
 
-    /// A step of chain 27 arriving at `a`.
-    fn step(sender: &str, value: u64) -> Event<CollatzPayload> {
-        Event::message(sender, ["a"], CollatzPayload::Step { chain: 27, value })
+    /// A step of chain `chain` observed by `a`. The times play no part in
+    /// what an agent does with it, so one stand-in serves every test here.
+    fn observing(sender: &str, chain: u64, value: u64) -> Observation<CollatzDomain> {
+        Observation {
+            event: Event::new(
+                sender,
+                ["a"],
+                Timestamp::default(),
+                CollatzPayload::Step { chain, value },
+            ),
+            received: Timestamp::default(),
+        }
     }
 
-    fn sent(
+    /// A step of chain 27 observed by `a`.
+    fn step(sender: &str, value: u64) -> Observation<CollatzDomain> {
+        observing(sender, 27, value)
+    }
+
+    fn sent<const N: usize>(
         agent: &mut Collatz,
-        events: &[Event<CollatzPayload>],
-    ) -> Vec<Outgoing<CollatzPayload>> {
-        agent.handle(events)
+        observations: &[Observation<CollatzDomain>; N],
+    ) -> Vec<Action<CollatzDomain>> {
+        agent.handle(observations)
     }
 
-    fn to_b(chain: u64, value: u64) -> Outgoing<CollatzPayload> {
-        Outgoing::to(["b"], CollatzPayload::Step { chain, value })
+    fn to_b(chain: u64, value: u64) -> Action<CollatzDomain> {
+        Action::to(["b"], CollatzPayload::Step { chain, value })
     }
 
     #[test]
@@ -197,52 +238,35 @@ mod tests {
     #[test]
     fn a_step_keeps_its_chain() {
         let mut agent = Collatz::new("b");
-        let step = Event::message(
-            "c",
-            ["a"],
-            CollatzPayload::Step {
-                chain: 7,
-                value: 10,
-            },
-        );
-        assert_eq!(sent(&mut agent, &[step]), [to_b(7, 5)]);
+        assert_eq!(sent(&mut agent, &[observing("c", 7, 10)]), [to_b(7, 5)]);
     }
 
     #[test]
-    fn chains_are_opened_on_start_in_order_and_named_by_their_start() {
+    fn chains_are_opened_at_the_start_in_order_and_named_by_their_start() {
         let mut agent = Collatz::new("b").opening(6).opening(7);
         assert_eq!(agent.opens(), [6, 7]);
         assert_eq!(agent.to(), &AgentId::new("b"));
+        assert_eq!(agent.start(), [to_b(6, 6), to_b(7, 7)]);
+        // An agent that opens nothing opens nothing.
+        assert!(Collatz::new("b").start().is_empty());
+    }
+
+    #[test]
+    fn a_cycle_is_answered_in_order() {
+        let mut agent = Collatz::new("b");
         assert_eq!(
-            sent(&mut agent, &[Event::Control(Control::Start)]),
-            [to_b(6, 6), to_b(7, 7)]
-        );
-        assert!(
-            Collatz::new("b")
-                .handle(&[Event::Control(Control::Start)])
-                .is_empty()
+            sent(&mut agent, &[step("c", 8), step("c", 1), step("c", 3)]),
+            [to_b(27, 4), to_b(27, 10)]
         );
     }
 
     #[test]
-    fn a_batch_is_answered_in_order() {
+    fn a_cycle_with_no_observations_sends_nothing() {
+        // What a timeout cycle looks like from inside the handler. A start
+        // is not among these: the loop calls the start hook instead of
+        // handing the handler a control.
         let mut agent = Collatz::new("b").opening(5);
-        let batch = [
-            Event::Control(Control::Start),
-            step("c", 8),
-            step("c", 1),
-            step("c", 3),
-        ];
-        assert_eq!(
-            sent(&mut agent, &batch),
-            [to_b(5, 5), to_b(27, 4), to_b(27, 10)]
-        );
-    }
-
-    #[test]
-    fn stop_and_think_send_nothing() {
-        let mut agent = Collatz::new("b").opening(5);
-        assert!(sent(&mut agent, &[Event::Control(Control::Stop), Event::Think]).is_empty());
+        assert!(agent.handle(&[]).is_empty());
     }
 
     #[test]

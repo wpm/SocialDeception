@@ -4,8 +4,9 @@
 //! The episode constructs the roster, wires each agent's inbox, dispatch
 //! channel and record channel, spawns one thread per agent, tells every
 //! agent to start, routes what the agents send until the episode is over,
-//! tells every agent to stop, and joins the threads. [`Control`] events are
-//! how it says start and stop.
+//! tells every agent to stop, and joins the threads. A [`Control`] is how it
+//! says start and stop, and the episode stamps each one with the instant it
+//! sent it, so that an agent's record of popping it says how long it waited.
 //!
 //! # Quiescence
 //!
@@ -20,11 +21,11 @@
 //! count never reads zero while a cycle that might still send is under way.
 //! When it reaches zero the episode is quiescent and shutdown begins.
 //!
-//! In-flight work is counted in **deliveries, not messages**: one event
+//! In-flight work is counted in **deliveries, not events**: one event
 //! addressed to six agents is six handles that have not happened yet.
 //!
-//! An episode's agents have no think interval: an agent with one keeps
-//! waking on its own, and the episode would never go quiescent.
+//! An episode's agents have no timeout: an agent with one keeps waking on
+//! its own, and the episode would never go quiescent.
 
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
@@ -34,9 +35,9 @@ use std::panic::{self, AssertUnwindSafe};
 
 use crossbeam_channel::{Receiver, Sender, select, unbounded};
 
-use crate::agent::{self, Agent, CycleDispatch, Handler, Outgoing, Wiring};
+use crate::agent::{self, Action, Agent, CycleDispatch, Handler, Observation, Wiring};
 use crate::clock::Clock;
-use crate::event::{AgentId, Control, Event, Payload};
+use crate::event::{AgentId, Control, Domain};
 use crate::router::{RouteError, Router};
 use crate::trajectory::LogRecord;
 
@@ -63,11 +64,11 @@ impl fmt::Display for Failure {
 pub enum EpisodeError {
     /// An id was added to the roster twice.
     DuplicateAgent(AgentId),
-    /// A control event could not be delivered.
+    /// A control could not be delivered.
     Control(RouteError),
-    /// The router refused a message this agent sent. That is a bug in the
+    /// The router refused an event this agent sent. That is a bug in the
     /// agent's handler, and the episode stops rather than carrying on
-    /// without the message.
+    /// without the event.
     Route {
         /// The agent that sent it.
         agent: AgentId,
@@ -82,11 +83,11 @@ impl fmt::Display for EpisodeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::DuplicateAgent(id) => write!(f, "agent {id} is in the roster twice"),
-            Self::Control(error) => write!(f, "could not deliver a control event: {error}"),
+            Self::Control(error) => write!(f, "could not deliver a control: {error}"),
             Self::Route { agent, error } => {
                 write!(
                     f,
-                    "agent {agent} sent a message that could not be routed: {error}"
+                    "agent {agent} sent an event that could not be routed: {error}"
                 )
             }
             Self::Agents(failures) => {
@@ -113,13 +114,13 @@ impl Error for EpisodeError {
 ///
 /// Build it with [`Episode::new`], add agents with [`Episode::add`], then
 /// [`Episode::run`] it. The roster is fixed from the moment `run` starts.
-pub struct Episode<P> {
-    roster: BTreeMap<AgentId, Box<dyn Handler<P> + Send>>,
-    records: Sender<LogRecord<P>>,
+pub struct Episode<D: Domain> {
+    roster: BTreeMap<AgentId, Box<dyn Handler<D> + Send>>,
+    records: Sender<LogRecord<D>>,
     clock: Clock,
 }
 
-impl<P> fmt::Debug for Episode<P> {
+impl<D: Domain> fmt::Debug for Episode<D> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Episode")
             .field("roster", &self.roster.keys().collect::<Vec<_>>())
@@ -127,17 +128,17 @@ impl<P> fmt::Debug for Episode<P> {
     }
 }
 
-impl<P: Payload> Episode<P> {
+impl<D: Domain> Episode<D> {
     /// An empty roster whose trajectory goes to `records`, timed by a
     /// [`Clock`] started now.
     #[must_use]
-    pub fn new(records: Sender<LogRecord<P>>) -> Self {
+    pub fn new(records: Sender<LogRecord<D>>) -> Self {
         Self::with_clock(records, Clock::start())
     }
 
     /// An empty roster whose trajectory goes to `records`, timed by `clock`.
     #[must_use]
-    pub fn with_clock(records: Sender<LogRecord<P>>, clock: Clock) -> Self {
+    pub fn with_clock(records: Sender<LogRecord<D>>, clock: Clock) -> Self {
         Self {
             roster: BTreeMap::new(),
             records,
@@ -153,7 +154,7 @@ impl<P: Payload> Episode<P> {
     pub fn add(
         &mut self,
         id: impl Into<AgentId>,
-        handler: impl Handler<P> + Send + 'static,
+        handler: impl Handler<D> + Send + 'static,
     ) -> Result<(), EpisodeError> {
         let id = id.into();
         if self.roster.contains_key(&id) {
@@ -177,8 +178,8 @@ impl<P: Payload> Episode<P> {
     ///
     /// # Errors
     ///
-    /// If a control event could not be delivered, an agent sent a message
-    /// the router refused, or an agent's thread ended with an error or a
+    /// If a control could not be delivered, an agent sent an event the
+    /// router refused, or an agent's thread ended with an error or a
     /// panic. In every case the agents that were running have been stopped
     /// and joined before this returns, so the trajectory is complete up to
     /// the failure.
@@ -207,7 +208,7 @@ impl<P: Payload> Episode<P> {
                 inbox,
                 dispatches: dispatch.clone(),
                 records: records.clone(),
-                think_every: None,
+                timeout: None,
                 peers: ids.iter().filter(|peer| **peer != id).cloned().collect(),
             };
             let watched = Watched {
@@ -256,9 +257,9 @@ use Halt::Departure;
 /// deliveries its outputs cause onto it, in that order but as one step, so
 /// the count reads zero only when no agent has anything left to handle or
 /// send.
-fn drive<P: Payload>(
-    router: &Router<P>,
-    dispatches: &Receiver<CycleDispatch<P>>,
+fn drive<D: Domain>(
+    router: &Router<D>,
+    dispatches: &Receiver<CycleDispatch<D>>,
     obituaries: &Receiver<AgentId>,
     mut in_flight: usize,
 ) -> Result<(), Halt> {
@@ -291,19 +292,23 @@ fn drive<P: Payload>(
 /// handler it gets back. Before shutdown an obituary can only mean the
 /// first two, and it is what keeps the episode from waiting forever for a
 /// cycle that will never be reported.
-struct Watched<P> {
+struct Watched<D: Domain> {
     id: AgentId,
-    handler: Box<dyn Handler<P> + Send>,
+    handler: Box<dyn Handler<D> + Send>,
     obituary: Sender<AgentId>,
 }
 
-impl<P> Handler<P> for Watched<P> {
-    fn handle(&mut self, events: &[Event<P>]) -> Vec<Outgoing<P>> {
-        self.handler.handle(events)
+impl<D: Domain> Handler<D> for Watched<D> {
+    fn start(&mut self) -> Vec<Action<D>> {
+        self.handler.start()
+    }
+
+    fn handle(&mut self, observations: &[Observation<D>]) -> Vec<Action<D>> {
+        self.handler.handle(observations)
     }
 }
 
-impl<P> Drop for Watched<P> {
+impl<D: Domain> Drop for Watched<D> {
     fn drop(&mut self) {
         // After shutdown nobody is listening, and that is fine.
         let _ = self.obituary.send(self.id.clone());
@@ -311,7 +316,7 @@ impl<P> Drop for Watched<P> {
 }
 
 /// Joins every thread and collects the ones that did not end cleanly.
-fn join<P>(agents: Vec<Agent<Watched<P>>>) -> Vec<(AgentId, Failure)> {
+fn join<D: Domain>(agents: Vec<Agent<Watched<D>>>) -> Vec<(AgentId, Failure)> {
     agents
         .into_iter()
         .filter_map(|agent| {
@@ -337,75 +342,112 @@ fn panic_message(payload: &(dyn Any + Send)) -> String {
 
 #[cfg(test)]
 mod tests {
+    use serde::Serialize;
     use serde_json::Value;
 
     use super::*;
     use crate::testing::parse_lines;
     use crate::trajectory::Writer;
 
+    /// A count, which is all these agents ever say to each other.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+    #[serde(transparent)]
+    struct Count(u64);
+
+    /// The domain of the counting games below.
+    struct Counting;
+
+    impl Domain for Counting {
+        type Payload = Count;
+        type Reward = i32;
+    }
+
+    /// The payloads of a batch of observations.
+    fn counts(observations: &[Observation<Counting>]) -> Vec<u64> {
+        observations
+            .iter()
+            .map(|observation| observation.event.payload.0)
+            .collect()
+    }
+
     /// Volleys a count back and forth with `partner` until it reaches
-    /// `limit`, then goes quiet. The one that `serves` opens on `Start`.
+    /// `limit`, then goes quiet. The one that `serves` opens the rally.
     struct Rally {
         partner: AgentId,
         serves: bool,
         limit: u64,
     }
 
-    impl Handler<u64> for Rally {
-        fn handle(&mut self, events: &[Event<u64>]) -> Vec<Outgoing<u64>> {
-            events
-                .iter()
-                .filter_map(|event| match event {
-                    Event::Control(Control::Start) if self.serves => Some(1),
-                    Event::Message { payload, .. } if *payload < self.limit => Some(payload + 1),
-                    _ => None,
-                })
-                .map(|n| Outgoing::to([self.partner.clone()], n))
+    impl Rally {
+        fn to_partner(&self, n: u64) -> Action<Counting> {
+            Action::to([self.partner.clone()], Count(n))
+        }
+    }
+
+    impl Handler<Counting> for Rally {
+        fn start(&mut self) -> Vec<Action<Counting>> {
+            if self.serves {
+                vec![self.to_partner(1)]
+            } else {
+                Vec::new()
+            }
+        }
+
+        fn handle(&mut self, observations: &[Observation<Counting>]) -> Vec<Action<Counting>> {
+            counts(observations)
+                .into_iter()
+                .filter(|n| *n < self.limit)
+                .map(|n| self.to_partner(n + 1))
                 .collect()
         }
     }
 
-    /// Broadcasts once, on `Start`, and says nothing more.
+    /// Broadcasts once when it starts, and says nothing more.
     struct Hub;
 
-    impl Handler<u64> for Hub {
-        fn handle(&mut self, events: &[Event<u64>]) -> Vec<Outgoing<u64>> {
-            events
-                .iter()
-                .filter(|event| matches!(event, Event::Control(Control::Start)))
-                .map(|_| Outgoing::broadcast(0))
-                .collect()
+    impl Handler<Counting> for Hub {
+        fn start(&mut self) -> Vec<Action<Counting>> {
+            vec![Action::broadcast(Count(0))]
+        }
+
+        fn handle(&mut self, _: &[Observation<Counting>]) -> Vec<Action<Counting>> {
+            Vec::new()
         }
     }
 
     /// Replies once to whoever sends it anything.
     struct Spoke;
 
-    impl Handler<u64> for Spoke {
-        fn handle(&mut self, events: &[Event<u64>]) -> Vec<Outgoing<u64>> {
-            events
+    impl Handler<Counting> for Spoke {
+        fn handle(&mut self, observations: &[Observation<Counting>]) -> Vec<Action<Counting>> {
+            observations
                 .iter()
-                .filter_map(|event| match event {
-                    Event::Message { sender, .. } => Some(Outgoing::to([sender.clone()], 1)),
-                    _ => None,
-                })
+                .map(|observation| Action::to([observation.event.sender.clone()], Count(1)))
                 .collect()
         }
     }
 
-    /// Sends one message to `to` on `Start`, whoever that is.
+    /// Sends one event to `to` when it starts, whoever that is.
     struct Addresses(&'static str);
 
-    impl Handler<u64> for Addresses {
-        fn handle(&mut self, _: &[Event<u64>]) -> Vec<Outgoing<u64>> {
-            vec![Outgoing::to([self.0], 1)]
+    impl Handler<Counting> for Addresses {
+        fn start(&mut self) -> Vec<Action<Counting>> {
+            vec![Action::to([self.0], Count(1))]
+        }
+
+        fn handle(&mut self, _: &[Observation<Counting>]) -> Vec<Action<Counting>> {
+            Vec::new()
         }
     }
 
     struct Panics;
 
-    impl Handler<u64> for Panics {
-        fn handle(&mut self, _: &[Event<u64>]) -> Vec<Outgoing<u64>> {
+    impl Handler<Counting> for Panics {
+        fn start(&mut self) -> Vec<Action<Counting>> {
+            panic!("the handler is broken")
+        }
+
+        fn handle(&mut self, _: &[Observation<Counting>]) -> Vec<Action<Counting>> {
             panic!("the handler is broken")
         }
     }
@@ -414,7 +456,7 @@ mod tests {
         lines.iter().filter(move |line| line["agent"] == agent)
     }
 
-    fn rally(limit: u64) -> (Episode<u64>, Writer<Vec<u8>>) {
+    fn rally(limit: u64) -> (Episode<Counting>, Writer<Vec<u8>>) {
         let (records, writer) = Writer::spawn(Vec::new());
         let mut episode = Episode::new(records);
         for (me, partner, serves) in [("a", "b", true), ("b", "a", false)] {
@@ -447,8 +489,7 @@ mod tests {
         // the writer; only each agent's own order is promised.
         let sent = |agent: &str| -> Vec<u64> {
             of(&lines, agent)
-                .filter(|line| line["event"]["kind"] == "message")
-                .filter(|line| line["event"]["sender"] == agent)
+                .filter(|line| line["type"] == "action")
                 .map(|line| line["event"]["payload"].as_u64().unwrap())
                 .collect()
         };
@@ -456,19 +497,82 @@ mod tests {
         assert_eq!(sent("b"), (2..=20).step_by(2).collect::<Vec<_>>());
         for agent in ["a", "b"] {
             let seqs: Vec<u64> = of(&lines, agent)
-                .filter(|line| line["type"] == "event")
+                .filter(|line| line["type"] != "cycle")
                 .map(|line| line["seq"].as_u64().unwrap())
                 .collect();
             assert_eq!(seqs, (0..seqs.len() as u64).collect::<Vec<_>>());
             let controls: Vec<&Value> = of(&lines, agent)
-                .filter(|line| line["event"]["kind"] == "control")
-                .map(|line| &line["event"]["control"])
+                .filter(|line| line["type"] == "control")
+                .map(|line| &line["control"])
                 .collect();
             assert_eq!(controls, ["start", "stop"]);
+            // No agent here has a timeout, so every cycle was woken by
+            // something on the queue and none is empty.
+            for line in of(&lines, agent).filter(|line| line["type"] == "cycle") {
+                assert_eq!(line["woken"], "queue", "{line}");
+                assert!(
+                    !line["inputs"].as_array().unwrap().is_empty(),
+                    "no cycle popped nothing: {line}"
+                );
+            }
+            // Every action lies within the window of the cycle that sent it,
+            // and every observation and control was received at a t_start.
+            let starts: BTreeSet<u64> = of(&lines, agent)
+                .filter(|line| line["type"] == "cycle")
+                .map(|line| line["t_start"].as_u64().unwrap())
+                .collect();
+            for line in of(&lines, agent).filter(|line| line["type"] != "cycle") {
+                if line["type"] == "action" {
+                    continue;
+                }
+                let (created, received) = (
+                    line["created"].as_u64().unwrap(),
+                    line["received"].as_u64().unwrap(),
+                );
+                assert!(
+                    created <= received,
+                    "nothing arrives before it was sent: {line}"
+                );
+                assert!(
+                    starts.contains(&received),
+                    "everything popped is popped at a cycle's start: {line}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_observation_carries_the_creation_time_of_the_action_that_sent_it() {
+        // The join a training pipeline makes: an observation in one agent's
+        // trajectory and the action in its sender's are the same event, and
+        // nothing but the sender and the creation time links them.
+        let (episode, writer) = rally(6);
+        episode.run().unwrap();
+        let lines = parse_lines(&writer.join().unwrap());
+
+        let actions: BTreeSet<(String, u64)> = lines
+            .iter()
+            .filter(|line| line["type"] == "action")
+            .map(|line| {
+                (
+                    line["event"]["sender"].as_str().unwrap().to_owned(),
+                    line["created"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        let observations: Vec<&Value> = lines
+            .iter()
+            .filter(|line| line["type"] == "observation")
+            .collect();
+        assert!(!observations.is_empty());
+        for line in observations {
+            let key = (
+                line["event"]["sender"].as_str().unwrap().to_owned(),
+                line["created"].as_u64().unwrap(),
+            );
             assert!(
-                of(&lines, agent).all(|line| line["type"] != "cycle"
-                    || !line["inputs"].as_array().unwrap().is_empty()),
-                "no cycle has an empty drain"
+                actions.contains(&key),
+                "every observation joins an action by sender and creation time: {line}"
             );
         }
     }
@@ -488,11 +592,11 @@ mod tests {
         // not have handled all six.
         let lines = parse_lines(&writer.join().unwrap());
         let replies_seen_by_hub = of(&lines, "hub")
-            .filter(|line| line["event"]["kind"] == "message" && line["event"]["sender"] != "hub")
+            .filter(|line| line["type"] == "observation")
             .count();
         assert_eq!(replies_seen_by_hub, 6);
         let broadcast = of(&lines, "hub")
-            .find(|line| line["event"]["sender"] == "hub")
+            .find(|line| line["type"] == "action")
             .expect("the hub recorded its broadcast");
         assert_eq!(
             broadcast["event"]["recipients"].as_array().unwrap().len(),
@@ -504,7 +608,7 @@ mod tests {
     #[test]
     fn an_empty_roster_runs_and_writes_nothing() {
         let (records, writer) = Writer::spawn(Vec::new());
-        Episode::<u64>::new(records).run().unwrap();
+        Episode::<Counting>::new(records).run().unwrap();
         assert!(writer.join().unwrap().is_empty());
     }
 
@@ -537,7 +641,7 @@ mod tests {
         assert!(error.to_string().contains("the handler is broken"));
         // The other agent was still stopped cleanly.
         let lines = parse_lines(&writer.join().unwrap());
-        assert!(of(&lines, "b").any(|line| line["event"]["control"] == "stop"));
+        assert!(of(&lines, "b").any(|line| line["control"] == "stop"));
     }
 
     #[test]
@@ -613,7 +717,7 @@ mod tests {
         );
         assert_eq!(
             EpisodeError::Control(RouteError::InboxClosed(AgentId::new("a"))).to_string(),
-            "could not deliver a control event: the inbox of agent a is closed"
+            "could not deliver a control: the inbox of agent a is closed"
         );
         assert_eq!(
             EpisodeError::Route {
@@ -621,7 +725,7 @@ mod tests {
                 error: RouteError::NoRecipients
             }
             .to_string(),
-            "agent a sent a message that could not be routed: a message must have at least one recipient"
+            "agent a sent an event that could not be routed: an event must have at least one recipient"
         );
         assert_eq!(
             EpisodeError::Agents(vec![
@@ -639,7 +743,7 @@ mod tests {
                 .source()
                 .is_some()
         );
-        let (records, _writer) = Writer::<Vec<u8>>::spawn::<u64>(Vec::new());
+        let (records, _writer) = Writer::<Vec<u8>>::spawn::<Counting>(Vec::new());
         assert!(format!("{:?}", Episode::new(records)).starts_with("Episode"));
     }
 }
