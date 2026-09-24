@@ -48,7 +48,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::message::{
-    Action, Cause, Message, Narration, Outcome, Phase, Request, RequestKind, Round,
+    Cause, Message, Move, Narration, Outcome, Phase, Request, RequestKind, Round,
 };
 use super::role::{Faction, Role};
 use crate::event::{AgentId, Event};
@@ -107,8 +107,8 @@ pub struct Heard {
     pub round: Round,
     /// Which half of the round.
     pub phase: Phase,
-    /// Each responding player's action.
-    pub votes: BTreeMap<AgentId, Action>,
+    /// Each responding player's move.
+    pub votes: BTreeMap<AgentId, Move>,
 }
 
 impl Knowledge {
@@ -129,18 +129,18 @@ impl Knowledge {
         }
     }
 
-    /// Folds one of this agent's own actions into the state: the answer it
+    /// Folds one of this agent's own moves into the state: the answer it
     /// gave to `request`.
     ///
     /// Total, like [`observe`](Self::observe), and almost always a no-op,
     /// because the moderator narrates the consequences of nearly every
-    /// action back to the agent. The one exception is a `Protect`, which is
+    /// move back to the agent. The one exception is a `Protect`, which is
     /// announced to nobody: its target is remembered as
     /// [`last_protected`](Self::last_protected), and an abstention clears
     /// it, since there was no protection to repeat.
-    pub fn acted(&mut self, request: &Request, action: &Action) {
+    pub fn acted(&mut self, request: &Request, chosen: &Move) {
         if request.kind == RequestKind::Protect {
-            self.last_protected = action.target().cloned();
+            self.last_protected = chosen.target().cloned();
         }
     }
 
@@ -255,7 +255,7 @@ mod tests {
     use crate::testing::{ME, id, ids, narrated, phase_began, request, target};
     use crate::werewolf::message::{RequestId, Response};
 
-    fn votes<const N: usize>(votes: [(&str, Action); N]) -> BTreeMap<AgentId, Action> {
+    fn votes<const N: usize>(votes: [(&str, Move); N]) -> BTreeMap<AgentId, Move> {
         votes
             .into_iter()
             .map(|(who, action)| (id(who), action))
@@ -273,7 +273,7 @@ mod tests {
         })
     }
 
-    fn tally(round: u32, phase: Phase, votes: BTreeMap<AgentId, Action>) -> Event<Message> {
+    fn tally(round: u32, phase: Phase, votes: BTreeMap<AgentId, Move>) -> Event<Message> {
         narrated(Narration::Tally {
             round: Round(round),
             phase,
@@ -308,7 +308,7 @@ mod tests {
     }
 
     /// The one day vote in [`a_seers_game`].
-    fn day_votes() -> BTreeMap<AgentId, Action> {
+    fn day_votes() -> BTreeMap<AgentId, Move> {
         votes([
             ("bob", target("carol")),
             ("carol", target("bob")),
@@ -335,7 +335,7 @@ mod tests {
             investigated("bob", Faction::Village),
             eliminated("bob", Role::Villager, 2, Cause::Devoured),
             narrated(Narration::Outcome(Outcome {
-                winner: Some(Faction::Werewolves),
+                winner: Faction::Werewolves,
                 rounds: Round(2),
                 living: ids([ME, "wolfgang"]),
             })),
@@ -369,7 +369,7 @@ mod tests {
                     votes: day_votes(),
                 }],
                 outcome: Some(Outcome {
-                    winner: Some(Faction::Werewolves),
+                    winner: Faction::Werewolves,
                     rounds: Round(2),
                     living: ids([ME, "wolfgang"]),
                 }),
@@ -469,7 +469,7 @@ mod tests {
                 ["moderator"],
                 Message::Response(Response {
                     request: RequestId(3),
-                    action: target("alice"),
+                    chosen: target("alice"),
                 }),
             ),
             narrated(Narration::NoDeath { round: Round(2) }),
@@ -493,7 +493,7 @@ mod tests {
         knowledge.acted(&protect, &target("bob"));
         assert_eq!(knowledge.last_protected, Some(id("bob")));
 
-        knowledge.acted(&protect, &Action::Abstain);
+        knowledge.acted(&protect, &Move::Abstain);
         assert_eq!(knowledge.last_protected, None);
     }
 

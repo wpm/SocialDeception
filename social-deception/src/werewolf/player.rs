@@ -6,7 +6,7 @@
 //! is answered with one [`Response`] to the moderator. The two halves of
 //! answering are kept apart, and ADR-0005 says why: a [`Player`] is a role,
 //! and computes the action space the rules permit it and nothing else; a
-//! [`Policy`] is the strategy, and picks one action from that space. The
+//! [`Policy`] is the strategy, and picks one move from that space. The
 //! roles are in [`roles`](super::roles), the baseline policy in
 //! [`policy`](super::policy).
 //!
@@ -23,12 +23,12 @@
 //! learn of it only from the tally the moderator narrates.
 
 use super::knowledge::Knowledge;
-use super::message::{Action, Message, Request, Response};
+use super::message::{Message, Move, Request, Response};
 use super::policy::{Policy, View};
 use crate::agent::{Handler, Outgoing};
 use crate::event::{AgentId, Event};
 
-/// What a role contributes to a player: its state, and the actions the
+/// What a role contributes to a player: its state, and the moves the
 /// rules permit it.
 ///
 /// Implemented once per role by the types in [`roles`](super::roles). A
@@ -42,7 +42,7 @@ pub trait Player {
     fn knowledge_mut(&mut self) -> &mut Knowledge;
 
     /// The action space for this request, in canonical order: targets in
-    /// sorted agent order, [`Action::Abstain`] last where permitted, so
+    /// sorted agent order, [`Move::Abstain`] last where permitted, so
     /// that an index into it is a stable action label. Never empty for a
     /// request the rules legitimately issue.
     ///
@@ -50,7 +50,7 @@ pub trait Player {
     ///
     /// If the request is of a kind this role is never asked, which is a bug
     /// in the moderator rather than a runtime condition.
-    fn action_space(&self, request: &Request) -> Vec<Action>;
+    fn action_space(&self, request: &Request) -> Vec<Move>;
 }
 
 /// A player as an agent in the episode: a role, the policy that decides for
@@ -82,20 +82,20 @@ impl<R: Player, P: Policy> Seat<R, P> {
     /// action space, checked against it and folded into the role's state.
     fn answer(&mut self, request: &Request) -> Response {
         let action_space = self.player.action_space(request);
-        let action = self.policy.choose(&View {
+        let chosen = self.policy.choose(&View {
             knowledge: self.player.knowledge(),
             request,
             action_space: &action_space,
         });
         assert!(
-            action_space.contains(&action),
-            "{}'s policy chose {action:?}, which is outside the action space {action_space:?}",
+            action_space.contains(&chosen),
+            "{}'s policy chose {chosen:?}, which is outside the action space {action_space:?}",
             self.player.knowledge().me
         );
-        self.player.knowledge_mut().acted(request, &action);
+        self.player.knowledge_mut().acted(request, &chosen);
         Response {
             request: request.id,
-            action,
+            chosen,
         }
     }
 }
@@ -147,7 +147,7 @@ mod tests {
     struct First;
 
     impl Policy for First {
-        fn choose(&mut self, view: &View<'_>) -> Action {
+        fn choose(&mut self, view: &View<'_>) -> Move {
             view.action_space[0].clone()
         }
     }
@@ -156,7 +156,7 @@ mod tests {
     struct Last;
 
     impl Policy for Last {
-        fn choose(&mut self, view: &View<'_>) -> Action {
+        fn choose(&mut self, view: &View<'_>) -> Move {
             view.action_space.last().unwrap().clone()
         }
     }
@@ -165,7 +165,7 @@ mod tests {
     struct Outside;
 
     impl Policy for Outside {
-        fn choose(&mut self, _: &View<'_>) -> Action {
+        fn choose(&mut self, _: &View<'_>) -> Move {
             target("nobody")
         }
     }
@@ -192,12 +192,12 @@ mod tests {
     }
 
     /// The response to the moderator that `Seat` sends.
-    fn response(id: u64, action: Action) -> Outgoing<Message> {
+    fn response(id: u64, chosen: Move) -> Outgoing<Message> {
         Outgoing::to(
             [MODERATOR],
             Message::Response(Response {
                 request: RequestId(id),
-                action,
+                chosen,
             }),
         )
     }

@@ -4,7 +4,6 @@
 //! seed = 20260918
 //! players = ["alice", "bob", "carol", "dave", "erin", "frank", "grace"]
 //! trajectory = "werewolf.jsonl"   # optional
-//! max_rounds = 100                # optional, default 100
 //! moderator = "moderator"         # optional, default "moderator"
 //!
 //! [roles]
@@ -37,9 +36,6 @@ use serde::{Deserialize, Serialize};
 use super::seed;
 use crate::event::AgentId;
 
-/// The round cap when the file does not set one.
-pub const DEFAULT_MAX_ROUNDS: u32 = 100;
-
 /// The moderator's id when the file does not set one.
 pub const DEFAULT_MODERATOR: &str = "moderator";
 
@@ -64,9 +60,6 @@ pub struct Config {
     /// Where to write the trajectory, if anywhere.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trajectory: Option<PathBuf>,
-    /// The round after which an unfinished game is a stalemate.
-    #[serde(default = "default_max_rounds")]
-    pub max_rounds: u32,
     /// The moderator's agent id. The moderator is an agent in the same
     /// roster as the players, so no player may have this id.
     #[serde(default = "default_moderator")]
@@ -93,10 +86,6 @@ impl RoleCounts {
     pub const fn special(self) -> usize {
         self.werewolves + self.seers + self.doctors
     }
-}
-
-fn default_max_rounds() -> u32 {
-    DEFAULT_MAX_ROUNDS
 }
 
 fn default_moderator() -> AgentId {
@@ -154,8 +143,6 @@ pub enum ConfigError {
     /// A player has the name of one of the seed streams that are not a
     /// player's, [`seed::RESERVED`], and would share its generator with it.
     ReservedPlayer(AgentId),
-    /// `max_rounds` is zero.
-    NoRounds,
 }
 
 impl fmt::Display for ConfigError {
@@ -197,7 +184,6 @@ impl fmt::Display for ConfigError {
                     .collect::<Vec<_>>()
                     .join(" and ")
             ),
-            Self::NoRounds => f.write_str("max_rounds must be at least 1"),
         }
     }
 }
@@ -321,9 +307,6 @@ impl Config {
                 return Err(ConfigError::ReservedPlayer(player.clone()));
             }
         }
-        if self.max_rounds == 0 {
-            return Err(ConfigError::NoRounds);
-        }
         Ok(())
     }
 
@@ -364,7 +347,6 @@ mod tests {
         seed = 20260918
         players = ["alice", "bob", "carol", "dave", "erin", "frank", "grace"]
         trajectory = "werewolf.jsonl"
-        max_rounds = 50
         moderator = "narrator"
 
         [roles]
@@ -404,7 +386,6 @@ mod tests {
                     doctors: 1,
                 },
                 trajectory: Some(PathBuf::from("werewolf.jsonl")),
-                max_rounds: 50,
                 moderator: AgentId::new("narrator"),
             }
         );
@@ -423,7 +404,6 @@ mod tests {
                     doctors: 0,
                 },
                 trajectory: None,
-                max_rounds: DEFAULT_MAX_ROUNDS,
                 moderator: AgentId::new(DEFAULT_MODERATOR),
             }
         );
@@ -626,15 +606,6 @@ mod tests {
     }
 
     #[test]
-    fn no_rounds() {
-        let mut config = valid();
-        config.max_rounds = 0;
-        let error = config.validate().unwrap_err();
-        assert!(matches!(error, ConfigError::NoRounds), "{error:?}");
-        assert!(error.to_string().contains("max_rounds"));
-    }
-
-    #[test]
     fn the_effective_config_reads_back_as_the_config_without_its_trajectory() {
         let config = valid();
         let text = config.effective();
@@ -653,10 +624,6 @@ mod tests {
         // What was defaulted on the way in is explicit on the way out, so the
         // file says what ran even if a default changes later.
         let text = Config::parse(MINIMAL).unwrap().effective();
-        assert!(
-            text.contains(&format!("max_rounds = {DEFAULT_MAX_ROUNDS}")),
-            "{text}"
-        );
         assert!(
             text.contains(&format!("moderator = \"{DEFAULT_MODERATOR}\"")),
             "{text}"

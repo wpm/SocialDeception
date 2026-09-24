@@ -47,7 +47,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use super::message::{
-    Action, Cause, Message, Narration, Outcome, Phase, Request, RequestId, RequestKind, Response,
+    Cause, Message, Move, Narration, Outcome, Phase, Request, RequestId, RequestKind, Response,
     Round,
 };
 use super::role::{Faction, Role};
@@ -83,10 +83,10 @@ pub struct RoundRecord {
 pub struct PhaseRecord {
     /// Everyone in the game when the phase began.
     pub living: BTreeSet<AgentId>,
-    /// Every action taken this phase, by the agent that took it, paired
-    /// with the kind of request it answered. The action alone does not say
+    /// Every move made this phase, by the agent that made it, paired
+    /// with the kind of request it answered. The move alone does not say
     /// whether a target was devoured, protected, investigated or nominated.
-    pub actions: BTreeMap<AgentId, (RequestKind, Action)>,
+    pub moves: BTreeMap<AgentId, (RequestKind, Move)>,
     /// The seer's finding: the seer, whom it investigated, and what it
     /// learned. `None` when there is no living seer or it abstained.
     pub investigation: Option<(AgentId, AgentId, Faction)>,
@@ -100,7 +100,7 @@ impl PhaseRecord {
     fn begun(living: BTreeSet<AgentId>) -> Self {
         Self {
             living,
-            actions: BTreeMap::new(),
+            moves: BTreeMap::new(),
             investigation: None,
             eliminated: None,
         }
@@ -522,8 +522,8 @@ impl Reader {
             }
         };
         self.current(line)?
-            .actions
-            .insert(from, (kind, response.action));
+            .moves
+            .insert(from, (kind, response.chosen));
         Ok(())
     }
 
@@ -543,7 +543,7 @@ const COLUMNS: usize = 4;
 
 impl fmt::Display for Transcript {
     /// The game at a glance: the roster with its roles, then each phase with
-    /// its actions and its elimination, then the outcome. Only what the
+    /// its moves and its elimination, then the outcome. Only what the
     /// moderator recorded, in the order it recorded it. Ends with a newline.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let width = self
@@ -576,9 +576,8 @@ impl fmt::Display for Transcript {
         writeln!(f)?;
         let Round(rounds) = self.outcome.rounds;
         match self.outcome.winner {
-            Some(Faction::Village) => write!(f, "Village wins")?,
-            Some(Faction::Werewolves) => write!(f, "Werewolves win")?,
-            None => write!(f, "Stalemate")?,
+            Faction::Village => write!(f, "Village wins")?,
+            Faction::Werewolves => write!(f, "Werewolves win")?,
         }
         let plural = if rounds == 1 { "" } else { "s" };
         write!(f, " after {rounds} round{plural}.  Survivors: ")?;
@@ -591,7 +590,7 @@ impl fmt::Display for Transcript {
     }
 }
 
-/// Writes a phase: its header with the living count, one line per action,
+/// Writes a phase: its header with the living count, one line per move,
 /// and who died.
 fn phase(
     f: &mut fmt::Formatter<'_>,
@@ -602,29 +601,29 @@ fn phase(
     writeln!(f)?;
     writeln!(f, "{name}  ({} living)", record.living.len())?;
     let (votes, deeds): (Vec<_>, Vec<_>) = record
-        .actions
+        .moves
         .iter()
         .partition(|(_, (kind, _))| *kind == RequestKind::Nominate);
-    // Nominations are a ballot, laid out in columns; night actions differ
+    // Nominations are a ballot, laid out in columns; night moves differ
     // by kind and get a line each.
     columns(
         f,
-        votes.iter().map(|(who, (_, action))| {
+        votes.iter().map(|(who, (_, chosen))| {
             format!(
                 "{:<width$} -> {:<width$}",
                 who.as_str(),
-                action.target().map_or("no one", AgentId::as_str)
+                chosen.target().map_or("no one", AgentId::as_str)
             )
         }),
     )?;
-    for (who, (kind, action)) in deeds {
+    for (who, (kind, chosen)) in deeds {
         let verb = match kind {
             RequestKind::Devour => "devours",
             RequestKind::Investigate => "investigates",
             RequestKind::Protect => "protects",
             RequestKind::Nominate => "nominates",
         };
-        let whom = action.target().map_or("no one", AgentId::as_str);
+        let whom = chosen.target().map_or("no one", AgentId::as_str);
         write!(f, "  {:<width$} {verb} {whom}", who.as_str())?;
         match &record.investigation {
             Some((seer, _, faction)) if seer == who => writeln!(f, "  ->  {faction}")?,
@@ -657,10 +656,13 @@ mod tests {
     use crate::werewolf::game::{Directive, Game};
     use crate::werewolf::role::Role::{Doctor, Seer, Villager, Werewolf};
 
-    /// The fixture: a seven-player game played to a village win, with its
-    /// effective config and its expected rendering beside it. It is chosen
-    /// for what it covers: a saved night, a werewolf devoured on its
-    /// packmate's vote, a tie-break, and an abstention.
+    /// The fixture: a seven-player game played to a werewolf win in two
+    /// rounds, with its effective config and its expected rendering beside
+    /// it. Between them the two rounds cover a saved night, a night the
+    /// doctor's own rule bars it from repeating a protection on, the
+    /// tie-break on both a split pack and a split ballot, a game that ends
+    /// by parity rather than by the pack being wiped out, and the
+    /// elimination of a doctor and a seer.
     const FIXTURE: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/werewolf.jsonl"
@@ -684,22 +686,22 @@ mod tests {
         Transcript::read(lines, &moderator())
     }
 
-    fn target(who: &str) -> Action {
-        Action::Target(id(who))
+    fn target(who: &str) -> Move {
+        Move::Target(id(who))
     }
 
-    fn actions<const N: usize>(
-        actions: [(&str, RequestKind, Action); N],
-    ) -> BTreeMap<AgentId, (RequestKind, Action)> {
-        actions
+    fn moves<const N: usize>(
+        moves: [(&str, RequestKind, Move); N],
+    ) -> BTreeMap<AgentId, (RequestKind, Move)> {
+        moves
             .into_iter()
-            .map(|(who, kind, action)| (id(who), (kind, action)))
+            .map(|(who, kind, chosen)| (id(who), (kind, chosen)))
             .collect()
     }
 
     fn nominations<const N: usize>(
         votes: [(&str, &str); N],
-    ) -> BTreeMap<AgentId, (RequestKind, Action)> {
+    ) -> BTreeMap<AgentId, (RequestKind, Move)> {
         votes
             .into_iter()
             .map(|(who, whom)| (id(who), (RequestKind::Nominate, target(whom))))
@@ -708,13 +710,13 @@ mod tests {
 
     fn phase<const N: usize>(
         living: [&str; N],
-        actions: BTreeMap<AgentId, (RequestKind, Action)>,
+        moves: BTreeMap<AgentId, (RequestKind, Move)>,
         investigation: Option<(&str, &str, Faction)>,
         eliminated: Option<(&str, Role, Cause)>,
     ) -> PhaseRecord {
         PhaseRecord {
             living: ids(living),
-            actions,
+            moves,
             investigation: investigation.map(|(seer, whom, faction)| (id(seer), id(whom), faction)),
             eliminated: eliminated.map(|(who, role, cause)| (id(who), role, cause)),
         }
@@ -746,13 +748,13 @@ mod tests {
                     // doctor has protected her: a saved night.
                     night: phase(
                         everyone,
-                        actions([
+                        moves([
                             ("carol", Protect, target("alice")),
                             ("dave", Devour, target("alice")),
                             ("erin", Devour, target("bob")),
-                            ("grace", Investigate, target("bob")),
+                            ("grace", Investigate, target("alice")),
                         ]),
-                        Some(("grace", "bob", Faction::Village)),
+                        Some(("grace", "alice", Faction::Village)),
                         None,
                     ),
                     day: Some(phase(
@@ -772,54 +774,39 @@ mod tests {
                 },
                 RoundRecord {
                     round: Round(2),
+                    // The pack agrees on carol, and the doctor, barred from
+                    // protecting alice again, protects erin instead.
                     night: phase(
                         ["bob", "carol", "dave", "erin", "frank", "grace"],
-                        actions([
-                            ("carol", Protect, target("frank")),
-                            ("dave", Devour, target("erin")),
+                        moves([
+                            ("carol", Protect, target("erin")),
+                            ("dave", Devour, target("carol")),
                             ("erin", Devour, target("carol")),
-                            ("grace", Investigate, target("erin")),
+                            ("grace", Investigate, target("dave")),
                         ]),
-                        Some(("grace", "erin", Faction::Werewolves)),
-                        Some(("erin", Werewolf, Devoured)),
+                        Some(("grace", "dave", Faction::Werewolves)),
+                        Some(("carol", Doctor, Devoured)),
                     ),
+                    // Grace and frank tie, and the tie-break lynches grace:
+                    // two werewolves among four living is parity.
                     day: Some(phase(
-                        ["bob", "carol", "dave", "frank", "grace"],
+                        ["bob", "dave", "erin", "frank", "grace"],
                         nominations([
                             ("bob", "grace"),
-                            ("carol", "frank"),
                             ("dave", "bob"),
+                            ("erin", "frank"),
                             ("frank", "grace"),
                             ("grace", "frank"),
                         ]),
                         None,
-                        Some(("frank", Villager, Lynched)),
-                    )),
-                },
-                RoundRecord {
-                    round: Round(3),
-                    night: phase(
-                        ["bob", "carol", "dave", "grace"],
-                        actions([
-                            ("carol", Protect, target("dave")),
-                            ("dave", Devour, target("carol")),
-                            ("grace", Investigate, Action::Abstain),
-                        ]),
-                        None,
-                        Some(("carol", Doctor, Devoured)),
-                    ),
-                    day: Some(phase(
-                        ["bob", "dave", "grace"],
-                        nominations([("bob", "dave"), ("dave", "bob"), ("grace", "dave")]),
-                        None,
-                        Some(("dave", Werewolf, Lynched)),
+                        Some(("grace", Seer, Lynched)),
                     )),
                 },
             ],
             outcome: Outcome {
-                winner: Some(Faction::Village),
-                rounds: Round(3),
-                living: ids(["bob", "grace"]),
+                winner: Faction::Werewolves,
+                rounds: Round(2),
+                living: ids(["bob", "dave", "erin", "frank"]),
             },
         }
     }
@@ -850,7 +837,7 @@ mod tests {
         let transcript = read(&fixture()).unwrap();
         let roles = &transcript.assignment;
         for round in &transcript.rounds {
-            for (who, (kind, _)) in &round.night.actions {
+            for (who, (kind, _)) in &round.night.moves {
                 let expected = match roles[who] {
                     Werewolf => RequestKind::Devour,
                     Seer => RequestKind::Investigate,
@@ -859,7 +846,7 @@ mod tests {
                 };
                 assert_eq!(*kind, expected, "{who} in round {:?}", round.round);
             }
-            for (who, (kind, _)) in &round.day.as_ref().unwrap().actions {
+            for (who, (kind, _)) in &round.day.as_ref().unwrap().moves {
                 assert_eq!(
                     *kind,
                     RequestKind::Nominate,
@@ -1094,7 +1081,7 @@ mod tests {
             assert!(error.to_string().contains("non-empty agent id"), "{error}");
         }
         let mut lines = fixture();
-        lines[index]["event"]["payload"]["Response"]["action"]["Target"] = json!("");
+        lines[index]["event"]["payload"]["Response"]["chosen"]["Target"] = json!("");
         let error = read(&lines).unwrap_err();
         assert!(
             matches!(&error, TranscriptError::Payload { line, .. } if *line == index + 1),
@@ -1283,15 +1270,10 @@ mod tests {
     }
 
     /// Plays `script`, one phase's answers per entry, through a game over
-    /// `assignment` capped at `max_rounds`, and returns the moderator's
-    /// records.
-    fn scripted(
-        assignment: Assignment,
-        max_rounds: u32,
-        script: &[Vec<(&str, Action)>],
-    ) -> Vec<Value> {
+    /// `assignment`, and returns the moderator's records.
+    fn scripted(assignment: Assignment, script: &[Vec<(&str, Move)>]) -> Vec<Value> {
         let mut scribe = Scribe::new(&assignment);
-        let mut game = Game::new(assignment, max_rounds, 1);
+        let mut game = Game::new(assignment, 1);
         let mut latest = game.begin();
         scribe.directives(latest.clone());
         for answers in script {
@@ -1302,10 +1284,10 @@ mod tests {
                     _ => None,
                 })
                 .collect();
-            for (who, action) in answers {
+            for (who, chosen) in answers {
                 let response = Response {
                     request: asked[&id(who)],
-                    action: action.clone(),
+                    chosen: chosen.clone(),
                 };
                 scribe.response(who, response.clone());
                 latest = game.record(&id(who), &response);
@@ -1315,14 +1297,14 @@ mod tests {
         scribe.lines
     }
 
-    fn answers<const N: usize>(answers: [(&'static str, &str); N]) -> Vec<(&'static str, Action)> {
+    fn answers<const N: usize>(answers: [(&'static str, &str); N]) -> Vec<(&'static str, Move)> {
         answers
             .into_iter()
             .map(|(who, whom)| {
                 (
                     who,
                     if whom == "-" {
-                        Action::Abstain
+                        Move::Abstain
                     } else {
                         target(whom)
                     },
@@ -1349,7 +1331,6 @@ mod tests {
         // the doctor abstains: the werewolves win at parity on night two.
         let lines = scripted(
             village(),
-            100,
             &[
                 answers([("bob", "carol"), ("carol", "bob"), ("dave", "alice")]),
                 answers([
@@ -1366,17 +1347,17 @@ mod tests {
         let last = &transcript.rounds[1];
         assert_eq!(last.day, None);
         assert_eq!(
-            last.night.actions,
-            actions([
+            last.night.moves,
+            moves([
                 ("bob", RequestKind::Devour, target("alice")),
-                ("dave", RequestKind::Protect, Action::Abstain),
+                ("dave", RequestKind::Protect, Move::Abstain),
             ])
         );
         assert_eq!(
             last.night.eliminated,
             Some((id("alice"), Villager, Cause::Devoured))
         );
-        assert_eq!(transcript.outcome.winner, Some(Faction::Werewolves));
+        assert_eq!(transcript.outcome.winner, Faction::Werewolves);
         let rendered = transcript.to_string();
         assert!(rendered.contains("Night 2  (3 living)\n"), "{rendered}");
         assert!(!rendered.contains("Day 2"), "{rendered}");
@@ -1399,7 +1380,6 @@ mod tests {
         // Bob is devoured, carol is lynched, dave is devoured: parity.
         let lines = scripted(
             assignment,
-            100,
             &[
                 answers([("alice", "bob")]),
                 answers([
@@ -1415,40 +1395,12 @@ mod tests {
         assert_eq!(transcript.rounds.len(), 2);
         for round in &transcript.rounds {
             assert_eq!(round.night.investigation, None, "{:?}", round.round);
-            assert_eq!(round.night.actions.len(), 1);
+            assert_eq!(round.night.moves.len(), 1);
             if let Some(day) = &round.day {
                 assert_eq!(day.investigation, None);
             }
         }
         assert!(!transcript.to_string().contains("investigates"));
-    }
-
-    #[test]
-    fn a_stalemate_renders_as_one() {
-        // The doctor saves alice and the seer abstains; erin is lynched;
-        // and the cap of one round ends the game undecided.
-        let lines = scripted(
-            village(),
-            1,
-            &[
-                answers([("bob", "alice"), ("carol", "-"), ("dave", "alice")]),
-                answers([
-                    ("alice", "erin"),
-                    ("bob", "erin"),
-                    ("carol", "erin"),
-                    ("dave", "erin"),
-                    ("erin", "alice"),
-                ]),
-            ],
-        );
-        let transcript = read(&lines).unwrap();
-        assert_eq!(transcript.outcome.winner, None);
-        let rendered = transcript.to_string();
-        assert!(rendered.contains("  no one died\n"), "{rendered}");
-        assert!(
-            rendered.ends_with("Stalemate after 1 round.  Survivors: alice, bob, carol, dave\n"),
-            "{rendered}"
-        );
     }
 
     #[test]

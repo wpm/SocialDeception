@@ -151,14 +151,13 @@ mod tests {
     use crate::testing::{id, ids};
     use crate::werewolf::assignment::Assignment;
     use crate::werewolf::message::{
-        Action, Narration, Phase, Request, RequestId, RequestKind, Response, Round,
+        Move, Narration, Phase, Request, RequestId, RequestKind, Response, Round,
     };
     use crate::werewolf::role::Faction;
     use crate::werewolf::role::Role::{self, Doctor, Seer, Villager, Werewolf};
 
     const MODERATOR: &str = "moderator";
     const SEED: u64 = 20_260_918;
-    const MAX_ROUNDS: u32 = 100;
 
     /// Five players and one werewolf: alice and erin are villagers, bob is
     /// the werewolf, carol the seer and dave the doctor.
@@ -188,7 +187,7 @@ mod tests {
 
     fn moderator(assignment: Assignment) -> (Moderator, Receiver<Outcome>) {
         let (sender, receiver) = unbounded();
-        let game = Game::new(assignment, MAX_ROUNDS, SEED);
+        let game = Game::new(assignment, SEED);
         (Moderator::new(game, sender), receiver)
     }
 
@@ -201,32 +200,32 @@ mod tests {
         Event::message(who, [MODERATOR], payload)
     }
 
-    fn response(who: &AgentId, request: RequestId, action: Action) -> Event<Message> {
+    fn response(who: &AgentId, request: RequestId, chosen: Move) -> Event<Message> {
         from_player(
             who.as_str(),
-            Message::Response(Response { request, action }),
+            Message::Response(Response { request, chosen }),
         )
     }
 
     /// A stub player: what it does with a request, given who it is and who
     /// is living.
-    type Policy = fn(&AgentId, &Request, &BTreeSet<AgentId>) -> Action;
+    type Policy = fn(&AgentId, &Request, &BTreeSet<AgentId>) -> Move;
 
     /// Targets the first living player other than itself.
-    fn first_other(me: &AgentId, _: &Request, living: &BTreeSet<AgentId>) -> Action {
-        Action::Target(living.iter().find(|who| *who != me).unwrap().clone())
+    fn first_other(me: &AgentId, _: &Request, living: &BTreeSet<AgentId>) -> Move {
+        Move::Target(living.iter().find(|who| *who != me).unwrap().clone())
     }
 
     /// Targets the last living player other than itself.
-    fn last_other(me: &AgentId, _: &Request, living: &BTreeSet<AgentId>) -> Action {
-        Action::Target(living.iter().rev().find(|who| *who != me).unwrap().clone())
+    fn last_other(me: &AgentId, _: &Request, living: &BTreeSet<AgentId>) -> Move {
+        Move::Target(living.iter().rev().find(|who| *who != me).unwrap().clone())
     }
 
     /// Abstains wherever the request permits it, and otherwise targets the
     /// last living player other than itself.
-    fn abstainer(me: &AgentId, request: &Request, living: &BTreeSet<AgentId>) -> Action {
+    fn abstainer(me: &AgentId, request: &Request, living: &BTreeSet<AgentId>) -> Move {
         if request.kind.may_abstain() {
-            Action::Abstain
+            Move::Abstain
         } else {
             last_other(me, request, living)
         }
@@ -408,12 +407,12 @@ mod tests {
 
     #[test]
     fn the_stub_players_between_them_reach_every_terminal_state() {
-        let winners: Vec<Option<Faction>> = played_games()
+        let winners: Vec<Faction> = played_games()
             .iter()
             .map(|played| played.outcome.winner)
             .collect();
-        assert!(winners.contains(&Some(Faction::Village)), "{winners:?}");
-        assert!(winners.contains(&Some(Faction::Werewolves)), "{winners:?}");
+        assert!(winners.contains(&Faction::Village), "{winners:?}");
+        assert!(winners.contains(&Faction::Werewolves), "{winners:?}");
     }
 
     #[test]
@@ -509,7 +508,7 @@ mod tests {
             })
             .unwrap();
         let late = [
-            response(&who, request, Action::Target(id("bob"))),
+            response(&who, request, Move::Target(id("bob"))),
             Event::Control(Control::Stop),
             Event::Think,
             start(),

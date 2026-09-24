@@ -34,9 +34,10 @@
 //!   eliminates at most one player and each day exactly one, the player
 //!   eliminated is one the phase's tally names most often, a night with no
 //!   death is one on which the doctor protected such a player and only
-//!   then, the living set strictly shrinks every round, the winner is what
-//!   the parity rule says of the final living set, and the roles dealt are
-//!   the ones configured.
+//!   then, the living set strictly shrinks every round, the game ends
+//!   within as many rounds as there are players, the winner is what the
+//!   parity rule says of the final living set, and the roles dealt are the
+//!   ones configured.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -44,7 +45,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use social_deception::AgentId;
 use social_deception::werewolf::{
-    Action, Assignment, Cause, Config, Faction, Message, Narration, Outcome, Phase, Request,
+    Assignment, Cause, Config, Faction, Message, Move, Narration, Outcome, Phase, Request,
     RequestId, RequestKind, Response, Role, Round,
 };
 
@@ -145,9 +146,9 @@ fn outcome(message: &Message) -> Option<&Outcome> {
 
 /// The players a tally names most often: the ones the elimination is
 /// drawn from. Abstentions name nobody.
-fn leaders(votes: &BTreeMap<AgentId, Action>) -> BTreeSet<AgentId> {
+fn leaders(votes: &BTreeMap<AgentId, Move>) -> BTreeSet<AgentId> {
     let mut counts: BTreeMap<&AgentId, usize> = BTreeMap::new();
-    for who in votes.values().filter_map(Action::target) {
+    for who in votes.values().filter_map(Move::target) {
         *counts.entry(who).or_default() += 1;
     }
     let most = counts.values().copied().max().unwrap_or(0);
@@ -367,32 +368,32 @@ impl<'a> Play<'a> {
                 said.line
             );
         }
-        let mut last_protected: BTreeMap<&AgentId, &Action> = BTreeMap::new();
+        let mut last_protected: BTreeMap<&AgentId, &Move> = BTreeMap::new();
         for heard in &self.heard {
             let line = heard.line;
             let (asked, _, request) = self.asked(heard.response.request).unwrap();
-            let action = &heard.response.action;
-            match action {
-                Action::Abstain => assert!(
+            let chosen = &heard.response.chosen;
+            match chosen {
+                Move::Abstain => assert!(
                     request.kind.may_abstain(),
                     "an abstention is outside the action space of {:?}: {line}",
                     request.kind
                 ),
-                Action::Target(target) => {
+                Move::Target(target) => {
                     assert_ne!(
                         target, &heard.from,
-                        "no action targets the player taking it: {line}"
+                        "no move targets the player taking it: {line}"
                     );
                     assert!(
                         self.assignment.role(target).is_some() && !self.dead_at(target, asked.seq),
-                        "an action targets a living player: {line}"
+                        "a move targets a living player: {line}"
                     );
                 }
             }
             if request.kind == RequestKind::Protect {
-                if let Some(last) = last_protected.insert(&heard.from, action) {
+                if let Some(last) = last_protected.insert(&heard.from, chosen) {
                     assert!(
-                        last.target().is_none() || last != action,
+                        last.target().is_none() || last != chosen,
                         "the doctor never protects the same player two nights running: {line}"
                     );
                 }
@@ -498,7 +499,7 @@ impl<'a> Play<'a> {
             .iter()
             .filter_map(|heard| {
                 let (_, _, request) = self.asked(heard.response.request)?;
-                match (request.kind, heard.response.action.target()) {
+                match (request.kind, heard.response.chosen.target()) {
                     (RequestKind::Protect, Some(target)) => Some((request.round, target)),
                     _ => None,
                 }
@@ -528,8 +529,9 @@ impl<'a> Play<'a> {
 
     /// The outcome names the living as they are, and the winner the parity
     /// rule gives for them: the village if no werewolf lives, the
-    /// werewolves if they are at least as many as everyone else, and nobody
-    /// only at the round cap.
+    /// werewolves if they are at least as many as everyone else. A game
+    /// always reaches one of the two, within as many rounds as there are
+    /// players.
     fn check_outcome(&self) {
         let outcome = &self.outcome;
         assert_eq!(
@@ -543,27 +545,23 @@ impl<'a> Play<'a> {
             .filter(|who| self.role(who).faction() == Faction::Werewolves)
             .count();
         let others = outcome.living.len() - werewolves;
+        assert!(
+            werewolves == 0 || werewolves >= others,
+            "the game ends only once the parity rule decides it: {outcome:?}"
+        );
         let winner = if werewolves == 0 {
-            Some(Faction::Village)
-        } else if werewolves >= others {
-            Some(Faction::Werewolves)
+            Faction::Village
         } else {
-            None
+            Faction::Werewolves
         };
         assert_eq!(
             outcome.winner, winner,
             "the winner is what the parity rule says of the survivors: {outcome:?}"
         );
         assert!(
-            outcome.rounds.0 <= self.config.max_rounds,
-            "the game ends by the round cap: {outcome:?}"
+            outcome.rounds.0 as usize <= self.config.players.len(),
+            "the game ends within as many rounds as there are players: {outcome:?}"
         );
-        if winner.is_none() {
-            assert_eq!(
-                outcome.rounds.0, self.config.max_rounds,
-                "a stalemate happens only at the round cap: {outcome:?}"
-            );
-        }
     }
 
     /// What the players' own records show: each sent nothing but responses,
@@ -828,10 +826,11 @@ mod tests {
 
     use super::*;
 
-    /// The fixture: a seven-player game played to a village win, with its
-    /// effective config beside it. Its first night is a saved one, so the
-    /// fixture's first `Eliminated` is a lynching, and its seer abstains on
-    /// the last night.
+    /// The fixture: a seven-player game played to a werewolf win in two
+    /// rounds, with its effective config beside it. Its first night is a
+    /// saved one, so the fixture's first `Eliminated` is a lynching, and it
+    /// ends by parity rather than by the pack being wiped out. Every
+    /// request in it is answered with a target: it holds no abstention.
     const FIXTURE: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/werewolf.jsonl"
@@ -982,7 +981,7 @@ mod tests {
     }
 
     fn target(line: &mut Value, whom: &str) {
-        line["event"]["payload"]["Response"]["action"] = json!({"Target": whom});
+        line["event"]["payload"]["Response"]["chosen"] = json!({"Target": whom});
     }
 
     #[test]
@@ -1078,7 +1077,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "no action targets the player taking it")]
+    #[should_panic(expected = "no move targets the player taking it")]
     fn a_self_target_is_caught() {
         let nominate = asked("alice", 1, "Nominate");
         check(
@@ -1088,7 +1087,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "an action targets a living player")]
+    #[should_panic(expected = "a move targets a living player")]
     fn a_dead_target_is_caught() {
         // alice was lynched on day 1; bob nominates her on day 2.
         let nominate = asked("bob", 2, "Nominate");
@@ -1102,7 +1101,7 @@ mod tests {
     #[should_panic(expected = "an abstention is outside the action space of Nominate")]
     fn an_abstention_from_nominating_is_caught() {
         let lines = heard(response(asked("alice", 1, "Nominate")), |line| {
-            line["event"]["payload"]["Response"]["action"] = json!("Abstain");
+            line["event"]["payload"]["Response"]["chosen"] = json!("Abstain");
         });
         check(&lines, &config());
     }
@@ -1259,12 +1258,13 @@ mod tests {
     #[test]
     #[should_panic(expected = "an elimination is of a player the tally names most")]
     fn a_lynching_the_tally_does_not_call_for_is_caught() {
-        // On the last day dave has two nominations and bob one, and bob, a
-        // villager, is lynched in dave's place. The last day, so that no
-        // later request to bob trips the check on the dead first.
-        let lines = said(eliminated("dave"), |line| {
+        // On the last day grace and frank each have two nominations and
+        // bob one, and bob, a villager, is lynched in the tie-break's
+        // place. The last day, so that no later request to bob trips the
+        // check on the dead first.
+        let lines = said(eliminated("grace"), |line| {
             line["event"]["payload"]["Narration"]["Eliminated"] =
-                json!({"who": "bob", "role": "Villager", "round": 3, "cause": "Lynched"});
+                json!({"who": "bob", "role": "Villager", "round": 2, "cause": "Lynched"});
         });
         check(&lines, &config());
     }
@@ -1272,10 +1272,40 @@ mod tests {
     #[test]
     #[should_panic(expected = "a death at night is of a player the doctor did not protect")]
     fn a_death_of_a_protected_player_is_caught() {
-        // On night 2 the pack splits between erin and carol, erin is
-        // devoured, and carol protects frank.
-        let lines = heard(response(asked("carol", 2, "Protect")), |line| {
-            target(line, "erin");
+        // On night 2 the pack agrees on carol while carol protects erin.
+        // Moving dave onto erin splits the pack, so erin is one of the
+        // players that night's tally names most, and erin is the one the
+        // doctor protected: reporting erin devoured is a death the
+        // protection should have prevented. Erin, eliminated, takes no
+        // further part, so nothing said later contradicts it.
+        let mut lines = fixture();
+        let index = find(&lines, "moderator", "arrived", |payload| {
+            payload["Response"]["request"] == asked("dave", 2, "Devour")
+        });
+        target(&mut lines[index], "erin");
+        // The pack is told the tally, so it moves with dave's response.
+        // The test reads through `&line[..]`, which yields `Null` for a key
+        // that is not there; only the assignment, reached once the record is
+        // known to be a night-2 tally, indexes mutably.
+        for line in &mut lines {
+            let tally = &line["event"]["payload"]["Narration"]["Tally"];
+            if tally["round"] == 2 && tally["phase"] == "Night" {
+                line["event"]["payload"]["Narration"]["Tally"]["votes"]["dave"] =
+                    json!({"Target": "erin"});
+            }
+        }
+        let index = find(&lines, "moderator", "sent", |payload| {
+            payload["Narration"]["Eliminated"]["cause"] == "Devoured"
+        });
+        lines[index]["event"]["payload"]["Narration"]["Eliminated"]["who"] = json!("erin");
+        lines[index]["event"]["payload"]["Narration"]["Eliminated"]["role"] = json!("Werewolf");
+        let eliminated = lines[index]["seq"].as_u64().unwrap();
+        lines.retain(|line| {
+            let after = line["seq"].as_u64().is_some_and(|seq| seq > eliminated);
+            let erins = line["agent"] == "erin"
+                || line["event"]["recipients"] == json!(["erin"])
+                || line["event"]["sender"] == "erin";
+            !(after && erins)
         });
         check(&lines, &config());
     }
@@ -1313,7 +1343,7 @@ mod tests {
     #[should_panic(expected = "the winner is what the parity rule says")]
     fn a_winner_against_the_parity_rule_is_caught() {
         let lines = said(narration("Outcome"), |line| {
-            line["event"]["payload"]["Narration"]["Outcome"]["winner"] = json!("Werewolves");
+            line["event"]["payload"]["Narration"]["Outcome"]["winner"] = json!("Village");
         });
         check(&lines, &config());
     }

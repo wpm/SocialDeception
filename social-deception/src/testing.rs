@@ -9,7 +9,7 @@ use serde_json::Value;
 
 use crate::event::{AgentId, Event};
 use crate::werewolf::{
-    Action, Faction, Knowledge, Message, Narration, Phase, Request, RequestId, RequestKind, Role,
+    Faction, Knowledge, Message, Move, Narration, Phase, Request, RequestId, RequestKind, Role,
     Round,
 };
 
@@ -51,10 +51,10 @@ pub(crate) fn ids<const N: usize>(names: [&str; N]) -> BTreeSet<AgentId> {
     names.map(AgentId::new).into()
 }
 
-/// An action targeting the named agent, for tests that name agents by
+/// A move targeting the named agent, for tests that name agents by
 /// string literal.
-pub(crate) fn target(name: &str) -> Action {
-    Action::Target(id(name))
+pub(crate) fn target(name: &str) -> Move {
+    Move::Target(id(name))
 }
 
 /// A request of `kind`, for tests where its id and round do not matter.

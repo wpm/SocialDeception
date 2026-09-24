@@ -167,10 +167,7 @@ impl fmt::Display for Played {
     /// The effective seed, how the game ended, and what was written.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "seed: {}", self.config.seed)?;
-        match self.outcome.winner {
-            Some(winner) => writeln!(f, "winner: {winner}")?,
-            None => writeln!(f, "winner: nobody, a stalemate at the round cap")?,
-        }
+        writeln!(f, "winner: {}", self.outcome.winner)?;
         writeln!(f, "rounds: {}", self.outcome.rounds.0)?;
         let survivors: Vec<&str> = self.outcome.living.iter().map(AgentId::as_str).collect();
         writeln!(f, "survivors: {}", survivors.join(", "))?;
@@ -436,7 +433,6 @@ mod tests {
         let trajectory = dir.join("out.jsonl");
         let played = play(&example(), Some(7), Some(trajectory.clone())).unwrap();
         assert_eq!(played.config.seed, 7);
-        assert!(played.outcome.winner.is_some(), "{played:?}");
         let text = played.to_string();
         assert!(text.starts_with("seed: 7\nwinner: "), "{text}");
         assert!(text.contains("\nrounds: "), "{text}");
@@ -569,7 +565,7 @@ mod tests {
         assert_eq!(seed(&replayed), Some(26));
         assert_eq!(replayed.moderator, AgentId::new("moderator"));
         assert_eq!(replayed.overridden, None);
-        assert_eq!(replayed.transcript.rounds.len(), 3);
+        assert_eq!(replayed.transcript.rounds.len(), 2);
         let golden = fs::read_to_string(fixture().with_extension("txt")).unwrap();
         assert_eq!(
             replayed.to_string(),
@@ -585,7 +581,7 @@ mod tests {
         assert_eq!(seed(&disagreeing), Some(26));
         assert_eq!(disagreeing.moderator, AgentId::new("moderator"));
         assert_eq!(disagreeing.overridden.as_deref(), Some("narrator"));
-        assert_eq!(disagreeing.transcript.rounds.len(), 3);
+        assert_eq!(disagreeing.transcript.rounds.len(), 2);
         // The same flag, agreeing, is not overridden.
         let agreeing = replay(&fixture(), Some("moderator")).unwrap();
         assert_eq!(agreeing.overridden, None);
@@ -601,7 +597,7 @@ mod tests {
         assert_eq!(seed(&replayed), None);
         assert_eq!(replayed.moderator, AgentId::new("moderator"));
         assert_eq!(replayed.overridden, None);
-        assert_eq!(replayed.transcript.rounds.len(), 3);
+        assert_eq!(replayed.transcript.rounds.len(), 2);
         assert!(
             replayed
                 .to_string()

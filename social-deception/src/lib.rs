@@ -20,8 +20,8 @@
 //! phases and the [`Message`](werewolf::Message) payload that travels over
 //! [`Event`] in a game of Werewolf, the [`Knowledge`](werewolf::Knowledge)
 //! a player folds those events into, the [`Policy`](werewolf::Policy) that
-//! picks its actions, the roles ([`werewolf::roles`]) whose rules say which
-//! actions it may pick from and the [`Seat`](werewolf::Seat) that plays one
+//! picks its moves, the roles ([`werewolf::roles`]) whose rules say which
+//! moves it may pick from and the [`Seat`](werewolf::Seat) that plays one
 //! as an agent, the [`Game`](werewolf::Game) whose rules decide what is said
 //! to whom, and the [`Moderator`](werewolf::Moderator) that runs it as an
 //! agent in the roster. [`werewolf::run`] plays one episode of it from a

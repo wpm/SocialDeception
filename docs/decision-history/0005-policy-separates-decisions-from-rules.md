@@ -48,31 +48,31 @@ synonyms.
 
 | RL | Here | Kind |
 |----|------|------|
-| observation | `Event<Message>` — everything that arrives on an agent's receiver | enum |
+| observation | an observation of a `Message` — everything that arrives on an agent's receiver | enum |
 | state | `Knowledge` — a sufficient statistic of the observation history | struct |
-| action | `Action`, drawn from the action space available now | enum |
+| action | the response an agent sends, carrying one `Move` drawn from the action space available now | struct |
 
-The set of permitted actions is the **action space**. The role computes it,
-as `Player::action_space` and `View::action_space`. An action not in it is
+The set of permitted moves is the **action space**. The role computes it,
+as `Player::action_space` and `View::action_space`. A move not in it is
 *outside the action space*. **No identifier is called `legal`.**
 
-`Action` is the *type* of an action. The action space is a *value* of type
-`Vec<Action>`: the subset available for one decision. The space depends on
-the state; the type does not.
+`Move` is the *type* of the choice an action carries. The action space is a
+*value* of type `Vec<Move>`: the subset available for one decision. The
+space depends on the state; the type does not.
 
 A request invokes `Policy::choose` with the `Knowledge` and the action
-space, and the chosen `Action` becomes the response.
+space, and the chosen `Move` becomes the response.
 
 ### The message kinds are named for what they do
 
-So that the word `Action` names one thing only, the three message kinds are
+So that the word `action` names one thing only, the three message kinds are
 named for their function rather than for their content.
 
 | Message | Direction | Is |
 |---------|-----------|----|
 | `Narration` | moderator → a chosen set of players | a true statement the recipients now observe |
 | `Request` | moderator → one player | a decision point: the moment the policy is invoked |
-| `Response` | player → moderator | the reply, echoing the request's id and carrying one `Action` |
+| `Response` | player → moderator | the reply, echoing the request's id and carrying one `Move` |
 
 Narration is addressed, not broadcast;
 [ADR-0004](0004-moderator-agent-runs-the-game.md) records why. A player
@@ -136,7 +136,7 @@ decision.
   can be weakened, ablated or learned away. In the action space it cannot be
   moved, and it silently becomes part of the definition of the game.
 
-Therefore the action space is an **ordered** `Vec<Action>`: targets in sorted
+Therefore the action space is an **ordered** `Vec<Move>`: targets in sorted
 agent order, `Abstain` last where it is permitted. An index into it is a
 stable action label, which is what a learner needs and what a constrained
 decode over a model's output needs.
@@ -163,7 +163,7 @@ the role counts alone.
 A language model will time out, refuse, or emit garbage, and there is no
 correct thing for the *rules* to do about that. The decision belongs to the
 policy that failed: it owns its retries and holds a `RandomPolicy` fallback.
-A role validates the returned action against the action space and panics on
+A role validates the returned move against the action space and panics on
 a violation, because that is a policy bug and not a condition the game can
 continue from.
 

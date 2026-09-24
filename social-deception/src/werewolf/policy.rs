@@ -1,5 +1,5 @@
 //! The decision boundary: a [`Policy`] is handed what an agent sees and
-//! returns one action.
+//! returns one [`Move`](super::Move).
 //!
 //! A policy is a conditional distribution over the action space given the
 //! state, in the vocabulary the [module](super) documentation states and
@@ -58,7 +58,7 @@
 //! from the master seed and the agent's id, so its actions depend on its own
 //! history alone and adding a player perturbs nobody else's; the [`seed`]
 //! module says why that, and the choice of generator, make an experiment
-//! reproducible. The golden test in this module pins the first actions of
+//! reproducible. The golden test in this module pins the first moves of
 //! one seeded policy, so that a change to the mixing or the sampling fails
 //! a test rather than silently becoming a different experiment.
 //!
@@ -68,7 +68,7 @@ use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 
 use super::knowledge::Knowledge;
-use super::message::{Action, Request, RequestKind};
+use super::message::{Move, Request, RequestKind};
 use super::role::Role;
 use super::seed::{pick, seed_for};
 use crate::event::AgentId;
@@ -84,9 +84,9 @@ pub struct View<'a> {
     /// The request being answered.
     pub request: &'a Request,
     /// Every action the rules permit, in canonical order: targets in sorted
-    /// agent order, [`Action::Abstain`] last where it is permitted. Never
+    /// agent order, [`Move::Abstain`] last where it is permitted. Never
     /// empty.
-    pub action_space: &'a [Action],
+    pub action_space: &'a [Move],
 }
 
 /// How an agent picks an action from the action space.
@@ -98,7 +98,7 @@ pub trait Policy {
     ///
     /// Infallible, and free to block; the [module documentation](self) says
     /// why.
-    fn choose(&mut self, view: &View<'_>) -> Action;
+    fn choose(&mut self, view: &View<'_>) -> Move;
 }
 
 /// The uniform random baseline: a policy that samples uniformly from its own
@@ -128,7 +128,7 @@ impl RandomPolicy {
 }
 
 impl Policy for RandomPolicy {
-    fn choose(&mut self, view: &View<'_>) -> Action {
+    fn choose(&mut self, view: &View<'_>) -> Move {
         (*pick(&mut self.rng, &candidates(view))).clone()
     }
 }
@@ -137,16 +137,16 @@ impl Policy for RandomPolicy {
 /// non-empty of the targets [`excluded`] leaves, `Abstain` where the rules
 /// permit it, and the whole action space, because a policy handed nothing
 /// has no correct behavior.
-fn candidates<'a>(view: &View<'a>) -> Vec<&'a Action> {
+fn candidates<'a>(view: &View<'a>) -> Vec<&'a Move> {
     let space = view.action_space;
-    let targets: Vec<&Action> = space
+    let targets: Vec<&Move> = space
         .iter()
-        .filter(|action| matches!(action, Action::Target(who) if !excluded(view, who)))
+        .filter(|action| matches!(action, Move::Target(who) if !excluded(view, who)))
         .collect();
     if !targets.is_empty() {
         return targets;
     }
-    match space.iter().find(|action| **action == Action::Abstain) {
+    match space.iter().find(|action| **action == Move::Abstain) {
         Some(abstain) => vec![abstain],
         None => space.iter().collect(),
     }
@@ -184,8 +184,8 @@ mod tests {
         policy: &mut RandomPolicy,
         knowledge: &Knowledge,
         kind: RequestKind,
-        space: &[Action],
-    ) -> Action {
+        space: &[Move],
+    ) -> Move {
         policy.choose(&View {
             knowledge,
             request: &request(kind),
@@ -195,7 +195,7 @@ mod tests {
 
     /// The first action a fresh policy under each of [`SEEDS`] takes for
     /// `kind`, in the action space the rules would hand it.
-    fn first_choices(knowledge: &Knowledge, kind: RequestKind) -> Vec<(u64, Action)> {
+    fn first_choices(knowledge: &Knowledge, kind: RequestKind) -> Vec<(u64, Move)> {
         let space = base_action_space(knowledge, &request(kind));
         SEEDS
             .map(|seed| {
@@ -207,7 +207,7 @@ mod tests {
 
     /// The first `n` nominations a policy makes as a villager among
     /// [`OTHERS`], where no heuristic is in play.
-    fn nominations(mut policy: RandomPolicy, n: usize) -> Vec<Action> {
+    fn nominations(mut policy: RandomPolicy, n: usize) -> Vec<Move> {
         let knowledge = knowing(Role::Villager, OTHERS);
         let space = base_action_space(&knowledge, &request(RequestKind::Nominate));
         (0..n)
@@ -287,7 +287,7 @@ mod tests {
         // A guard against an off-by-one that could never return the last
         // element, not a statistical test.
         let draws = 1000;
-        let mut counts: BTreeMap<Action, usize> = BTreeMap::new();
+        let mut counts: BTreeMap<Move, usize> = BTreeMap::new();
         for action in nominations(RandomPolicy::from_seed(MASTER), draws) {
             *counts.entry(action).or_default() += 1;
         }
@@ -334,10 +334,10 @@ mod tests {
         ] {
             assert_eq!(
                 base_action_space(knowledge, &request(kind)).last(),
-                Some(&Action::Abstain)
+                Some(&Move::Abstain)
             );
             for (seed, action) in first_choices(knowledge, kind) {
-                assert_ne!(action, Action::Abstain, "seed {seed}, {kind:?}");
+                assert_ne!(action, Move::Abstain, "seed {seed}, {kind:?}");
             }
         }
     }
@@ -357,7 +357,7 @@ mod tests {
     fn a_seer_that_has_investigated_everyone_living_abstains() {
         let knowledge = seer_knowing(["alice", "bob"], ["alice", "bob"]);
         for (seed, action) in first_choices(&knowledge, RequestKind::Investigate) {
-            assert_eq!(action, Action::Abstain, "seed {seed}");
+            assert_eq!(action, Move::Abstain, "seed {seed}");
         }
     }
 
@@ -366,7 +366,7 @@ mod tests {
         // The rules have removed the doctor's only target, so the space is
         // not derivable from its knowledge.
         let knowledge = knowing(Role::Doctor, ["alice"]);
-        let space = [Action::Abstain];
+        let space = [Move::Abstain];
         for seed in SEEDS {
             let action = choose(
                 &mut RandomPolicy::from_seed(seed),
@@ -374,7 +374,7 @@ mod tests {
                 RequestKind::Protect,
                 &space,
             );
-            assert_eq!(action, Action::Abstain, "seed {seed}");
+            assert_eq!(action, Move::Abstain, "seed {seed}");
         }
     }
 
