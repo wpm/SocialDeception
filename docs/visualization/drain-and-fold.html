@@ -20,8 +20,6 @@
     --ctl-bg: #e3e8ee;
     --msg: #3f6ab0;
     --msg-bg: #e1e9f7;
-    --think: #b8681b;
-    --think-bg: #fbe9d3;
     --out: #0f8b8d;
     --out-bg: #d9f0f0;
     --log: #6f4fa6;
@@ -36,7 +34,6 @@
       --ink: #e6ebf0; --ink-2: #aab5c1; --ink-3: #7f8b98;
       --ctl: #a9b6c6; --ctl-bg: #2c3641;
       --msg: #8fb0e6; --msg-bg: #24344d;
-      --think: #e9a55a; --think-bg: #43301a;
       --out: #4fc3c5; --out-bg: #163a3b;
       --log: #b79ce6; --log-bg: #302543;
       --focus: #4fc3c5;
@@ -47,7 +44,6 @@
     --ink: #e6ebf0; --ink-2: #aab5c1; --ink-3: #7f8b98;
     --ctl: #a9b6c6; --ctl-bg: #2c3641;
     --msg: #8fb0e6; --msg-bg: #24344d;
-    --think: #e9a55a; --think-bg: #43301a;
     --out: #4fc3c5; --out-bg: #163a3b;
     --log: #b79ce6; --log-bg: #302543;
     --focus: #4fc3c5;
@@ -74,17 +70,11 @@
   .chip { font-family: var(--mono); font-size: 12.5px; padding: 4px 9px; border-radius: 999px; border: 1px solid transparent; white-space: nowrap; transition: transform 240ms ease, opacity 240ms ease; }
   .chip.ctl { background: var(--ctl-bg); color: var(--ctl); }
   .chip.msg { background: var(--msg-bg); color: var(--msg); }
-  .chip.think { background: var(--think-bg); color: var(--think); }
   .chip.out { background: var(--out-bg); color: var(--out); }
   .chip.disp { background: var(--out-bg); color: var(--out); border-color: var(--out); }
   .chip.enter { animation: enter 320ms ease; }
   @keyframes enter { from { transform: translateY(-6px); opacity: 0; } to { transform: none; opacity: 1; } }
 
-  .wake { font-family: var(--mono); font-size: 12.5px; display: flex; align-items: center; gap: 8px; min-height: 28px; color: var(--ink-2); }
-  .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--line); flex: none; }
-  .dot.armed { background: var(--think); box-shadow: 0 0 0 3px var(--think-bg); }
-  .dot.fired { background: var(--think); animation: pulse 900ms ease-in-out infinite; }
-  @keyframes pulse { 0%,100% { box-shadow: 0 0 0 2px var(--think-bg); } 50% { box-shadow: 0 0 0 7px var(--think-bg); } }
 
   .agentbox { border-width: 2px; border-color: var(--out); }
   .pill { font-family: var(--mono); font-size: 12px; text-transform: none; letter-spacing: 0; padding: 2px 9px; border-radius: 999px; background: var(--panel-2); color: var(--ink-2); }
@@ -125,7 +115,7 @@
 
   @media (max-width: 1000px) { .stage { grid-template-columns: 1fr 1fr; } .stage .writer { grid-column: 1 / -1; } }
   @media (max-width: 640px) { .stage { grid-template-columns: 1fr; } .stage .writer { grid-column: auto; } header h1 { font-size: 24px; } .caption { grid-template-columns: 1fr; } .stepno { grid-row: auto; } }
-  @media (prefers-reduced-motion: reduce) { .chip, .progress i { transition: none; } .chip.enter, .log li.new, .dot.fired { animation: none; } }
+  @media (prefers-reduced-motion: reduce) { .chip, .progress i { transition: none; } .chip.enter, .log li.new { animation: none; } }
 </style>
 
 <main class="wrap">
@@ -145,10 +135,6 @@
         <div id="inbox" class="chips"></div>
       </div>
       <div class="lane">
-        <div class="lanehead"><span>wake channel → agent</span><span class="mono" id="wakekind">never()</span></div>
-        <div id="wake" class="wake"></div>
-      </div>
-      <div class="lane">
         <div class="lanehead"><span>agent → router</span><span class="mono">one per pass</span></div>
         <div id="dispatch" class="chips"></div>
       </div>
@@ -160,7 +146,7 @@
         <div class="row"><span class="lbl">batch</span><div id="batch" class="chips"></div></div>
         <div class="row"><span class="lbl">handler</span><div id="handler" class="handler"></div></div>
         <div class="row"><span class="lbl">outgoing</span><div id="outputs" class="chips"></div></div>
-        <div class="row meta"><span>next seq <b id="seq">0</b></span><span>deadline <b id="deadline">none</b></span><span>clock <b id="clock">0</b></span></div>
+        <div class="row meta"><span>next seq <b id="seq">0</b></span><span>clock <b id="clock">0</b></span></div>
       </div>
     </div>
 
@@ -191,10 +177,9 @@
   <div class="legend">
     <span><i class="sw" style="background:var(--ctl)"></i>control event</span>
     <span><i class="sw" style="background:var(--msg)"></i>message from another agent</span>
-    <span><i class="sw" style="background:var(--think)"></i>deadline and Think</span>
     <span><i class="sw" style="background:var(--out)"></i>what the agent sends</span>
     <span><i class="sw" style="background:var(--log)"></i>cycle record</span>
-    <span class="mono">times are clock units; think interval is 100</span>
+    <span class="mono">times are clock units</span>
   </div>
 </main>
 
@@ -203,17 +188,15 @@
   // ---- Chip and record builders --------------------------------------
   const ctl = (name, t) => ({ k: 'ctl', text: name + ' · t ' + t, t });
   const msg = (from, to, n, t) => ({ k: 'msg', text: from + '→' + to + ' Step(' + n + ') · t ' + t, t });
-  const think = (t) => ({ k: 'think', text: 'Think · t ' + t, t });
   const out = (to, n, t) => ({ k: 'out', text: 'a→' + to + ' Step(' + n + ') · t ' + t, t });
 
   const evLine = (seq, stamp, t, ev) => ({ cls: 'event', text: '{"type":"event","agent":"a","seq":' + seq + ',"' + stamp + '":' + t + ',"event":' + ev + '}' });
   const evCtl = (c) => '{"kind":"control","control":"' + c + '"}';
   const evMsg = (s, r, n) => '{"kind":"message","sender":"' + s + '","recipients":["' + r + '"],"payload":{"Step":' + n + '}}';
-  const evThink = '{"kind":"think"}';
   const cyLine = (ts, te, i, o) => ({ cls: 'cycle', text: '{"type":"cycle","agent":"a","t_start":' + ts + ',"t_stop":' + te + ',"inputs":[' + i + '],"outputs":[' + o + ']}' });
 
   // ---- Scenario ------------------------------------------------------
-  const base = { inbox: [], wake: { armed: false, deadline: null, fired: false }, state: 'waiting', batch: [], handler: '', outputs: [], dispatch: null, log: [], seq: 0, clock: 0, exited: false };
+  const base = { inbox: [], state: 'waiting', batch: [], handler: '', outputs: [], dispatch: null, log: [], seq: 0, clock: 0, exited: false };
   const frames = [];
   let cur = base;
   function frame(title, body, patch) {
@@ -224,35 +207,33 @@
     frames.push(next); cur = next;
   }
 
-  frame('At rest', 'The agent thread blocks in a select over two channels: its inbox and a wake channel. No deadline is armed yet, so the wake channel is never() and only an arrival can wake it.', s => {});
+  frame('At rest', 'The agent thread blocks on its inbox. Only an arrival can wake it.', s => {});
   frame('The router delivers Start', 'The episode tells everyone to begin. The router stamps the delivery with the clock (t 10) and puts it on the inbox. The send returns at once; the channel is unbounded.', s => { s.inbox = [ctl('Start', 10)]; s.clock = 10; });
   frame('Wake and drain', 'The select returns the delivery. The agent then calls try_recv until the inbox reports Empty, so the batch is everything that was waiting. Only then is t_start read: 12.', s => { s.inbox = []; s.batch = [ctl('Start', 10)]; s.state = 'draining'; s.clock = 12; });
   frame('Record the input', 'Before the handler sees anything, each input gets an event record with the next sequence number. Its stamp is arrived: the time the router put it on the inbox, not now.', s => { s.state = 'recording'; s.log.push(evLine(0, 'arrived', 10, evCtl('start'))); s.seq = 1; });
-  frame('Fold', 'The handler receives the batch as a slice and returns what to send. Start returns nothing. Because the pass contained Start, a deadline is scheduled one interval ahead: 12 + 100 = 112.', s => { s.state = 'folding'; s.handler = 'handle([Start]) → []'; s.wake = { armed: true, deadline: 112, fired: false }; });
+  frame('Fold', 'The handler receives the batch as a slice and returns what to send. Start returns nothing.', s => { s.state = 'folding'; s.handler = 'handle([Start]) → []'; });
   frame('Dispatch and close the cycle', 'One dispatch goes to the router: how many deliveries this pass consumed and what it sent, together. Then the cycle record is written with the handling window and the sequence numbers it saw.', s => { s.state = 'dispatching'; s.dispatch = { deliveries: 1, sent: 0 }; s.clock = 14; s.log.push(cyLine(12, 14, '0', '')); });
-  frame('Waiting, with a deadline', 'The loop asks the timer source for a wake channel at the absolute deadline 112 and keeps it. The select now waits on both channels. Nothing resets the deadline while messages arrive.', s => { s.state = 'waiting'; s.batch = []; s.handler = ''; s.outputs = []; });
   frame('A message arrives', 'Agent b sends Step(6) to a. The router validates the recipient set, stamps t 20, and delivers.', s => { s.inbox = [msg('b', 'a', 6, 20)]; s.clock = 20; });
-  frame('Wake and drain again', 'Same rule as before: drain everything, read t_start after. The deadline is still 112; the wake channel the agent holds was never touched.', s => { s.inbox = []; s.batch = [msg('b', 'a', 6, 20)]; s.state = 'draining'; s.clock = 22; });
+  frame('Wake and drain again', 'Same rule as before: drain everything, read t_start after.', s => { s.inbox = []; s.batch = [msg('b', 'a', 6, 20)]; s.state = 'draining'; s.clock = 22; });
   frame('Record the input', 'Sequence numbers run on across passes. This message is seq 1, arrived 20: two clock units before the pass began.', s => { s.state = 'recording'; s.log.push(evLine(1, 'arrived', 20, evMsg('b', 'a', 6))); s.seq = 2; });
   frame('Fold', 'The handler halves 6 and replies to whoever sent it. It returns an Outgoing with recipients and payload only; the loop is what attaches the sender.', s => { s.state = 'folding'; s.handler = 'handle([b→a Step(6)]) → [to b: Step(3)]'; s.outputs = [out('b', 3, 24)]; });
   frame('Record the output and dispatch', 'Each outgoing message becomes an Event::Message with sender a, gets its own record (seq 2, sent 24: when the loop handed it to the router), and rides the dispatch.', s => { s.state = 'dispatching'; s.clock = 24; s.log.push(evLine(2, 'sent', 24, evMsg('a', 'b', 3))); s.seq = 3; s.dispatch = { deliveries: 1, sent: 1 }; });
   frame('Close the cycle', 'The cycle names input 1 and output 2. Per agent, a cycle always follows every record it references, and nothing from this agent lands between them.', s => { s.clock = 25; s.log.push(cyLine(22, 25, '1', '2')); s.state = 'waiting'; s.batch = []; s.handler = ''; s.outputs = []; });
   frame('A message that takes a while', 'Agent c sends Step(40) at t 30. The agent drains it and records it as seq 3. This time the handler is slow, the way a model call would be.', s => { s.clock = 31; s.batch = [msg('c', 'a', 40, 30)]; s.state = 'folding'; s.log.push(evLine(3, 'arrived', 30, evMsg('c', 'a', 40))); s.seq = 4; s.handler = 'handle([c→a Step(40)]) … still folding'; });
   frame('Arrivals while busy', 'Two more messages land at t 60 and t 80. Nothing interrupts the fold. They wait in the inbox and will be picked up at the start of the next pass. This is the one-window staleness the design accepts.', s => { s.inbox = [msg('b', 'a', 2, 60), msg('c', 'a', 9, 80)]; s.clock = 80; });
-  frame('The deadline passes while busy', 'At t 112 the wake channel delivers its message. The agent is not listening; it is still inside handle. The message sits in the channel like any other.', s => { s.wake.fired = true; s.clock = 112; });
   frame('The slow fold finishes', 'The handler returns Step(20) for c. Output recorded as seq 4, dispatch sent, cycle closed. t_stop minus t_start is 100 units: the busy window is in the log.', s => { s.clock = 131; s.handler = 'handle([c→a Step(40)]) → [to c: Step(20)]'; s.outputs = [out('c', 20, 130)]; s.log.push(evLine(4, 'sent', 130, evMsg('a', 'c', 20))); s.seq = 5; s.dispatch = { deliveries: 1, sent: 1 }; s.log.push(cyLine(31, 131, '3', '4')); s.state = 'dispatching'; });
-  frame('Everything ready is one batch', 'Back at the select, both channels are ready. Whichever wins, the loop drains the inbox and then try_recvs the wake channel, so the batch is the two messages followed by a Think. The deadline is retired and the next one scheduled from t_start: 132 + 100 = 232.', s => { s.inbox = []; s.batch = [msg('b', 'a', 2, 60), msg('c', 'a', 9, 80), think(112)]; s.state = 'draining'; s.handler = ''; s.outputs = []; s.clock = 132; s.wake = { armed: true, deadline: 232, fired: false }; });
-  frame('Record the inputs', 'Three records. Every event line carries exactly one of arrived, sent or due. The Think is due 112, the deadline it was scheduled for, not when the loop noticed it. Every arrived and due value is at or before t_start 132, so the wait each one suffered is readable.', s => { s.state = 'recording'; s.log.push(evLine(5, 'arrived', 60, evMsg('b', 'a', 2)), evLine(6, 'arrived', 80, evMsg('c', 'a', 9)), evLine(7, 'due', 112, evThink)); s.seq = 8; });
-  frame('Fold the batch', 'One call to handle with all three. The handler replies to b with 1 and to c with 28, and does nothing special for Think.', s => { s.state = 'folding'; s.handler = 'handle([b→a Step(2), c→a Step(9), Think]) → [to b: Step(1), to c: Step(28)]'; s.outputs = [out('b', 1, 134), out('c', 28, 135)]; });
-  frame('Record outputs, dispatch, close', 'Outputs are seq 8 and 9. The dispatch says two deliveries consumed, two messages sent. The cycle lists inputs 5, 6, 7 and outputs 8, 9.', s => { s.state = 'dispatching'; s.clock = 136; s.log.push(evLine(8, 'sent', 134, evMsg('a', 'b', 1)), evLine(9, 'sent', 135, evMsg('a', 'c', 28))); s.seq = 10; s.dispatch = { deliveries: 2, sent: 2 }; s.log.push(cyLine(132, 136, '5,6,7', '8,9')); });
+  frame('Everything ready is one batch', 'Back at the select, the inbox is ready. The loop drains it, so the batch is both messages that arrived while it was busy.', s => { s.inbox = []; s.batch = [msg('b', 'a', 2, 60), msg('c', 'a', 9, 80)]; s.state = 'draining'; s.handler = ''; s.outputs = []; s.clock = 132; });
+  frame('Record the inputs', 'Two records. Every event line carries exactly one of arrived or sent. Both arrived values are before t_start 132, so the wait each one suffered is readable.', s => { s.state = 'recording'; s.log.push(evLine(5, 'arrived', 60, evMsg('b', 'a', 2)), evLine(6, 'arrived', 80, evMsg('c', 'a', 9))); s.seq = 7; });
+  frame('Fold the batch', 'One call to handle with both. The handler replies to b with 1 and to c with 28.', s => { s.state = 'folding'; s.handler = 'handle([b→a Step(2), c→a Step(9)]) → [to b: Step(1), to c: Step(28)]'; s.outputs = [out('b', 1, 134), out('c', 28, 135)]; });
+  frame('Record outputs, dispatch, close', 'Outputs are seq 7 and 8. The dispatch says two deliveries consumed, two messages sent. The cycle lists inputs 5, 6 and outputs 7, 8.', s => { s.state = 'dispatching'; s.clock = 136; s.log.push(evLine(7, 'sent', 134, evMsg('a', 'b', 1)), evLine(8, 'sent', 135, evMsg('a', 'c', 28))); s.seq = 9; s.dispatch = { deliveries: 2, sent: 2 }; s.log.push(cyLine(132, 136, '5,6', '7,8')); });
   frame('Stop arrives', 'The episode has gone quiescent, so it delivers Stop to everyone.', s => { s.state = 'waiting'; s.batch = []; s.handler = ''; s.outputs = []; s.inbox = [ctl('Stop', 150)]; s.clock = 150; });
-  frame('The final pass', 'Stop is handled like any other event: drained, recorded, folded, dispatched, and closed with a cycle. The handler sees it and returns nothing.', s => { s.inbox = []; s.batch = [ctl('Stop', 150)]; s.state = 'dispatching'; s.clock = 152; s.handler = 'handle([Stop]) → []'; s.log.push(evLine(10, 'arrived', 150, evCtl('stop'))); s.seq = 11; s.dispatch = { deliveries: 1, sent: 0 }; s.log.push(cyLine(151, 152, '10', '')); });
-  frame('Exit', 'After the pass that contained Stop, the loop returns the handler to whoever joins the thread. Its sender to the writer is dropped; when the last agent drops theirs, the writer flushes and the file is complete.', s => { s.state = 'exited'; s.exited = true; s.batch = []; s.handler = ''; s.outputs = []; s.wake = { armed: false, deadline: null, fired: false }; });
-  frame('What always holds', 'Per agent: inputs, then outputs, then the cycle, contiguous, for every pass. A cycle follows every record it names. Every pass has at least one input. Every event line has exactly one of arrived, sent or due, and it matches the direction of the event. Across agents, lines interleave freely; the file is one stream and readers filter on agent.', s => {});
+  frame('The final pass', 'Stop is handled like any other event: drained, recorded, folded, dispatched, and closed with a cycle. The handler sees it and returns nothing.', s => { s.inbox = []; s.batch = [ctl('Stop', 150)]; s.state = 'dispatching'; s.clock = 152; s.handler = 'handle([Stop]) → []'; s.log.push(evLine(9, 'arrived', 150, evCtl('stop'))); s.seq = 10; s.dispatch = { deliveries: 1, sent: 0 }; s.log.push(cyLine(151, 152, '9', '')); });
+  frame('Exit', 'After the pass that contained Stop, the loop returns the handler to whoever joins the thread. Its sender to the writer is dropped; when the last agent drops theirs, the writer flushes and the file is complete.', s => { s.state = 'exited'; s.exited = true; s.batch = []; s.handler = ''; s.outputs = []; });
+  frame('What always holds', 'Per agent: inputs, then outputs, then the cycle, contiguous, for every pass. A cycle follows every record it names. Every pass has at least one input. Every event line has exactly one of arrived or sent, and it matches the direction of the event. Across agents, lines interleave freely; the file is one stream and readers filter on agent.', s => {});
 
   // ---- Rendering -----------------------------------------------------
   const $ = (id) => document.getElementById(id);
-  const el = { inbox: $('inbox'), wake: $('wake'), wakekind: $('wakekind'), dispatch: $('dispatch'), state: $('state'), batch: $('batch'), handler: $('handler'), outputs: $('outputs'), seq: $('seq'), deadline: $('deadline'), clock: $('clock'), log: $('log'), stepno: $('stepno'), ctitle: $('ctitle'), cbody: $('cbody'), bar: $('bar'), play: $('play'), prev: $('prev'), next: $('next'), reset: $('reset'), speed: $('speed') };
+  const el = { inbox: $('inbox'), dispatch: $('dispatch'), state: $('state'), batch: $('batch'), handler: $('handler'), outputs: $('outputs'), seq: $('seq'), clock: $('clock'), log: $('log'), stepno: $('stepno'), ctitle: $('ctitle'), cbody: $('cbody'), bar: $('bar'), play: $('play'), prev: $('prev'), next: $('next'), reset: $('reset'), speed: $('speed') };
   let i = 0, timer = null, lastLog = 0;
 
   function chips(container, list, animate) {
@@ -272,19 +253,12 @@
     chips(el.outputs, s.outputs, direction > 0);
     chips(el.dispatch, s.dispatch ? [{ k: 'disp', text: 'deliveries ' + s.dispatch.deliveries + ' · sent ' + s.dispatch.sent }] : [], direction > 0);
 
-    el.wakekind.textContent = s.wake.armed ? 'wake_at(' + s.wake.deadline + ')' : 'never()';
-    el.wake.innerHTML = '';
-    const dot = document.createElement('i'); dot.className = 'dot' + (s.wake.fired ? ' fired' : s.wake.armed ? ' armed' : '');
-    const txt = document.createElement('span');
-    txt.textContent = !s.wake.armed ? 'no deadline: only an arrival can wake the agent' : s.wake.fired ? 'fired at ' + s.wake.deadline + ', waiting to be read' : 'pending until ' + s.wake.deadline;
-    el.wake.append(dot, txt);
 
     el.state.textContent = s.state;
     el.state.className = 'pill ' + (s.state === 'waiting' ? 'wait' : s.state === 'exited' ? 'done' : 'busy');
     el.handler.textContent = s.handler || (s.state === 'exited' ? 'returned to join()' : 'idle');
     el.handler.className = 'handler' + (s.handler ? ' busy' : '');
     el.seq.textContent = s.seq;
-    el.deadline.textContent = s.wake.armed ? s.wake.deadline : 'none';
     el.clock.textContent = s.clock;
 
     el.log.innerHTML = '';

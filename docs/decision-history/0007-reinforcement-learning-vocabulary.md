@@ -190,12 +190,21 @@ pub trait Timestamped: Created {
 
 | Object | `created` | `received` | Implements |
 |--------|-----------|------------|------------|
-| `Action` | the instant the agent sent it | — | `Created` |
-| `Observation` | the sender's `Action.created`, carried through | the instant it was popped off the queue | `Timestamped` |
+| `Event`, as sent | the instant the agent sent it | — | `Created` |
+| `Observation` | the sent `Event`'s `created`, carried through | the instant it was popped off the queue | `Timestamped` |
 | `Control` | the instant the environment sent it | the instant it was popped off the control queue | `Timestamped` |
 | `Reward` | the instant the environment logged it | — | `Created` |
 
-An observation's latency is therefore its whole staleness: routing plus
+A handler returns `Action`s: recipients and a payload, nothing more. An
+action has no creation time until it is sent, and the handler cannot know
+that instant, so the loop stamps each action with its sender and `created`
+as it sends it, and the stamped action is the `Event` on the wire. That is
+why `Created` belongs to the sent `Event` (and to the `action` record that
+logs it) rather than to the `Action` value the handler returns. When this
+record speaks of an action's `created`, it means that stamp. There is no
+separate outgoing-message type.
+
+An observation's latency is its whole staleness: routing plus
 waiting in the queue, the delay the agent actually suffers. The moment it
 entered the queue is not recorded; ADR-0002 already observed that in a
 single process arrival is send time plus scheduler jitter.
