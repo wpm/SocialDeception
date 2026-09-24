@@ -36,9 +36,10 @@ use std::panic::{self, AssertUnwindSafe};
 use crossbeam_channel::{Receiver, Sender, select, unbounded};
 
 use crate::agent::{self, Action, Agent, CycleDispatch, Handler, Observation, Wiring};
+use crate::cancel::{Cancel, ControlSender};
 use crate::clock::Clock;
 use crate::event::{AgentId, Control, Domain};
-use crate::router::{RouteError, Router};
+use crate::router::{Queues, RouteError, Router};
 use crate::trajectory::LogRecord;
 
 /// Why an agent's thread did not end cleanly.
@@ -192,20 +193,29 @@ impl<D: Domain> Episode<D> {
         let ids: BTreeSet<AgentId> = roster.keys().cloned().collect();
         let (dispatch, dispatches) = unbounded();
         let (obituary, obituaries) = unbounded();
-        let mut inboxes = BTreeMap::new();
-        // Every inbox stays open until every thread has been joined, so that
+        let mut queues = BTreeMap::new();
+        // Every queue stays open until every thread has been joined, so that
         // a message to an agent that has already stopped is delivered, and
         // never read, rather than failing its sender.
         let mut held = Vec::with_capacity(roster.len());
         let mut agents = Vec::with_capacity(roster.len());
         for (id, handler) in roster {
-            let (sender, inbox) = unbounded();
-            held.push(inbox.clone());
-            inboxes.insert(id.clone(), sender);
+            let (sender, events) = unbounded();
+            let (commander, controls, arm) = ControlSender::new();
+            held.push((events.clone(), controls.clone()));
+            queues.insert(
+                id.clone(),
+                Queues {
+                    events: sender,
+                    controls: commander,
+                },
+            );
             let wiring = Wiring {
                 id: id.clone(),
                 clock,
-                inbox,
+                events,
+                controls,
+                arm,
                 dispatches: dispatch.clone(),
                 records: records.clone(),
                 timeout: None,
@@ -219,7 +229,7 @@ impl<D: Domain> Episode<D> {
             agents.push(Agent::spawn(wiring, watched, clock));
         }
         drop((dispatch, obituary, records));
-        let router = Router::new(inboxes, clock);
+        let router = Router::new(queues, clock);
 
         let outcome = router
             .control(Control::Start)
@@ -303,8 +313,8 @@ impl<D: Domain> Handler<D> for Watched<D> {
         self.handler.start()
     }
 
-    fn handle(&mut self, observations: &[Observation<D>]) -> Vec<Action<D>> {
-        self.handler.handle(observations)
+    fn handle(&mut self, observations: &[Observation<D>], cancel: &Cancel) -> Vec<Action<D>> {
+        self.handler.handle(observations, cancel)
     }
 }
 
@@ -393,7 +403,11 @@ mod tests {
             }
         }
 
-        fn handle(&mut self, observations: &[Observation<Counting>]) -> Vec<Action<Counting>> {
+        fn handle(
+            &mut self,
+            observations: &[Observation<Counting>],
+            _: &Cancel,
+        ) -> Vec<Action<Counting>> {
             counts(observations)
                 .into_iter()
                 .filter(|n| *n < self.limit)
@@ -410,7 +424,7 @@ mod tests {
             vec![Action::broadcast(Count(0))]
         }
 
-        fn handle(&mut self, _: &[Observation<Counting>]) -> Vec<Action<Counting>> {
+        fn handle(&mut self, _: &[Observation<Counting>], _: &Cancel) -> Vec<Action<Counting>> {
             Vec::new()
         }
     }
@@ -419,7 +433,11 @@ mod tests {
     struct Spoke;
 
     impl Handler<Counting> for Spoke {
-        fn handle(&mut self, observations: &[Observation<Counting>]) -> Vec<Action<Counting>> {
+        fn handle(
+            &mut self,
+            observations: &[Observation<Counting>],
+            _: &Cancel,
+        ) -> Vec<Action<Counting>> {
             observations
                 .iter()
                 .map(|observation| Action::to([observation.event.sender.clone()], Count(1)))
@@ -435,7 +453,7 @@ mod tests {
             vec![Action::to([self.0], Count(1))]
         }
 
-        fn handle(&mut self, _: &[Observation<Counting>]) -> Vec<Action<Counting>> {
+        fn handle(&mut self, _: &[Observation<Counting>], _: &Cancel) -> Vec<Action<Counting>> {
             Vec::new()
         }
     }
@@ -447,7 +465,7 @@ mod tests {
             panic!("the handler is broken")
         }
 
-        fn handle(&mut self, _: &[Observation<Counting>]) -> Vec<Action<Counting>> {
+        fn handle(&mut self, _: &[Observation<Counting>], _: &Cancel) -> Vec<Action<Counting>> {
             panic!("the handler is broken")
         }
     }
