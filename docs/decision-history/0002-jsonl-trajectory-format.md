@@ -3,7 +3,8 @@
 **Status:** Accepted
 **Date:** 2026-09-18
 **Deciders:** Bill McNeill
-**Amended by:** [ADR-0003](0003-event-record-stamps.md), which replaces the event record's `time` field
+**Amended by:** [ADR-0003](0003-event-record-stamps.md), which replaces the event record's `time` field, and by [ADR-0007](0007-reinforcement-learning-vocabulary.md),
+which replaces the event record with observation, action, dropped, control and reward records
 
 ## Context
 

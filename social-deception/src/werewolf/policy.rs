@@ -136,7 +136,7 @@ impl Policy for RandomPolicy {
 /// The baseline's candidates, in the action space's order: the first
 /// non-empty of the targets [`excluded`] leaves, `Abstain` where the rules
 /// permit it, and the whole action space, because a policy handed nothing
-/// has no correct behaviour.
+/// has no correct behavior.
 fn candidates<'a>(view: &View<'a>) -> Vec<&'a Action> {
     let space = view.action_space;
     let targets: Vec<&Action> = space
@@ -232,9 +232,9 @@ mod tests {
 
     #[test]
     fn for_agent_is_from_seed_under_the_agents_id() {
-        let labelled = nominations(RandomPolicy::for_agent(MASTER, &id("carol")), 20);
+        let labeled = nominations(RandomPolicy::for_agent(MASTER, &id("carol")), 20);
         let explicit = nominations(RandomPolicy::from_seed(seed_for(MASTER, "carol")), 20);
-        assert_eq!(labelled, explicit);
+        assert_eq!(labeled, explicit);
     }
 
     #[test]

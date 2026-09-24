@@ -5,6 +5,8 @@
 **Deciders:** Bill McNeill
 **Refined by:** [ADR-0006](0006-knowledge-holds-what-the-agent-did-in-secret.md),
 which adds the agent's own secret actions to what `Knowledge` folds
+**Amended by:** [ADR-0007](0007-reinforcement-learning-vocabulary.md), which renames the action type `Move`: an
+`Action` is now the message an agent sends, here a `Response` carrying a `Move`
 
 ## Context
 
@@ -20,7 +22,7 @@ Three properties are wanted at once, and they pull against each other.
 - **The rules must be unbypassable.** A language model will name dead
   players, nominate itself, and emit strings that are not player names at
   all. Nothing it does may put the game in a state the rules forbid.
-- **Interesting behaviour must stay available.** A werewolf that sacrifices a
+- **Interesting behavior must stay available.** A werewolf that sacrifices a
   packmate to build credibility with the village is playing well. Encoding
   "never eat a packmate" as a rule designs that play out of the game before
   any model has been asked.
