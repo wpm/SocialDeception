@@ -34,7 +34,7 @@ agent may do, and what the runtime has to learn about games.
 the roster. The runtime learns nothing about Werewolf. The seam between the
 game and the episode is episode construction: a function takes a
 configuration and hands back a populated episode. `Episode`, `Agent`,
-`Router`, `Event` and the trajectory format do not change behaviourally.**
+`Router`, `Event` and the trajectory format do not change behaviorally.**
 
 ### The game is a pure fold and the moderator is a thin shell around it
 

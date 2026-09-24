@@ -20,7 +20,7 @@ Three properties are wanted at once, and they pull against each other.
 - **The rules must be unbypassable.** A language model will name dead
   players, nominate itself, and emit strings that are not player names at
   all. Nothing it does may put the game in a state the rules forbid.
-- **Interesting behaviour must stay available.** A werewolf that sacrifices a
+- **Interesting behavior must stay available.** A werewolf that sacrifices a
   packmate to build credibility with the village is playing well. Encoding
   "never eat a packmate" as a rule designs that play out of the game before
   any model has been asked.

@@ -5,6 +5,7 @@
 extend-exclude = ["Cargo.lock"]
 
 [default]
+locale = "en-us"
 # Identifiers that are spelled the way we want them, not typos. Add sparingly,
 # and prefer the narrowest form that stops the false positive.
 extend-ignore-identifiers-re = []

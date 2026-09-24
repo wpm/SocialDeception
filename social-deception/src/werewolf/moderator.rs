@@ -12,7 +12,7 @@
 //! [`Control::Start`] begins the game; a [`Response`](super::Response) from a player is
 //! recorded; [`Control::Stop`] and [`Event::Think`] do nothing. An episode's
 //! agents have no think interval, so no `Think` ever arrives; the arm exists
-//! so that turning timers on later is not a change of behaviour here. A
+//! so that turning timers on later is not a change of behavior here. A
 //! [`Narration`](super::Narration) or a [`Request`](super::Request) arriving from a player is a bug, and the
 //! moderator panics rather than run a game whose state it cannot vouch for.
 //!

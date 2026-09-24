@@ -222,7 +222,7 @@ fn the_same_seed_plays_the_same_game() {
     // wall-clock timestamps, and the records of different agents' threads
     // interleave however the scheduler ran them, so the files of the same
     // game differ from run to run. Tightening this test to compare them
-    // would assert something the runtime cannot honour, and is not meant
+    // would assert something the runtime cannot honor, and is not meant
     // to. The transcript is the claim.
 }
 

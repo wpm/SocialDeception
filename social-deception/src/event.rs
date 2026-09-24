@@ -142,7 +142,7 @@ mod tests {
     }
 
     #[test]
-    fn message_serialises_with_sorted_recipients() {
+    fn message_serializes_with_sorted_recipients() {
         let event = Event::message("a", ["c", "b"], TestPayload::Step(7));
         assert_eq!(
             json(&event),
@@ -156,7 +156,7 @@ mod tests {
     }
 
     #[test]
-    fn control_serialises_flat() {
+    fn control_serializes_flat() {
         let event: Event<TestPayload> = Event::Control(Control::Stop);
         assert_eq!(
             json(&event),
@@ -165,25 +165,25 @@ mod tests {
     }
 
     #[test]
-    fn think_serialises_as_its_tag_alone() {
+    fn think_serializes_as_its_tag_alone() {
         let event: Event<TestPayload> = Event::Think;
         assert_eq!(json(&event), serde_json::json!({"kind": "think"}));
     }
 
     #[test]
-    fn agent_id_serialises_as_a_bare_string() {
+    fn agent_id_serializes_as_a_bare_string() {
         assert_eq!(json(&AgentId::new("alice")), serde_json::json!("alice"));
         assert_eq!(AgentId::new("alice").to_string(), "alice");
     }
 
     #[test]
-    fn agent_id_deserialises_from_a_bare_string() {
+    fn agent_id_deserializes_from_a_bare_string() {
         let id: AgentId = serde_json::from_value(serde_json::json!("alice")).unwrap();
         assert_eq!(id, AgentId::new("alice"));
     }
 
     #[test]
-    fn an_empty_agent_id_does_not_deserialise() {
+    fn an_empty_agent_id_does_not_deserialize() {
         let error = serde_json::from_value::<AgentId>(serde_json::json!("")).unwrap_err();
         assert!(error.to_string().contains("non-empty agent id"), "{error}");
         // Inside a collection too, since that is where a reader meets it.

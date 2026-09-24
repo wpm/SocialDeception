@@ -48,7 +48,7 @@
 //! `Vec<Action>` computed by the rules; an action outside it is a policy bug.
 //! A request and its response are correlated by [`RequestId`] on purpose:
 //! they are RPC-shaped, and a response naming an id the moderator is not
-//! waiting for is a bug rather than a judgement call.
+//! waiting for is a bug rather than a judgment call.
 //!
 //! # Narration is addressed, not broadcast
 //!

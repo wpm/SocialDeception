@@ -44,7 +44,7 @@
 //! Nothing here narrows an action space for strategic reasons. A werewolf's
 //! `Devour` includes its living packmates, and a seer's `Investigate`
 //! includes players it has already seen; whether to pick them is the
-//! policy's judgement (ADR-0005), and the tests in this module assert that
+//! policy's judgment (ADR-0005), and the tests in this module assert that
 //! it stays that way.
 
 use std::collections::BTreeSet;
@@ -202,7 +202,7 @@ impl Player for Seer {
     }
 
     /// Re-investigating someone is in the action space: permitted but
-    /// pointless, and "pointless" is the policy's judgement to make.
+    /// pointless, and "pointless" is the policy's judgment to make.
     fn action_space(&self, request: &Request) -> Vec<Action> {
         base_action_space(&self.knowledge, request)
     }
