@@ -4,7 +4,7 @@
 //! records it as it folds and sends the records over an in-process channel
 //! to a [`Writer`].
 //!
-//! # Four record types
+//! # Five record types
 //!
 //! An agent runs one cycle per wake-up: it pops everything waiting, hands
 //! the observations to its handler, and sends the actions that come back.
@@ -16,6 +16,9 @@
 //! - a [`ControlRecord`] per control popped, likewise;
 //! - an [`ActionRecord`] per action sent, written the instant it is sent,
 //!   carrying the `created` stamp the loop has just given it;
+//! - a [`DroppedRecord`] per action *not* sent, in the one case where a
+//!   cycle sends nothing it produced: [`Control::Stop`] arrived while the
+//!   handler was deliberating;
 //! - a [`CycleRecord`] closing the cycle: the handling window, what woke it,
 //!   and the sequence numbers of everything popped and everything sent.
 //!
@@ -23,9 +26,11 @@
 //! it, which is what makes the trajectory joinable: an observation in one
 //! agent's trajectory matches the action in its sender's whose `created` and
 //! payload it carries. Nothing else links them, and nothing else needs to.
+//! A dropped action has no other side, because it never traveled, and a
+//! reader joining observations to actions passes over it.
 //!
-//! Sequence numbers are per agent and cover all three of the non-cycle
-//! records, inputs and outputs alike.
+//! Sequence numbers are per agent and cover every non-cycle record, inputs
+//! and outputs alike, and a dropped action, which is neither.
 //!
 //! # Why a record is written when it is
 //!
@@ -63,8 +68,8 @@
 //! # On-disk format
 //!
 //! One JSON object per line, wrapped in [`LogRecord`], whose `type` field is
-//! `observation`, `action`, `control` or `cycle`. Nothing here reads a log
-//! back; only `Serialize` is required of a payload.
+//! `observation`, `action`, `dropped`, `control` or `cycle`. Nothing here
+//! reads a log back; only `Serialize` is required of a payload.
 //!
 //! ```json
 //! {"type":"control","agent":"alice","seq":0,"created":10,"received":12,"control":"start"}
@@ -185,6 +190,49 @@ impl<D: Domain> Serialize for ActionRecord<D> {
     }
 }
 
+/// An event this agent produced and did not send, because
+/// [`Control::Stop`] arrived while the handler was deciding it.
+///
+/// Its fields are an [`ActionRecord`]'s, and deliberately so: it is the
+/// action that would have been logged had the cycle not been preempted,
+/// stamped exactly as one, with `created` the instant the handler returned
+/// it. What differs is the `type` on the line, and what that tells a
+/// reader: this event never traveled, so nobody observed it, and it joins
+/// nothing.
+///
+/// Dropping is the honest record rather than a loss. After `Stop` the
+/// recipients have stopped too, so sending would go nowhere, and what a
+/// cancelled policy returns is typically its fallback's choice rather than
+/// its own (ADR-0007). Logging it lets a training pipeline see that the
+/// agent was mid-decision when the episode ended, and exclude the truncated
+/// decision rather than mistake its absence for silence.
+///
+/// `Debug`, `Clone` and equality are written out for the same reason
+/// [`ObservationRecord`]'s are.
+pub struct DroppedRecord<D: Domain> {
+    /// The agent whose trajectory this record belongs to.
+    pub agent: AgentId,
+    /// The agent's sequence number for it.
+    pub seq: Seq,
+    /// When the handler returned it, which is the `created` it would have
+    /// been sent with.
+    pub created: Timestamp,
+    /// The event as it would have been sent.
+    pub event: Event<D>,
+}
+
+impl<D: Domain> Serialize for DroppedRecord<D> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut record = serializer.serialize_struct("DroppedRecord", 4)?;
+        record.serialize_field("agent", &self.agent)?;
+        record.serialize_field("seq", &self.seq)?;
+        record.serialize_field("created", &self.created)?;
+        record.serialize_field("event", &Envelope(&self.event))?;
+        record.end()
+    }
+}
+
 /// A control this agent popped off its queue.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ControlRecord {
@@ -232,6 +280,8 @@ pub enum LogRecord<D: Domain> {
     Observation(ObservationRecord<D>),
     /// An event some agent sent.
     Action(ActionRecord<D>),
+    /// An event some agent produced and did not send.
+    Dropped(DroppedRecord<D>),
     /// A control some agent popped.
     Control(ControlRecord),
     /// A cycle of some agent's loop.
@@ -319,6 +369,45 @@ where
 
 impl<D: Domain> Eq for ActionRecord<D> where D::Payload: Eq {}
 
+impl<D: Domain> fmt::Debug for DroppedRecord<D>
+where
+    D::Payload: fmt::Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DroppedRecord")
+            .field("agent", &self.agent)
+            .field("seq", &self.seq)
+            .field("created", &self.created)
+            .field("event", &self.event)
+            .finish()
+    }
+}
+
+impl<D: Domain> Clone for DroppedRecord<D> {
+    fn clone(&self) -> Self {
+        Self {
+            agent: self.agent.clone(),
+            seq: self.seq,
+            created: self.created,
+            event: self.event.clone(),
+        }
+    }
+}
+
+impl<D: Domain> PartialEq for DroppedRecord<D>
+where
+    D::Payload: PartialEq,
+{
+    fn eq(&self, other: &Self) -> bool {
+        self.agent == other.agent
+            && self.seq == other.seq
+            && self.created == other.created
+            && self.event == other.event
+    }
+}
+
+impl<D: Domain> Eq for DroppedRecord<D> where D::Payload: Eq {}
+
 impl<D: Domain> fmt::Debug for LogRecord<D>
 where
     D::Payload: fmt::Debug,
@@ -327,6 +416,7 @@ where
         match self {
             Self::Observation(record) => f.debug_tuple("Observation").field(record).finish(),
             Self::Action(record) => f.debug_tuple("Action").field(record).finish(),
+            Self::Dropped(record) => f.debug_tuple("Dropped").field(record).finish(),
             Self::Control(record) => f.debug_tuple("Control").field(record).finish(),
             Self::Cycle(record) => f.debug_tuple("Cycle").field(record).finish(),
         }
@@ -338,6 +428,7 @@ impl<D: Domain> Clone for LogRecord<D> {
         match self {
             Self::Observation(record) => Self::Observation(record.clone()),
             Self::Action(record) => Self::Action(record.clone()),
+            Self::Dropped(record) => Self::Dropped(record.clone()),
             Self::Control(record) => Self::Control(record.clone()),
             Self::Cycle(record) => Self::Cycle(record.clone()),
         }
@@ -352,6 +443,7 @@ where
         match (self, other) {
             (Self::Observation(a), Self::Observation(b)) => a == b,
             (Self::Action(a), Self::Action(b)) => a == b,
+            (Self::Dropped(a), Self::Dropped(b)) => a == b,
             (Self::Control(a), Self::Control(b)) => a == b,
             (Self::Cycle(a), Self::Cycle(b)) => a == b,
             _ => false,
@@ -370,6 +462,12 @@ impl<D: Domain> From<ObservationRecord<D>> for LogRecord<D> {
 impl<D: Domain> From<ActionRecord<D>> for LogRecord<D> {
     fn from(record: ActionRecord<D>) -> Self {
         Self::Action(record)
+    }
+}
+
+impl<D: Domain> From<DroppedRecord<D>> for LogRecord<D> {
+    fn from(record: DroppedRecord<D>) -> Self {
+        Self::Dropped(record)
     }
 }
 
@@ -545,6 +643,40 @@ mod tests {
             written.ends_with(r#""event":{"sender":"b","recipients":["a"],"payload":{"Step":6}}}"#),
             "{written}"
         );
+    }
+
+    #[test]
+    fn a_dropped_action_is_written_exactly_as_the_action_it_would_have_been() {
+        // Same fields, same order, same stamps: only the `type` differs, and
+        // that is what tells a reader the event never traveled.
+        let event = Event::new("a", ["b"], at(40), TestPayload::Step(3));
+        let dropped: LogRecord<TestDomain> = DroppedRecord {
+            agent: AgentId::new("a"),
+            seq: Seq(2),
+            created: at(40),
+            event: event.clone(),
+        }
+        .into();
+        let sent: LogRecord<TestDomain> = ActionRecord {
+            agent: AgentId::new("a"),
+            seq: Seq(2),
+            created: at(40),
+            event,
+        }
+        .into();
+        assert_eq!(
+            serde_json::to_value(&dropped).unwrap(),
+            json!({"type": "dropped", "agent": "a", "seq": 2, "created": 40,
+                   "event": {"sender": "a", "recipients": ["b"], "payload": {"Step": 3}}})
+        );
+        let (mut as_dropped, mut as_action) = (
+            serde_json::to_value(&dropped).unwrap(),
+            serde_json::to_value(&sent).unwrap(),
+        );
+        assert_ne!(as_dropped, as_action);
+        as_dropped["type"] = json!("x");
+        as_action["type"] = json!("x");
+        assert_eq!(as_dropped, as_action);
     }
 
     #[test]

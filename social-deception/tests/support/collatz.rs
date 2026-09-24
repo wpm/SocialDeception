@@ -25,7 +25,7 @@
 //! end-to-end test.
 
 use serde::Serialize;
-use social_deception::{Action, AgentId, Domain, Handler, Observation};
+use social_deception::{Action, AgentId, Cancel, Domain, Handler, Observation};
 
 /// The Collatz environment as a [`Domain`].
 ///
@@ -154,9 +154,12 @@ impl Handler<CollatzDomain> for Collatz {
             .collect()
     }
 
+    /// Ignores `cancel`: computing the next value of a chain cannot block,
+    /// so there is nothing a preemption could interrupt.
     fn handle(
         &mut self,
         observations: &[Observation<CollatzDomain>],
+        _: &Cancel,
     ) -> Vec<Action<CollatzDomain>> {
         observations
             .iter()
@@ -195,7 +198,7 @@ mod tests {
         agent: &mut Collatz,
         observations: &[Observation<CollatzDomain>; N],
     ) -> Vec<Action<CollatzDomain>> {
-        agent.handle(observations)
+        agent.handle(observations, &Cancel::cancelled())
     }
 
     fn to_b(chain: u64, value: u64) -> Action<CollatzDomain> {
@@ -266,7 +269,7 @@ mod tests {
         // is not among these: the loop calls the start hook instead of
         // handing the handler a control.
         let mut agent = Collatz::new("b").opening(5);
-        assert!(agent.handle(&[]).is_empty());
+        assert!(agent.handle(&[], &Cancel::cancelled()).is_empty());
     }
 
     #[test]

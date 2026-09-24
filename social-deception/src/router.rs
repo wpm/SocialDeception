@@ -10,13 +10,23 @@
 //! unknown agent id, an empty recipient set, and a sender in its own
 //! recipient set are each rejected loudly. There is no loopback. What it no
 //! longer has to reject is a wake-up or a control arriving where an event
-//! belongs: [`route`](Router::route) takes an [`Event`], and a control goes
-//! through [`control`](Router::control), so the type says which is which.
+//! belongs: an event and a control travel on different channels, so the
+//! router holds two senders per agent and the type says which is which.
+//!
+//! # A control preempts as it is sent
+//!
+//! An agent's control sender is a [`ControlSender`], not a plain channel
+//! sender, so [`control`](Router::control) queues the control *and* trips
+//! the recipient's current cycle in one step. The router does not know or
+//! care that it is doing so; it is a property of the sending half it was
+//! handed, which is what keeps a control on a queue and a cycle unaware of
+//! it from being a state anything here can produce. See
+//! [`cancel`](crate::cancel).
 //!
 //! Channels are unbounded. With bounded channels one agent slow to drain its
-//! inbox would apply back-pressure through the router to every other agent in
-//! the episode. A slow agent is a normal condition here and must not be able
-//! to stall the world.
+//! queues would apply back-pressure through the router to every other agent
+//! in the episode. A slow agent is a normal condition here and must not be
+//! able to stall the world.
 
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -24,7 +34,7 @@ use std::fmt;
 
 use crossbeam_channel::Sender;
 
-use crate::agent::Delivery;
+use crate::cancel::ControlSender;
 use crate::clock::Clock;
 use crate::event::{AgentId, Control, Domain, Event};
 
@@ -40,9 +50,9 @@ pub enum RouteError {
     NoRecipients,
     /// A sender that addressed itself.
     Loopback(AgentId),
-    /// A recipient whose inbox has been dropped, so the copy for it could
+    /// A recipient whose queue has been dropped, so the copy for it could
     /// not be delivered.
-    InboxClosed(AgentId),
+    QueueClosed(AgentId),
 }
 
 impl fmt::Display for RouteError {
@@ -51,31 +61,64 @@ impl fmt::Display for RouteError {
             Self::UnknownAgent(id) => write!(f, "no agent {id} in the roster"),
             Self::NoRecipients => f.write_str("an event must have at least one recipient"),
             Self::Loopback(id) => write!(f, "agent {id} addressed itself"),
-            Self::InboxClosed(id) => write!(f, "the inbox of agent {id} is closed"),
+            Self::QueueClosed(id) => write!(f, "the queue of agent {id} is closed"),
         }
     }
 }
 
 impl Error for RouteError {}
 
-/// The map from agent id to that agent's sender.
+/// The two sending halves of one agent's queues.
+///
+/// They are held together because an agent is addressed as one thing, and
+/// kept apart because what goes on them is: an [`Event`] is in-domain data
+/// the handler will see, and a [`Control`] is an instruction to the loop
+/// that preempts the cycle it lands in.
+/// `Debug` and `Clone` are written out rather than derived, for the reason
+/// [`Event`]'s are: a derive would ask them of `D`.
+pub struct Queues<D: Domain> {
+    /// Where the agent's events go.
+    pub events: Sender<Event<D>>,
+    /// Where the agent's controls go, tripping its current cycle as they
+    /// land.
+    pub controls: ControlSender,
+}
+
+impl<D: Domain> fmt::Debug for Queues<D> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Queues")
+            .field("controls", &self.controls)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<D: Domain> Clone for Queues<D> {
+    fn clone(&self) -> Self {
+        Self {
+            events: self.events.clone(),
+            controls: self.controls.clone(),
+        }
+    }
+}
+
+/// The map from agent id to that agent's queues.
 #[derive(Debug)]
 pub struct Router<D: Domain> {
-    inboxes: BTreeMap<AgentId, Sender<Delivery<D>>>,
+    queues: BTreeMap<AgentId, Queues<D>>,
     clock: Clock,
 }
 
 impl<D: Domain> Router<D> {
-    /// A router over the given senders, stamping every control it sends with
+    /// A router over the given queues, stamping every control it sends with
     /// `clock`.
     #[must_use]
-    pub fn new(inboxes: BTreeMap<AgentId, Sender<Delivery<D>>>, clock: Clock) -> Self {
-        Self { inboxes, clock }
+    pub fn new(queues: BTreeMap<AgentId, Queues<D>>, clock: Clock) -> Self {
+        Self { queues, clock }
     }
 
     /// The ids in the roster, in order.
     pub fn ids(&self) -> impl Iterator<Item = &AgentId> {
-        self.inboxes.keys()
+        self.queues.keys()
     }
 
     /// Copies an event onto the channel of each of its recipients and
@@ -87,7 +130,8 @@ impl<D: Domain> Router<D> {
     /// - [`RouteError::Loopback`] if the sender is among the recipients;
     /// - [`RouteError::UnknownAgent`] if the sender or a recipient is not in
     ///   the roster;
-    /// - [`RouteError::InboxClosed`] if a recipient's inbox has been dropped.
+    /// - [`RouteError::QueueClosed`] if a recipient's event queue has been
+    ///   dropped.
     ///   Recipients before it in the set have already received the event.
     ///
     /// Nothing is delivered when a validation fails.
@@ -101,49 +145,55 @@ impl<D: Domain> Router<D> {
         if recipients.contains(sender) {
             return Err(RouteError::Loopback(sender.clone()));
         }
-        if let Some(unknown) = std::iter::once(sender)
-            .chain(recipients)
-            .find(|id| !self.inboxes.contains_key(*id))
-        {
-            return Err(RouteError::UnknownAgent(unknown.clone()));
+        if !self.queues.contains_key(sender) {
+            return Err(RouteError::UnknownAgent(sender.clone()));
         }
-        self.deliver(recipients, || Delivery::Event(event.clone()))
+        // Every recipient is resolved before anything is sent, so an event
+        // addressed to a stranger delivers to nobody rather than to the
+        // agents that happened to be named before it. Resolving keeps the
+        // queues it found, so each recipient is looked up once.
+        let mut resolved = Vec::with_capacity(recipients.len());
+        for id in recipients {
+            resolved.push((id, self.queues_of(id)?));
+        }
+        let mut deliveries = 0;
+        for (id, queues) in resolved {
+            queues
+                .events
+                .send(event.clone())
+                .map_err(|_| RouteError::QueueClosed(id.clone()))?;
+            deliveries += 1;
+        }
+        Ok(deliveries)
     }
 
     /// Delivers a control to every agent in the roster, stamped with the
     /// instant it was sent, and returns how many deliveries that was.
     ///
+    /// Each delivery trips the recipient's current cycle as it lands; see
+    /// the [module documentation](self).
+    ///
     /// # Errors
     ///
-    /// [`RouteError::InboxClosed`] if some agent's inbox has been dropped.
-    /// Agents before it in the roster have already received the control.
+    /// [`RouteError::QueueClosed`] if some agent's control queue has been
+    /// dropped. Agents before it in the roster have already received the
+    /// control, and have already been tripped.
     pub fn control(&self, control: Control) -> Result<usize, RouteError> {
-        self.deliver(self.inboxes.keys(), || {
-            Delivery::control(self.clock, control)
-        })
-    }
-
-    /// `delivery` is called once per recipient rather than cloned from one
-    /// value, so routing to n agents makes exactly n deliveries and not
-    /// n + 1: an event carries its recipients and its payload, so the
-    /// spare copy was not a cheap one.
-    fn deliver<'a>(
-        &self,
-        recipients: impl IntoIterator<Item = &'a AgentId>,
-        delivery: impl Fn() -> Delivery<D>,
-    ) -> Result<usize, RouteError> {
         let mut deliveries = 0;
-        for id in recipients {
-            let inbox = self
-                .inboxes
-                .get(id)
-                .ok_or_else(|| RouteError::UnknownAgent(id.clone()))?;
-            inbox
-                .send(delivery())
-                .map_err(|_| RouteError::InboxClosed(id.clone()))?;
+        for (id, queues) in &self.queues {
+            queues
+                .controls
+                .control(self.clock, control)
+                .map_err(|_| RouteError::QueueClosed(id.clone()))?;
             deliveries += 1;
         }
         Ok(deliveries)
+    }
+
+    fn queues_of(&self, id: &AgentId) -> Result<&Queues<D>, RouteError> {
+        self.queues
+            .get(id)
+            .ok_or_else(|| RouteError::UnknownAgent(id.clone()))
     }
 }
 
@@ -152,25 +202,44 @@ mod tests {
     use crossbeam_channel::{Receiver, unbounded};
 
     use super::*;
+    use crate::cancel::{Arm, Cancel, Signal};
     use crate::clock::Timestamp;
     use crate::testing::{TestDomain, TestPayload, id};
 
-    type TestDelivery = Delivery<TestDomain>;
+    /// The receiving ends of one agent's two queues, and the arm an agent
+    /// loop would hold. Nothing here runs a loop, so a cycle is armed only
+    /// where a test asks for one, but the arm is kept either way so that the
+    /// slot it shares lives as long as the sending half does, exactly as an
+    /// agent's would.
+    struct Ends {
+        events: Receiver<Event<TestDomain>>,
+        controls: Receiver<Signal>,
+        arm: Arm,
+    }
 
-    fn world(
-        names: &[&str],
-    ) -> (
-        Router<TestDomain>,
-        BTreeMap<AgentId, Receiver<TestDelivery>>,
-    ) {
-        let mut senders = BTreeMap::new();
-        let mut receivers = BTreeMap::new();
+    fn world(names: &[&str]) -> (Router<TestDomain>, BTreeMap<AgentId, Ends>) {
+        let mut queues = BTreeMap::new();
+        let mut ends = BTreeMap::new();
         for name in names {
-            let (sender, receiver) = unbounded();
-            senders.insert(AgentId::new(*name), sender);
-            receivers.insert(AgentId::new(*name), receiver);
+            let (sender, events) = unbounded();
+            let (commander, controls, arm) = ControlSender::new();
+            queues.insert(
+                AgentId::new(*name),
+                Queues {
+                    events: sender,
+                    controls: commander,
+                },
+            );
+            ends.insert(
+                AgentId::new(*name),
+                Ends {
+                    events,
+                    controls,
+                    arm,
+                },
+            );
         }
-        (Router::new(senders, Clock::start()), receivers)
+        (Router::new(queues, Clock::start()), ends)
     }
 
     /// An event from `sender` to `recipients`, created at a time the router
@@ -186,15 +255,18 @@ mod tests {
 
     #[test]
     fn an_event_is_copied_to_each_recipient_and_nobody_else() {
-        let (router, inboxes) = world(&["a", "b", "c"]);
+        let (router, queues) = world(&["a", "b", "c"]);
         let sent = event("a", ["b", "c"], 7);
         assert_eq!(router.route(&sent), Ok(2));
         for name in ["b", "c"] {
-            let delivery = inboxes[&id(name)].try_recv().unwrap();
-            assert_eq!(delivery, Delivery::Event(sent.clone()));
+            assert_eq!(queues[&id(name)].events.try_recv().unwrap(), sent);
+            assert!(
+                queues[&id(name)].controls.try_recv().is_err(),
+                "an event goes on the event queue and nowhere else"
+            );
         }
         assert!(
-            inboxes[&id("a")].try_recv().is_err(),
+            queues[&id("a")].events.try_recv().is_err(),
             "the sender gets no copy"
         );
     }
@@ -203,58 +275,58 @@ mod tests {
     fn routing_leaves_the_senders_creation_time_alone() {
         // The event was created when its sender sent it; the router carries
         // it, and nothing about delivery changes when that was.
-        let (router, inboxes) = world(&["a", "b"]);
+        let (router, queues) = world(&["a", "b"]);
         let created = Timestamp::from(std::time::Duration::from_nanos(40));
         let sent = Event::new("a", ["b"], created, TestPayload::Step(1));
         router.route(&sent).unwrap();
-        let Ok(Delivery::Event(delivered)) = inboxes[&id("b")].try_recv() else {
-            panic!("an event was delivered");
-        };
+        let delivered = queues[&id("b")].events.try_recv().unwrap();
         assert_eq!(delivered.created, created);
     }
 
     #[test]
     fn an_unknown_recipient_is_rejected_and_nothing_is_delivered() {
-        let (router, inboxes) = world(&["a", "b"]);
+        let (router, queues) = world(&["a", "b"]);
         let error = router.route(&event("a", ["b", "nobody"], 1)).unwrap_err();
         assert_eq!(error, RouteError::UnknownAgent(id("nobody")));
-        assert!(inboxes[&id("b")].try_recv().is_err());
+        assert!(queues[&id("b")].events.try_recv().is_err());
     }
 
     #[test]
     fn an_unknown_sender_is_rejected() {
-        let (router, _inboxes) = world(&["a", "b"]);
+        let (router, _queues) = world(&["a", "b"]);
         let error = router.route(&event("ghost", ["b"], 1)).unwrap_err();
         assert_eq!(error, RouteError::UnknownAgent(id("ghost")));
     }
 
     #[test]
     fn an_empty_recipient_set_is_rejected() {
-        let (router, _inboxes) = world(&["a", "b"]);
+        let (router, _queues) = world(&["a", "b"]);
         let error = router.route(&event("a", [], 1)).unwrap_err();
         assert_eq!(error, RouteError::NoRecipients);
     }
 
     #[test]
     fn a_sender_in_its_own_recipient_set_is_rejected() {
-        let (router, inboxes) = world(&["a", "b"]);
+        let (router, queues) = world(&["a", "b"]);
         let error = router.route(&event("a", ["a", "b"], 1)).unwrap_err();
         assert_eq!(error, RouteError::Loopback(id("a")));
-        assert!(inboxes[&id("b")].try_recv().is_err());
+        assert!(queues[&id("b")].events.try_recv().is_err());
     }
 
     #[test]
     fn a_control_goes_to_everyone_stamped_with_when_it_was_sent() {
-        let (router, inboxes) = world(&["a", "b", "c"]);
+        let (router, queues) = world(&["a", "b", "c"]);
         let before = router.clock.now();
         assert_eq!(router.control(Control::Start), Ok(3));
         let after = router.clock.now();
-        for inbox in inboxes.values() {
-            let Ok(TestDelivery::Control { control, created }) = inbox.try_recv() else {
-                panic!("a control was delivered");
-            };
-            assert_eq!(control, Control::Start);
-            assert!(before <= created && created <= after);
+        for ends in queues.values() {
+            let delivered = ends.controls.try_recv().expect("a control was delivered");
+            assert_eq!(delivered.control, Control::Start);
+            assert!(before <= delivered.created && delivered.created <= after);
+            assert!(
+                ends.events.try_recv().is_err(),
+                "a control goes on the control queue and nowhere else"
+            );
         }
         assert_eq!(
             router.ids().collect::<Vec<_>>(),
@@ -263,17 +335,40 @@ mod tests {
     }
 
     #[test]
-    fn a_closed_inbox_is_reported() {
-        let (router, mut inboxes) = world(&["a", "b"]);
-        drop(inboxes.remove(&id("b")));
+    fn a_closed_queue_is_reported() {
+        let (router, mut queues) = world(&["a", "b"]);
+        drop(queues.remove(&id("b")));
         assert_eq!(
             router.route(&event("a", ["b"], 1)),
-            Err(RouteError::InboxClosed(id("b")))
+            Err(RouteError::QueueClosed(id("b")))
         );
         assert_eq!(
             router.control(Control::Stop),
-            Err(RouteError::InboxClosed(id("b")))
+            Err(RouteError::QueueClosed(id("b")))
         );
+    }
+
+    #[test]
+    fn a_control_trips_the_cycle_of_the_agent_it_goes_to_and_nobody_elses() {
+        // This is the coupling the router itself knows nothing about: it
+        // calls `send` on the sending half it was handed, and the preemption
+        // is that half's doing.
+        let (router, queues) = world(&["a", "b"]);
+        let cycles: BTreeMap<&AgentId, _> = queues
+            .iter()
+            .map(|(who, ends)| (who, ends.arm.arm()))
+            .collect();
+        assert!(cycles.values().all(|cancel| !cancel.is_cancelled()));
+        router.control(Control::Stop).unwrap();
+        assert!(cycles.values().all(Cancel::is_cancelled));
+
+        // Routing an event trips nobody: only a control preempts.
+        let fresh: BTreeMap<&AgentId, _> = queues
+            .iter()
+            .map(|(who, ends)| (who, ends.arm.arm()))
+            .collect();
+        router.route(&event("a", ["b"], 1)).unwrap();
+        assert!(fresh.values().all(|cancel| !cancel.is_cancelled()));
     }
 
     #[test]
@@ -291,8 +386,8 @@ mod tests {
             "agent a addressed itself"
         );
         assert_eq!(
-            RouteError::InboxClosed(id("b")).to_string(),
-            "the inbox of agent b is closed"
+            RouteError::QueueClosed(id("b")).to_string(),
+            "the queue of agent b is closed"
         );
     }
 }

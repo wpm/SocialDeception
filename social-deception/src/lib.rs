@@ -17,6 +17,7 @@
 //! | [`Action`] | what a handler returns for the loop to send |
 //! | [`Domain`] | the types one game contributes: its payload and its reward |
 //! | cycle | one turn of an agent's loop: pop, hand to the handler, send |
+//! | [`Cancel`] | the handler's view of whether its cycle has been preempted |
 //!
 //! [`Observation`] and [`Action`] are relative to an agent; on the wire
 //! there are only events and controls. The same [`Event`] is the sent action
@@ -36,7 +37,9 @@
 //! - [`trajectory`]: the records an agent's loop produces and the [`Writer`]
 //!   that puts them on disk;
 //! - [`timer`]: the [`TimerSource`] an agent's deadlines come from;
-//! - [`agent`]: the [`Agent`] thread that pops its inbox, folds the
+//! - [`cancel`]: the [`Cancel`] a handler is given each cycle and the
+//!   [`ControlSender`] that trips it;
+//! - [`agent`]: the [`Agent`] thread that pops its two queues, folds the
 //!   [`Observation`]s through a [`Handler`], and records what it saw and
 //!   sent;
 //! - [`router`]: the [`Router`] from agent ids to their channels;
@@ -56,6 +59,7 @@
 //! line for that.
 
 pub mod agent;
+pub mod cancel;
 pub mod clock;
 pub mod episode;
 pub mod event;
@@ -67,14 +71,15 @@ pub mod trajectory;
 pub mod werewolf;
 
 pub use agent::{
-    Action, Agent, CycleDispatch, Delivery, Error, Handler, Instruction, Observation, Recipients,
-    Wiring,
+    Action, Agent, CycleDispatch, Error, Handler, Instruction, Observation, Recipients, Wiring,
 };
+pub use cancel::{Arm, Cancel, ControlSender, Never, Signal};
 pub use clock::{Clock, Created, Timestamp, Timestamped};
 pub use episode::{Episode, EpisodeError, Failure};
 pub use event::{AgentId, Control, Domain, Event, Payload};
-pub use router::{RouteError, Router};
+pub use router::{Queues, RouteError, Router};
 pub use timer::{ManualTimer, ManualTimerControl, TimerSource};
 pub use trajectory::{
-    ActionRecord, ControlRecord, CycleRecord, LogRecord, ObservationRecord, Seq, Woken, Writer,
+    ActionRecord, ControlRecord, CycleRecord, DroppedRecord, LogRecord, ObservationRecord, Seq,
+    Woken, Writer,
 };

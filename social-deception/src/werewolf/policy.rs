@@ -47,10 +47,19 @@
 //! the action space, and there is no correct thing for the *rules* to do
 //! about that. The decision belongs to the policy that failed, so a model
 //! policy owns its retries and holds a `RandomPolicy` for the case where no
-//! action in the space can be extracted from what the model said. A policy
-//! may also block: an agent owns a thread (ADR-0001), so a policy waiting on
-//! a model provider over ordinary blocking HTTP delays only its own agent,
-//! and nothing here needs to accommodate a slow one.
+//! action in the space can be extracted from what the model said.
+//!
+//! A policy may also block: an agent owns a thread (ADR-0001), so a policy
+//! waiting on a model provider delays only its own agent. What it owes in
+//! return is the [`Cancel`] it is handed. ADR-0007 states the shape the
+//! first model-backed policy is written to: it makes its call on its own
+//! thread, **streams** the response, waits on the stream and
+//! [`Cancel::receiver`] together, and on cancellation closes the connection
+//! so that generation stops rather than running to completion unread. The
+//! same wait is where its per-call deadline and its [`RandomPolicy`]
+//! fallback live. A policy that blocks and ignores its cancel makes a
+//! `Stop` wait for it; that is a bug in the policy, not in the runtime,
+//! which preempts the cycle either way.
 //!
 //! # Determinism
 //!
@@ -71,6 +80,7 @@ use super::knowledge::Knowledge;
 use super::message::{Move, Request, RequestKind};
 use super::role::Role;
 use super::seed::{pick, seed_for};
+use crate::cancel::Cancel;
 use crate::event::AgentId;
 
 /// What a policy sees when it decides: the agent's state, the request in
@@ -97,8 +107,13 @@ pub trait Policy {
     /// Picks an action. The result must be in `view.action_space`.
     ///
     /// Infallible, and free to block; the [module documentation](self) says
-    /// why.
-    fn choose(&mut self, view: &View<'_>) -> Move;
+    /// why, and what a policy that blocks owes `cancel`. A policy that never
+    /// blocks may ignore it: nothing is asked of a decision that is already
+    /// made by the time anybody could preempt it.
+    ///
+    /// [`View`] is `Copy` and is passed by value, so a policy that hands it
+    /// on does not have to thread a reference through.
+    fn choose(&mut self, view: View<'_>, cancel: &Cancel) -> Move;
 }
 
 /// The uniform random baseline: a policy that samples uniformly from its own
@@ -128,8 +143,12 @@ impl RandomPolicy {
 }
 
 impl Policy for RandomPolicy {
-    fn choose(&mut self, view: &View<'_>) -> Move {
-        (*pick(&mut self.rng, &candidates(view))).clone()
+    /// Ignores `cancel`: sampling from a list cannot block, so there is
+    /// never anything for a preemption to interrupt. That is also what keeps
+    /// a deterministic episode deterministic, since nothing about the draw
+    /// depends on when a control happened to arrive.
+    fn choose(&mut self, view: View<'_>, _: &Cancel) -> Move {
+        (*pick(&mut self.rng, &candidates(&view))).clone()
     }
 }
 
@@ -186,11 +205,14 @@ mod tests {
         kind: RequestKind,
         space: &[Move],
     ) -> Move {
-        policy.choose(&View {
-            knowledge,
-            request: &request(kind),
-            action_space: space,
-        })
+        policy.choose(
+            View {
+                knowledge,
+                request: &request(kind),
+                action_space: space,
+            },
+            &Cancel::cancelled(),
+        )
     }
 
     /// The first action a fresh policy under each of [`SEEDS`] takes for

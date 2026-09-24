@@ -61,6 +61,7 @@ use super::WerewolfDomain;
 use super::game::{Directive, Game};
 use super::message::{Message, Outcome};
 use crate::agent::{Action, Handler, Observation, Recipients};
+use crate::cancel::Cancel;
 
 /// The agent that runs a game of Werewolf: a [`Game`] behind a
 /// [`Handler`].
@@ -131,6 +132,10 @@ impl Handler<WerewolfDomain> for Moderator {
     /// wants said. The observation that ends the game also sends the
     /// outcome on the channel; after it, nothing, whatever arrives.
     ///
+    /// The cancel is ignored. Folding a response into the game is a few
+    /// microseconds of bookkeeping with nothing to wait on, so there is no
+    /// point in the fold at which giving up would be better than finishing.
+    ///
     /// # Panics
     ///
     /// If a player sends the moderator a narration or a request, or if a
@@ -138,6 +143,7 @@ impl Handler<WerewolfDomain> for Moderator {
     fn handle(
         &mut self,
         observations: &[Observation<WerewolfDomain>],
+        _: &Cancel,
     ) -> Vec<Action<WerewolfDomain>> {
         let mut actions = Vec::new();
         for observation in observations {
@@ -298,11 +304,13 @@ mod tests {
         let mut sent = opening;
         while !pending.is_empty() {
             let actions = if batched {
-                moderator.handle(&pending)
+                moderator.handle(&pending, &Cancel::cancelled())
             } else {
                 pending
                     .iter()
-                    .flat_map(|observation| moderator.handle(std::slice::from_ref(observation)))
+                    .flat_map(|observation| {
+                        moderator.handle(std::slice::from_ref(observation), &Cancel::cancelled())
+                    })
                     .collect()
             };
             pending = respond(&actions, policy, moderator.game.living());
@@ -411,7 +419,7 @@ mod tests {
         // that the moderator must ignore.
         let (mut moderator, _receiver) = moderator(village());
         moderator.start();
-        assert_eq!(moderator.handle(&[]), []);
+        assert_eq!(moderator.handle(&[], &Cancel::cancelled()), []);
     }
 
     #[test]
@@ -535,7 +543,7 @@ mod tests {
             })
             .unwrap();
         let late = [response(&who, request, Move::Target(id("bob")))];
-        assert_eq!(moderator.handle(&late), []);
+        assert_eq!(moderator.handle(&late, &Cancel::cancelled()), []);
     }
 
     #[test]
@@ -549,7 +557,7 @@ mod tests {
         assert_eq!(padded.start(), opening);
         let mut pending = respond(&opening, first_other, reference.game.living());
         while !pending.is_empty() {
-            let actions = reference.handle(&pending);
+            let actions = reference.handle(&pending, &Cancel::cancelled());
             let mut cycle = pending.clone();
             if actions
                 .last()
@@ -557,7 +565,7 @@ mod tests {
             {
                 cycle.push(pending.last().unwrap().clone());
             }
-            assert_eq!(padded.handle(&cycle), actions);
+            assert_eq!(padded.handle(&cycle, &Cancel::cancelled()), actions);
             pending = respond(&actions, first_other, reference.game.living());
         }
         assert!(reference.game.outcome().is_some() && padded.game.outcome().is_some());
@@ -568,10 +576,13 @@ mod tests {
     fn a_narration_from_a_player_panics() {
         let (mut moderator, _receiver) = moderator(village());
         moderator.start();
-        moderator.handle(&[from_player(
-            "erin",
-            Message::Narration(Narration::NoDeath { round: Round(1) }),
-        )]);
+        moderator.handle(
+            &[from_player(
+                "erin",
+                Message::Narration(Narration::NoDeath { round: Round(1) }),
+            )],
+            &Cancel::cancelled(),
+        );
     }
 
     #[test]
@@ -579,14 +590,17 @@ mod tests {
     fn a_request_from_a_player_panics() {
         let (mut moderator, _receiver) = moderator(village());
         moderator.start();
-        moderator.handle(&[from_player(
-            "carol",
-            Message::Request(Request {
-                id: RequestId(1),
-                round: Round(1),
-                kind: RequestKind::Nominate,
-            }),
-        )]);
+        moderator.handle(
+            &[from_player(
+                "carol",
+                Message::Request(Request {
+                    id: RequestId(1),
+                    round: Round(1),
+                    kind: RequestKind::Nominate,
+                }),
+            )],
+            &Cancel::cancelled(),
+        );
     }
 
     #[test]

@@ -1,35 +1,84 @@
-//! The agent: one thread, one inbox, and a pop-fold-send loop.
+//! The agent: one thread, two queues, and a pop-fold-send loop.
 //!
-//! An agent's life is a fold over what arrives on its inbox. Each cycle of
+//! An agent's life is a fold over what arrives on its queues. Each cycle of
 //! the loop:
 //!
-//! 1. waits until something arrives or its timeout fires;
-//! 2. pops everything waiting, whichever of the two woke it, splitting it
-//!    into [`Observation`]s for the handler and [`Control`]s for the loop
-//!    itself;
-//! 3. records each of them, stamped with the instant of the pop;
-//! 4. hands the observations to the game's [`Handler`] and gets back the
-//!    [`Action`]s to send;
-//! 5. stamps each action with the agent's id and the instant of the send,
-//!    records it, sends the cycle's actions to the router as one
-//!    [`CycleDispatch`], and records the cycle.
+//! 1. waits until something arrives on either queue or its timeout fires;
+//! 2. arms a fresh [`Cancel`] for this cycle;
+//! 3. pops everything waiting, **controls first**, splitting it into
+//!    [`Instruction`]s for the loop itself and [`Observation`]s for the
+//!    handler;
+//! 4. records each of them, stamped with the instant of the pop;
+//! 5. hands the observations and the cancel to the game's [`Handler`] and
+//!    gets back the [`Action`]s to send;
+//! 6. looks at the control queue again. If a [`Stop`] arrived while the
+//!    handler was deciding, the cycle sends nothing; otherwise it stamps
+//!    each action with the agent's id and the instant of the send, records
+//!    it, and sends the cycle's actions to the router as one
+//!    [`CycleDispatch`];
+//! 7. records the cycle.
 //!
-//! Something that arrives while the agent is busy waits in the inbox and is
-//! picked up at the start of the next cycle. Nothing is interrupted and
-//! nothing is discarded, and every agent is always stale by exactly one
-//! handling window.
+//! An event that arrives while the agent is busy waits its turn and is
+//! picked up at the start of the next cycle, so every agent is always stale
+//! by exactly one handling window. A control does not wait: see below.
 //!
-//! Everything a cycle pops is popped at its start, so every observation and
-//! control in a cycle has the same `received`: the cycle's `t_start`. That
+//! Everything a cycle pops at its start is stamped with that instant, so
+//! every observation in a cycle, and every control the cycle popped before
+//! calling the handler, has the same `received`: the cycle's `t_start`. That
 //! is what makes an agent's deliberation recoverable from the log without a
 //! stamp for it, as ADR-0007 sets out: it is a sent action's `created` minus
 //! the `received` of the observations in the same cycle, and the cycle
-//! record groups them.
+//! record groups them. The one exception is the `Stop` that preempted a
+//! cycle, which was popped after the handler returned and says so.
 //!
 //! The handler returns what to send rather than sending it, so the loop sees
 //! everything that goes out and the trajectory it records is authoritative.
 //! It also means a handler cannot speak as anybody but itself: the loop is
 //! what writes the sender.
+//!
+//! # Two queues, and why controls go first
+//!
+//! Events and controls arrive on separate channels, and the loop waits on
+//! both. At the top of every cycle it takes the controls before the events,
+//! so a [`Stop`] is acted on before anything queued behind it rather than
+//! after. Events still waiting when the agent stops are never popped, so
+//! they never become observations and are never logged: an agent that has
+//! stopped did not see them, and a trajectory that said otherwise would be
+//! claiming it did.
+//!
+//! One inbox carrying both would make a control wait for whatever is ahead
+//! of it, which for a batch of events is an ordering accident and for a slow
+//! cycle is an unbounded delay. ADR-0007 rejected it for that reason.
+//!
+//! # A cycle preempted by `Stop` sends nothing
+//!
+//! Two queues get a control past a queue of events; they do nothing about a
+//! control that arrives while the handler is *running*. That is what
+//! [`Cancel`] is for. The loop arms one per cycle, whoever queues a control
+//! trips it in the same step (see [`cancel`](crate::cancel)), and a handler
+//! that is blocked can wait on it alongside whatever it is blocked on.
+//!
+//! When the handler returns, the loop looks at the control queue before it
+//! sends anything. If a `Stop` is waiting there:
+//!
+//! - **none of the cycle's actions is sent.** Each is stamped as it would
+//!   have been and logged as a [`DroppedRecord`] instead of an
+//!   [`ActionRecord`]; [`DroppedRecord`] says why that is the honest record.
+//!   Nothing is routed, so the episode's in-flight count never sees them;
+//! - the `Stop` is then popped and logged among the cycle's `inputs`, with
+//!   its `received` the instant it was popped, which is after the handler
+//!   returned;
+//! - the cycle's `outputs` are empty, and the loop exits.
+//!
+//! A handler that ignores its `Cancel` is preempted just the same: what
+//! decides is that a `Stop` was waiting when the handler returned, not how
+//! the handler came to return. Ignoring the cancel only makes the `Stop`
+//! wait for the handler, which ADR-0007 calls a bug in the policy rather
+//! than in the runtime.
+//!
+//! [`Stop`] is the only control there is. What a future control that
+//! preempts a cycle *without* ending the episode should do with that cycle's
+//! actions is deliberately undecided.
 //!
 //! # The handler never sees a control
 //!
@@ -60,7 +109,7 @@
 //!
 //! # Termination
 //!
-//! The loop exits when its inbox closes, meaning every sender has been
+//! The loop exits when both its queues close, meaning every sender has been
 //! dropped and nothing is left to pop, or after the cycle in which it popped
 //! [`Control::Stop`], whichever comes first. Every record of that last cycle
 //! has been sent to the writer before the thread returns.
@@ -73,8 +122,8 @@
 //! ```
 //! use crossbeam_channel::unbounded;
 //! use social_deception::{
-//!     Action, Agent, AgentId, Clock, Control, CycleDispatch, Delivery, Domain, Event, Handler,
-//!     Observation, Wiring, Writer,
+//!     Action, Agent, AgentId, Cancel, Clock, Control, ControlSender, CycleDispatch, Domain,
+//!     Event, Handler, Observation, Wiring, Writer,
 //! };
 //!
 //! struct Chat;
@@ -87,7 +136,7 @@
 //! struct Echo;
 //!
 //! impl Handler<Chat> for Echo {
-//!     fn handle(&mut self, observations: &[Observation<Chat>]) -> Vec<Action<Chat>> {
+//!     fn handle(&mut self, observations: &[Observation<Chat>], _: &Cancel) -> Vec<Action<Chat>> {
 //!         observations
 //!             .iter()
 //!             .map(|observation| {
@@ -98,20 +147,26 @@
 //! }
 //!
 //! let clock = Clock::start();
-//! let (to_agent, inbox) = unbounded();
+//! let (to_agent, events) = unbounded();
+//! let (commander, controls, arm) = ControlSender::new();
 //! let (dispatches, from_agent) = unbounded();
 //! let (records, writer) = Writer::spawn::<Chat>(Vec::new());
 //! let peers = [AgentId::new("caller")].into();
-//! let wiring = Wiring { id: "echo".into(), clock, inbox, dispatches, records, timeout: None, peers };
+//! let wiring =
+//!     Wiring { id: "echo".into(), clock, events, controls, arm, dispatches, records,
+//!              timeout: None, peers };
 //! let agent = Agent::spawn(wiring, Echo, clock);
 //!
 //! let hello = Event::<Chat>::new("caller", ["echo"], clock.now(), String::from("hello"));
-//! to_agent.send(Delivery::control(clock, Control::Start)).unwrap();
-//! to_agent.send(Delivery::Event(hello.clone())).unwrap();
-//! to_agent.send(Delivery::control(clock, Control::Stop)).unwrap();
+//! commander.control(clock, Control::Start).unwrap();
+//! to_agent.send(hello.clone()).unwrap();
+//! // Wait for the reply before stopping: a `Stop` that arrived first would
+//! // preempt the cycle, and the echo would be dropped rather than sent.
+//! let echoed: CycleDispatch<Chat> = from_agent.iter().find(|r| !r.sent.is_empty()).unwrap();
+//! commander.control(clock, Control::Stop).unwrap();
 //!
 //! agent.join().unwrap();
-//! let sent: Vec<Event<Chat>> = from_agent.iter().flat_map(|r: CycleDispatch<_>| r.sent).collect();
+//! let sent = echoed.sent;
 //! assert_eq!(sent.len(), 1);
 //! assert_eq!(sent[0].sender, AgentId::new("echo"));
 //! assert_eq!(sent[0].payload, "hello");
@@ -127,11 +182,13 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError, never, select};
 
+use crate::cancel::{Arm, Cancel, Signal};
 use crate::clock::{Clock, Created, Timestamp, Timestamped};
 use crate::event::{AgentId, Control, Domain, Event};
 use crate::timer::TimerSource;
 use crate::trajectory::{
-    ActionRecord, ControlRecord, CycleRecord, LogRecord, ObservationRecord, Seq, Woken,
+    ActionRecord, ControlRecord, CycleRecord, DroppedRecord, LogRecord, ObservationRecord, Seq,
+    Woken,
 };
 
 /// An event this agent has popped off its queue: what it observed, and when.
@@ -312,6 +369,10 @@ pub trait Handler<D: Domain> {
     ///
     /// This is where an agent that acts before anybody has spoken to it does
     /// so. Most agents only react, and the default returns nothing.
+    ///
+    /// It takes no [`Cancel`]: opening actions are the agent's own, decided
+    /// from nothing, and a handler with work to do before it can name them
+    /// has state to fold and belongs in `handle`.
     fn start(&mut self) -> Vec<Action<D>> {
         Vec::new()
     }
@@ -320,96 +381,17 @@ pub trait Handler<D: Domain> {
     /// to send.
     ///
     /// Empty when the cycle was woken by the timeout.
-    fn handle(&mut self, observations: &[Observation<D>]) -> Vec<Action<D>>;
+    ///
+    /// `cancel` is this cycle's, and it trips when a control is queued for
+    /// this agent while the handler is running. A handler that thinks in
+    /// steps checks [`Cancel::is_cancelled`] between them; one that blocks
+    /// waits on [`Cancel::receiver`] alongside whatever it is blocked on and
+    /// gives up on whichever comes first. Honoring it is a courtesy to the
+    /// episode, not a condition of correctness: a cycle preempted by
+    /// [`Control::Stop`] sends nothing either way, and a handler that
+    /// ignores the cancel only makes the stop wait for it.
+    fn handle(&mut self, observations: &[Observation<D>], cancel: &Cancel) -> Vec<Action<D>>;
 }
-
-/// Something on its way to an agent's inbox.
-///
-/// Until controls get a queue of their own, one inbox carries both kinds.
-/// An event already knows when it was created; a control is stamped by
-/// whoever sends it, which is the episode.
-/// `Debug`, `Clone` and equality are written out for the same reason
-/// [`Event`]'s are.
-pub enum Delivery<D: Domain> {
-    /// In-domain data, which becomes an [`Observation`] when popped.
-    Event(Event<D>),
-    /// An out-of-domain instruction, which the loop acts on itself.
-    Control {
-        /// The control.
-        control: Control,
-        /// When the episode sent it.
-        created: Timestamp,
-    },
-}
-
-impl<D: Domain> Delivery<D> {
-    /// A control stamped with the clock's current time.
-    #[must_use]
-    pub fn control(clock: Clock, control: Control) -> Self {
-        Self::Control {
-            control,
-            created: clock.now(),
-        }
-    }
-}
-
-impl<D: Domain> Created for Delivery<D> {
-    fn created(&self) -> Timestamp {
-        match self {
-            Self::Event(event) => event.created,
-            Self::Control { created, .. } => *created,
-        }
-    }
-}
-
-impl<D: Domain> fmt::Debug for Delivery<D>
-where
-    D::Payload: fmt::Debug,
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Event(event) => f.debug_tuple("Event").field(event).finish(),
-            Self::Control { control, created } => f
-                .debug_struct("Control")
-                .field("control", control)
-                .field("created", created)
-                .finish(),
-        }
-    }
-}
-
-impl<D: Domain> Clone for Delivery<D> {
-    fn clone(&self) -> Self {
-        match self {
-            Self::Event(event) => Self::Event(event.clone()),
-            Self::Control { control, created } => Self::Control {
-                control: *control,
-                created: *created,
-            },
-        }
-    }
-}
-
-impl<D: Domain> PartialEq for Delivery<D>
-where
-    D::Payload: PartialEq,
-{
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Event(a), Self::Event(b)) => a == b,
-            (
-                Self::Control { control, created },
-                Self::Control {
-                    control: other,
-                    created: then,
-                },
-            ) => control == other && created == then,
-            _ => false,
-        }
-    }
-}
-
-impl<D: Domain> Eq for Delivery<D> where D::Payload: Eq {}
 
 /// What one cycle of an agent's loop hands the router.
 ///
@@ -423,7 +405,7 @@ impl<D: Domain> Eq for Delivery<D> where D::Payload: Eq {}
 pub struct CycleDispatch<D: Domain> {
     /// The agent whose cycle this was.
     pub agent: AgentId,
-    /// How many deliveries the cycle took off the inbox. A timeout is not a
+    /// How many deliveries the cycle took off its queues. A timeout is not a
     /// delivery.
     pub deliveries: usize,
     /// The events the cycle sent, stamped with this agent as sender, in the
@@ -432,14 +414,27 @@ pub struct CycleDispatch<D: Domain> {
 }
 
 /// Everything an agent's thread needs besides its handler and timer.
+///
+/// The two queues are separate channels and the loop waits on both; the
+/// [module documentation](self) says why they are not one. The [`Arm`] is
+/// the other end of the coupling: it belongs to the same agent as
+/// `controls`, and arming it each cycle is what lets whoever queues a
+/// control preempt the cycle in progress.
 pub struct Wiring<D: Domain> {
     /// The agent's id: the sender on everything it emits and the `agent` on
     /// every record it writes.
     pub id: AgentId,
     /// The episode clock.
     pub clock: Clock,
-    /// The agent's one receiver.
-    pub inbox: Receiver<Delivery<D>>,
+    /// The event queue: in-domain data, which becomes an [`Observation`]
+    /// when popped.
+    pub events: Receiver<Event<D>>,
+    /// The control queue: out-of-domain instructions, which the loop acts on
+    /// itself.
+    pub controls: Receiver<Signal>,
+    /// Where each cycle's [`Cancel`] is armed, so that a control queued
+    /// during the cycle trips it.
+    pub arm: Arm,
     /// Where each cycle's dispatch goes.
     pub dispatches: Sender<CycleDispatch<D>>,
     /// Where the agent's trajectory goes.
@@ -495,7 +490,7 @@ impl<D: Domain> fmt::Debug for Wiring<D> {
     }
 }
 
-/// Why an agent's loop stopped before its inbox closed or it was told to
+/// Why an agent's loop stopped before its queues closed or it was told to
 /// stop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Error {
@@ -547,6 +542,8 @@ impl<H> Agent<H> {
             handler,
             timer,
             next_seq: 0,
+            last_created: None,
+            closed: Closed::default(),
             pending: None,
         };
         let thread = thread::Builder::new()
@@ -579,16 +576,87 @@ impl<H> Agent<H> {
     }
 }
 
-/// What ended a wait.
+/// What ended a wait, and what it took off a queue doing so.
+///
+/// A `select!` receive is destructive, so whatever woke the loop is already
+/// in hand and has to be carried into the cycle rather than left to the
+/// drain to find.
 enum Wake<D: Domain> {
-    /// Something arrived.
-    Delivery(Delivery<D>),
+    /// A control arrived, and here it is.
+    Control(Signal),
+    /// An event arrived, and here it is.
+    Event(Event<D>),
     /// The pending deadline passed.
     Deadline,
-    /// The inbox is closed and empty.
+    /// A queue closed. Which one is not said, because the loop learns that
+    /// from the drain that follows, which is where a closure is noticed
+    /// without anything being thrown away.
     Closed,
     /// The wake channel disconnected.
     TimerGone,
+}
+
+/// Everything one cycle popped, in the order the loop records it: controls
+/// first, then events.
+struct Batch<D: Domain> {
+    controls: Vec<Signal>,
+    events: Vec<Event<D>>,
+}
+
+impl<D: Domain> Batch<D> {
+    /// Nothing popped yet.
+    fn empty() -> Self {
+        Self {
+            controls: Vec::new(),
+            events: Vec::new(),
+        }
+    }
+
+    /// Whether the cycle popped nothing at all, which is how a wake-up that
+    /// was only a queue closing is told from one that brought work.
+    fn is_empty(&self) -> bool {
+        self.controls.is_empty() && self.events.is_empty()
+    }
+
+    /// How many deliveries the cycle took off its queues, which is the unit
+    /// the episode's in-flight count is kept in.
+    fn deliveries(&self) -> usize {
+        self.controls.len() + self.events.len()
+    }
+}
+
+/// Which of an agent's queues are closed, and so can never produce anything
+/// again.
+///
+/// The loop keeps this across waits because a closure is learned once, by a
+/// drain that found a queue disconnected, and is true forever after. Asking
+/// again is not free: the only way to ask is `try_recv`, which would take
+/// the very item that makes the answer no.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Closed {
+    controls: bool,
+    events: bool,
+}
+
+impl Closed {
+    /// Whether both are closed, which is the only state in which nothing
+    /// could ever reach the agent again.
+    fn both(self) -> bool {
+        self.controls && self.events
+    }
+}
+
+/// Takes everything waiting on one queue, and says whether it turned out to
+/// be closed. Nothing is thrown away: the `try_recv` that reports the queue
+/// disconnected is the one that found it empty.
+fn drain_queue<T>(queue: &Receiver<T>, taken: &mut Vec<T>) -> bool {
+    loop {
+        match queue.try_recv() {
+            Ok(item) => taken.push(item),
+            Err(TryRecvError::Empty) => return false,
+            Err(TryRecvError::Disconnected) => return true,
+        }
+    }
 }
 
 /// The state of an agent's thread.
@@ -598,6 +666,15 @@ struct Loop<D: Domain, H, T> {
     timer: T,
     /// The next sequence number to assign.
     next_seq: u64,
+    /// The last `created` this agent stamped onto an action. Per agent, not
+    /// per cycle: the join an observation makes is on the sender and the
+    /// instant over the whole trajectory, so two actions of one agent may
+    /// not share an instant even across a cycle boundary.
+    last_created: Option<Timestamp>,
+
+    /// Which queues have closed. Sticky: learned from a drain and true from
+    /// then on.
+    closed: Closed,
 
     /// The earliest deadline and the wake channel asked for it, kept across
     /// cycles until it fires.
@@ -612,50 +689,113 @@ where
 {
     fn run(mut self) -> Result<H, Error> {
         loop {
-            let (mut batch, mut closed) = (Vec::new(), false);
+            let mut woke_with = Batch::empty();
             let woken_by_deadline = match self.wait() {
-                Wake::Delivery(delivery) => {
-                    batch.push(delivery);
+                Wake::Control(control) => {
+                    woke_with.controls.push(control);
+                    false
+                }
+                Wake::Event(event) => {
+                    woke_with.events.push(event);
                     false
                 }
                 Wake::Deadline => true,
-                Wake::Closed => break,
+                Wake::Closed => false,
                 Wake::TimerGone => return Err(Error::TimerClosed),
             };
-            closed |= self.drain(&mut batch);
+            // The cancel is armed before the drain, so that a control
+            // arriving from here on trips this cycle rather than one that is
+            // already over. Anything that arrived between the wake-up and
+            // the arming is found by the drain, which is the same cycle's
+            // business either way.
+            let cancel = self.wiring.arm.arm();
+            let batch = self.drain(woke_with);
+            if batch.is_empty() && !woken_by_deadline {
+                // A queue closed and brought nothing with it. There is no
+                // cycle to run; whether there is anything left to wait for
+                // is the next wait's question.
+                if self.closed.both() {
+                    break;
+                }
+                continue;
+            }
             let timed_out = woken_by_deadline || self.deadline_passed()?;
             if timed_out {
                 self.take_deadline();
             }
             let t_start = self.wiring.clock.now();
-            let stop = self.cycle(t_start, batch, timed_out)?;
-            if stop || closed {
+            let stop = self.cycle(t_start, batch, timed_out, &cancel)?;
+            if stop || self.closed.both() {
                 break;
             }
         }
         Ok(self.handler)
     }
 
-    /// Blocks until something arrives or the pending deadline fires.
+    /// Blocks until something arrives on either queue or the pending
+    /// deadline fires.
+    ///
+    /// A queue that has closed and emptied is a `select!` arm that is ready
+    /// forever, which would spin, so a queue already known to be closed is
+    /// swapped for one that is never ready. Knowing is the point: the answer
+    /// comes from a drain, which learns it without taking anything, and is
+    /// kept, because the only way to ask a channel directly is to try to
+    /// receive from it.
     fn wait(&self) -> Wake<D> {
-        let never = never();
-        let wake = self.pending.as_ref().map_or(&never, |(_, wake)| wake);
+        let (idle, quiet, spent) = (never(), never(), never());
+        let deadline = self.pending.as_ref().map_or(&idle, |(_, wake)| wake);
+        let controls = if self.closed.controls {
+            &quiet
+        } else {
+            &self.wiring.controls
+        };
+        let events = if self.closed.events {
+            &spent
+        } else {
+            &self.wiring.events
+        };
         select! {
-            recv(self.wiring.inbox) -> delivery => delivery.map_or(Wake::Closed, Wake::Delivery),
-            recv(wake) -> fired => if fired.is_ok() { Wake::Deadline } else { Wake::TimerGone },
+            recv(controls) -> control => control.map_or(Wake::Closed, Wake::Control),
+            recv(events) -> event => event.map_or(Wake::Closed, Wake::Event),
+            recv(deadline) -> fired => if fired.is_ok() { Wake::Deadline } else { Wake::TimerGone },
         }
     }
 
-    /// Takes everything waiting in the inbox. Returns whether the inbox
-    /// turned out to be closed.
-    fn drain(&self, batch: &mut Vec<Delivery<D>>) -> bool {
-        loop {
-            match self.wiring.inbox.try_recv() {
-                Ok(delivery) => batch.push(delivery),
-                Err(TryRecvError::Empty) => return false,
-                Err(TryRecvError::Disconnected) => return true,
-            }
+    /// Takes everything waiting on both queues, **controls first**, adding it
+    /// to what the wake-up already had in hand, and remembers either queue
+    /// that turned out to be closed.
+    ///
+    /// The order is the whole point of there being two queues: a `Stop` is
+    /// popped ahead of every event waiting behind it, so it is acted on
+    /// rather than queued. And once a `Stop` is in hand the event queue is
+    /// not drained at all, because this cycle is the agent's last: an event
+    /// left on the queue is one the agent never saw, and it is not an
+    /// observation and is not logged. Taking it only to hand it to a handler
+    /// whose output will be dropped would put a decision in the trajectory
+    /// that went nowhere and was made after the episode had ended.
+    fn drain(&mut self, mut batch: Batch<D>) -> Batch<D> {
+        if !self.closed.controls {
+            self.closed.controls = drain_queue(&self.wiring.controls, &mut batch.controls);
         }
+        if batch
+            .controls
+            .iter()
+            .any(|signal| signal.control == Control::Stop)
+        {
+            // A `Stop` is in hand, so this cycle is the agent's last and no
+            // event belongs in it. The queue is left alone, and the one
+            // event the wake-up may have taken before the stop was seen goes
+            // back the only way it can: it is forgotten. That is the same
+            // fact as the ones still queued — an event the agent never
+            // observed — and the trajectory says the same thing about both,
+            // which is nothing.
+            batch.events.clear();
+            return batch;
+        }
+        if !self.closed.events {
+            self.closed.events = drain_queue(&self.wiring.events, &mut batch.events);
+        }
+        batch
     }
 
     /// Whether the pending deadline has fired without being the reason for
@@ -685,40 +825,41 @@ where
         }
     }
 
-    /// Runs one cycle: record what was popped, hand the observations to the
-    /// handler, send and record what comes back, and close with the cycle
-    /// record. Returns whether the batch contained a stop.
+    /// Runs one cycle: record what was popped, hand the observations and the
+    /// cancel to the handler, send and record what comes back unless a
+    /// `Stop` arrived meanwhile, and close with the cycle record. Returns
+    /// whether the cycle popped a stop.
     fn cycle(
         &mut self,
         t_start: Timestamp,
-        batch: Vec<Delivery<D>>,
+        batch: Batch<D>,
         timed_out: bool,
+        cancel: &Cancel,
     ) -> Result<bool, Error> {
-        let deliveries = batch.len();
-        let (mut observations, mut inputs) = (Vec::with_capacity(deliveries), Vec::new());
-        let (mut started, mut stopped) = (false, false);
-        for delivery in batch {
-            match delivery {
-                Delivery::Control { control, created } => {
-                    match control {
-                        Control::Start => started = true,
-                        Control::Stop => stopped = true,
-                    }
-                    inputs.push(self.record_control(&Instruction {
-                        control,
-                        created,
-                        received: t_start,
-                    })?);
-                }
-                Delivery::Event(event) => {
-                    let observation = Observation {
-                        event,
-                        received: t_start,
-                    };
-                    inputs.push(self.record_observation(&observation)?);
-                    observations.push(observation);
-                }
+        let mut deliveries = batch.deliveries();
+        let Batch { controls, events } = batch;
+        let (mut inputs, mut started, mut stopped) = (Vec::new(), false, false);
+        // Controls first, and in one pass, so that a `Stop` already waiting
+        // is acted on ahead of every event behind it rather than after them.
+        for Signal { control, created } in controls {
+            match control {
+                Control::Start => started = true,
+                Control::Stop => stopped = true,
             }
+            inputs.push(self.record_control(&Instruction {
+                control,
+                created,
+                received: t_start,
+            })?);
+        }
+        let mut observations = Vec::with_capacity(events.len());
+        for event in events {
+            let observation = Observation {
+                event,
+                received: t_start,
+            };
+            inputs.push(self.record_observation(&observation)?);
+            observations.push(observation);
         }
         if timed_out {
             self.schedule_timeout(t_start);
@@ -733,27 +874,49 @@ where
         } else {
             Vec::new()
         };
-        actions.extend(self.handler.handle(&observations));
+        actions.extend(self.handler.handle(&observations, cancel));
 
-        let (mut sent, mut outputs) = (Vec::with_capacity(actions.len()), Vec::new());
-        for Action {
-            recipients,
-            payload,
-        } in actions
-        {
-            let recipients = match recipients {
-                Recipients::Broadcast => self.wiring.peers.clone(),
-                Recipients::To(recipients) => recipients,
-            };
-            let event = Event {
-                sender: self.wiring.id.clone(),
-                recipients,
-                created: self.wiring.clock.now(),
-                payload,
-            };
-            outputs.push(self.record_action(&event)?);
-            sent.push(event);
+        // The handler has returned; the question now is whether a `Stop`
+        // arrived while it was deciding. It is asked of the queue and not of
+        // the cancel, because the cancel says only that *some* control was
+        // queued, and because a handler that ignored its cancel is preempted
+        // just the same.
+        let mut late = Vec::new();
+        if !self.closed.controls {
+            self.closed.controls = drain_queue(&self.wiring.controls, &mut late);
         }
+        deliveries += late.len();
+        let preempted = stopped || late.iter().any(|signal| signal.control == Control::Stop);
+
+        let (mut sent, mut outputs) = (Vec::new(), Vec::new());
+        for action in actions {
+            let event = self.stamp(action);
+            if preempted {
+                // Not sent, so not an output of the cycle and not routed:
+                // the episode's in-flight count never sees it.
+                self.record_dropped(&event)?;
+            } else {
+                outputs.push(self.record_action(&event)?);
+                sent.push(event);
+            }
+        }
+
+        // The late controls are recorded after the dropped actions, with the
+        // instant they were popped, which is after the handler returned.
+        // That is the one place a cycle's inputs do not all share its
+        // `t_start`, and the trajectory checker knows it.
+        let received = self.wiring.clock.now();
+        for Signal { control, created } in late {
+            if control == Control::Stop {
+                stopped = true;
+            }
+            inputs.push(self.record_control(&Instruction {
+                control,
+                created,
+                received,
+            })?);
+        }
+
         let dispatch = CycleDispatch {
             agent: self.wiring.id.clone(),
             deliveries,
@@ -780,6 +943,46 @@ where
             .send(cycle.into())
             .map_err(|_| Error::WriterClosed)?;
         Ok(stopped)
+    }
+
+    /// Stamps one action with this agent as sender and the instant of the
+    /// stamp, resolving a broadcast to the peers it actually goes to.
+    ///
+    /// For an action that is sent, the stamp is its `created` on the wire.
+    /// For one that is dropped, it is the instant the handler returned it,
+    /// which is what its record carries: a dropped action is stamped exactly
+    /// as it would have been, so that the two records differ only in what
+    /// they say happened.
+    ///
+    /// The stamp is always strictly later than the last one this agent
+    /// handed out. That is not cosmetic. An observation names the action it
+    /// came from by the sender and the creation time and by nothing else,
+    /// since no event carries an identifier (ADR-0002), so two of an agent's
+    /// actions sharing an instant would be two actions no observation could
+    /// tell apart. A cycle that returns several actions stamps them within a
+    /// few hundred nanoseconds of each other, which the clock's resolution
+    /// does not always separate, and two cycles can run that close together
+    /// too, so the guarantee is the agent's and not one cycle's.
+    fn stamp(&mut self, action: Action<D>) -> Event<D> {
+        let Action {
+            recipients,
+            payload,
+        } = action;
+        let now = self.wiring.clock.now();
+        let created = match self.last_created {
+            Some(previous) if now <= previous => previous + Duration::from_nanos(1),
+            _ => now,
+        };
+        self.last_created = Some(created);
+        Event {
+            sender: self.wiring.id.clone(),
+            recipients: match recipients {
+                Recipients::Broadcast => self.wiring.peers.clone(),
+                Recipients::To(recipients) => recipients,
+            },
+            created,
+            payload,
+        }
     }
 
     /// Takes the next sequence number.
@@ -818,6 +1021,20 @@ where
         Ok(seq)
     }
 
+    fn record_dropped(&mut self, event: &Event<D>) -> Result<Seq, Error> {
+        let seq = self.next_seq();
+        self.send_record(
+            DroppedRecord {
+                agent: self.wiring.id.clone(),
+                seq,
+                created: event.created,
+                event: event.clone(),
+            }
+            .into(),
+        )?;
+        Ok(seq)
+    }
+
     fn record_control(&mut self, instruction: &Instruction) -> Result<Seq, Error> {
         let seq = self.next_seq();
         self.send_record(
@@ -843,12 +1060,14 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     use crossbeam_channel::unbounded;
     use serde_json::json;
 
     use super::*;
+    use crate::cancel::ControlSender;
     use crate::testing::{TestDomain, TestPayload, parse_lines};
     use crate::timer::{ManualTimer, ManualTimerControl};
     use crate::trajectory::Writer;
@@ -862,7 +1081,6 @@ mod tests {
     const EVERY: Duration = Duration::from_secs(1);
 
     type TestEvent = Event<TestDomain>;
-    type TestDelivery = Delivery<TestDomain>;
 
     fn at(nanos: u64) -> Timestamp {
         Timestamp::from(Duration::from_nanos(nanos))
@@ -906,7 +1124,11 @@ mod tests {
             Vec::new()
         }
 
-        fn handle(&mut self, observations: &[Observation<TestDomain>]) -> Vec<Action<TestDomain>> {
+        fn handle(
+            &mut self,
+            observations: &[Observation<TestDomain>],
+            _: &Cancel,
+        ) -> Vec<Action<TestDomain>> {
             self.batches.push(payloads(observations));
             observations
                 .iter()
@@ -929,10 +1151,14 @@ mod tests {
     }
 
     impl Handler<TestDomain> for Gated {
-        fn handle(&mut self, observations: &[Observation<TestDomain>]) -> Vec<Action<TestDomain>> {
+        fn handle(
+            &mut self,
+            observations: &[Observation<TestDomain>],
+            cancel: &Cancel,
+        ) -> Vec<Action<TestDomain>> {
             self.entered.send(()).unwrap();
             self.release.recv().unwrap();
-            self.inner.handle(observations)
+            self.inner.handle(observations, cancel)
         }
     }
 
@@ -944,7 +1170,7 @@ mod tests {
             vec![Action::broadcast(TestPayload::Step(0))]
         }
 
-        fn handle(&mut self, _: &[Observation<TestDomain>]) -> Vec<Action<TestDomain>> {
+        fn handle(&mut self, _: &[Observation<TestDomain>], _: &Cancel) -> Vec<Action<TestDomain>> {
             Vec::new()
         }
     }
@@ -953,8 +1179,98 @@ mod tests {
     struct Faulty;
 
     impl Handler<TestDomain> for Faulty {
-        fn handle(&mut self, _: &[Observation<TestDomain>]) -> Vec<Action<TestDomain>> {
+        fn handle(&mut self, _: &[Observation<TestDomain>], _: &Cancel) -> Vec<Action<TestDomain>> {
             panic!("handler bug");
+        }
+    }
+
+    /// A handler that blocks on its cancel and nothing else, then answers
+    /// every observation it was given. It tells the test when it entered the
+    /// wait, so the test can put a control on the queue at a moment it knows
+    /// the agent is inside `handle`.
+    ///
+    /// This is the shape ADR-0007 asks of a model-backed policy, with the
+    /// model's answer left out: a wait on a result and on the cancel, which
+    /// here has only the one arm because the result never comes.
+    struct Waits {
+        entered: Sender<()>,
+        woke_cancelled: Sender<bool>,
+    }
+
+    impl Handler<TestDomain> for Waits {
+        fn handle(
+            &mut self,
+            observations: &[Observation<TestDomain>],
+            cancel: &Cancel,
+        ) -> Vec<Action<TestDomain>> {
+            self.entered.send(()).unwrap();
+            // Nothing is ever sent on this, so the cancel is the only thing
+            // that can end the wait.
+            let (_never, answer) = unbounded::<()>();
+            select! {
+                recv(answer) -> _ => {}
+                recv(cancel.receiver()) -> _ => {}
+            }
+            self.woke_cancelled.send(cancel.is_cancelled()).unwrap();
+            observations
+                .iter()
+                .map(|observation| {
+                    let TestPayload::Step(n) = observation.event.payload;
+                    Action::to([observation.event.sender.clone()], TestPayload::Step(n + 1))
+                })
+                .collect()
+        }
+    }
+
+    /// A handler that never looks at its cancel: it waits to be released by
+    /// the test and then answers, whatever has happened meanwhile.
+    struct Deaf {
+        entered: Sender<()>,
+        release: Receiver<()>,
+        cancelled_when_done: Sender<bool>,
+    }
+
+    impl Handler<TestDomain> for Deaf {
+        fn handle(
+            &mut self,
+            observations: &[Observation<TestDomain>],
+            cancel: &Cancel,
+        ) -> Vec<Action<TestDomain>> {
+            self.entered.send(()).unwrap();
+            self.release.recv().unwrap();
+            self.cancelled_when_done
+                .send(cancel.is_cancelled())
+                .unwrap();
+            observations
+                .iter()
+                .map(|observation| {
+                    let TestPayload::Step(n) = observation.event.payload;
+                    Action::to([observation.event.sender.clone()], TestPayload::Step(n + 1))
+                })
+                .collect()
+        }
+    }
+
+    /// A handler that polls its cancel throughout a cycle and reports every
+    /// answer it got, so that a test can say what was true for the whole of
+    /// a cycle rather than only at its end.
+    #[derive(Debug, Default)]
+    struct Polls {
+        answers: Vec<bool>,
+        cycles: AtomicUsize,
+    }
+
+    impl Handler<TestDomain> for Polls {
+        fn handle(
+            &mut self,
+            _: &[Observation<TestDomain>],
+            cancel: &Cancel,
+        ) -> Vec<Action<TestDomain>> {
+            self.cycles.fetch_add(1, Ordering::Relaxed);
+            for _ in 0..50 {
+                self.answers.push(cancel.is_cancelled());
+            }
+            Vec::new()
         }
     }
 
@@ -962,7 +1278,8 @@ mod tests {
     struct Rig<H> {
         agent: Agent<H>,
         clock: Clock,
-        inbox: Sender<TestDelivery>,
+        events: Sender<TestEvent>,
+        controls: ControlSender,
         dispatches: Receiver<CycleDispatch<TestDomain>>,
         records: Receiver<LogRecord<TestDomain>>,
         timer: ManualTimerControl,
@@ -971,19 +1288,33 @@ mod tests {
     /// The channels of a rig, before the agent is spawned on them.
     struct Wires {
         wiring: Wiring<TestDomain>,
-        inbox: Sender<TestDelivery>,
+        events: Sender<TestEvent>,
+        controls: ControlSender,
         dispatches: Receiver<CycleDispatch<TestDomain>>,
         records: Receiver<LogRecord<TestDomain>>,
     }
 
+    impl Wires {
+        fn control(&self, control: Control) {
+            self.controls.control(self.wiring.clock, control).unwrap();
+        }
+
+        fn send(&self, event: TestEvent) {
+            self.events.send(event).unwrap();
+        }
+    }
+
     fn wires(timeout: Option<Duration>) -> Wires {
-        let (inbox, receiver) = unbounded();
+        let (events, receiver) = unbounded();
+        let (commander, controls, arm) = ControlSender::new();
         let (outbox, dispatches) = unbounded();
         let (recorder, records) = unbounded();
         let wiring = Wiring {
             id: AgentId::new("a"),
             clock: Clock::start(),
-            inbox: receiver,
+            events: receiver,
+            controls,
+            arm,
             dispatches: outbox,
             records: recorder,
             timeout,
@@ -991,7 +1322,8 @@ mod tests {
         };
         Wires {
             wiring,
-            inbox,
+            events,
+            controls: commander,
             dispatches,
             records,
         }
@@ -1007,7 +1339,8 @@ mod tests {
         Rig {
             agent: Agent::spawn(wires.wiring, handler, timer),
             clock,
-            inbox: wires.inbox,
+            events: wires.events,
+            controls: wires.controls,
             dispatches: wires.dispatches,
             records: wires.records,
             timer: control,
@@ -1016,13 +1349,11 @@ mod tests {
 
     impl<H> Rig<H> {
         fn send(&self, event: TestEvent) {
-            self.inbox.send(Delivery::Event(event)).unwrap();
+            self.events.send(event).unwrap();
         }
 
         fn control(&self, control: Control) {
-            self.inbox
-                .send(Delivery::control(self.clock, control))
-                .unwrap();
+            self.controls.control(self.clock, control).unwrap();
         }
 
         fn start(&self) {
@@ -1065,18 +1396,37 @@ mod tests {
         ns.map(TestPayload::Step).into()
     }
 
+    /// The payloads of the dropped records among `records`, in order.
+    fn dropped(records: &[LogRecord<TestDomain>]) -> Vec<TestPayload> {
+        records
+            .iter()
+            .filter_map(|record| match record {
+                LogRecord::Dropped(record) => Some(record.event.payload.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The payloads of the action records among `records`, in order.
+    fn acted(records: &[LogRecord<TestDomain>]) -> Vec<TestPayload> {
+        records
+            .iter()
+            .filter_map(|record| match record {
+                LogRecord::Action(record) => Some(record.event.payload.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
     #[test]
-    fn a_cycle_pops_everything_waiting_in_the_inbox() {
+    fn a_cycle_pops_everything_waiting_on_both_queues() {
         let wires = wires(None);
-        wires
-            .inbox
-            .send(Delivery::control(wires.wiring.clock, Control::Start))
-            .unwrap();
+        wires.control(Control::Start);
         for event in [step("b", 6), step("c", 3), step("b", 5)] {
-            wires.inbox.send(Delivery::Event(event)).unwrap();
+            wires.send(event);
         }
         let agent = Agent::spawn(wires.wiring, Recorder::default(), Clock::start());
-        drop(wires.inbox);
+        drop((wires.events, wires.controls));
 
         let handler = agent.join().unwrap();
         // The control was the loop's, so the handler saw three observations
@@ -1098,7 +1448,9 @@ mod tests {
     fn a_handler_never_sees_a_control_but_the_loop_acts_on_it() {
         let rig = rig(Recorder::default(), None);
         rig.start();
+        rig.dispatch();
         rig.send(step("b", 1));
+        rig.dispatch();
         rig.stop();
         let handler = rig.agent.join().unwrap();
         // The start called `start` once; the stop ended the loop; and
@@ -1132,6 +1484,11 @@ mod tests {
         release.send(()).unwrap();
         recv(&busy);
         release.send(()).unwrap();
+        // The stop waits for the cycle it would otherwise preempt to have
+        // dispatched, so that this test is about what waits for the next
+        // cycle and not about what a preemption drops.
+        rig.dispatch();
+        rig.dispatch();
         rig.stop();
         recv(&busy);
         release.send(()).unwrap();
@@ -1146,33 +1503,52 @@ mod tests {
     #[test]
     fn exits_after_the_cycle_that_contained_stop() {
         let wires = wires(None);
-        let clock = wires.wiring.clock;
-        wires
-            .inbox
-            .send(Delivery::control(clock, Control::Start))
-            .unwrap();
-        wires
-            .inbox
-            .send(Delivery::control(clock, Control::Stop))
-            .unwrap();
-        wires.inbox.send(Delivery::Event(step("b", 1))).unwrap();
+        wires.control(Control::Start);
+        wires.control(Control::Stop);
+        wires.send(step("b", 1));
         let agent = Agent::spawn(wires.wiring, Recorder::default(), Clock::start());
-        // The test still holds the inbox sender, so the join returning at all
-        // is the stop path; and an event that arrived before the agent looked
-        // is still handled, even after the stop.
+        // The test still holds both senders, so the join returning at all is
+        // the stop path. The handler was called once, with nothing: the
+        // event was queued behind a stop and so was never popped.
         let handler = agent.join().unwrap();
-        assert_eq!(handler.batches, [steps([1])]);
-        drop(wires.inbox);
+        assert_eq!(handler.started, 1);
+        assert_eq!(handler.batches, [Vec::new()]);
+        drop((wires.events, wires.controls));
     }
 
     #[test]
-    fn exits_when_the_inbox_closes_without_a_cycle() {
+    fn exits_when_both_queues_close_without_a_cycle() {
         let rig = rig(Recorder::default(), Some(EVERY));
-        drop(rig.inbox);
+        drop((rig.events, rig.controls));
         let handler = rig.agent.join().unwrap();
         assert!(handler.batches.is_empty());
         assert!(rig.dispatches.try_recv().is_err());
         assert!(rig.records.try_recv().is_err());
+    }
+
+    #[test]
+    fn one_queue_closing_does_not_end_the_loop() {
+        // An agent whose event queue has gone still has to hear a `Stop`,
+        // and one whose control queue has gone still has to handle what is
+        // said to it.
+        let deaf = rig(Recorder::default(), None);
+        deaf.start();
+        deaf.dispatch();
+        let (events, controls, agent) = (deaf.events, deaf.controls, deaf.agent);
+        drop(events);
+        controls.control(deaf.clock, Control::Stop).unwrap();
+        assert_eq!(agent.join().unwrap().started, 1);
+
+        let mute = rig(Recorder::default(), None);
+        mute.start();
+        mute.dispatch();
+        let (events, controls, agent) = (mute.events, mute.controls, mute.agent);
+        drop(controls);
+        events.send(step("b", 1)).unwrap();
+        assert_eq!(recv(&mute.dispatches).deliveries, 1);
+        drop(events);
+        let handler = agent.join().unwrap();
+        assert_eq!(handler.batches, [Vec::new(), steps([1])]);
     }
 
     #[test]
@@ -1227,6 +1603,10 @@ mod tests {
         release.send(()).unwrap();
         recv(&busy);
         release.send(()).unwrap();
+        // As above: the stop comes only once the cycle it could preempt is
+        // over and has dispatched.
+        rig.dispatch();
+        rig.dispatch();
         rig.stop();
         recv(&busy);
         release.send(()).unwrap();
@@ -1241,7 +1621,9 @@ mod tests {
     fn an_agent_without_an_interval_never_times_out() {
         let rig = rig(Recorder::default(), None);
         rig.start();
+        rig.dispatch();
         rig.send(step("b", 1));
+        rig.dispatch();
         rig.stop();
         rig.agent.join().unwrap();
         assert!(rig.timer.requests().try_recv().is_err());
@@ -1271,21 +1653,17 @@ mod tests {
         let (records, writer) = Writer::spawn(Vec::new());
         wires.wiring.records = records;
         wires
-            .inbox
-            .send(Delivery::Control {
+            .controls
+            .send(Signal {
                 control: Control::Start,
                 created: at(10),
             })
             .unwrap();
-        wires
-            .inbox
-            .send(Delivery::Event(step_at("b", 6, at(20))))
-            .unwrap();
-        drop(wires.inbox);
+        wires.send(step_at("b", 6, at(20)));
         let clock = wires.wiring.clock;
-        Agent::spawn(wires.wiring, Recorder::default(), clock)
-            .join()
-            .unwrap();
+        let agent = Agent::spawn(wires.wiring, Recorder::default(), clock);
+        drop((wires.events, wires.controls));
+        agent.join().unwrap();
         let lines = parse_lines(&writer.join().unwrap());
 
         assert_eq!(lines.len(), 4);
@@ -1373,6 +1751,53 @@ mod tests {
         rig.agent.join().unwrap();
     }
 
+    /// Answers one observation with many actions at once, which is where
+    /// two of an agent's stamps could collide.
+    struct Chatters(usize);
+
+    impl Handler<TestDomain> for Chatters {
+        fn handle(&mut self, _: &[Observation<TestDomain>], _: &Cancel) -> Vec<Action<TestDomain>> {
+            (0..self.0)
+                .map(|n| Action::to(["b"], TestPayload::Step(n as u64)))
+                .collect()
+        }
+    }
+
+    #[test]
+    fn an_agents_actions_never_share_an_instant() {
+        // An observation names the action it came from by the sender and
+        // the creation time alone, so two of one agent's actions at one
+        // instant would be two an observation could not tell apart. A cycle
+        // that returns a hundred actions returns them far faster than the
+        // clock's resolution.
+        let rig = rig(Chatters(100), None);
+        rig.start();
+        rig.cycle();
+        rig.send(step("b", 1));
+        let (records, cycle) = rig.cycle();
+        let created: Vec<Timestamp> = records
+            .iter()
+            .filter_map(|record| match record {
+                LogRecord::Action(record) => Some(record.created),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(created.len(), 100);
+        assert!(
+            created.windows(2).all(|pair| pair[0] < pair[1]),
+            "every action of a cycle is stamped later than the one before it: {created:?}"
+        );
+        // And the stamps still lie inside the cycle's window, which is what
+        // the trajectory checker asserts of an output.
+        assert!(
+            created
+                .iter()
+                .all(|at| cycle.t_start <= *at && *at <= cycle.t_stop)
+        );
+        rig.stop();
+        rig.agent.join().unwrap();
+    }
+
     #[test]
     fn a_vanished_writer_is_an_error() {
         let rig = rig(Recorder::default(), None);
@@ -1412,7 +1837,7 @@ mod tests {
         let rig = rig(Recorder::default(), None);
         assert_eq!(rig.agent.id(), &AgentId::new("a"));
         assert_eq!(rig.agent.thread.thread().name(), Some("a"));
-        drop(rig.inbox);
+        drop((rig.events, rig.controls));
         rig.agent.join().unwrap();
     }
 
@@ -1432,19 +1857,249 @@ mod tests {
             received: at(12),
         };
         assert_eq!(instruction.latency(), Duration::from_nanos(2));
+    }
 
-        // A delivery knows when it was created, whichever kind it is.
+    /// A rig whose handler blocks on its cancel, with the channel it says
+    /// it has entered `handle` on and the one it reports on.
+    fn waiting() -> (Rig<Waits>, Receiver<()>, Receiver<bool>) {
+        let (entered, inside) = unbounded();
+        let (woke_cancelled, woke) = unbounded();
+        let handler = Waits {
+            entered,
+            woke_cancelled,
+        };
+        (rig(handler, None), inside, woke)
+    }
+
+    #[test]
+    fn a_handler_blocked_on_its_cancel_wakes_when_a_stop_is_queued() {
+        let (rig, inside, woke) = waiting();
+        rig.start();
+        // The start's own cycle blocks too; release it by stopping nothing
+        // and letting it see the queue empty. Instead, step past it: the
+        // cancel of the start's cycle is tripped by the event that follows
+        // only if that event were a control, which it is not, so the start
+        // cycle would block forever. Send the stop straight away and let the
+        // start cycle be the one that is preempted.
+        recv(&inside);
+        rig.stop();
+        // The wait ends promptly, and the handler saw the cancel tripped.
+        assert!(
+            woke.recv_timeout(PATIENCE).expect("the handler woke"),
+            "the handler woke because its cancel had tripped"
+        );
+        rig.agent.join().unwrap();
+    }
+
+    #[test]
+    fn a_preempted_cycles_actions_are_dropped_and_none_reaches_the_router() {
+        let (rig, inside, woke) = waiting();
+        rig.start();
+        recv(&inside);
+        // Preempt the start's own cycle so the loop gets past it, then set
+        // up the cycle the test is about.
+        rig.stop();
+        assert!(recv(&woke));
+
+        let (records, cycle) = rig.cycle();
+        assert!(
+            dropped(&records).is_empty() && acted(&records).is_empty(),
+            "the start cycle produced nothing to drop: {records:?}"
+        );
+        assert!(cycle.outputs.is_empty());
+        let dispatch = rig.dispatch();
+        assert!(dispatch.sent.is_empty());
+        rig.agent.join().unwrap();
+    }
+
+    #[test]
+    fn a_stop_queued_behind_many_events_is_acted_on_first() {
+        // Everything is queued before the agent is spawned, so there is one
+        // cycle and the order within it is the queues' doing and nothing
+        // else: twenty events went on the wire first and the stop last.
+        let wires = wires(None);
+        wires.control(Control::Start);
+        for n in 1..=20 {
+            wires.send(step("b", n));
+        }
+        wires.control(Control::Stop);
+        let agent = Agent::spawn(wires.wiring, Recorder::default(), Clock::start());
+        let handler = agent.join().unwrap();
+
+        // One cycle, in which the handler saw nothing: the stop was popped
+        // ahead of every event behind it, so the twenty events were never
+        // popped at all.
+        assert_eq!(handler.batches, [Vec::new()]);
+        let records: Vec<LogRecord<TestDomain>> = wires.records.try_iter().collect();
+        assert!(
+            !records
+                .iter()
+                .any(|record| matches!(record, LogRecord::Observation(_))),
+            "an event never popped is never logged as an observation: {records:?}"
+        );
+        let controls: Vec<Control> = records
+            .iter()
+            .filter_map(|record| match record {
+                LogRecord::Control(record) => Some(record.control),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(controls, [Control::Start, Control::Stop]);
+        let dispatches: Vec<_> = wires.dispatches.try_iter().collect();
         assert_eq!(
-            TestDelivery::Event(step_at("b", 1, at(40))).created(),
-            at(40)
+            dispatches.len(),
+            1,
+            "one cycle, not one per queued event: {dispatches:?}"
         );
         assert_eq!(
-            TestDelivery::Control {
-                control: Control::Stop,
-                created: at(10)
-            }
-            .created(),
-            at(10)
+            dispatches[0].deliveries, 2,
+            "the cycle took the two controls off its queues and no events"
+        );
+        drop((wires.events, wires.controls));
+    }
+
+    #[test]
+    fn a_handler_that_ignores_its_cancel_still_has_its_actions_dropped() {
+        let (entered, inside) = unbounded();
+        let (release, released) = unbounded();
+        let (cancelled_when_done, seen) = unbounded();
+        let rig = rig(
+            Deaf {
+                entered,
+                release: released,
+                cancelled_when_done,
+            },
+            None,
+        );
+        rig.start();
+        recv(&inside);
+        release.send(()).unwrap();
+        assert!(!recv(&seen), "the start's cycle was never cancelled");
+        rig.cycle();
+        rig.dispatch();
+
+        rig.send(step("b", 1));
+        recv(&inside);
+        // The stop arrives while the handler is deliberating, and the
+        // handler pays it no attention at all.
+        rig.stop();
+        release.send(()).unwrap();
+        assert!(recv(&seen), "the cancel had tripped, unread");
+
+        let (records, cycle) = rig.cycle();
+        assert_eq!(
+            dropped(&records),
+            steps([2]),
+            "what the handler returned was dropped: {records:?}"
+        );
+        assert!(acted(&records).is_empty(), "and none of it was sent");
+        assert!(
+            cycle.outputs.is_empty(),
+            "a preempted cycle has no outputs: {cycle:?}"
+        );
+        let dispatch = rig.dispatch();
+        assert!(
+            dispatch.sent.is_empty(),
+            "nothing reached the router: {dispatch:?}"
+        );
+        rig.agent.join().unwrap();
+    }
+
+    #[test]
+    fn a_preempting_stop_is_logged_in_the_cycle_it_preempted_after_the_drops() {
+        let (entered, inside) = unbounded();
+        let (release, released) = unbounded();
+        let (cancelled_when_done, seen) = unbounded();
+        let rig = rig(
+            Deaf {
+                entered,
+                release: released,
+                cancelled_when_done,
+            },
+            None,
+        );
+        rig.start();
+        recv(&inside);
+        release.send(()).unwrap();
+        recv(&seen);
+        rig.cycle();
+        rig.dispatch();
+
+        rig.send(step("b", 1));
+        recv(&inside);
+        rig.stop();
+        release.send(()).unwrap();
+        recv(&seen);
+
+        let (records, cycle) = rig.cycle();
+        // The order on the wire: the observation popped at t_start, the
+        // action that was dropped, then the stop, popped after the handler
+        // returned and stamped with that later instant.
+        let kinds: Vec<&str> = records
+            .iter()
+            .map(|record| match record {
+                LogRecord::Observation(_) => "observation",
+                LogRecord::Action(_) => "action",
+                LogRecord::Dropped(_) => "dropped",
+                LogRecord::Control(_) => "control",
+                LogRecord::Cycle(_) => "cycle",
+            })
+            .collect();
+        assert_eq!(kinds, ["observation", "dropped", "control"]);
+        let (LogRecord::Dropped(gone), LogRecord::Control(stop)) = (&records[1], &records[2])
+        else {
+            unreachable!("the kinds were just checked");
+        };
+        assert_eq!(stop.control, Control::Stop);
+        assert!(
+            gone.created <= stop.received,
+            "the stop was popped after the handler returned what was dropped"
+        );
+        assert!(
+            cycle.t_start < stop.received,
+            "which is later than the cycle's start: {cycle:?}"
+        );
+        assert_eq!(
+            cycle.inputs,
+            [Seq(1), Seq(3)],
+            "the stop is among the cycle's inputs, after the observation"
+        );
+        assert_eq!(
+            (gone.seq, stop.seq),
+            (Seq(2), Seq(3)),
+            "the dropped action took a sequence number between them"
+        );
+        assert!(cycle.outputs.is_empty());
+        rig.agent.join().unwrap();
+    }
+
+    #[test]
+    fn a_cycle_no_control_interrupts_is_never_cancelled() {
+        let rig = rig(Polls::default(), None);
+        rig.start();
+        rig.cycle();
+        for n in 1..=5 {
+            rig.send(step("b", n));
+            rig.cycle();
+        }
+        rig.stop();
+        let handler = rig.agent.join().unwrap();
+        // Every poll of every cycle but the last said no. The last cycle is
+        // the one that popped the stop, and its cancel was never tripped
+        // either: the stop was already on the queue when the cycle began.
+        //
+        // How many cycles that took is the scheduler's business, not the
+        // claim: a cycle drains whatever has arrived, so two steps landing
+        // together are one cycle rather than two. What must hold is that
+        // every cycle ran and none of them was cancelled.
+        let cycles = handler.cycles.load(Ordering::Relaxed);
+        assert!(
+            (2..=7).contains(&cycles),
+            "the start, at least one step and the stop each ran: {cycles}"
+        );
+        assert!(
+            handler.answers.iter().all(|cancelled| !cancelled),
+            "no poll of any cycle saw a cancel"
         );
     }
 }

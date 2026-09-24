@@ -19,7 +19,7 @@
 //! plays the game as a fold over players' responses, producing
 //! [`Directive`]s that say what to tell whom. The [`Moderator`]
 //! ([`moderator`]) is the agent that runs a game: the thin
-//! [`Handler`](crate::Handler) that folds the events on its inbox into the
+//! [`Handler`](crate::Handler) that folds the observations it pops into the
 //! game and sends the directives as messages.
 //!
 //! The seam with the runtime is [`setup`]: [`episode`] builds a populated

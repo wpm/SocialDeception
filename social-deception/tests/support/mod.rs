@@ -34,7 +34,10 @@ pub fn parse(bytes: &[u8]) -> Vec<Value> {
 /// Asserts the invariants every trajectory satisfies:
 ///
 /// - every observation and control was received at or after it was created,
-///   and at exactly the `t_start` of the cycle that lists it;
+///   and at exactly the `t_start` of the cycle that lists it, except a
+///   `Stop` that preempted its cycle, which was popped after the handler
+///   returned and so is stamped at or after the `created` of that cycle's
+///   dropped records;
 /// - every action was created within the window of the cycle that lists it;
 /// - a cycle's inputs followed by its outputs are exactly the records its
 ///   agent wrote since its previous cycle, and every record belongs to some
@@ -46,28 +49,45 @@ pub fn parse(bytes: &[u8]) -> Vec<Value> {
 /// - no event has its sender among its recipients; an observation lists the
 ///   agent that recorded it among the recipients, and an action names it as
 ///   the sender;
+/// - a `dropped` record appears only in a cycle whose inputs include a
+///   `Stop`, such a cycle has no action outputs, and nothing follows an
+///   agent's `Stop` in its trajectory but the end of that cycle;
 /// - every observation joins exactly one action, by sender and creation
 ///   time, and every action has one matching observation per recipient.
 ///
 /// The last is the one that makes a trajectory a single object rather than a
 /// pile of per-agent logs: an observation and the action that produced it
 /// are the same event seen from its two ends, and nothing but the sender and
-/// the creation time links them.
+/// the creation time links them. A dropped action is outside it on purpose:
+/// it never traveled, so nobody observed it, and asking it to join would be
+/// asking for the one thing its record says did not happen.
 ///
 /// # Panics
 ///
 /// On the first invariant that does not hold, naming the record.
 pub fn check(lines: &[Value]) {
     let records = records(lines);
+    // Each cycle's run: the sequence numbers its agent wrote since its
+    // previous cycle. `check_grouping` proves the run is the cycle's inputs
+    // and outputs; what it also holds is the dropped records, which the
+    // cycle record does not list because they were neither popped nor sent.
+    let mut runs: HashMap<&str, Vec<u64>> = HashMap::new();
     for line in lines {
         match line["type"].as_str() {
-            Some(kind @ ("observation" | "action" | "control")) => check_record(line, kind),
-            Some("cycle") => check_cycle(line, &records),
+            Some(kind @ ("observation" | "action" | "dropped" | "control")) => {
+                check_record(line, kind);
+                runs.entry(agent(line)).or_default().push(seq(line));
+            }
+            Some("cycle") => {
+                let run = runs.remove(agent(line)).unwrap_or_default();
+                check_cycle(line, &run, &records);
+            }
             other => panic!("unknown record type {other:?} in {line}"),
         }
     }
     check_sequence_numbers(lines);
     check_grouping(lines);
+    check_nothing_follows_a_stop(lines);
     check_the_join(lines);
 }
 
@@ -125,9 +145,13 @@ fn event(line: &Value) -> (&str, Vec<&Value>, &Value) {
 
 fn check_record(line: &Value, kind: &str) {
     // Everything that was popped says when, and nothing is popped before it
-    // was created. An action is the exception: it was never received.
+    // was created. An action is the exception: it was never received. So is
+    // a dropped action, which was never even sent.
     if line["received"].is_null() {
-        assert_eq!(kind, "action", "only an action records no receipt: {line}");
+        assert!(
+            kind == "action" || kind == "dropped",
+            "only an action records no receipt: {line}"
+        );
     } else {
         assert!(
             time(line, "created") <= time(line, "received"),
@@ -149,10 +173,12 @@ fn check_record(line: &Value, kind: &str) {
                 "an agent does not observe what it sent: {line}"
             );
         }
-        "action" => {
+        "action" | "dropped" => {
             // An action has no `received`: its sender knows only when it
             // sent it, and when each recipient got it is in that
             // recipient's own observation record. The check above says so.
+            // A dropped action is stamped exactly as the action it would
+            // have been, so the same holds of it.
             let (sender, recipients, _) = event(line);
             check_recipients(line, sender, &recipients);
             assert_eq!(
@@ -174,7 +200,7 @@ fn check_recipients(line: &Value, sender: &str, recipients: &[&Value]) {
     );
 }
 
-fn check_cycle(cycle: &Value, records: &HashMap<(&str, u64), &Value>) {
+fn check_cycle(cycle: &Value, run: &[u64], records: &HashMap<(&str, u64), &Value>) {
     let (t_start, t_stop) = (time(cycle, "t_start"), time(cycle, "t_stop"));
     assert!(
         t_start <= t_stop,
@@ -207,16 +233,39 @@ fn check_cycle(cycle: &Value, records: &HashMap<(&str, u64), &Value>) {
             "a cycle woken by the queue popped something: {cycle}"
         );
     }
+    // A `Stop` that preempted its cycle was popped after the handler
+    // returned, so it alone among the inputs is stamped later than the
+    // cycle's start, and no earlier than the actions its arrival dropped.
+    let preempting_stop = preempting_stop(cycle, records);
     for input in inputs {
         assert!(
-            input["type"] != "action",
+            input["type"] != "action" && input["type"] != "dropped",
             "an input is something popped, not an output: {input} in {cycle}"
         );
-        assert_eq!(
-            time(input, "received"),
-            t_start,
-            "everything a cycle popped was popped at its start: {input} in {cycle}"
-        );
+        if preempting_stop == Some(seq(input)) {
+            assert!(
+                time(input, "received") >= t_start,
+                "a preempting stop was popped during its cycle: {input} in {cycle}"
+            );
+            assert!(
+                time(input, "received") <= t_stop,
+                "and before the cycle closed: {input} in {cycle}"
+            );
+            for record in dropped_of(cycle, run, records) {
+                let created = time(record, "created");
+                assert!(
+                    time(input, "received") >= created,
+                    "a preempting stop was popped after the handler returned what it \
+                     dropped: {input} in {cycle}"
+                );
+            }
+        } else {
+            assert_eq!(
+                time(input, "received"),
+                t_start,
+                "everything a cycle popped was popped at its start: {input} in {cycle}"
+            );
+        }
     }
     for record in seqs(cycle, "outputs").map(record) {
         assert_eq!(
@@ -229,6 +278,66 @@ fn check_cycle(cycle: &Value, records: &HashMap<(&str, u64), &Value>) {
             "an action is created within its cycle's window: {record} in {cycle}"
         );
     }
+    let dropped = dropped_of(cycle, run, records);
+    if dropped.is_empty() {
+        return;
+    }
+    assert!(
+        preempting_stop.is_some(),
+        "a cycle with dropped actions popped a stop that preempted it: {cycle}"
+    );
+    assert!(
+        seqs(cycle, "outputs").next().is_none(),
+        "a preempted cycle sends nothing, so it has no action outputs: {cycle}"
+    );
+    for record in dropped {
+        let created = time(record, "created");
+        assert!(
+            t_start <= created && created <= t_stop,
+            "a dropped action was produced within its cycle's window: {record} in {cycle}"
+        );
+    }
+}
+
+/// The sequence number of the `Stop` among a cycle's inputs that preempted
+/// it: the one that was not popped at the cycle's start.
+///
+/// A cycle that popped its stop at the start was not preempted by it; it
+/// simply had one waiting, and the loop called the handler and then exited.
+fn preempting_stop(cycle: &Value, records: &HashMap<(&str, u64), &Value>) -> Option<u64> {
+    let t_start = time(cycle, "t_start");
+    seqs(cycle, "inputs")
+        .filter_map(|seq| records.get(&(agent(cycle), seq)).map(|line| (seq, *line)))
+        .find(|(_, line)| {
+            line["type"] == "control"
+                && line["control"] == "stop"
+                && time(line, "received") > t_start
+        })
+        .map(|(seq, _)| seq)
+}
+
+/// The dropped records of one cycle, by the sequence numbers a caller has
+/// already worked out belong to it.
+///
+/// A dropped record is neither an input nor an output — it was neither
+/// popped nor sent — so it is not listed anywhere in the cycle record.
+/// What places it is file order: an agent's records between two cycle
+/// records belong to the cycle that ends the run, which is the grouping
+/// [`check_grouping`] establishes.
+fn dropped_of<'a>(
+    cycle: &Value,
+    run: &'a [u64],
+    records: &'a HashMap<(&'a str, u64), &'a Value>,
+) -> Vec<&'a Value> {
+    let listed: HashSet<u64> = seqs(cycle, "inputs")
+        .chain(seqs(cycle, "outputs"))
+        .collect();
+    let agent = agent(cycle);
+    run.iter()
+        .filter(|seq| !listed.contains(*seq))
+        .filter_map(|seq| records.get(&(agent, *seq)).copied())
+        .filter(|line| line["type"] == "dropped")
+        .collect()
 }
 
 fn check_sequence_numbers(lines: &[Value]) {
@@ -244,16 +353,34 @@ fn check_sequence_numbers(lines: &[Value]) {
     }
 }
 
+/// A cycle's inputs followed by its outputs are the records its agent wrote
+/// since its previous cycle, with the dropped ones taken out.
+///
+/// A dropped action is in the run and in neither list, and it sits where it
+/// was written: after the cycle's inputs and in place of the outputs it
+/// would have been, since a preempted cycle has none. What the check asserts
+/// is that removing them leaves exactly the two lists, in order, which is
+/// the grouping every reader of a trajectory relies on.
 fn check_grouping(lines: &[Value]) {
     let mut pending: HashMap<&str, Vec<u64>> = HashMap::new();
+    let dropped: HashSet<(&str, u64)> = lines
+        .iter()
+        .filter(|line| line["type"] == "dropped")
+        .map(|line| (agent(line), seq(line)))
+        .collect();
     for line in lines {
-        let pending = pending.entry(agent(line)).or_default();
+        let agent = agent(line);
+        let pending = pending.entry(agent).or_default();
         if line["type"] == "cycle" {
             let listed: Vec<u64> = seqs(line, "inputs").chain(seqs(line, "outputs")).collect();
+            let written: Vec<u64> = std::mem::take(pending)
+                .into_iter()
+                .filter(|seq| !dropped.contains(&(agent, *seq)))
+                .collect();
             assert_eq!(
-                listed,
-                std::mem::take(pending),
-                "a cycle lists exactly the records since its agent's previous cycle: {line}"
+                listed, written,
+                "a cycle lists exactly the records since its agent's previous cycle, \
+                 but for the ones it dropped: {line}"
             );
         } else {
             pending.push(seq(line));
@@ -264,6 +391,32 @@ fn check_grouping(lines: &[Value]) {
             pending.is_empty(),
             "every record belongs to a cycle, but {agent} left {pending:?} after its last"
         );
+    }
+}
+
+/// Nothing follows an agent's `Stop` in its trajectory but the end of the
+/// cycle that popped it.
+///
+/// A `Stop` is the last thing an agent ever pops, so its trajectory ends
+/// there: one cycle record to close the cycle, and nothing after it. An
+/// agent that wrote anything more either kept running after it was told to
+/// stop or was told twice, and the log would be claiming both.
+fn check_nothing_follows_a_stop(lines: &[Value]) {
+    let mut stopped: HashSet<&str> = HashSet::new();
+    let mut closed: HashSet<&str> = HashSet::new();
+    for line in lines {
+        let agent = agent(line);
+        assert!(
+            !closed.contains(agent),
+            "an agent's trajectory ends with the cycle that popped its stop: {line}"
+        );
+        if line["type"] == "cycle" {
+            if stopped.contains(agent) {
+                closed.insert(agent);
+            }
+        } else if line["type"] == "control" && line["control"] == "stop" {
+            assert!(stopped.insert(agent), "an agent is stopped once: {line}");
+        }
     }
 }
 
@@ -352,6 +505,150 @@ mod tests {
         let mut lines = good();
         edit(&mut lines[index]);
         lines
+    }
+
+    /// A trajectory whose last cycle was preempted: `a` was deliberating
+    /// when the stop arrived, so its reply was dropped rather than sent, and
+    /// the stop was popped after the handler returned. `b`'s side is here
+    /// for the join, and `b` never observes what `a` dropped, because `a`
+    /// never sent it.
+    fn preempted() -> Vec<Value> {
+        vec![
+            json!({"type": "control", "agent": "a", "seq": 0, "created": 10, "received": 30,
+                   "control": "start"}),
+            json!({"type": "cycle", "agent": "a", "t_start": 30, "t_stop": 31, "woken": "queue",
+                   "inputs": [0], "outputs": []}),
+            json!({"type": "observation", "agent": "a", "seq": 1, "created": 40, "received": 45,
+                   "event": {"sender": "b", "recipients": ["a"], "payload": {"Step": 6}}}),
+            json!({"type": "dropped", "agent": "a", "seq": 2, "created": 70,
+                   "event": {"sender": "a", "recipients": ["b"], "payload": {"Step": 7}}}),
+            json!({"type": "control", "agent": "a", "seq": 3, "created": 60, "received": 71,
+                   "control": "stop"}),
+            json!({"type": "cycle", "agent": "a", "t_start": 45, "t_stop": 72, "woken": "queue",
+                   "inputs": [1, 3], "outputs": []}),
+            json!({"type": "action", "agent": "b", "seq": 0, "created": 40,
+                   "event": {"sender": "b", "recipients": ["a"], "payload": {"Step": 6}}}),
+            json!({"type": "cycle", "agent": "b", "t_start": 35, "t_stop": 41,
+                   "woken": "timeout", "inputs": [], "outputs": [0]}),
+        ]
+    }
+
+    /// The preempted trajectory with one edit applied to line `index`.
+    fn edited_preempted(index: usize, edit: impl FnOnce(&mut Value)) -> Vec<Value> {
+        let mut lines = preempted();
+        edit(&mut lines[index]);
+        lines
+    }
+
+    #[test]
+    fn a_preempted_cycle_passes() {
+        check(&preempted());
+    }
+
+    #[test]
+    #[should_panic(expected = "popped a stop that preempted it")]
+    fn a_dropped_record_in_a_cycle_with_no_stop_is_caught() {
+        // The cycle's stop is gone, and with it the only thing that could
+        // explain the dropped record before it.
+        let mut lines = preempted();
+        lines.remove(4);
+        lines[4]["inputs"] = json!([1]);
+        check(&lines);
+    }
+
+    #[test]
+    #[should_panic(expected = "popped a stop that preempted it")]
+    fn a_dropped_record_beside_a_stop_popped_at_the_start_is_caught() {
+        // A stop popped at the cycle's start did not preempt it: the loop
+        // had it in hand before it called the handler, so nothing the
+        // handler returned can have been dropped on its account.
+        let mut lines = preempted();
+        lines[4]["created"] = json!(44);
+        lines[4]["received"] = json!(45);
+        check(&lines);
+    }
+
+    #[test]
+    #[should_panic(expected = "a preempted cycle sends nothing")]
+    fn a_preempted_cycle_that_also_sent_is_caught() {
+        let mut lines = preempted();
+        lines.insert(
+            4,
+            json!({"type": "action", "agent": "a", "seq": 4, "created": 71,
+                   "event": {"sender": "a", "recipients": ["b"], "payload": {"Step": 8}}}),
+        );
+        lines[5]["seq"] = json!(3);
+        lines[6]["inputs"] = json!([1, 3]);
+        lines[6]["outputs"] = json!([4]);
+        check(&lines);
+    }
+
+    #[test]
+    #[should_panic(expected = "after the handler returned what it dropped")]
+    fn a_preempting_stop_popped_before_the_drop_it_explains_is_caught() {
+        check(&edited_preempted(4, |line| line["received"] = json!(69)));
+    }
+
+    #[test]
+    #[should_panic(expected = "popped at its start")]
+    fn an_ordinary_control_popped_late_is_still_caught() {
+        // Only a stop may be popped after a cycle's start; a start popped
+        // late is the old invariant breaking.
+        check(&edited_preempted(0, |line| line["received"] = json!(31)));
+    }
+
+    #[test]
+    #[should_panic(expected = "ends with the cycle that popped its stop")]
+    fn a_cycle_after_an_agents_stop_is_caught() {
+        // A whole cycle after the one that popped the stop: the agent kept
+        // running after it was told to stop.
+        let mut lines = preempted();
+        lines.insert(
+            6,
+            json!({"type": "cycle", "agent": "a", "t_start": 90, "t_stop": 91,
+                   "woken": "timeout", "inputs": [], "outputs": []}),
+        );
+        check(&lines);
+    }
+
+    #[test]
+    #[should_panic(expected = "an agent is stopped once")]
+    fn an_agent_stopped_twice_is_caught() {
+        // Both stops are popped in the same cycle, so nothing follows the
+        // first one but the cycle it belongs to, and it is being told twice
+        // that the check has left to catch.
+        // Two stops in the opening cycle: nothing follows either but the
+        // cycle they belong to, so being told twice is all that is left to
+        // catch. The rest of the trajectory is renumbered around the extra
+        // record and its cycle is dropped, since a trajectory that ends at
+        // the stop is what the other check already asserts.
+        let mut lines = preempted()[..2].to_vec();
+        lines[0]["control"] = json!("stop");
+        lines.insert(
+            1,
+            json!({"type": "control", "agent": "a", "seq": 1, "created": 11, "received": 30,
+                   "control": "stop"}),
+        );
+        lines[2]["inputs"] = json!([0, 1]);
+        check(&lines);
+    }
+
+    #[test]
+    #[should_panic(expected = "joins an action by sender and creation time")]
+    fn a_dropped_action_does_not_stand_in_for_the_one_that_was_sent() {
+        // A dropped action never traveled, so it cannot satisfy the join on
+        // behalf of an action that did: `b` observed what `a` says it only
+        // produced and dropped, and nothing explains that observation.
+        let mut lines = preempted();
+        lines.push(
+            json!({"type": "observation", "agent": "b", "seq": 1, "created": 70, "received": 75,
+                   "event": {"sender": "a", "recipients": ["b"], "payload": {"Step": 7}}}),
+        );
+        lines.push(
+            json!({"type": "cycle", "agent": "b", "t_start": 75, "t_stop": 76,
+                   "woken": "queue", "inputs": [1], "outputs": []}),
+        );
+        check(&lines);
     }
 
     #[test]
