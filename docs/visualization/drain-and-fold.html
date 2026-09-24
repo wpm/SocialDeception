@@ -246,7 +246,7 @@
 
   frame('Pop it as an observation', 'An event popped off the queue is an observation. Same rule as before: pop everything, then read t_start, 22.', s => { s.events = []; s.batch = [msg('b', 'a', 6, 20)]; s.state = 'popping'; s.clock = 22; });
 
-  frame('Record the observation', 'Seq 1. created 20 is when b sent it; received 22 is when a popped it. The difference is the observation’s latency: its whole staleness, routing and queueing together.', s => { s.state = 'recording'; s.log.push(obsLine(1, 20, 22, envelope('b', 'a', 6))); s.seq = 2; });
+  frame('Record the observation', 'Seq 1. created 20 is when b sent it; received 22 is when a popped it. The difference is the observation’s latency: its whole staleness, routing and queuing together.', s => { s.state = 'recording'; s.log.push(obsLine(1, 20, 22, envelope('b', 'a', 6))); s.seq = 2; });
 
   frame('Fold', 'The handler is given the cycle’s observations and its cancel, and returns actions: recipients and a payload, nothing more. It cannot name a sender — the loop is what writes that.', s => { s.state = 'folding'; s.handler = 'handle([b→a Step(6)], cancel) → [to b: Step(3)]'; s.outputs = [out('b', 3, 24)]; });
 
