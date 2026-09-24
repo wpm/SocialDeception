@@ -138,7 +138,6 @@ mod tests {
             players: players.iter().copied().map(AgentId::new).collect(),
             roles,
             trajectory: None,
-            max_rounds: 100,
             moderator: AgentId::new("moderator"),
         };
         config.validate().unwrap();

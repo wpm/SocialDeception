@@ -44,11 +44,11 @@
 //!
 //! # Termination
 //!
-//! The day always eliminates someone, so the living set strictly shrinks
-//! every round even on a night when the doctor saves, and a game terminates
-//! on its own. The round cap passed to [`Game::new`] is a guard against a
-//! future policy that stalls, not part of the game, and a game that reaches
-//! it ends in a stalemate with no winner.
+//! The day always eliminates someone, since a `Nominate` cannot abstain, so
+//! the living set strictly shrinks every round even on a night when the
+//! doctor saves. A game of n players is therefore over within n rounds
+//! however its players answer, and it needs no cap to end: every game has a
+//! winner.
 //!
 //! # Player bugs are panics
 //!
@@ -71,7 +71,7 @@ use rand_chacha::ChaCha8Rng;
 use crate::event::AgentId;
 use crate::werewolf::assignment::Assignment;
 use crate::werewolf::message::{
-    Action, Cause, Narration, Outcome, Phase, Request, RequestId, RequestKind, Response, Round,
+    Cause, Move, Narration, Outcome, Phase, Request, RequestId, RequestKind, Response, Round,
 };
 use crate::werewolf::role::{Faction, Role};
 use crate::werewolf::roles;
@@ -106,7 +106,6 @@ pub struct Game {
     living: BTreeSet<AgentId>,
     round: Round,
     phase: Phase,
-    max_rounds: u32,
     ties: ChaCha8Rng,
     /// How many requests have been issued; the next one's id is one more.
     issued: u64,
@@ -114,7 +113,7 @@ pub struct Game {
     outstanding: BTreeMap<RequestId, (AgentId, RequestKind)>,
     /// This phase's answers so far, by the agent that gave them: what it
     /// was asked, and what it did.
-    answers: BTreeMap<AgentId, (RequestKind, Action)>,
+    answers: BTreeMap<AgentId, (RequestKind, Move)>,
     /// Whom each doctor protected last night, for doctors that protected
     /// someone: the state the doctor's own rule constrains its next
     /// `Protect` with.
@@ -123,17 +122,15 @@ pub struct Game {
 }
 
 impl Game {
-    /// A game over the given assignment, ending in a stalemate if it is
-    /// still running after `max_rounds` rounds, breaking ties with a
-    /// generator derived from `seed`.
+    /// A game over the given assignment, breaking ties with a generator
+    /// derived from `seed`.
     ///
     /// # Panics
     ///
     /// If the assignment has no werewolf, or as many werewolves as other
-    /// players, so that the game would be over before it began; or if
-    /// `max_rounds` is zero.
+    /// players, so that the game would be over before it began.
     #[must_use]
-    pub fn new(assignment: Assignment, max_rounds: u32, seed: u64) -> Self {
+    pub fn new(assignment: Assignment, seed: u64) -> Self {
         let living: BTreeSet<AgentId> = assignment.players().map(|(who, _)| who.clone()).collect();
         let werewolves = assignment.pack().len();
         assert!(werewolves >= 1, "a game needs at least one werewolf");
@@ -141,13 +138,11 @@ impl Game {
             living.len() > 2 * werewolves,
             "a game needs more other players than werewolves"
         );
-        assert!(max_rounds >= 1, "a game needs at least one round");
         Self {
             assignment,
             living,
             round: Round(1),
             phase: Phase::Night,
-            max_rounds,
             ties: ChaCha8Rng::seed_from_u64(seed_for(seed, TIES)),
             issued: 0,
             outstanding: BTreeMap::new(),
@@ -214,14 +209,14 @@ impl Game {
         );
         let space = roles::action_space(from, &self.living, kind, self.last_protected.get(from));
         assert!(
-            space.contains(&response.action),
+            space.contains(&response.chosen),
             "{from} {} request {id}, which is outside its action space for {kind:?}",
-            match &response.action {
-                Action::Abstain => "abstained from".to_owned(),
-                Action::Target(target) => format!("targeted {target} in"),
+            match &response.chosen {
+                Move::Abstain => "abstained from".to_owned(),
+                Move::Target(target) => format!("targeted {target} in"),
             }
         );
-        self.answers.insert(to, (kind, response.action.clone()));
+        self.answers.insert(to, (kind, response.chosen.clone()));
         if !self.outstanding.is_empty() {
             return Vec::new();
         }
@@ -278,10 +273,7 @@ impl Game {
 
     /// Resolves a night from its answers: the pack's tally to the pack,
     /// each seer's finding to that seer, then the death or the lack of one.
-    fn resolve_night(
-        &mut self,
-        answers: BTreeMap<AgentId, (RequestKind, Action)>,
-    ) -> Vec<Directive> {
+    fn resolve_night(&mut self, answers: BTreeMap<AgentId, (RequestKind, Move)>) -> Vec<Directive> {
         let mut votes = BTreeMap::new();
         let mut protected = BTreeSet::new();
         let mut findings = Vec::new();
@@ -334,8 +326,8 @@ impl Game {
 
     /// Resolves a day from its nominations: the full tally to the living,
     /// then the lynching.
-    fn resolve_day(&mut self, answers: BTreeMap<AgentId, (RequestKind, Action)>) -> Vec<Directive> {
-        let votes: BTreeMap<AgentId, Action> = answers
+    fn resolve_day(&mut self, answers: BTreeMap<AgentId, (RequestKind, Move)>) -> Vec<Directive> {
+        let votes: BTreeMap<AgentId, Move> = answers
             .into_iter()
             .map(|(who, (_, action))| (who, action))
             .collect();
@@ -371,21 +363,17 @@ impl Game {
     /// the next phase.
     fn advance(&mut self) -> Vec<Directive> {
         match self.winner() {
-            Some(winner) => vec![self.end(Some(winner))],
+            Some(winner) => vec![self.end(winner)],
             None => self.next_phase(),
         }
     }
 
     /// Begins the phase after this one: the day of the same round, or the
-    /// night of the next, unless the round cap has been reached, in which
-    /// case the game ends in a stalemate.
+    /// night of the next.
     fn next_phase(&mut self) -> Vec<Directive> {
         match self.phase {
             Phase::Night => self.phase = Phase::Day,
             Phase::Day => {
-                if self.round.0 >= self.max_rounds {
-                    return vec![self.end(None)];
-                }
                 self.round = Round(self.round.0 + 1);
                 self.phase = Phase::Night;
             }
@@ -413,7 +401,7 @@ impl Game {
     }
 
     /// Ends the game and announces how, to everyone.
-    fn end(&mut self, winner: Option<Faction>) -> Directive {
+    fn end(&mut self, winner: Faction) -> Directive {
         let outcome = Outcome {
             winner,
             rounds: self.round,
@@ -444,11 +432,11 @@ impl Game {
 /// A tie is broken by [`pick`]ing among the tied players, in agent order,
 /// from `ties`, which is touched only when there is a tie.
 fn plurality<'a>(
-    actions: impl IntoIterator<Item = &'a Action>,
+    actions: impl IntoIterator<Item = &'a Move>,
     ties: &mut ChaCha8Rng,
 ) -> Option<AgentId> {
     let mut counts: BTreeMap<&AgentId, usize> = BTreeMap::new();
-    for who in actions.into_iter().filter_map(Action::target) {
+    for who in actions.into_iter().filter_map(Move::target) {
         *counts.entry(who).or_default() += 1;
     }
     let most = *counts.values().max()?;
@@ -469,22 +457,21 @@ mod tests {
     use crate::werewolf::role::Role::{Doctor, Seer, Villager, Werewolf};
 
     const SEED: u64 = 20_260_918;
-    const MAX_ROUNDS: u32 = 100;
 
     /// One phase of a script: every request's answer, keyed by the agent
     /// asked, in the order the answers are to be recorded.
-    type Answers = Vec<(&'static str, Action)>;
+    type Answers = Vec<(&'static str, Move)>;
 
     fn answers(pairs: &[(&'static str, &str)]) -> Answers {
         pairs
             .iter()
             .map(|(who, whom)| {
-                let action = if *whom == "-" {
-                    Action::Abstain
+                let chosen = if *whom == "-" {
+                    Move::Abstain
                 } else {
                     target(whom)
                 };
-                (*who, action)
+                (*who, chosen)
             })
             .collect()
     }
@@ -530,7 +517,7 @@ mod tests {
     }
 
     fn game(assignment: Assignment) -> Game {
-        Game::new(assignment, MAX_ROUNDS, SEED)
+        Game::new(assignment, SEED)
     }
 
     /// The requests among some directives, by the agent asked.
@@ -554,11 +541,11 @@ mod tests {
             "a script answers exactly the requests issued"
         );
         let mut caused = Vec::new();
-        for (index, (who, action)) in answers.iter().enumerate() {
+        for (index, (who, chosen)) in answers.iter().enumerate() {
             let who = id(who);
             let response = Response {
                 request: asks[&who].id,
-                action: action.clone(),
+                chosen: chosen.clone(),
             };
             caused = game.record(&who, &response);
             if index + 1 < answers.len() {
@@ -659,11 +646,7 @@ mod tests {
         )
     }
 
-    fn outcome<const N: usize>(
-        winner: Option<Faction>,
-        rounds: u32,
-        living: [&str; N],
-    ) -> Directive {
+    fn outcome<const N: usize>(winner: Faction, rounds: u32, living: [&str; N]) -> Directive {
         Directive::Broadcast(Narration::Outcome(Outcome {
             winner,
             rounds: Round(rounds),
@@ -682,10 +665,10 @@ mod tests {
     }
 
     /// Records one response to the request with the given id.
-    fn respond(game: &mut Game, from: &str, request: u64, action: Action) -> Vec<Directive> {
+    fn respond(game: &mut Game, from: &str, request: u64, chosen: Move) -> Vec<Directive> {
         let response = Response {
             request: RequestId(request),
-            action,
+            chosen,
         };
         game.record(&id(from), &response)
     }
@@ -720,27 +703,6 @@ mod tests {
         ]
     }
 
-    /// In the town, alice is devoured and erin is lynched, which decides
-    /// nothing: with a cap of one round, a stalemate.
-    fn stalemate() -> Vec<Answers> {
-        vec![
-            answers(&[
-                ("bob", "alice"),
-                ("carol", "erin"),
-                ("dave", "grace"),
-                ("frank", "alice"),
-            ]),
-            answers(&[
-                ("bob", "erin"),
-                ("carol", "erin"),
-                ("dave", "erin"),
-                ("erin", "grace"),
-                ("frank", "erin"),
-                ("grace", "erin"),
-            ]),
-        ]
-    }
-
     /// In the town, the werewolves split between alice and erin on the
     /// first night, so the generator picks the victim.
     fn split_pack() -> Vec<Answers> {
@@ -762,14 +724,13 @@ mod tests {
         ])]
     }
 
-    /// Every scripted game, with its assignment and round cap.
-    fn scripted_games() -> Vec<(Assignment, u32, Vec<Answers>)> {
+    /// Every scripted game, with the assignment it is played over.
+    fn scripted_games() -> Vec<(Assignment, Vec<Answers>)> {
         vec![
-            (village(), MAX_ROUNDS, village_wins()),
-            (village(), MAX_ROUNDS, werewolves_win()),
-            (town(), 1, stalemate()),
-            (town(), MAX_ROUNDS, split_pack()),
-            (village(), MAX_ROUNDS, saved()),
+            (village(), village_wins()),
+            (village(), werewolves_win()),
+            (town(), split_pack()),
+            (village(), saved()),
         ]
     }
 
@@ -778,8 +739,8 @@ mod tests {
     fn played_games() -> Vec<(Assignment, Game, Vec<Directive>)> {
         scripted_games()
             .into_iter()
-            .map(|(assignment, max_rounds, script)| {
-                let mut game = Game::new(assignment.clone(), max_rounds, SEED);
+            .map(|(assignment, script)| {
+                let mut game = Game::new(assignment.clone(), SEED);
                 let directives = play(&mut game, &script);
                 (assignment, game, directives)
             })
@@ -823,13 +784,13 @@ mod tests {
                     ],
                 ),
                 eliminated(survivors, "bob", Werewolf, 1, Cause::Lynched),
-                outcome(Some(Faction::Village), 1, ["carol", "dave", "erin"]),
+                outcome(Faction::Village, 1, ["carol", "dave", "erin"]),
             ]
         );
         assert_eq!(
             game.outcome(),
             Some(&Outcome {
-                winner: Some(Faction::Village),
+                winner: Faction::Village,
                 rounds: Round(1),
                 living: ids(["carol", "dave", "erin"]),
             })
@@ -889,52 +850,74 @@ mod tests {
                     2,
                     Cause::Devoured
                 ),
-                outcome(Some(Faction::Werewolves), 2, ["bob", "dave"]),
+                outcome(Faction::Werewolves, 2, ["bob", "dave"]),
             ]
         );
         assert_eq!(
             game.outcome().map(|outcome| outcome.winner),
-            Some(Some(Faction::Werewolves))
+            Some(Faction::Werewolves)
         );
     }
 
+    /// Plays a game to its end, answering every request with a move drawn
+    /// from the action space the rules compute, and returns the outcome
+    /// and how many were living at the start of each round.
+    ///
+    /// The answers are arbitrary, so nothing but the rules keeps the game
+    /// finite: this is the termination guarantee under adversity.
+    fn play_out(assignment: Assignment, seed: u64) -> (Outcome, Vec<usize>) {
+        let mut game = Game::new(assignment, seed);
+        let mut moves = ChaCha8Rng::seed_from_u64(seed);
+        let mut latest = game.begin();
+        let mut living = vec![game.living.len()];
+        let mut round = game.round;
+        while game.outcome().is_none() {
+            if game.round != round {
+                round = game.round;
+                living.push(game.living.len());
+            }
+            let asked = asks(&latest);
+            assert!(!asked.is_empty(), "a running game always asks something");
+            let mut caused = Vec::new();
+            for (who, request) in asked {
+                let space = roles::action_space(
+                    &who,
+                    &game.living,
+                    request.kind,
+                    game.last_protected.get(&who),
+                );
+                let response = Response {
+                    request: request.id,
+                    chosen: pick(&mut moves, &space).clone(),
+                };
+                caused = game.record(&who, &response);
+            }
+            latest = caused;
+        }
+        (game.outcome().unwrap().clone(), living)
+    }
+
     #[test]
-    fn a_game_reaching_the_round_cap_is_a_stalemate() {
-        let mut game = Game::new(town(), 1, SEED);
-        let directives = play(&mut game, &stalemate());
-        let living = ["bob", "carol", "dave", "frank", "grace"];
-        assert_eq!(
-            directives[directives.len() - 3..],
-            [
-                tally(
-                    ["bob", "carol", "dave", "erin", "frank", "grace"],
-                    1,
-                    Phase::Day,
-                    &[
-                        ("bob", "erin"),
-                        ("carol", "erin"),
-                        ("dave", "erin"),
-                        ("erin", "grace"),
-                        ("frank", "erin"),
-                        ("grace", "erin"),
-                    ],
-                ),
-                eliminated(
-                    ["bob", "carol", "dave", "erin", "frank", "grace"],
-                    "erin",
-                    Villager,
-                    1,
-                    Cause::Lynched,
-                ),
-                outcome(None, 1, living),
-            ]
-        );
-        assert_eq!(game.outcome().map(|outcome| outcome.winner), Some(None));
-        // The same game under a higher cap goes on to a second night.
-        let mut game = Game::new(town(), 2, SEED);
-        let directives = play(&mut game, &stalemate());
-        assert_eq!(game.outcome(), None);
-        assert!(directives.contains(&phase_began(2, Phase::Night, living)));
+    fn a_game_ends_within_as_many_rounds_as_there_are_players() {
+        // A `Nominate` cannot abstain, so every day lynches someone and the
+        // living set strictly shrinks each round. A game of n players is
+        // therefore over by round n however its players answer, which is
+        // what makes a round cap unnecessary.
+        for assignment in [village(), town(), pack_of_three()] {
+            let players = assignment.players().count();
+            for seed in 0..200 {
+                let (outcome, living) = play_out(assignment.clone(), seed);
+                assert!(
+                    outcome.rounds.0 as usize <= players,
+                    "{players} players, seed {seed}: {outcome:?}"
+                );
+                // The bound above is loose; this is the reason it holds.
+                assert!(
+                    living.windows(2).all(|pair| pair[1] < pair[0]),
+                    "the living set shrinks every round, seed {seed}: {living:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -988,9 +971,9 @@ mod tests {
 
     #[test]
     fn the_same_seed_and_responses_produce_the_same_game() {
-        for (assignment, max_rounds, script) in scripted_games() {
-            let mut first = Game::new(assignment.clone(), max_rounds, SEED);
-            let mut second = Game::new(assignment, max_rounds, SEED);
+        for (assignment, script) in scripted_games() {
+            let mut first = Game::new(assignment.clone(), SEED);
+            let mut second = Game::new(assignment, SEED);
             assert_eq!(play(&mut first, &script), play(&mut second, &script));
             assert_eq!(first.outcome(), second.outcome());
             assert_eq!(first.living(), second.living());
@@ -1015,7 +998,7 @@ mod tests {
                 ),
                 eliminated(everyone, "dave", Villager, 1, Cause::Devoured),
                 outcome(
-                    Some(Faction::Werewolves),
+                    Faction::Werewolves,
                     1,
                     ["alice", "bob", "carol", "erin", "frank", "grace"],
                 ),
@@ -1060,16 +1043,10 @@ mod tests {
     #[test]
     fn a_plurality_ignores_abstentions() {
         let mut ties = ChaCha8Rng::seed_from_u64(1);
-        assert_eq!(
-            plurality(&[Action::Abstain, Action::Abstain], &mut ties),
-            None
-        );
+        assert_eq!(plurality(&[Move::Abstain, Move::Abstain], &mut ties), None);
         assert_eq!(plurality(&[], &mut ties), None);
         assert_eq!(
-            plurality(
-                &[Action::Abstain, target("bob"), Action::Abstain],
-                &mut ties
-            ),
+            plurality(&[Move::Abstain, target("bob"), Move::Abstain], &mut ties),
             Some(id("bob"))
         );
     }
@@ -1123,7 +1100,7 @@ mod tests {
             ("erin", Faction::Village),
         ];
         for (whom, faction) in expected {
-            let mut game = Game::new(assignment.clone(), MAX_ROUNDS, SEED);
+            let mut game = Game::new(assignment.clone(), SEED);
             let night = answers(&[
                 ("bob", "alice"),
                 ("carol", whom),
@@ -1334,7 +1311,7 @@ mod tests {
     fn an_abstention_where_none_is_permitted_panics() {
         let mut game = game(village());
         game.begin();
-        respond(&mut game, "bob", 1, Action::Abstain);
+        respond(&mut game, "bob", 1, Move::Abstain);
     }
 
     #[test]
@@ -1504,11 +1481,5 @@ mod tests {
             ("carol", Werewolf),
             ("dave", Villager),
         ]));
-    }
-
-    #[test]
-    #[should_panic(expected = "a game needs at least one round")]
-    fn a_game_with_no_rounds_panics() {
-        let _ = Game::new(village(), 0, SEED);
     }
 }

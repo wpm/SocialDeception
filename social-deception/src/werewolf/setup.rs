@@ -144,7 +144,7 @@ fn moderate(
     assignment: Assignment,
 ) -> Receiver<Outcome> {
     let (outcome, outcomes) = unbounded();
-    let game = Game::new(assignment, config.max_rounds, config.seed);
+    let game = Game::new(assignment, config.seed);
     add(episode, &config.moderator, Moderator::new(game, outcome));
     outcomes
 }
@@ -254,7 +254,7 @@ mod tests {
     use crate::agent::Outgoing;
     use crate::event::Event;
     use crate::testing::{TempDir, id, ids, parse_lines};
-    use crate::werewolf::config::{DEFAULT_MAX_ROUNDS, DEFAULT_MODERATOR, RoleCounts};
+    use crate::werewolf::config::{DEFAULT_MODERATOR, RoleCounts};
     use crate::werewolf::message::Round;
     use crate::werewolf::transcript::{self, Transcript};
 
@@ -277,7 +277,6 @@ mod tests {
                 doctors,
             },
             trajectory: None,
-            max_rounds: DEFAULT_MAX_ROUNDS,
             moderator: id(DEFAULT_MODERATOR),
         };
         config.validate().unwrap();
@@ -300,11 +299,15 @@ mod tests {
         Transcript::read(&transcript::lines(&text).unwrap(), &config.moderator).unwrap()
     }
 
-    /// Asserts that `outcome` is a finished game among `config`'s players.
+    /// Asserts that `outcome` is a finished game among `config`'s players,
+    /// decided within as many rounds as there are players.
     fn check(config: &Config, outcome: &Outcome) {
         let players: BTreeSet<&AgentId> = config.players.iter().collect();
         assert!(outcome.rounds >= Round(1), "{outcome:?}");
-        assert!(outcome.rounds.0 <= config.max_rounds, "{outcome:?}");
+        assert!(
+            outcome.rounds.0 as usize <= config.players.len(),
+            "{outcome:?}"
+        );
         assert!(!outcome.living.is_empty(), "{outcome:?}");
         assert!(
             outcome.living.iter().all(|who| players.contains(who)),
@@ -337,7 +340,6 @@ mod tests {
         let config = town();
         let outcome = run(&config).unwrap();
         check(&config, &outcome);
-        assert!(outcome.winner.is_some(), "{outcome:?}");
     }
 
     #[test]
@@ -356,21 +358,7 @@ mod tests {
         ] {
             let outcome = run(&config).unwrap();
             check(&config, &outcome);
-            assert!(outcome.winner.is_some(), "{outcome:?}");
         }
-    }
-
-    #[test]
-    fn the_round_cap_is_a_stalemate() {
-        // Seven players and two werewolves cannot finish in one round: the
-        // night takes at most one player and the day exactly one, which
-        // leaves the pack neither dead nor at parity.
-        let mut config = town();
-        config.max_rounds = 1;
-        let outcome = run(&config).unwrap();
-        check(&config, &outcome);
-        assert_eq!(outcome.winner, None, "{outcome:?}");
-        assert_eq!(outcome.rounds, Round(1));
     }
 
     #[test]

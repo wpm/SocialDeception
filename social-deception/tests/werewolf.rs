@@ -30,7 +30,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 use social_deception::AgentId;
-use social_deception::werewolf::config::{DEFAULT_MAX_ROUNDS, DEFAULT_MODERATOR};
+use social_deception::werewolf::config::DEFAULT_MODERATOR;
 use social_deception::werewolf::{self, Config, Faction, RoleCounts, Transcript, config};
 use support::TempDir;
 
@@ -65,7 +65,6 @@ fn config(players: &[&str], werewolves: usize, seers: usize, doctors: usize, see
             doctors,
         },
         trajectory: None,
-        max_rounds: DEFAULT_MAX_ROUNDS,
         moderator: AgentId::new(DEFAULT_MODERATOR),
     };
     config.validate().unwrap();
@@ -136,8 +135,7 @@ fn the_fixture_is_a_trajectory_the_runtime_could_have_written() {
 
 #[test]
 fn seven_players_with_two_werewolves_a_seer_and_a_doctor() {
-    let transcript = run(&town(SEED));
-    assert!(transcript.outcome.winner.is_some());
+    run(&town(SEED));
 }
 
 #[test]
@@ -145,7 +143,7 @@ fn three_players_with_one_werewolf_is_the_smallest_game() {
     // The werewolf devours one of the other two on the first night, and
     // with no doctor to save them that is parity, whatever the seed.
     let transcript = run(&config(&["alice", "bob", "carol"], 1, 0, 0, SEED));
-    assert_eq!(transcript.outcome.winner, Some(Faction::Werewolves));
+    assert_eq!(transcript.outcome.winner, Faction::Werewolves);
     assert_eq!(transcript.rounds.len(), 1);
 }
 
@@ -158,29 +156,6 @@ fn a_game_without_a_seer_or_a_doctor_or_either() {
     for (seers, doctors) in [(0, 1), (1, 0), (0, 0)] {
         run(&config(&players, 2, seers, doctors, SEED));
     }
-}
-
-#[test]
-fn a_game_that_reaches_the_round_cap_is_a_stalemate() {
-    // Nine players and three werewolves cannot finish in one round: the
-    // night takes at most one player and the day exactly one, so at least
-    // one werewolf survives it and at least four others do, which is neither
-    // side's win. So the cap ends the game with nobody winning, whatever the
-    // seed.
-    let mut config = config(
-        &[
-            "alice", "bob", "carol", "dave", "erin", "frank", "grace", "heidi", "ivan",
-        ],
-        3,
-        1,
-        1,
-        SEED,
-    );
-    config.max_rounds = 1;
-    let transcript = run(&config);
-    assert_eq!(transcript.outcome.winner, None);
-    assert_eq!(transcript.rounds.len(), 1);
-    assert!(transcript.rounds[0].day.is_some());
 }
 
 #[test]
@@ -200,10 +175,7 @@ fn the_seeds_hold_a_save_and_a_win_for_each_side() {
             .iter()
             .any(|round| round.night.eliminated.is_none());
         winners.push(transcript.outcome.winner);
-        if saved
-            && winners.contains(&Some(Faction::Village))
-            && winners.contains(&Some(Faction::Werewolves))
-        {
+        if saved && winners.contains(&Faction::Village) && winners.contains(&Faction::Werewolves) {
             return;
         }
     }
@@ -277,10 +249,7 @@ fn a_run_is_reproduced_from_its_artifacts() {
     assert_eq!(effective.trajectory, None, "and names no trajectory");
 
     let transcript = read(&original, &effective);
-    let winner = match transcript.outcome.winner {
-        Some(winner) => winner.to_string(),
-        None => "nobody, a stalemate at the round cap".to_owned(),
-    };
+    let winner = transcript.outcome.winner;
     assert!(
         played.starts_with(&format!("seed: {SEED}\nwinner: {winner}\n")),
         "{played}"
