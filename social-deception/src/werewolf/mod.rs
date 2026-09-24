@@ -64,7 +64,7 @@
 //!
 //! # What a player knows, and how it decides
 //!
-//! [`Knowledge`] is the state a player carries between passes: the fold of
+//! [`Knowledge`] is the state a player carries between cycles: the fold of
 //! every observation it has received, and what a policy conditions on. It
 //! records only what the moderator said, so nothing in it can be false.
 //!

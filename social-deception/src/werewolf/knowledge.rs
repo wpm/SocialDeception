@@ -1,4 +1,4 @@
-//! The state a player carries between passes: [`Knowledge`], a fold over the
+//! The state a player carries between cycles: [`Knowledge`], a fold over the
 //! observations it has received.
 //!
 //! In the reinforcement-learning vocabulary of the design, `Event<Message>`

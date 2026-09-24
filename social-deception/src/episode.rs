@@ -13,11 +13,11 @@
 //! send again, which for a purely reactive environment is the natural end
 //! of the run. The episode can tell, because it is the only component that
 //! sees both halves of the work in progress: the deliveries it has routed
-//! and the passes the agents have reported. It keeps one count, of
+//! and the cycles the agents have reported. It keeps one count, of
 //! deliveries routed and not yet reported handled. A cycle in progress is
 //! exactly a set of deliveries taken off an inbox and not yet reported, and
-//! an agent dispatches a pass's deliveries and its outputs together, so the
-//! count never reads zero while a pass that might still send is under way.
+//! an agent dispatches a cycle's deliveries and its outputs together, so the
+//! count never reads zero while a cycle that might still send is under way.
 //! When it reaches zero the episode is quiescent and shutdown begins.
 //!
 //! In-flight work is counted in **deliveries, not messages**: one event
@@ -252,7 +252,7 @@ use Halt::Departure;
 /// Routes what the agents send until nothing is in flight.
 ///
 /// `in_flight` is the number of deliveries already made and not yet reported
-/// handled. Each dispatch takes a pass's deliveries off the count and puts the
+/// handled. Each dispatch takes a cycle's deliveries off the count and puts the
 /// deliveries its outputs cause onto it, in that order but as one step, so
 /// the count reads zero only when no agent has anything left to handle or
 /// send.
@@ -290,7 +290,7 @@ fn drive<P: Payload>(
 /// an error, or, after shutdown, by the episode joining it and dropping the
 /// handler it gets back. Before shutdown an obituary can only mean the
 /// first two, and it is what keeps the episode from waiting forever for a
-/// pass that will never be reported.
+/// cycle that will never be reported.
 struct Watched<P> {
     id: AgentId,
     handler: Box<dyn Handler<P> + Send>,

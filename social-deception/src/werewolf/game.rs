@@ -10,12 +10,11 @@
 //! # How a game runs
 //!
 //! [`Game::begin`] tells each player its role, and a werewolf its pack, then
-//! opens the first night. Every phase is one pass: the game issues every
-//! request the phase calls for, and resolves the phase at the moment the
-//! last of them is answered. A night asks every living werewolf to devour,
-//! the living seer to investigate and the living doctor to protect; a day
-//! asks every living player to nominate. No request ever goes to a dead
-//! player.
+//! opens the first night. A phase issues every request it calls for at once,
+//! and resolves at the moment the last of them is answered. A night asks
+//! every living werewolf to devour, the living seer to investigate and the
+//! living doctor to protect; a day asks every living player to nominate. No
+//! request ever goes to a dead player.
 //!
 //! A night resolves in a fixed order: the tally of the werewolves' choices,
 //! to the pack alone; the victim, a plurality of those choices; the seer's

@@ -221,7 +221,7 @@ mod tests {
     use super::*;
 
     /// A well-formed trajectory: agent `a` receives a start and a message
-    /// from `b` in one pass and replies, then receives a stop.
+    /// from `b` in one cycle and replies, then receives a stop.
     fn good() -> Vec<Value> {
         vec![
             json!({"type": "event", "agent": "a", "seq": 0, "arrived": 10,
