@@ -4,7 +4,7 @@
 //! records it as it folds and sends the records over an in-process channel
 //! to a [`Writer`].
 //!
-//! # Five record types
+//! # Six record types
 //!
 //! An agent runs one cycle per wake-up: it pops everything waiting, hands
 //! the observations to its handler, and sends the actions that come back.
@@ -22,6 +22,10 @@
 //! - a [`CycleRecord`] closing the cycle: the handling window, what woke it,
 //!   and the sequence numbers of everything popped and everything sent.
 //!
+//! The sixth is the odd one out. A [`RewardRecord`] is written by the
+//! **environment**, and belongs to the agent it names rather than to the
+//! agent that wrote it; see [`RewardRecord`] and ADR-0007.
+//!
 //! An observation and an action record the same event from the two sides of
 //! it, which is what makes the trajectory joinable: an observation in one
 //! agent's trajectory matches the action in its sender's whose `created` and
@@ -30,7 +34,8 @@
 //! reader joining observations to actions passes over it.
 //!
 //! Sequence numbers are per agent and cover every non-cycle record, inputs
-//! and outputs alike, and a dropped action, which is neither.
+//! and outputs alike, and a dropped action, which is neither. A reward has
+//! none, because it is not the agent loop's to number.
 //!
 //! # Why a record is written when it is
 //!
@@ -62,14 +67,20 @@
 //! records from different agents interleave arbitrarily, and a recipient's
 //! cycle can precede the sender's action record that caused it.
 //!
+//! A reward record is outside all of it. It belongs to the agent it names
+//! and was written by another, so it is in no cycle of that agent's, sits
+//! between two of its cycles wherever the writer happened to take it, and
+//! carries no sequence number to place it. Its `created` is what places it.
+//!
 //! If the writer fails mid-cycle, the agent's loop exits with an error and
 //! its records end without a closing cycle record.
 //!
 //! # On-disk format
 //!
 //! One JSON object per line, wrapped in [`LogRecord`], whose `type` field is
-//! `observation`, `action`, `dropped`, `control` or `cycle`. Nothing here
-//! reads a log back; only `Serialize` is required of a payload.
+//! `observation`, `action`, `dropped`, `control`, `reward` or `cycle`.
+//! Nothing here reads a log back; only `Serialize` is required of a payload
+//! or a reward.
 //!
 //! ```json
 //! {"type":"control","agent":"alice","seq":0,"created":10,"received":12,"control":"start"}
@@ -77,6 +88,7 @@
 //! {"type":"observation","agent":"alice","seq":1,"created":40,"received":55,"event":{"sender":"moderator","recipients":["alice"],"payload":{"Request":{}}}}
 //! {"type":"action","agent":"alice","seq":2,"created":90,"event":{"sender":"alice","recipients":["moderator"],"payload":{"Response":{}}}}
 //! {"type":"cycle","agent":"alice","t_start":55,"t_stop":90,"woken":"queue","inputs":[1],"outputs":[2]}
+//! {"type":"reward","agent":"alice","created":500,"value":1}
 //! ```
 
 use std::fmt;
@@ -88,7 +100,7 @@ use std::thread::{self, JoinHandle};
 use crossbeam_channel::{Sender, unbounded};
 use serde::{Serialize, Serializer};
 
-use crate::clock::Timestamp;
+use crate::clock::{Created, Timestamp};
 use crate::event::{AgentId, Control, Domain, Event};
 
 /// An agent's sequence number for one of its own records.
@@ -248,6 +260,50 @@ pub struct ControlRecord {
     pub control: Control,
 }
 
+/// A reward the environment assigned to one agent.
+///
+/// It is the one record an agent does not write about itself. The
+/// environment decides what an agent's behavior was worth, and `agent`
+/// names the agent **rewarded**, whose trajectory the record belongs to,
+/// not the environment that wrote it. Training joins a reward to that
+/// agent's trajectory by the agent id and the time (ADR-0007).
+///
+/// There is no `seq`. Sequence numbers are the agent loop's to assign, and
+/// this record was not written by that loop, so numbering it would either
+/// invent a number nobody issued or perturb the numbering of the records
+/// the agent did write. There is no `received` either: a reward is logged,
+/// never sent, so nobody ever receives it, and it implements
+/// [`Created`] alone.
+///
+/// `Debug`, `Clone` and equality are written out rather than derived, for
+/// the reason [`ObservationRecord`]'s are: a derive would ask them of `D`,
+/// the marker type, when what has to have them is `D::Reward`.
+pub struct RewardRecord<D: Domain> {
+    /// The agent rewarded, whose trajectory this record belongs to.
+    pub agent: AgentId,
+    /// When the environment logged it.
+    pub created: Timestamp,
+    /// What the agent's behavior was worth, in the game's own units.
+    pub value: D::Reward,
+}
+
+impl<D: Domain> Serialize for RewardRecord<D> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut record = serializer.serialize_struct("RewardRecord", 3)?;
+        record.serialize_field("agent", &self.agent)?;
+        record.serialize_field("created", &self.created)?;
+        record.serialize_field("value", &self.value)?;
+        record.end()
+    }
+}
+
+impl<D: Domain> Created for RewardRecord<D> {
+    fn created(&self) -> Timestamp {
+        self.created
+    }
+}
+
 /// One cycle of an agent's loop: pop, hand to the handler, send.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CycleRecord {
@@ -284,6 +340,8 @@ pub enum LogRecord<D: Domain> {
     Dropped(DroppedRecord<D>),
     /// A control some agent popped.
     Control(ControlRecord),
+    /// A reward the environment assigned to some agent.
+    Reward(RewardRecord<D>),
     /// A cycle of some agent's loop.
     Cycle(CycleRecord),
 }
@@ -408,9 +466,44 @@ where
 
 impl<D: Domain> Eq for DroppedRecord<D> where D::Payload: Eq {}
 
+impl<D: Domain> fmt::Debug for RewardRecord<D>
+where
+    D::Reward: fmt::Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RewardRecord")
+            .field("agent", &self.agent)
+            .field("created", &self.created)
+            .field("value", &self.value)
+            .finish()
+    }
+}
+
+impl<D: Domain> Clone for RewardRecord<D> {
+    fn clone(&self) -> Self {
+        Self {
+            agent: self.agent.clone(),
+            created: self.created,
+            value: self.value,
+        }
+    }
+}
+
+impl<D: Domain> PartialEq for RewardRecord<D>
+where
+    D::Reward: PartialEq,
+{
+    fn eq(&self, other: &Self) -> bool {
+        self.agent == other.agent && self.created == other.created && self.value == other.value
+    }
+}
+
+impl<D: Domain> Eq for RewardRecord<D> where D::Reward: Eq {}
+
 impl<D: Domain> fmt::Debug for LogRecord<D>
 where
     D::Payload: fmt::Debug,
+    D::Reward: fmt::Debug,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -418,6 +511,7 @@ where
             Self::Action(record) => f.debug_tuple("Action").field(record).finish(),
             Self::Dropped(record) => f.debug_tuple("Dropped").field(record).finish(),
             Self::Control(record) => f.debug_tuple("Control").field(record).finish(),
+            Self::Reward(record) => f.debug_tuple("Reward").field(record).finish(),
             Self::Cycle(record) => f.debug_tuple("Cycle").field(record).finish(),
         }
     }
@@ -430,6 +524,7 @@ impl<D: Domain> Clone for LogRecord<D> {
             Self::Action(record) => Self::Action(record.clone()),
             Self::Dropped(record) => Self::Dropped(record.clone()),
             Self::Control(record) => Self::Control(record.clone()),
+            Self::Reward(record) => Self::Reward(record.clone()),
             Self::Cycle(record) => Self::Cycle(record.clone()),
         }
     }
@@ -438,6 +533,7 @@ impl<D: Domain> Clone for LogRecord<D> {
 impl<D: Domain> PartialEq for LogRecord<D>
 where
     D::Payload: PartialEq,
+    D::Reward: PartialEq,
 {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
@@ -445,13 +541,19 @@ where
             (Self::Action(a), Self::Action(b)) => a == b,
             (Self::Dropped(a), Self::Dropped(b)) => a == b,
             (Self::Control(a), Self::Control(b)) => a == b,
+            (Self::Reward(a), Self::Reward(b)) => a == b,
             (Self::Cycle(a), Self::Cycle(b)) => a == b,
             _ => false,
         }
     }
 }
 
-impl<D: Domain> Eq for LogRecord<D> where D::Payload: Eq {}
+impl<D: Domain> Eq for LogRecord<D>
+where
+    D::Payload: Eq,
+    D::Reward: Eq,
+{
+}
 
 impl<D: Domain> From<ObservationRecord<D>> for LogRecord<D> {
     fn from(record: ObservationRecord<D>) -> Self {
@@ -474,6 +576,12 @@ impl<D: Domain> From<DroppedRecord<D>> for LogRecord<D> {
 impl<D: Domain> From<ControlRecord> for LogRecord<D> {
     fn from(record: ControlRecord) -> Self {
         Self::Control(record)
+    }
+}
+
+impl<D: Domain> From<RewardRecord<D>> for LogRecord<D> {
+    fn from(record: RewardRecord<D>) -> Self {
+        Self::Reward(record)
     }
 }
 
@@ -677,6 +785,52 @@ mod tests {
         as_dropped["type"] = json!("x");
         as_action["type"] = json!("x");
         assert_eq!(as_dropped, as_action);
+    }
+
+    #[test]
+    fn a_reward_names_the_agent_rewarded_and_carries_no_sequence_number() {
+        // Three fields and no more: the agent whose trajectory it belongs
+        // to, when the environment logged it, and what it is worth. No
+        // `seq`, because the agent loop did not write it, and no
+        // `received`, because nobody received it.
+        let reward: LogRecord<TestDomain> = RewardRecord {
+            agent: AgentId::new("alice"),
+            created: at(500),
+            value: 1,
+        }
+        .into();
+        assert_eq!(
+            serde_json::to_value(&reward).unwrap(),
+            json!({"type": "reward", "agent": "alice", "created": 500, "value": 1})
+        );
+        assert_eq!(
+            serde_json::to_string(&reward).unwrap(),
+            r#"{"type":"reward","agent":"alice","created":500,"value":1}"#
+        );
+    }
+
+    #[test]
+    fn a_reward_is_created_and_never_received() {
+        // `Created` and not `Timestamped`: a reward is logged, never sent,
+        // so there is no instant at which anybody got it.
+        let reward: RewardRecord<TestDomain> = RewardRecord {
+            agent: AgentId::new("alice"),
+            created: at(500),
+            value: -1,
+        };
+        assert_eq!(reward.created(), at(500));
+        assert_eq!(reward, reward.clone());
+        assert_ne!(
+            reward,
+            RewardRecord {
+                value: 1,
+                ..reward.clone()
+            }
+        );
+        assert!(format!("{reward:?}").starts_with("RewardRecord"));
+        let line: LogRecord<TestDomain> = reward.into();
+        assert!(format!("{line:?}").starts_with("Reward"));
+        assert_eq!(line, line.clone());
     }
 
     #[test]

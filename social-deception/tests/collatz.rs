@@ -439,6 +439,23 @@ fn a_step_sent_to_the_wrong_agent_is_caught() {
 }
 
 #[test]
+fn a_ring_that_rewards_nobody_logs_no_rewards() {
+    // A reward is a game's verdict on a player, and a ring passing numbers
+    // around has nothing to win. The runtime offers the environment an
+    // `Effect::Reward` and this one never returns any, so no reward record
+    // exists: nothing writes one on an environment's behalf, and an
+    // ordinary agent has no way to ask for one.
+    let ring: &Ring = &[("a", &[6, 7]), ("b", &[]), ("c", &[3])];
+    let lines = run(ring);
+    assert_eq!(
+        of(&lines, "reward").count(),
+        0,
+        "the Collatz ring rewards nobody"
+    );
+    check_outcome(&lines, ring);
+}
+
+#[test]
 fn a_ring_that_opens_nothing_is_started_and_stopped_and_says_nothing() {
     let ring: &Ring = &[("a", &[]), ("b", &[])];
     let lines = run(ring);

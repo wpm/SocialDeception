@@ -23,7 +23,7 @@
 //! it from being a state anything here can produce. See
 //! [`cancel`](crate::cancel).
 //!
-//! # Only the environment commands
+//! # Only the environment commands, and only the environment rewards
 //!
 //! A control is the [`Environment`](crate::Environment)'s to send, and no
 //! ordinary agent's (ADR-0007). The types already say so — a
@@ -33,6 +33,11 @@
 //! [`command`](Router::command) refuses a control whose sender is not the
 //! environment the router was built with, with
 //! [`RouteError::NotTheEnvironment`].
+//!
+//! A reward is the environment's alone for the same reason, and though it
+//! travels nowhere, whom it may name is the same question about the same
+//! roster. [`rewardable`](Router::rewardable) answers it, and the episode
+//! asks before letting a cycle's rewards stand.
 //!
 //! Channels are unbounded. With bounded channels one agent slow to drain its
 //! queues would apply back-pressure through the router to every other agent
@@ -286,6 +291,30 @@ impl<D: Domain> Router<D> {
         Ok(())
     }
 
+    /// Whether a reward from `sender` to `agent` would be accepted.
+    ///
+    /// A reward is logged and never sent, so there is nothing here to
+    /// deliver and nothing to count; what the router is being asked is only
+    /// whether the environment named somebody it could be rewarding. The
+    /// answers are the same as for a control, and for the same reasons:
+    /// only the environment rewards, and it cannot reward itself, having no
+    /// game to play and so nothing its behavior could be worth.
+    ///
+    /// # Errors
+    ///
+    /// [`RouteError::NotTheEnvironment`] if `sender` is not the
+    /// environment, [`RouteError::Loopback`] if it rewarded itself, and
+    /// [`RouteError::UnknownAgent`] if `agent` is not in the roster.
+    pub fn rewardable(&self, sender: &AgentId, agent: &AgentId) -> Result<(), RouteError> {
+        if *sender != self.environment {
+            return Err(RouteError::NotTheEnvironment(sender.clone()));
+        }
+        if *agent == *sender {
+            return Err(RouteError::Loopback(sender.clone()));
+        }
+        self.queues_of(agent).map(|_| ())
+    }
+
     /// Every agent in the roster but the environment: whom an episode
     /// starts and stops through its environment.
     #[must_use]
@@ -467,6 +496,37 @@ mod tests {
             router.control(&all(&["a", "b"]), Control::Stop),
             Err(RouteError::QueueClosed(id("b")))
         );
+    }
+
+    #[test]
+    fn only_the_environment_rewards_and_never_itself() {
+        // The same three answers as for a control, and for the same
+        // reasons, except that nothing is delivered either way: a reward
+        // is logged, so all the router is asked is whether the environment
+        // named somebody it could be rewarding.
+        let (router, queues) = world(&["env", "a", "b"]);
+        assert_eq!(router.rewardable(&id("env"), &id("a")), Ok(()));
+        assert_eq!(
+            router.rewardable(&id("a"), &id("b")),
+            Err(RouteError::NotTheEnvironment(id("a"))),
+            "an ordinary agent cannot reward"
+        );
+        assert_eq!(
+            router.rewardable(&id("env"), &id("env")),
+            Err(RouteError::Loopback(id("env"))),
+            "the environment plays no game, so it has nothing to be worth"
+        );
+        assert_eq!(
+            router.rewardable(&id("env"), &id("nobody")),
+            Err(RouteError::UnknownAgent(id("nobody")))
+        );
+        for name in ["a", "b"] {
+            assert!(
+                queues[&id(name)].controls.try_recv().is_err()
+                    && queues[&id(name)].events.try_recv().is_err(),
+                "checking a reward delivers nothing to {name}"
+            );
+        }
     }
 
     #[test]

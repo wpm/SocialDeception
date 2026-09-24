@@ -260,6 +260,36 @@ impl Game {
         self.assignment.players().map(|(who, _)| who)
     }
 
+    /// What each player's game was worth, once the game has ended: **+1**
+    /// for a player whose role's faction won, **−1** for every other,
+    /// living or dead, in agent order. `None` while the game is still on.
+    ///
+    /// It is a rule of Werewolf and so it lives here, with the rules, and
+    /// not in the [`Moderator`](super::Moderator), which is plumbing
+    /// (ADR-0005). The rule is as simple as a rule gets, and the reason it
+    /// stays simple is that there are no stalemates (ADR-0007): a day
+    /// always eliminates somebody, so every game reaches a winner and every
+    /// player gets exactly one of the two numbers. A game that could end
+    /// undecided would need a third.
+    ///
+    /// Being dead is not being out of the game. A villager the pack
+    /// devoured in the first round wins with its faction, and the record
+    /// says so, because what a trajectory is being scored for is the
+    /// behavior that led to the result and not the length of the episode.
+    #[must_use]
+    pub fn rewards(&self) -> Option<BTreeMap<AgentId, i32>> {
+        let winner = self.outcome.as_ref()?.winner;
+        Some(
+            self.assignment
+                .players()
+                .map(|(who, role)| {
+                    let value = if role.faction() == winner { 1 } else { -1 };
+                    (who.clone(), value)
+                })
+                .collect(),
+        )
+    }
+
     /// Announces the current phase to the living and issues its requests,
     /// in agent order.
     fn begin_phase(&mut self) -> Vec<Directive> {
@@ -901,6 +931,13 @@ mod tests {
     /// The answers are arbitrary, so nothing but the rules keeps the game
     /// finite: this is the termination guarantee under adversity.
     fn play_out(assignment: Assignment, seed: u64) -> (Outcome, Vec<usize>) {
+        let (game, _, living) = played(assignment, seed);
+        (game.outcome().unwrap().clone(), living)
+    }
+
+    /// The same, giving back the game itself, whatever else is wanted of
+    /// it once it has ended.
+    fn played(assignment: Assignment, seed: u64) -> (Game, Outcome, Vec<usize>) {
         let mut game = Game::new(assignment, seed);
         let mut moves = ChaCha8Rng::seed_from_u64(seed);
         let mut latest = game.begin();
@@ -929,7 +966,54 @@ mod tests {
             }
             latest = caused;
         }
-        (game.outcome().unwrap().clone(), living)
+        let outcome = game.outcome().unwrap().clone();
+        (game, outcome, living)
+    }
+
+    #[test]
+    fn every_player_is_paid_for_its_faction_living_or_dead() {
+        // The reward is the faction's, not the survivor's: a player the
+        // pack devoured in round one still wins with its side. Nothing is
+        // ever zero, because there are no stalemates.
+        for assignment in [village(), town(), pack_of_three()] {
+            for seed in 0..20 {
+                let (game, outcome, _) = played(assignment.clone(), seed);
+                let rewards = game.rewards().expect("the game has ended");
+                assert_eq!(
+                    rewards.keys().collect::<BTreeSet<_>>(),
+                    assignment.players().map(|(who, _)| who).collect(),
+                    "every player is paid, and nobody else: seed {seed}"
+                );
+                for (who, value) in &rewards {
+                    let role = assignment.role(who).unwrap();
+                    let expected = if role.faction() == outcome.winner {
+                        1
+                    } else {
+                        -1
+                    };
+                    assert_eq!(
+                        *value, expected,
+                        "{who} held {role} and {:?} won: seed {seed}",
+                        outcome.winner
+                    );
+                }
+                // The dead are paid too, which is the whole point of
+                // paying on the faction rather than on survival.
+                let dead: Vec<&AgentId> = rewards
+                    .keys()
+                    .filter(|who| !outcome.living.contains(who))
+                    .collect();
+                assert!(!dead.is_empty(), "somebody died: seed {seed}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_game_still_running_has_paid_nobody() {
+        let mut game = Game::new(village(), SEED);
+        assert_eq!(game.rewards(), None, "a game not yet begun pays nobody");
+        game.begin();
+        assert_eq!(game.rewards(), None, "nor does one under way");
     }
 
     #[test]

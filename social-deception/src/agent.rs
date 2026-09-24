@@ -2042,6 +2042,9 @@ mod tests {
                 LogRecord::Action(_) => "action",
                 LogRecord::Dropped(_) => "dropped",
                 LogRecord::Control(_) => "control",
+                // An agent's loop never writes one: a reward is the
+                // environment's, and it goes out through the adapter.
+                LogRecord::Reward(_) => "reward",
                 LogRecord::Cycle(_) => "cycle",
             })
             .collect();

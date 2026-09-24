@@ -67,7 +67,7 @@ use crossbeam_channel::{Receiver, Sender, select, unbounded};
 use crate::agent::{self, Action, Agent, CycleDispatch, Handler, Observation, Wiring};
 use crate::cancel::{Cancel, ControlSender};
 use crate::clock::Clock;
-use crate::environment::{Adapter, Commanded, Environment};
+use crate::environment::{Adapter, Commanded, Environment, Rewarded};
 use crate::event::{AgentId, Control, Domain};
 use crate::router::{Queues, RouteError, Router};
 use crate::trajectory::LogRecord;
@@ -283,61 +283,42 @@ impl<D: Domain> Episode<D> {
         let (dispatch, dispatches) = unbounded();
         let (obituary, obituaries) = unbounded();
         let (asked_for, commands) = unbounded();
-        let mut queues = BTreeMap::new();
-        // Every queue stays open until every thread has been joined, so that
-        // a message to an agent that has already stopped is delivered, and
-        // never read, rather than failing its sender.
-        let mut held = Vec::with_capacity(ids.len());
-        let mut agents = Vec::with_capacity(ids.len());
+        let (paid, rewards) = unbounded();
         let mut handlers: BTreeMap<AgentId, Box<dyn Handler<D> + Send>> = roster;
         handlers.insert(
             environment_id.clone(),
-            Box::new(Adapter::new(environment, asked_for)),
-        );
-        for (id, handler) in handlers {
-            let (sender, events) = unbounded();
-            let (commander, controls, arm) = ControlSender::new();
-            held.push((events.clone(), controls.clone()));
-            queues.insert(
-                id.clone(),
-                Queues {
-                    events: sender,
-                    controls: commander,
-                },
-            );
-            let wiring = Wiring {
-                id: id.clone(),
+            Box::new(Adapter::new(
+                environment,
+                asked_for,
+                paid,
+                records.clone(),
                 clock,
-                events,
-                controls,
-                arm,
-                dispatches: dispatch.clone(),
-                records: records.clone(),
-                timeout: None,
-                peers: ids.iter().filter(|peer| **peer != id).cloned().collect(),
-            };
-            let watched = Watched {
-                id,
-                handler,
-                obituary: obituary.clone(),
-            };
-            agents.push(Agent::spawn(wiring, watched, clock));
-        }
+            )),
+        );
+        let Spawned {
+            queues,
+            held,
+            agents,
+        } = spawn(handlers, &ids, &dispatch, &obituary, &records, clock);
         drop((dispatch, obituary, records));
         let router = Router::new(queues, environment_id.clone(), clock);
 
         let environment_only = BTreeSet::from([environment_id.clone()]);
         let mut running = router.agents();
+        let seat = Seat {
+            id: environment_id.clone(),
+            commanded: commands,
+            rewarded: rewards,
+        };
         let outcome = router
             .control(&environment_only, Control::Start)
             .map_err(|error| Halt::Error(EpisodeError::Control(error)))
             .and_then(|in_flight| {
                 drive(
                     &router,
-                    &environment_id,
+                    &seat,
                     &dispatches,
                     &obituaries,
-                    &commands,
                     in_flight,
                     &mut running,
                 )
@@ -379,12 +360,90 @@ impl<D: Domain> Episode<D> {
 /// other.
 type Threads<D> = Vec<Agent<Watched<D>>>;
 
+/// What spawning an episode's threads leaves the episode holding.
+struct Spawned<D: Domain> {
+    /// Where to address each agent, which is what the router is built from.
+    queues: BTreeMap<AgentId, Queues<D>>,
+    /// A receiving half of every queue, kept alive until every thread has
+    /// been joined, so that a message to an agent that has already stopped
+    /// is delivered and never read rather than failing its sender.
+    held: Vec<(Receiver<crate::Event<D>>, Receiver<crate::Signal>)>,
+    /// The threads themselves.
+    agents: Threads<D>,
+}
+
+/// Wires and spawns one thread per handler, in roster order.
+fn spawn<D: Domain>(
+    handlers: BTreeMap<AgentId, Box<dyn Handler<D> + Send>>,
+    ids: &BTreeSet<AgentId>,
+    dispatch: &Sender<CycleDispatch<D>>,
+    obituary: &Sender<AgentId>,
+    records: &Sender<LogRecord<D>>,
+    clock: Clock,
+) -> Spawned<D> {
+    let mut queues = BTreeMap::new();
+    let mut held = Vec::with_capacity(ids.len());
+    let mut agents = Vec::with_capacity(ids.len());
+    for (id, handler) in handlers {
+        let (sender, events) = unbounded();
+        let (commander, controls, arm) = ControlSender::new();
+        held.push((events.clone(), controls.clone()));
+        queues.insert(
+            id.clone(),
+            Queues {
+                events: sender,
+                controls: commander,
+            },
+        );
+        let wiring = Wiring {
+            id: id.clone(),
+            clock,
+            events,
+            controls,
+            arm,
+            dispatches: dispatch.clone(),
+            records: records.clone(),
+            timeout: None,
+            peers: ids.iter().filter(|peer| **peer != id).cloned().collect(),
+        };
+        let watched = Watched {
+            id,
+            handler,
+            obituary: obituary.clone(),
+        };
+        agents.push(Agent::spawn(wiring, watched, clock));
+    }
+    Spawned {
+        queues,
+        held,
+        agents,
+    }
+}
+
 /// Splits the environment's agent out of the roster's, so that the two can
 /// be stopped and joined in their own order.
 fn split<D: Domain>(agents: Threads<D>, environment: &AgentId) -> (Threads<D>, Threads<D>) {
     agents
         .into_iter()
         .partition(|agent| agent.id() == environment)
+}
+
+/// The environment's seat in the episode: who it is, and the two channels
+/// it asks for things on.
+///
+/// The three travel together because they are one thing — what the episode
+/// knows about its environment that it knows about nobody else — and
+/// because a control and a reward are both drained at the same moment, just
+/// after a dispatch of the environment's.
+struct Seat {
+    /// The environment's id.
+    id: AgentId,
+    /// The controls it has asked for and the episode has not yet issued.
+    commanded: Receiver<Commanded>,
+    /// The agents it has rewarded and the episode has not yet checked. The
+    /// records are already written; see
+    /// [`Adapter`](crate::environment::Adapter).
+    rewarded: Receiver<Rewarded>,
 }
 
 /// Why routing stopped.
@@ -437,13 +496,17 @@ use Halt::Departure;
 /// running is a stall; see the [module documentation](self).
 fn drive<D: Domain>(
     router: &Router<D>,
-    environment: &AgentId,
+    environment: &Seat,
     dispatches: &Receiver<CycleDispatch<D>>,
     obituaries: &Receiver<AgentId>,
-    commanded: &Receiver<Commanded>,
     mut in_flight: usize,
     running: &mut BTreeSet<AgentId>,
 ) -> Result<(), Halt> {
+    let Seat {
+        id: environment,
+        commanded,
+        rewarded,
+    } = environment;
     let mut held: Vec<BTreeSet<AgentId>> = Vec::new();
     while !running.is_empty() {
         if in_flight == 0 {
@@ -479,6 +542,13 @@ fn drive<D: Domain>(
             })
         };
         if dispatch.agent == *environment {
+            // The rewards of this cycle, checked but not routed: a reward
+            // is already in the trajectory and is not a delivery, so
+            // nothing here adds to the in-flight count. What is left is
+            // whether the environment named an agent it could reward.
+            while let Ok(Rewarded { agent }) = rewarded.try_recv() {
+                router.rewardable(environment, &agent).map_err(refused)?;
+            }
             while let Ok(Commanded { to, control }) = commanded.try_recv() {
                 match control {
                     Control::Start => {
@@ -641,6 +711,118 @@ mod tests {
                 Vec::new()
             }
         }
+    }
+
+    /// An environment that starts two agents, pays `to` whatever `value`
+    /// is, and stops everybody, all in its opening cycle.
+    ///
+    /// It is the smallest thing that logs a reward: enough to see the
+    /// record the runtime writes, and to point `to` at somebody who is not
+    /// there.
+    struct Paymaster {
+        to: AgentId,
+        value: i32,
+    }
+
+    impl Paymaster {
+        fn paying(to: &str, value: i32) -> Self {
+            Self {
+                to: AgentId::new(to),
+                value,
+            }
+        }
+    }
+
+    impl Environment<Counting> for Paymaster {
+        fn start(&mut self) -> Vec<Effect<Counting>> {
+            vec![
+                Effect::control(["a", "b"], Control::Start),
+                Effect::reward(self.to.clone(), self.value),
+                Effect::control(["a", "b"], Control::Stop),
+            ]
+        }
+
+        fn handle(&mut self, _: &[Observation<Counting>], _: &Cancel) -> Vec<Effect<Counting>> {
+            Vec::new()
+        }
+    }
+
+    /// An episode of a [`Paymaster`] over two mute agents, and its writer.
+    fn paid(to: &str, value: i32) -> (Episode<Counting>, Writer<Vec<u8>>) {
+        let (records, writer) = Writer::spawn(Vec::new());
+        let mut episode = Episode::new(records, REFEREE, Paymaster::paying(to, value));
+        episode.add("a", Mute).unwrap();
+        episode.add("b", Mute).unwrap();
+        (episode, writer)
+    }
+
+    #[test]
+    fn a_reward_is_logged_to_the_agent_it_names_and_routed_nowhere() {
+        let (episode, writer) = paid("a", 7);
+        episode.run().unwrap();
+        let lines = parse_lines(&writer.join().unwrap());
+        let rewards: Vec<&Value> = lines
+            .iter()
+            .filter(|line| line["type"] == "reward")
+            .collect();
+        assert_eq!(rewards.len(), 1, "{lines:?}");
+        let reward = rewards[0];
+        assert_eq!(reward["agent"], "a", "the agent rewarded, not the payer");
+        assert_eq!(reward["value"], 7);
+        assert!(
+            reward["seq"].is_null(),
+            "a reward carries no sequence number: {reward}"
+        );
+        assert!(
+            reward["received"].is_null(),
+            "a reward is logged, never sent: {reward}"
+        );
+        assert!(reward["created"].is_u64(), "{reward}");
+        // Nobody observed it: a reward is not a delivery, so it never
+        // touched the in-flight count and never reached a queue.
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line["type"] == "observation")
+                .count(),
+            0
+        );
+        // And it was logged before the stop it precedes.
+        let stop = lines
+            .iter()
+            .find(|line| {
+                line["agent"] == "a" && line["type"] == "control" && line["control"] == "stop"
+            })
+            .expect("a was stopped");
+        assert!(reward["created"].as_u64() <= stop["created"].as_u64());
+    }
+
+    #[test]
+    fn a_reward_for_an_agent_not_in_the_roster_fails_the_episode() {
+        // The router rejects it the way it rejects a control addressed to
+        // a stranger: the episode stops and says whose bug it is.
+        let (episode, _writer) = paid("nobody", 1);
+        assert_eq!(
+            episode.run().unwrap_err(),
+            EpisodeError::Route {
+                agent: AgentId::new(REFEREE),
+                error: RouteError::UnknownAgent(AgentId::new("nobody")),
+            }
+        );
+    }
+
+    #[test]
+    fn an_environment_that_rewards_itself_fails_the_episode() {
+        // The environment runs the game rather than playing it, so there
+        // is nothing its own behavior could be worth.
+        let (episode, _writer) = paid(REFEREE, 1);
+        assert_eq!(
+            episode.run().unwrap_err(),
+            EpisodeError::Route {
+                agent: AgentId::new(REFEREE),
+                error: RouteError::Loopback(AgentId::new(REFEREE)),
+            }
+        );
     }
 
     /// An environment that starts its agents and never stops them, so that
