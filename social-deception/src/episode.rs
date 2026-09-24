@@ -289,6 +289,10 @@ impl<D: Domain> Episode<D> {
             environment_id.clone(),
             Box::new(Adapter::new(
                 environment,
+                ids.iter()
+                    .filter(|id| **id != environment_id)
+                    .cloned()
+                    .collect(),
                 asked_for,
                 paid,
                 records.clone(),
@@ -546,6 +550,10 @@ fn drive<D: Domain>(
             // is already in the trajectory and is not a delivery, so
             // nothing here adds to the in-flight count. What is left is
             // whether the environment named an agent it could reward.
+            // Only a refusal arrives here: the adapter writes a reward it
+            // accepts and says nothing. What comes is a name it would not
+            // write, which the router turns into the error it would give
+            // for addressing that name.
             while let Ok(Rewarded { agent }) = rewarded.try_recv() {
                 router.rewardable(environment, &agent).map_err(refused)?;
             }

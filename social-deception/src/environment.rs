@@ -240,12 +240,13 @@ pub struct Commanded {
     pub control: Control,
 }
 
-/// One agent an environment has rewarded, on its way to the episode for
-/// checking.
+/// An agent an environment tried to reward and could not: one that is not
+/// in the roster, or the environment itself.
 ///
-/// The record itself has already been written by the time this is sent; see
-/// [`Adapter`]. What travels here is only the claim the episode has to
-/// check, which is that the agent is one it could be rewarding at all.
+/// Only a refusal travels here. A reward the adapter accepts is written and
+/// nothing is sent; this says the environment named somebody it could not
+/// be rewarding, which is a bug in the environment, and the episode turns
+/// it into the same error the router would give for addressing a stranger.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rewarded {
     /// The agent rewarded.
@@ -259,8 +260,7 @@ pub struct Rewarded {
 /// to the loop, which stamps, records and dispatches them as it would any
 /// agent's; the controls go on `commands`, a channel the episode drains;
 /// and a reward is **written to the trajectory here**, the instant the
-/// handler returns it, with the id of the agent it is rewarded to on
-/// `rewards` for the episode to check.
+/// handler returns it, if it names somebody this episode can reward.
 ///
 /// # Why a reward is written here and not by the episode
 ///
@@ -272,12 +272,14 @@ pub struct Rewarded {
 /// scheduling delay between the instant the record claims and the instant
 /// it was made.
 ///
-/// The episode still has to see it, because whether the agent named is one
-/// this episode could reward is the roster's question and the adapter has
-/// no roster. So the id goes on `rewards`, and the episode checks it where
-/// it drains `commands`. A record written for an agent that turns out not
-/// to exist is a record in a trajectory the episode is about to fail and
-/// abandon, which is where the rest of that failure's evidence lives too.
+/// Whether the agent named is one this episode could reward is the
+/// roster's question, and the roster is settled before any thread is
+/// spawned, so the adapter is handed it and answers before it writes. A
+/// reward for a stranger is therefore never written at all, rather than
+/// written and then disowned: the episode is about to fail, and a
+/// trajectory holding a reward for an agent that has no trajectory would
+/// be evidence of nothing. The name goes on `rewards` instead, and the
+/// episode fails the episode where it drains `commands`.
 ///
 /// # The ordering the two channels keep
 ///
@@ -292,6 +294,10 @@ pub struct Rewarded {
 /// than stopping with the narration still on its queue and never seeing it.
 pub struct Adapter<D: Domain, E> {
     environment: E,
+    /// Whom this episode may reward: every agent in the roster but the
+    /// environment itself. Fixed before any thread is spawned and never
+    /// added to, so the adapter can answer the question rather than ask.
+    rewardable: BTreeSet<AgentId>,
     commands: Sender<Commanded>,
     rewards: Sender<Rewarded>,
     records: Sender<LogRecord<D>>,
@@ -304,6 +310,7 @@ impl<D: Domain, E: Environment<D>> Adapter<D, E> {
     /// naming each rewarded agent on `rewards` for the episode to check.
     pub const fn new(
         environment: E,
+        rewardable: BTreeSet<AgentId>,
         commands: Sender<Commanded>,
         rewards: Sender<Rewarded>,
         records: Sender<LogRecord<D>>,
@@ -311,6 +318,7 @@ impl<D: Domain, E: Environment<D>> Adapter<D, E> {
     ) -> Self {
         Self {
             environment,
+            rewardable,
             commands,
             rewards,
             records,
@@ -339,16 +347,24 @@ impl<D: Domain, E: Environment<D>> Adapter<D, E> {
                     let _ = self.commands.send(Commanded { to, control });
                 }
                 Effect::Reward { agent, value } => {
-                    // Written first and stamped now, so that `created` is
-                    // the instant the reward was decided rather than the
-                    // instant anybody got around to it.
+                    // Checked before it is written, so that a trajectory
+                    // never carries a reward for somebody who has none:
+                    // the roster is settled before any thread starts, so
+                    // the answer is here to be had rather than somewhere
+                    // to be asked.
+                    if !self.rewardable.contains(&agent) {
+                        let _ = self.rewards.send(Rewarded { agent });
+                        continue;
+                    }
+                    // Stamped now, so that `created` is the instant the
+                    // reward was decided rather than the instant anybody
+                    // got around to it.
                     let record = RewardRecord {
-                        agent: agent.clone(),
+                        agent,
                         created: self.clock.now(),
                         value,
                     };
                     let _ = self.records.send(record.into());
-                    let _ = self.rewards.send(Rewarded { agent });
                 }
             }
         }
@@ -414,7 +430,14 @@ mod tests {
         let (paid, rewarded) = unbounded();
         let (recorder, records) = unbounded();
         Rig {
-            adapter: Adapter::new(Opener, commands, paid, recorder, Clock::start()),
+            adapter: Adapter::new(
+                Opener,
+                ids(["a", "b"]),
+                commands,
+                paid,
+                recorder,
+                Clock::start(),
+            ),
             commanded,
             rewarded,
             records,
@@ -466,9 +489,54 @@ mod tests {
             rig.records.try_recv().is_err(),
             "one effect writes one record"
         );
-        // And the episode is told whom to check, the record having already
-        // been written.
-        assert_eq!(rig.rewarded.try_recv(), Ok(Rewarded { agent: id("a") }));
+        // And the episode is told nothing: a reward the adapter accepts
+        // needs no checking, because the checking is why it was written.
+        assert!(
+            rig.rewarded.try_recv().is_err(),
+            "an accepted reward is not reported"
+        );
+    }
+
+    /// An environment that rewards somebody who is not in the roster.
+    struct Stranger;
+
+    impl Environment<TestDomain> for Stranger {
+        fn start(&mut self) -> Vec<Effect<TestDomain>> {
+            vec![Effect::reward("nobody", 1)]
+        }
+
+        fn handle(&mut self, _: &[Observation<TestDomain>], _: &Cancel) -> Vec<Effect<TestDomain>> {
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn a_reward_for_somebody_outside_the_roster_is_reported_and_not_written() {
+        // The episode is about to fail. A trajectory carrying a reward for
+        // an agent that has no trajectory would be evidence of nothing, so
+        // the name is reported and the line is never written.
+        let (commands, _commanded) = unbounded();
+        let (paid, rewarded) = unbounded();
+        let (recorder, records) = unbounded::<LogRecord<TestDomain>>();
+        let mut adapter = Adapter::new(
+            Stranger,
+            ids(["a", "b"]),
+            commands,
+            paid,
+            recorder,
+            Clock::start(),
+        );
+        assert!(adapter.start().is_empty());
+        assert_eq!(
+            rewarded.try_recv(),
+            Ok(Rewarded {
+                agent: id("nobody")
+            })
+        );
+        assert!(
+            records.try_recv().is_err(),
+            "a reward for a stranger is not written"
+        );
     }
 
     #[test]

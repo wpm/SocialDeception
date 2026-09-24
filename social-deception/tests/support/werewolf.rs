@@ -651,20 +651,6 @@ impl<'a> Play<'a> {
                 self.role(who),
                 self.outcome.winner
             );
-            // Before the stop that ends its trajectory: a reward assigned
-            // afterwards would be scoring an episode already over for it.
-            let stop = lines
-                .iter()
-                .find(|other| {
-                    other["type"] == "control"
-                        && other["control"] == "stop"
-                        && super::agent(other) == who.as_str()
-                })
-                .unwrap_or_else(|| panic!("{who} was stopped"));
-            assert!(
-                line["created"].as_u64() <= stop["created"].as_u64(),
-                "{who}'s reward was logged before its stop: {line} against {stop}"
-            );
         }
         assert!(
             !rewards.contains_key(&self.config.moderator),
@@ -1609,10 +1595,12 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "was logged before its stop")]
+    #[should_panic(expected = "logged before the stop that ends its agent's trajectory")]
     fn a_reward_logged_after_its_agents_stop_is_caught() {
         // An agent's trajectory ends at its stop, so a reward stamped
         // after one is scoring an episode that was already over for it.
+        // The claim is the shared checker's, since it holds of any
+        // environment's rewards and not only Werewolf's.
         let mut lines = fixture();
         let index = reward_of(&lines, "grace");
         let stop = lines
@@ -1620,7 +1608,7 @@ mod tests {
             .find(|line| line["agent"] == "grace" && line["control"] == "stop")
             .expect("grace is stopped");
         lines[index]["created"] = json!(stop["created"].as_u64().unwrap() + 1);
-        check(&lines, &config());
+        super::super::check(&lines);
     }
 
     #[test]
