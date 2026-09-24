@@ -84,15 +84,20 @@ fn run(ring: &Ring) -> Vec<Value> {
     lines
 }
 
-/// The step a message record carries, as the chain's name and the value, or
-/// `None` for a control or a think.
+/// The step a record's event carries, as the chain's name and the value, or
+/// `None` for a control or a cycle.
 fn step(record: &Value) -> Option<(u64, u64)> {
     let step = &record["event"]["payload"]["Step"];
     Some((step["chain"].as_u64()?, step["value"].as_u64()?))
 }
 
+/// The records of `lines` of the given type.
+fn of<'a>(lines: &'a [Value], kind: &'a str) -> impl Iterator<Item = &'a Value> {
+    lines.iter().filter(move |line| line["type"] == kind)
+}
+
 fn cycles(lines: &[Value]) -> impl Iterator<Item = &Value> {
-    lines.iter().filter(|line| line["type"] == "cycle")
+    of(lines, "cycle")
 }
 
 /// The steps a cycle sent, in order.
@@ -104,23 +109,32 @@ fn outputs(cycle: &Value, records: &HashMap<(&str, u64), &Value>) -> Vec<(u64, u
 }
 
 /// Asserts that every cycle sent exactly what the rule says its inputs call
-/// for, in order: the agent's own chains on `Start`, each at its starting
-/// value; the next value of the same chain for each value above 1; and
-/// nothing for a 1, a stop or a think.
+/// for, in order: the agent's own chains when it pops its start, each at its
+/// starting value; the next value of the same chain for each value above 1;
+/// and nothing for a 1 or a stop.
+///
+/// The chains an agent opens are sent in the cycle that popped its start,
+/// because that is the cycle in which the loop calls the start hook, and
+/// they come first in it, ahead of anything that cycle also observed.
 fn every_hop_follows_the_rule(lines: &[Value], ring: &Ring) {
     let opens: HashMap<&str, &[u64]> = ring.iter().copied().collect();
     let records = support::records(lines);
     for cycle in cycles(lines) {
         let agent = support::agent(cycle);
-        let expected: Vec<(u64, u64)> = support::seqs(cycle, "inputs")
+        let inputs: Vec<&Value> = support::seqs(cycle, "inputs")
             .map(|seq| records[&(agent, seq)])
-            .flat_map(
-                |input| match (input["event"]["control"].as_str(), step(input)) {
-                    (Some("start"), _) => opens[agent].iter().map(|&s| (s, s)).collect(),
-                    (_, Some((_, 1)) | None) => Vec::new(),
-                    (_, Some((chain, n))) => vec![(chain, successor(n))],
-                },
-            )
+            .collect();
+        let opened: Vec<(u64, u64)> = if inputs.iter().any(|input| input["control"] == "start") {
+            opens[agent].iter().map(|&s| (s, s)).collect()
+        } else {
+            Vec::new()
+        };
+        let expected: Vec<(u64, u64)> = opened
+            .into_iter()
+            .chain(inputs.iter().flat_map(|input| match step(input) {
+                Some((_, 1)) | None => Vec::new(),
+                Some((chain, n)) => vec![(chain, successor(n))],
+            }))
             .collect();
         assert_eq!(outputs(cycle, &records), expected, "the outputs of {cycle}");
     }
@@ -128,15 +142,18 @@ fn every_hop_follows_the_rule(lines: &[Value], ring: &Ring) {
 
 /// Every chain in `lines`, by name, each in the order it was passed.
 ///
-/// A chain is followed hop by hop from the record of a step's arrival to
-/// the output of the cycle that handled it, so the order recovered is causal
+/// A chain is followed hop by hop from the observation of a step to the
+/// output of the cycle that handled it, so the order recovered is causal
 /// and owes nothing to timestamps. A chain begins at the step that carries
-/// its name as its value, which is what its opener sends on `Start`.
+/// its name as its value, which is what its opener sends when it starts.
 fn chains(lines: &[Value]) -> BTreeMap<u64, Vec<u64>> {
     let records = support::records(lines);
     let mut arrivals: HashMap<(u64, u64), (&str, u64)> = HashMap::new();
     for (&(agent, seq), record) in &records {
-        if let Some(step) = step(record).filter(|_| !record["arrived"].is_null()) {
+        if record["type"] != "observation" {
+            continue;
+        }
+        if let Some(step) = step(record) {
             assert!(
                 arrivals.insert(step, (agent, seq)).is_none(),
                 "a chain never carries the same value twice: {step:?}"
@@ -179,9 +196,7 @@ fn chains(lines: &[Value]) -> BTreeMap<u64, Vec<u64>> {
 
 /// Every step sent by anyone, in ascending order.
 fn steps_sent(lines: &[Value]) -> Vec<(u64, u64)> {
-    let mut steps: Vec<(u64, u64)> = lines
-        .iter()
-        .filter(|line| !line["sent"].is_null())
+    let mut steps: Vec<(u64, u64)> = of(lines, "action")
         .map(|line| step(line).expect("an agent only ever sends a step"))
         .collect();
     steps.sort_unstable();
@@ -201,10 +216,10 @@ fn check_outcome(lines: &[Value], ring: &Ring) {
         .enumerate()
         .map(|(i, (name, _))| (*name, passes_to(ring, i)))
         .collect();
-    for line in lines.iter().filter(|line| !line["sent"].is_null()) {
+    for line in of(lines, "action") {
         let recipients = line["event"]["recipients"]
             .as_array()
-            .expect("a message lists its recipients");
+            .expect("an event lists its recipients");
         assert_eq!(
             recipients.as_slice(),
             [Value::from(next[support::agent(line)])],
@@ -264,45 +279,50 @@ fn chains_that_share_a_value_stay_apart() {
 /// one cycle. The runtime makes such cycles likely but not certain, so the
 /// case is pinned down here rather than hoped for in a live episode.
 fn mixed_drains() -> Vec<Value> {
-    let control = |agent: &str, seq: u64, time: u64, control: &str| {
-        serde_json::json!({"type": "event", "agent": agent, "seq": seq, "arrived": time,
-                           "event": {"kind": "control", "control": control}})
+    let control = |agent: &str, seq: u64, created: u64, received: u64, control: &str| {
+        serde_json::json!({"type": "control", "agent": agent, "seq": seq, "created": created,
+                           "received": received, "control": control})
     };
-    let step = |agent: &str, seq: u64, stamp: &str, time: u64, chain: u64, value: u64| {
+    // An action and the observation of it carry the same `created`: they are
+    // the same event from its two ends, and that is what joins them.
+    let action = |agent: &str, seq: u64, created: u64, chain: u64, value: u64| {
         let other = if agent == "a" { "b" } else { "a" };
-        let (sender, recipient) = if stamp == "sent" {
-            (agent, other)
-        } else {
-            (other, agent)
-        };
-        serde_json::json!({"type": "event", "agent": agent, "seq": seq, stamp: time,
-                           "event": {"kind": "message", "sender": sender, "recipients": [recipient],
+        serde_json::json!({"type": "action", "agent": agent, "seq": seq, "created": created,
+                           "event": {"sender": agent, "recipients": [other],
                                      "payload": {"Step": {"chain": chain, "value": value}}}})
     };
+    let observation =
+        |agent: &str, seq: u64, created: u64, received: u64, chain: u64, value: u64| {
+            let other = if agent == "a" { "b" } else { "a" };
+            serde_json::json!({"type": "observation", "agent": agent, "seq": seq,
+                               "created": created, "received": received,
+                               "event": {"sender": other, "recipients": [agent],
+                                         "payload": {"Step": {"chain": chain, "value": value}}}})
+        };
     let cycle = |agent: &str, t_start: u64, t_stop: u64, inputs: &[u64], outputs: &[u64]| {
         serde_json::json!({"type": "cycle", "agent": agent, "t_start": t_start, "t_stop": t_stop,
-                           "inputs": inputs, "outputs": outputs})
+                           "woken": "queue", "inputs": inputs, "outputs": outputs})
     };
     vec![
-        control("a", 0, 10, "start"),
-        step("a", 1, "sent", 20, 4, 4),
-        step("a", 2, "sent", 21, 2, 2),
+        control("a", 0, 10, 15, "start"),
+        action("a", 1, 20, 4, 4),
+        action("a", 2, 21, 2, 2),
         cycle("a", 15, 25, &[0], &[1, 2]),
-        control("b", 0, 10, "start"),
-        step("b", 1, "arrived", 20, 4, 4),
-        step("b", 2, "arrived", 21, 2, 2),
-        step("b", 3, "sent", 40, 4, 2),
-        step("b", 4, "sent", 41, 2, 1),
+        control("b", 0, 10, 30, "start"),
+        observation("b", 1, 20, 30, 4, 4),
+        observation("b", 2, 21, 30, 2, 2),
+        action("b", 3, 40, 4, 2),
+        action("b", 4, 41, 2, 1),
         cycle("b", 30, 45, &[0, 1, 2], &[3, 4]),
-        step("a", 3, "arrived", 40, 4, 2),
-        step("a", 4, "arrived", 41, 2, 1),
-        step("a", 5, "sent", 60, 4, 1),
+        observation("a", 3, 40, 50, 4, 2),
+        observation("a", 4, 41, 50, 2, 1),
+        action("a", 5, 60, 4, 1),
         cycle("a", 50, 65, &[3, 4], &[5]),
-        step("b", 5, "arrived", 60, 4, 1),
+        observation("b", 5, 60, 70, 4, 1),
         cycle("b", 70, 75, &[5], &[]),
-        control("a", 6, 80, "stop"),
+        control("a", 6, 80, 85, "stop"),
         cycle("a", 85, 86, &[6], &[]),
-        control("b", 6, 80, "stop"),
+        control("b", 6, 80, 85, "stop"),
         cycle("b", 85, 86, &[6], &[]),
     ]
 }
@@ -343,10 +363,7 @@ fn a_ring_that_opens_nothing_goes_quiescent_at_once() {
     let ring: &Ring = &[("a", &[]), ("b", &[])];
     let lines = run(ring);
     assert!(chains(&lines).is_empty());
-    let controls: Vec<&Value> = lines
-        .iter()
-        .filter(|line| line["event"]["kind"] == "control")
-        .collect();
+    let controls: Vec<&Value> = of(&lines, "control").collect();
     assert_eq!(
         controls.len(),
         4,

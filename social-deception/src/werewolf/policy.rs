@@ -1,5 +1,5 @@
 //! The decision boundary: a [`Policy`] is handed what an agent sees and
-//! returns one [`Move`](super::Move).
+//! returns one [`Move`].
 //!
 //! A policy is a conditional distribution over the action space given the
 //! state, in the vocabulary the [module](super) documentation states and

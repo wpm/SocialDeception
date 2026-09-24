@@ -22,9 +22,11 @@
 //! # Only the moderator's records
 //!
 //! [`Transcript::read`] reads the moderator's records and nobody else's. The
-//! moderator is the authoritative view: its sent records are every narration
-//! and every request, and its arrived records are every response, with the
-//! responding player as sender. Reassembling the game from the players'
+//! moderator is the authoritative view: its `action` records are every
+//! narration and every request it sent, and its `observation` records are
+//! every response it received, each naming the responding player as its
+//! sender. Which record type a line is *is* the direction, so the reader
+//! needs no direction of its own. Reassembling the game from the players'
 //! records would mean recovering hidden information from partial views,
 //! which is the thing the design prevents. Within one agent's records the
 //! runtime guarantees that sequence numbers are contiguous and increasing in
@@ -125,7 +127,7 @@ pub enum TranscriptError {
         /// The line.
         line: usize,
     },
-    /// A record's `type` is neither `event` nor `cycle`.
+    /// A record's `type` is not one the runtime writes.
     UnknownRecordType {
         /// The line.
         line: usize,
@@ -173,7 +175,7 @@ pub enum TranscriptError {
         line: usize,
     },
     /// A message the moderator never records: a narration or a request
-    /// arriving at it, or a response sent by it.
+    /// observed by it, or a response it took as an action.
     Misdirected {
         /// The line.
         line: usize,
@@ -252,11 +254,23 @@ pub fn lines(text: &str) -> Result<Vec<Value>, TranscriptError> {
         .collect()
 }
 
-/// Which way a message crossed the moderator's boundary.
+/// Which way a message crossed the moderator's boundary, which is which of
+/// the two record types it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Direction {
+    /// An `action` record: something the moderator sent.
     Sent,
-    Arrived,
+    /// An `observation` record: something the moderator received.
+    Received,
+}
+
+/// One record of the moderator's, still as JSON.
+///
+/// `direction` is `None` for a control, which carries a sequence number and
+/// so must be counted, but says nothing about the game and is not decoded.
+struct Line<'a> {
+    record: &'a Map<String, Value>,
+    direction: Option<Direction>,
 }
 
 /// One message record of the moderator's, with its envelope decoded.
@@ -285,9 +299,12 @@ impl Transcript {
         let mut next_seq = 0;
         for (index, value) in lines.iter().enumerate() {
             let line = index + 1;
-            let Some(record) = moderator_event(value, line, moderator)? else {
+            let Some(Line { record, direction }) = moderator_record(value, line, moderator)? else {
                 continue;
             };
+            // The moderator's controls are counted but not read: they carry
+            // a sequence number, so skipping them without counting would
+            // look like a gap, and they say nothing about the game.
             let seq = integer(record, "seq", line)?;
             if seq != next_seq {
                 return Err(TranscriptError::SeqGap {
@@ -297,8 +314,8 @@ impl Transcript {
                 });
             }
             next_seq += 1;
-            if let Some(record) = message(record, line)? {
-                reader.fold(record)?;
+            if let Some(direction) = direction {
+                reader.fold(message(record, direction, line)?)?;
             }
         }
         let outcome = reader.outcome.ok_or(TranscriptError::NoOutcome)?;
@@ -310,18 +327,25 @@ impl Transcript {
     }
 }
 
-/// The event record on `value` if it is the moderator's, `None` if it is a
-/// cycle record or another agent's, and an error if it is not a record.
-fn moderator_event<'a>(
+/// One of the moderator's records, and which way its event went; `None` for
+/// a cycle record or another agent's, and an error for something that is not
+/// a record at all.
+///
+/// The direction is `None` for the moderator's own controls. They say
+/// nothing about the game, but they carry sequence numbers, so the caller
+/// must count them or the numbers look full of gaps.
+fn moderator_record<'a>(
     value: &'a Value,
     line: usize,
     moderator: &AgentId,
-) -> Result<Option<&'a Map<String, Value>>, TranscriptError> {
+) -> Result<Option<Line<'a>>, TranscriptError> {
     let record = value
         .as_object()
         .ok_or(TranscriptError::NotAnObject { line })?;
-    match record.get("type").and_then(Value::as_str) {
-        Some("event") => {}
+    let direction = match record.get("type").and_then(Value::as_str) {
+        Some("action") => Some(Direction::Sent),
+        Some("observation") => Some(Direction::Received),
+        Some("control") => None,
         Some("cycle") => return Ok(None),
         found => {
             return Err(TranscriptError::UnknownRecordType {
@@ -329,26 +353,21 @@ fn moderator_event<'a>(
                 found: found.map(str::to_owned),
             });
         }
-    }
+    };
     let agent = string(record, "agent", line)?;
-    Ok((agent == moderator.as_str()).then_some(record))
+    Ok((agent == moderator.as_str()).then_some(Line { record, direction }))
 }
 
-/// Decodes an event record's envelope and payload, or returns `None` for a
-/// control event or a think, which say nothing about the game.
-fn message(record: &Map<String, Value>, line: usize) -> Result<Option<Record>, TranscriptError> {
+/// Decodes an event record's envelope and payload.
+fn message(
+    record: &Map<String, Value>,
+    direction: Direction,
+    line: usize,
+) -> Result<Record, TranscriptError> {
     let event = record
         .get("event")
         .and_then(Value::as_object)
         .ok_or_else(|| malformed(line, "no event"))?;
-    if string(event, "kind", line)? != "message" {
-        return Ok(None);
-    }
-    let direction = match (record.get("sent"), record.get("arrived")) {
-        (Some(_), None) => Direction::Sent,
-        (None, Some(_)) => Direction::Arrived,
-        _ => return Err(malformed(line, "a message is stamped sent or arrived")),
-    };
     let sender: AgentId = decode(event, "sender", line)?;
     let recipients: BTreeSet<AgentId> = decode(event, "recipients", line)?;
     let payload = event
@@ -356,13 +375,13 @@ fn message(record: &Map<String, Value>, line: usize) -> Result<Option<Record>, T
         .ok_or_else(|| malformed(line, "no payload"))?;
     let message = Message::deserialize(payload)
         .map_err(|source| TranscriptError::Payload { line, source })?;
-    Ok(Some(Record {
+    Ok(Record {
         line,
         direction,
         sender,
         recipients,
         message,
-    }))
+    })
 }
 
 fn malformed(line: usize, what: &str) -> TranscriptError {
@@ -440,7 +459,7 @@ impl Reader {
                 self.narrated(line, recipients, narration)
             }
             (Direction::Sent, Message::Request(request)) => self.asked(line, recipients, &request),
-            (Direction::Arrived, Message::Response(response)) => {
+            (Direction::Received, Message::Response(response)) => {
                 self.answered(line, sender, response)
             }
             _ => Err(TranscriptError::Misdirected { line }),
@@ -774,8 +793,8 @@ mod tests {
                 },
                 RoundRecord {
                     round: Round(2),
-                    // The pack agrees on carol, and the doctor, barred from
-                    // protecting alice again, protects erin instead.
+                    // The pack agrees on carol, whom the doctor did not
+                    // protect, and the seer finds a werewolf too late.
                     night: phase(
                         ["bob", "carol", "dave", "erin", "frank", "grace"],
                         moves([
@@ -862,7 +881,7 @@ mod tests {
     fn rewritten() -> Vec<Value> {
         let mut lines = fixture();
         for (offset, line) in lines.iter_mut().enumerate() {
-            for key in ["arrived", "sent", "due", "t_start", "t_stop"] {
+            for key in ["created", "received", "t_start", "t_stop"] {
                 if let Some(time) = line.get_mut(key) {
                     *time = json!(1_000_000 + offset);
                 }
@@ -895,14 +914,14 @@ mod tests {
         assert!(matches!(error, TranscriptError::NoOutcome), "{error:?}");
     }
 
-    /// The index of the first moderator event record whose payload
-    /// satisfies `matching`, and the record itself.
+    /// The index of the first of the moderator's records that carries an
+    /// event whose payload satisfies `matching`.
     fn moderator_record(lines: &[Value], matching: impl Fn(&Value) -> bool) -> usize {
         lines
             .iter()
             .position(|line| {
                 line["agent"] == MODERATOR
-                    && line["type"] == "event"
+                    && (line["type"] == "action" || line["type"] == "observation")
                     && matching(&line["event"]["payload"])
             })
             .expect("the fixture has such a record")
@@ -983,14 +1002,30 @@ mod tests {
                 "{key}: {error:?}"
             );
         }
-        let mut lines = fixture();
-        lines[index]["sent"] = lines[index]["arrived"].clone();
-        let error = read(&lines).unwrap_err();
-        assert!(
-            matches!(error, TranscriptError::Malformed { .. }),
-            "{error:?}"
-        );
-        assert!(error.to_string().contains("sent or arrived"), "{error}");
+        for key in ["sender", "recipients", "payload"] {
+            let mut lines = fixture();
+            lines[index]["event"].as_object_mut().unwrap().remove(key);
+            let error = read(&lines).unwrap_err();
+            assert!(
+                matches!(&error, TranscriptError::Malformed { line, what }
+                    if *line == index + 1 && what.starts_with(&format!("no {key}"))),
+                "{key}: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_control_record_says_nothing_about_the_game_and_is_skipped() {
+        // The moderator's own start and stop are in the file and count
+        // toward its sequence numbers, and the reader steps over them
+        // without taking them for messages.
+        let lines = fixture();
+        let controls = lines
+            .iter()
+            .filter(|line| line["agent"] == MODERATOR && line["type"] == "control")
+            .count();
+        assert_eq!(controls, 2, "the moderator was started and stopped");
+        read(&lines).unwrap();
     }
 
     #[test]
@@ -1182,12 +1217,11 @@ mod tests {
 
     #[test]
     fn a_message_the_moderator_never_records_is_an_error() {
-        // A response the moderator sent.
+        // A response the moderator took as an action of its own.
         let mut lines = fixture();
         let index = moderator_record(&lines, is_response);
-        let record = lines[index].as_object_mut().unwrap();
-        let time = record.remove("arrived").unwrap();
-        record.insert("sent".to_owned(), time);
+        lines[index]["type"] = json!("action");
+        lines[index].as_object_mut().unwrap().remove("received");
         let error = read(&lines).unwrap_err();
         assert!(
             matches!(error, TranscriptError::Misdirected { line } if line == index + 1),
@@ -1195,12 +1229,11 @@ mod tests {
         );
         assert!(error.to_string().contains("never records"), "{error}");
 
-        // A narration that arrived at the moderator.
+        // A narration the moderator observed rather than sent.
         let mut lines = fixture();
         let index = moderator_record(&lines, |payload| !payload["Narration"].is_null());
-        let record = lines[index].as_object_mut().unwrap();
-        let time = record.remove("sent").unwrap();
-        record.insert("arrived".to_owned(), time);
+        lines[index]["type"] = json!("observation");
+        lines[index]["received"] = lines[index]["created"].clone();
         let error = read(&lines).unwrap_err();
         assert!(
             matches!(error, TranscriptError::Misdirected { .. }),
@@ -1224,26 +1257,32 @@ mod tests {
             }
         }
 
+        /// One record of the moderator's, of the given type, with stamps
+        /// invented from the sequence number: every record needs a
+        /// `created`, and an `observation` a `received` as well.
         fn record(
             &mut self,
-            stamp: &str,
+            kind: &str,
             sender: &str,
             recipients: &BTreeSet<AgentId>,
             payload: &Message,
         ) {
             let seq = self.lines.len();
-            self.lines.push(json!({
-                "type": "event",
+            let mut line = json!({
+                "type": kind,
                 "agent": MODERATOR,
                 "seq": seq,
-                stamp: seq * 10,
+                "created": seq * 10,
                 "event": {
-                    "kind": "message",
                     "sender": sender,
                     "recipients": recipients,
                     "payload": payload,
                 },
-            }));
+            });
+            if kind == "observation" {
+                line["received"] = json!(seq * 10 + 1);
+            }
+            self.lines.push(line);
         }
 
         fn directives(&mut self, directives: Vec<Directive>) {
@@ -1255,13 +1294,13 @@ mod tests {
                         (self.players.clone(), Message::Narration(narration))
                     }
                 };
-                self.record("sent", MODERATOR, &to, &payload);
+                self.record("action", MODERATOR, &to, &payload);
             }
         }
 
         fn response(&mut self, from: &str, response: Response) {
             self.record(
-                "arrived",
+                "observation",
                 from,
                 &ids([MODERATOR]),
                 &Message::Response(response),

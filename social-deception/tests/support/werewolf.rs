@@ -3,10 +3,11 @@
 //!
 //! The checks are written against the parsed lines, the way the runtime's
 //! own checks are, and read the game the way the transcript reader does:
-//! from the moderator's records, which are every narration and request it
-//! sent and every response it received, in the order it recorded them. The
-//! players' records are consulted only for what the moderator cannot vouch
-//! for, which is what actually arrived at each of them.
+//! from the moderator's records, whose `action` records are every narration
+//! and request it sent and whose `observation` records are every response it
+//! received, in the order it recorded them. The players' records are
+//! consulted only for what the moderator cannot vouch for, which is what
+//! actually reached each of them.
 //!
 //! They fall into four groups:
 //!
@@ -115,19 +116,16 @@ fn recipients(line: &Value) -> BTreeSet<AgentId> {
     BTreeSet::deserialize(&line["event"]["recipients"]).expect("a message lists its recipients")
 }
 
-/// The message records of `agent` that crossed its boundary in the
-/// direction `stamp` names, `"sent"` or `"arrived"`, in file order.
+/// The records of `agent` of the given type, `"action"` for what it sent or
+/// `"observation"` for what it received, in file order.
 fn records_of<'a>(
     lines: &'a [Value],
     agent: &'a AgentId,
-    stamp: &'a str,
+    kind: &'a str,
 ) -> impl Iterator<Item = &'a Value> {
-    lines.iter().filter(move |line| {
-        line["type"] == "event"
-            && line["event"]["kind"] == "message"
-            && super::agent(line) == agent.as_str()
-            && !line[stamp].is_null()
-    })
+    lines
+        .iter()
+        .filter(move |line| line["type"] == kind && super::agent(line) == agent.as_str())
 }
 
 /// The one recipient of a message addressed to a single player.
@@ -169,7 +167,7 @@ impl<'a> Play<'a> {
     /// eliminated twice, or a game without an outcome.
     fn read(lines: &'a [Value], config: &'a Config) -> Self {
         let players: BTreeSet<&AgentId> = config.players.iter().collect();
-        let said: Vec<Said> = records_of(lines, &config.moderator, "sent")
+        let said: Vec<Said> = records_of(lines, &config.moderator, "action")
             .map(|line| {
                 let message = message(line);
                 assert!(
@@ -189,7 +187,7 @@ impl<'a> Play<'a> {
                 }
             })
             .collect();
-        let heard: Vec<Heard> = records_of(lines, &config.moderator, "arrived")
+        let heard: Vec<Heard> = records_of(lines, &config.moderator, "observation")
             .map(|line| {
                 let Message::Response(response) = message(line) else {
                     panic!("the moderator hears only responses: {line}");
@@ -564,22 +562,23 @@ impl<'a> Play<'a> {
         );
     }
 
-    /// What the players' own records show: each sent nothing but responses,
-    /// to the moderator alone; each received its role exactly once, the one
-    /// the moderator dealt it, and the outcome as the last thing; and a
-    /// dead player received nothing between its own death and the outcome.
-    /// And the roles dealt are the ones configured.
+    /// What the players' own records show: each took no action but a
+    /// response, to the moderator alone; each observed its role exactly
+    /// once, the one the moderator dealt it, and the outcome as the last
+    /// thing; and a dead player observed nothing between its own death and
+    /// the outcome. And the roles dealt are the ones configured.
     fn check_players(&self, lines: &[Value]) {
         let moderator = BTreeSet::from([self.config.moderator.clone()]);
         for who in &self.config.players {
-            for line in records_of(lines, who, "sent") {
+            for line in records_of(lines, who, "action") {
                 assert!(
                     matches!(message(line), Message::Response(_)) && recipients(line) == moderator,
                     "a player sends only responses, to the moderator alone: {line}"
                 );
             }
-            let arrived: Vec<Message> = records_of(lines, who, "arrived").map(message).collect();
-            let assigned: Vec<&Role> = arrived
+            let received: Vec<Message> =
+                records_of(lines, who, "observation").map(message).collect();
+            let assigned: Vec<&Role> = received
                 .iter()
                 .filter_map(|message| match message {
                     Message::Narration(Narration::Assigned { role, .. }) => Some(role),
@@ -591,7 +590,7 @@ impl<'a> Play<'a> {
                 [&self.role(who)],
                 "{who} is assigned its role exactly once"
             );
-            let last = arrived
+            let last = received
                 .last()
                 .unwrap_or_else(|| panic!("{who} received nothing"));
             assert_eq!(
@@ -599,14 +598,14 @@ impl<'a> Play<'a> {
                 Some(&self.outcome),
                 "the last thing {who} received is the outcome"
             );
-            let death = arrived.iter().position(|message| {
+            let death = received.iter().position(|message| {
                 matches!(message, Message::Narration(Narration::Eliminated { who: dead, .. }) if dead == who)
             });
             match death {
                 Some(death) => assert_eq!(
-                    arrived.len(),
+                    received.len(),
                     death + 2,
-                    "a dead player receives nothing between its death and the outcome: {who}"
+                    "a dead player observes nothing between its death and the outcome: {who}"
                 ),
                 None => assert!(
                     self.outcome.living.contains(who),
@@ -822,7 +821,7 @@ impl PhaseCounts {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
+    use serde_json::{Map, json};
 
     use super::*;
 
@@ -857,16 +856,13 @@ mod tests {
             .collect()
     }
 
-    /// The index of the first message record of `agent` in the direction
-    /// `stamp` whose payload satisfies `wanted`.
-    fn find(lines: &[Value], agent: &str, stamp: &str, wanted: impl Fn(&Value) -> bool) -> usize {
+    /// The index of the first record of `agent` of the given type whose
+    /// payload satisfies `wanted`.
+    fn find(lines: &[Value], agent: &str, kind: &str, wanted: impl Fn(&Value) -> bool) -> usize {
         lines
             .iter()
             .position(|line| {
-                line["type"] == "event"
-                    && line["agent"] == agent
-                    && !line[stamp].is_null()
-                    && wanted(&line["event"]["payload"])
+                line["type"] == kind && line["agent"] == agent && wanted(&line["event"]["payload"])
             })
             .expect("the fixture has such a record")
     }
@@ -924,7 +920,7 @@ mod tests {
     /// The id of the request of `kind` asked of `who` in `round`.
     fn asked(who: &str, round: u32, kind: &str) -> u64 {
         let lines = fixture();
-        let index = find(&lines, who, "arrived", |payload| {
+        let index = find(&lines, who, "observation", |payload| {
             payload["Request"]["round"] == round && payload["Request"]["kind"] == kind
         });
         lines[index]["event"]["payload"]["Request"]["id"]
@@ -935,41 +931,80 @@ mod tests {
     /// The fixture with `edit` applied to the record `find` names.
     fn edited(
         agent: &str,
-        stamp: &str,
+        kind: &str,
         wanted: impl Fn(&Value) -> bool,
         edit: impl FnOnce(&mut Value),
     ) -> Vec<Value> {
         let mut lines = fixture();
-        let index = find(&lines, agent, stamp, wanted);
+        let index = find(&lines, agent, kind, wanted);
         edit(&mut lines[index]);
         lines
     }
 
     /// The fixture with `edit` applied to something the moderator said.
     fn said(wanted: impl Fn(&Value) -> bool, edit: impl FnOnce(&mut Value)) -> Vec<Value> {
-        edited(config().moderator.as_str(), "sent", wanted, edit)
+        edited(config().moderator.as_str(), "action", wanted, edit)
     }
 
     /// The fixture with `edit` applied to a response the moderator heard.
     fn heard(wanted: impl Fn(&Value) -> bool, edit: impl FnOnce(&mut Value)) -> Vec<Value> {
-        edited(config().moderator.as_str(), "arrived", wanted, edit)
+        edited(config().moderator.as_str(), "observation", wanted, edit)
     }
 
     /// The fixture without the record `find` names.
-    fn without(agent: &str, stamp: &str, wanted: impl Fn(&Value) -> bool) -> Vec<Value> {
+    fn without(agent: &str, kind: &str, wanted: impl Fn(&Value) -> bool) -> Vec<Value> {
         let mut lines = fixture();
-        let index = find(&lines, agent, stamp, wanted);
+        let index = find(&lines, agent, kind, wanted);
         lines.remove(index);
         lines
     }
 
     /// The fixture with the record `find` names repeated, right after
     /// itself.
-    fn doubled(agent: &str, stamp: &str, wanted: impl Fn(&Value) -> bool) -> Vec<Value> {
+    fn doubled(agent: &str, kind: &str, wanted: impl Fn(&Value) -> bool) -> Vec<Value> {
         let mut lines = fixture();
-        let index = find(&lines, agent, stamp, wanted);
+        let index = find(&lines, agent, kind, wanted);
         lines.insert(index, lines[index].clone());
         lines
+    }
+
+    /// Exchanges two players' names everywhere in `lines`, so that a
+    /// forgery that kills one in the other's place leaves a trajectory
+    /// consistent about who is alive.
+    fn swap(lines: &mut [Value], one: &str, other: &str) {
+        fn rename(value: &mut Value, one: &str, other: &str) {
+            match value {
+                Value::String(name) if name == one => *name = other.to_owned(),
+                Value::String(name) if name == other => *name = one.to_owned(),
+                Value::Array(items) => {
+                    for item in items.iter_mut() {
+                        rename(item, one, other);
+                    }
+                    items.sort_by_key(ToString::to_string);
+                }
+                Value::Object(fields) => {
+                    let swapped: Map<String, Value> = std::mem::take(fields)
+                        .into_iter()
+                        .map(|(key, mut value)| {
+                            rename(&mut value, one, other);
+                            let key = if key == one {
+                                other.to_owned()
+                            } else if key == other {
+                                one.to_owned()
+                            } else {
+                                key
+                            };
+                            (key, value)
+                        })
+                        .collect();
+                    *fields = swapped;
+                }
+                _ => {}
+            }
+        }
+        for line in lines {
+            rename(line, one, other);
+        }
     }
 
     fn recipients(line: &mut Value, to: &[&str]) {
@@ -993,7 +1028,7 @@ mod tests {
     #[should_panic(expected = "truncated game")]
     fn a_game_without_an_outcome_is_caught() {
         check(
-            &without("moderator", "sent", narration("Outcome")),
+            &without("moderator", "action", narration("Outcome")),
             &config(),
         );
     }
@@ -1029,7 +1064,7 @@ mod tests {
     fn a_request_answered_twice_is_caught() {
         let nominate = asked("alice", 1, "Nominate");
         check(
-            &doubled("moderator", "arrived", response(nominate)),
+            &doubled("moderator", "observation", response(nominate)),
             &config(),
         );
     }
@@ -1039,7 +1074,7 @@ mod tests {
     fn an_unanswered_request_is_caught() {
         let nominate = asked("alice", 1, "Nominate");
         check(
-            &without("moderator", "arrived", response(nominate)),
+            &without("moderator", "observation", response(nominate)),
             &config(),
         );
     }
@@ -1071,7 +1106,7 @@ mod tests {
         // dave, a werewolf, is asked to devour; bob is a villager.
         let devour = asked("dave", 1, "Devour");
         let mut lines = said(request(devour), |line| recipients(line, &["bob"]));
-        let index = find(&lines, "moderator", "arrived", response(devour));
+        let index = find(&lines, "moderator", "observation", response(devour));
         sender(&mut lines[index], "bob");
         check(&lines, &config());
     }
@@ -1116,7 +1151,7 @@ mod tests {
         let index = find(
             &lines,
             "moderator",
-            "arrived",
+            "observation",
             response(asked("carol", 2, "Protect")),
         );
         target(&mut lines[index], "bob");
@@ -1177,7 +1212,7 @@ mod tests {
     #[should_panic(expected = "the outcome is announced once")]
     fn an_outcome_announced_twice_is_caught() {
         check(
-            &doubled("moderator", "sent", narration("Outcome")),
+            &doubled("moderator", "action", narration("Outcome")),
             &config(),
         );
     }
@@ -1244,7 +1279,7 @@ mod tests {
     #[should_panic(expected = "a night has one death or one NoDeath")]
     fn a_night_that_says_nothing_of_deaths_is_caught() {
         check(
-            &without("moderator", "sent", narration("NoDeath")),
+            &without("moderator", "action", narration("NoDeath")),
             &config(),
         );
     }
@@ -1252,61 +1287,62 @@ mod tests {
     #[test]
     #[should_panic(expected = "a day eliminates exactly one")]
     fn a_day_without_a_lynching_is_caught() {
-        check(&without("moderator", "sent", lynched), &config());
+        check(&without("moderator", "action", lynched), &config());
     }
 
     #[test]
     #[should_panic(expected = "an elimination is of a player the tally names most")]
     fn a_lynching_the_tally_does_not_call_for_is_caught() {
-        // On the last day grace and frank each have two nominations and
-        // bob one, and bob, a villager, is lynched in the tie-break's
-        // place. The last day, so that no later request to bob trips the
-        // check on the dead first.
-        let lines = said(eliminated("grace"), |line| {
-            line["event"]["payload"]["Narration"]["Eliminated"] =
-                json!({"who": "bob", "role": "Villager", "round": 2, "cause": "Lynched"});
-        });
+        // On the last day the tally names grace twice and frank twice, and
+        // bob once; bob, a villager, is lynched in grace's place. The last
+        // day, so that no later request to grace trips the check on the
+        // dead first, and the outcome is corrected to match, so that the
+        // tally is what the check trips on rather than the survivors.
+        let mut lines = fixture();
+        let death = find(&lines, "moderator", "action", eliminated("grace"));
+        lines[death]["event"]["payload"]["Narration"]["Eliminated"] =
+            json!({"who": "bob", "role": "Villager", "round": 2, "cause": "Lynched"});
+        let outcome = find(&lines, "moderator", "action", narration("Outcome"));
+        lines[outcome]["event"]["payload"]["Narration"]["Outcome"]["living"] =
+            json!(["dave", "erin", "frank", "grace"]);
         check(&lines, &config());
     }
 
     #[test]
     #[should_panic(expected = "a death at night is of a player the doctor did not protect")]
     fn a_death_of_a_protected_player_is_caught() {
-        // On night 2 the pack agrees on carol while carol protects erin.
-        // Moving dave onto erin splits the pack, so erin is one of the
-        // players that night's tally names most, and erin is the one the
-        // doctor protected: reporting erin devoured is a death the
-        // protection should have prevented. Erin, eliminated, takes no
-        // further part, so nothing said later contradicts it.
+        // On night 2 the pack agrees on carol, carol protects erin, and
+        // carol is devoured. The forgery has the pack name grace and carol
+        // protect grace, so the night's victim is the protected player.
+        // Grace dies in carol's place, so from that death on the two are
+        // exchanged everywhere — carol is lynched on day 2 in grace's
+        // stead — and each still dies exactly once.
         let mut lines = fixture();
-        let index = find(&lines, "moderator", "arrived", |payload| {
-            payload["Response"]["request"] == asked("dave", 2, "Devour")
-        });
-        target(&mut lines[index], "erin");
-        // The pack is told the tally, so it moves with dave's response.
-        // The test reads through `&line[..]`, which yields `Null` for a key
-        // that is not there; only the assignment, reached once the record is
-        // known to be a night-2 tally, indexes mutably.
-        for line in &mut lines {
-            let tally = &line["event"]["payload"]["Narration"]["Tally"];
-            if tally["round"] == 2 && tally["phase"] == "Night" {
-                line["event"]["payload"]["Narration"]["Tally"]["votes"]["dave"] =
-                    json!({"Target": "erin"});
-            }
+        for who in ["dave", "erin"] {
+            let index = find(
+                &lines,
+                "moderator",
+                "observation",
+                response(asked(who, 2, "Devour")),
+            );
+            target(&mut lines[index], "grace");
         }
-        let index = find(&lines, "moderator", "sent", |payload| {
-            payload["Narration"]["Eliminated"]["cause"] == "Devoured"
-        });
-        lines[index]["event"]["payload"]["Narration"]["Eliminated"]["who"] = json!("erin");
-        lines[index]["event"]["payload"]["Narration"]["Eliminated"]["role"] = json!("Werewolf");
-        let eliminated = lines[index]["seq"].as_u64().unwrap();
-        lines.retain(|line| {
-            let after = line["seq"].as_u64().is_some_and(|seq| seq > eliminated);
-            let erins = line["agent"] == "erin"
-                || line["event"]["recipients"] == json!(["erin"])
-                || line["event"]["sender"] == "erin";
-            !(after && erins)
-        });
+        let protect = find(
+            &lines,
+            "moderator",
+            "observation",
+            response(asked("carol", 2, "Protect")),
+        );
+        target(&mut lines[protect], "grace");
+        let tally = find(&lines, "moderator", "action", tally(2, "Night"));
+        lines[tally]["event"]["payload"]["Narration"]["Tally"]["votes"] =
+            json!({"dave": {"Target": "grace"}, "erin": {"Target": "grace"}});
+        let death = find(&lines, "moderator", "action", eliminated("carol"));
+        swap(&mut lines[death..], "carol", "grace");
+        // A swap exchanges the names, not the roles each death reveals.
+        lines[death]["event"]["payload"]["Narration"]["Eliminated"]["role"] = json!("Seer");
+        let lynched = find(&lines[death..], "moderator", "action", eliminated("carol")) + death;
+        lines[lynched]["event"]["payload"]["Narration"]["Eliminated"]["role"] = json!("Doctor");
         check(&lines, &config());
     }
 
@@ -1342,6 +1378,8 @@ mod tests {
     #[test]
     #[should_panic(expected = "the winner is what the parity rule says")]
     fn a_winner_against_the_parity_rule_is_caught() {
+        // The werewolves won this game, so it is the village that is the
+        // claim the survivors do not bear out.
         let lines = said(narration("Outcome"), |line| {
             line["event"]["payload"]["Narration"]["Outcome"]["winner"] = json!("Village");
         });
@@ -1369,7 +1407,7 @@ mod tests {
     #[should_panic(expected = "alice is assigned its role exactly once")]
     fn a_player_assigned_twice_is_caught() {
         check(
-            &doubled("alice", "arrived", narration("Assigned")),
+            &doubled("alice", "observation", narration("Assigned")),
             &config(),
         );
     }
@@ -1378,19 +1416,19 @@ mod tests {
     #[should_panic(expected = "the last thing alice received is the outcome")]
     fn a_player_that_never_hears_the_outcome_is_caught() {
         check(
-            &without("alice", "arrived", narration("Outcome")),
+            &without("alice", "observation", narration("Outcome")),
             &config(),
         );
     }
 
     #[test]
-    #[should_panic(expected = "a dead player receives nothing between its death and the outcome")]
+    #[should_panic(expected = "a dead player observes nothing between its death and the outcome")]
     fn a_dead_player_that_hears_more_is_caught() {
         // bob's copy of the day 2 tally, delivered to the dead alice too.
         let mut lines = fixture();
-        let mut leaked = lines[find(&lines, "bob", "arrived", tally(2, "Day"))].clone();
+        let mut leaked = lines[find(&lines, "bob", "observation", tally(2, "Day"))].clone();
         leaked["agent"] = json!("alice");
-        let outcome = find(&lines, "alice", "arrived", narration("Outcome"));
+        let outcome = find(&lines, "alice", "observation", narration("Outcome"));
         lines.insert(outcome, leaked);
         check(&lines, &config());
     }
@@ -1400,7 +1438,7 @@ mod tests {
     fn a_player_addressing_another_player_is_caught() {
         let lines = edited(
             "alice",
-            "sent",
+            "action",
             response(asked("alice", 1, "Nominate")),
             |line| {
                 recipients(line, &["bob", "moderator"]);

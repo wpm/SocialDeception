@@ -2,26 +2,30 @@
 //!
 //! [`Moderator`] is the [`Handler`] around a [`Game`]. It is plumbing, and
 //! thin by design: every rule of Werewolf lives in [`Game`], and this module
-//! only folds the events that arrive on the moderator's inbox into calls on
-//! the game and turns the [`Directive`]s that come back into [`Outgoing`]
-//! messages. The one thing it adds is the invariants the runtime imposes on
-//! how those messages are addressed.
+//! only folds the observations that arrive on the moderator's queue into
+//! calls on the game and turns the [`Directive`]s that come back into
+//! [`Action`]s. The one thing it adds is the invariants the runtime imposes
+//! on how those actions are addressed.
 //!
-//! # What the moderator does with each event
+//! # What the moderator does
 //!
-//! [`Control::Start`] begins the game; a [`Response`](super::Response) from a player is
-//! recorded; [`Control::Stop`] and [`Event::Think`] do nothing. An episode's
-//! agents have no think interval, so no `Think` ever arrives; the arm exists
-//! so that turning timers on later is not a change of behavior here. A
-//! [`Narration`](super::Narration) or a [`Request`](super::Request) arriving from a player is a bug, and the
-//! moderator panics rather than run a game whose state it cannot vouch for.
+//! Being started begins the game, which is what [`start`](Handler::start) is
+//! for: the moderator is the agent that opens play, and it does so before
+//! anybody has spoken to it. Thereafter a [`Response`](super::Response) from
+//! a player is recorded. The moderator never sees the control that started
+//! it, nor the one that stops it; those are the loop's, which is why there
+//! is no arm for either here.
+//!
+//! A [`Narration`](super::Narration) or a [`Request`](super::Request)
+//! arriving from a player is a bug, and the moderator panics rather than run
+//! a game whose state it cannot vouch for.
 //!
 //! Once the game is over the moderator emits nothing, whatever arrives. The
 //! episode is winding down, and a late response is not the game's problem.
 //!
 //! # The moderator never broadcasts, except once
 //!
-//! [`Outgoing::broadcast`] resolves to every other agent in the roster, so it
+//! [`Action::broadcast`] resolves to every other agent in the roster, so it
 //! reaches every player, living and dead. That is exactly right for the
 //! [`Outcome`] and exactly wrong for everything else, which is why every
 //! other directive carries an explicit recipient set: narration is
@@ -53,10 +57,10 @@
 
 use crossbeam_channel::Sender;
 
+use super::WerewolfDomain;
 use super::game::{Directive, Game};
 use super::message::{Message, Outcome};
-use crate::agent::{Handler, Outgoing, Recipients};
-use crate::event::{Control, Event};
+use crate::agent::{Action, Handler, Observation, Recipients};
 
 /// The agent that runs a game of Werewolf: a [`Game`] behind a
 /// [`Handler`].
@@ -70,72 +74,84 @@ impl Moderator {
     /// A moderator that runs `game` and, when it ends, sends its outcome
     /// on `outcome`.
     ///
-    /// The game must not have begun: the moderator begins it on
-    /// [`Control::Start`].
+    /// The game must not have begun: the moderator begins it when the
+    /// episode starts it.
     #[must_use]
     pub const fn new(game: Game, outcome: Sender<Outcome>) -> Self {
         Self { game, outcome }
     }
 
-    /// What one event makes the game say.
+    /// What one observation makes the game say.
     ///
     /// # Panics
     ///
     /// If a player sends the moderator a narration or a request.
-    fn fold(&mut self, event: &Event<Message>) -> Vec<Directive> {
-        match event {
-            Event::Control(Control::Start) => self.game.begin(),
-            Event::Control(Control::Stop) | Event::Think => Vec::new(),
-            Event::Message {
-                sender, payload, ..
-            } => match payload {
-                Message::Response(response) => self.game.record(sender, response),
-                Message::Narration(_) => panic!("{sender} sent the moderator a narration"),
-                Message::Request(_) => panic!("{sender} sent the moderator a request"),
-            },
+    fn fold(&mut self, observation: &Observation<WerewolfDomain>) -> Vec<Directive> {
+        let sender = &observation.event.sender;
+        match &observation.event.payload {
+            Message::Response(response) => self.game.record(sender, response),
+            Message::Narration(_) => panic!("{sender} sent the moderator a narration"),
+            Message::Request(_) => panic!("{sender} sent the moderator a request"),
         }
+    }
+
+    /// Everything the directives say, sent, with the outcome published on
+    /// the channel if the game has just ended.
+    fn say(&mut self, directives: Vec<Directive>) -> Vec<Action<WerewolfDomain>> {
+        if let Some(outcome) = self.game.outcome() {
+            // The caller may have dropped the receiver. That is not the
+            // game's problem: the in-world announcement is the record.
+            let _ = self.outcome.send(outcome.clone());
+        }
+        directives.into_iter().map(send).collect()
     }
 }
 
-/// The message that carries one directive.
-fn send(directive: Directive) -> Outgoing<Message> {
+/// The action that carries one directive.
+fn send(directive: Directive) -> Action<WerewolfDomain> {
     match directive {
-        Directive::Narrate { to, narration } => Outgoing {
+        Directive::Narrate { to, narration } => Action {
             recipients: Recipients::To(to),
             payload: Message::Narration(narration),
         },
-        Directive::Ask { to, request } => Outgoing::to([to], Message::Request(request)),
-        Directive::Broadcast(narration) => Outgoing::broadcast(Message::Narration(narration)),
+        Directive::Ask { to, request } => Action::to([to], Message::Request(request)),
+        Directive::Broadcast(narration) => Action::broadcast(Message::Narration(narration)),
     }
 }
 
-impl Handler<Message> for Moderator {
-    /// Folds each event into the game in order and says what the game wants
-    /// said. The event that ends the game also sends the outcome on the
-    /// channel; after it, nothing, whatever arrives.
+impl Handler<WerewolfDomain> for Moderator {
+    /// Begins the game and says what it wants said at the start: the roles,
+    /// the first phase, and the first night's requests.
+    fn start(&mut self) -> Vec<Action<WerewolfDomain>> {
+        let opening = self.game.begin();
+        self.say(opening)
+    }
+
+    /// Folds each observation into the game in order and says what the game
+    /// wants said. The observation that ends the game also sends the
+    /// outcome on the channel; after it, nothing, whatever arrives.
     ///
     /// # Panics
     ///
     /// If a player sends the moderator a narration or a request, or if a
     /// response is one the game cannot accept; see [`Game::record`].
-    fn handle(&mut self, events: &[Event<Message>]) -> Vec<Outgoing<Message>> {
-        let mut outgoing = Vec::new();
-        for event in events {
+    fn handle(
+        &mut self,
+        observations: &[Observation<WerewolfDomain>],
+    ) -> Vec<Action<WerewolfDomain>> {
+        let mut actions = Vec::new();
+        for observation in observations {
             // Whether the game is over is the game's to say, and it is
-            // asked before every event, so the event that ends it is the
-            // last one folded and the only one after which the outcome is
-            // seen for the first time.
+            // asked before every observation, so the one that ends it is the
+            // last folded and the only one after which the outcome is seen
+            // for the first time.
             if self.game.outcome().is_some() {
                 break;
             }
-            outgoing.extend(self.fold(event).into_iter().map(send));
-            if let Some(outcome) = self.game.outcome() {
-                // The caller may have dropped the receiver. That is not the
-                // game's problem: the in-world announcement is the record.
-                let _ = self.outcome.send(outcome.clone());
-            }
+            let directives = self.fold(observation);
+            actions.extend(self.say(directives));
         }
-        outgoing
+        actions
     }
 }
 
@@ -147,14 +163,16 @@ mod tests {
 
     use super::*;
     use crate::agent::Recipients;
-    use crate::event::AgentId;
-    use crate::testing::{id, ids};
+    use crate::event::{AgentId, Event};
+    use crate::testing::{id, ids, observed};
     use crate::werewolf::assignment::Assignment;
     use crate::werewolf::message::{
         Move, Narration, Phase, Request, RequestId, RequestKind, Response, Round,
     };
     use crate::werewolf::role::Faction;
     use crate::werewolf::role::Role::{self, Doctor, Seer, Villager, Werewolf};
+
+    use crate::agent::Action;
 
     const MODERATOR: &str = "moderator";
     const SEED: u64 = 20_260_918;
@@ -191,16 +209,19 @@ mod tests {
         (Moderator::new(game, sender), receiver)
     }
 
-    fn start() -> Event<Message> {
-        Event::Control(Control::Start)
+    /// An event from a player to the moderator, as the moderator observes
+    /// it. The creation time plays no part in the fold, so one stand-in
+    /// serves every test here.
+    fn from_player(who: &str, payload: Message) -> Observation<WerewolfDomain> {
+        observed(Event::new(
+            who,
+            [MODERATOR],
+            crate::clock::Timestamp::default(),
+            payload,
+        ))
     }
 
-    /// A message from a player to the moderator.
-    fn from_player(who: &str, payload: Message) -> Event<Message> {
-        Event::message(who, [MODERATOR], payload)
-    }
-
-    fn response(who: &AgentId, request: RequestId, chosen: Move) -> Event<Message> {
+    fn response(who: &AgentId, request: RequestId, chosen: Move) -> Observation<WerewolfDomain> {
         from_player(
             who.as_str(),
             Message::Response(Response { request, chosen }),
@@ -231,28 +252,28 @@ mod tests {
         }
     }
 
-    /// The agents an outgoing message is addressed to, which for a request
-    /// is exactly one.
-    fn asked(outgoing: &Outgoing<Message>) -> &AgentId {
-        let Recipients::To(to) = &outgoing.recipients else {
-            panic!("a request was broadcast: {outgoing:?}");
+    /// The agents an action is addressed to, which for a request is exactly
+    /// one.
+    fn asked(action: &Action<WerewolfDomain>) -> &AgentId {
+        let Recipients::To(to) = &action.recipients else {
+            panic!("a request was broadcast: {action:?}");
         };
-        assert_eq!(to.len(), 1, "a request to several players: {outgoing:?}");
+        assert_eq!(to.len(), 1, "a request to several players: {action:?}");
         to.iter().next().unwrap()
     }
 
     /// The responses stub players following `policy` give to the requests
-    /// among some outgoing messages, choosing among `living`.
+    /// among some actions, choosing among `living`.
     fn respond(
-        outgoing: &[Outgoing<Message>],
+        actions: &[Action<WerewolfDomain>],
         policy: Policy,
         living: &BTreeSet<AgentId>,
-    ) -> Vec<Event<Message>> {
-        outgoing
+    ) -> Vec<Observation<WerewolfDomain>> {
+        actions
             .iter()
-            .filter_map(|message| match &message.payload {
+            .filter_map(|action| match &action.payload {
                 Message::Request(request) => {
-                    let who = asked(message);
+                    let who = asked(action);
                     Some(response(who, request.id, policy(who, request, living)))
                 }
                 Message::Narration(_) | Message::Response(_) => None,
@@ -260,26 +281,32 @@ mod tests {
             .collect()
     }
 
-    /// Plays a whole game through `handle`, with stub players following
-    /// `policy`, and returns every outgoing message in order.
+    /// Plays a whole game, with stub players following `policy`, and returns
+    /// every action the moderator took in order.
     ///
-    /// Each phase's responses arrive as one batch when `batched`, and one
-    /// per batch otherwise. Either way the game runs until the moderator
+    /// The game opens with the start hook, as the agent loop opens it. Each
+    /// phase's responses then arrive as one cycle when `batched`, and one
+    /// per cycle otherwise. Either way the game runs until the moderator
     /// asks nothing more.
-    fn play(moderator: &mut Moderator, policy: Policy, batched: bool) -> Vec<Outgoing<Message>> {
-        let mut sent = Vec::new();
-        let mut pending = vec![start()];
+    fn play(
+        moderator: &mut Moderator,
+        policy: Policy,
+        batched: bool,
+    ) -> Vec<Action<WerewolfDomain>> {
+        let opening = moderator.start();
+        let mut pending = respond(&opening, policy, moderator.game.living());
+        let mut sent = opening;
         while !pending.is_empty() {
-            let outgoing = if batched {
+            let actions = if batched {
                 moderator.handle(&pending)
             } else {
                 pending
                     .iter()
-                    .flat_map(|event| moderator.handle(std::slice::from_ref(event)))
+                    .flat_map(|observation| moderator.handle(std::slice::from_ref(observation)))
                     .collect()
             };
-            pending = respond(&outgoing, policy, moderator.game.living());
-            sent.extend(outgoing);
+            pending = respond(&actions, policy, moderator.game.living());
+            sent.extend(actions);
         }
         sent
     }
@@ -290,7 +317,7 @@ mod tests {
         assignment: Assignment,
         outcome: Outcome,
         receiver: Receiver<Outcome>,
-        sent: Vec<Outgoing<Message>>,
+        sent: Vec<Action<WerewolfDomain>>,
     }
 
     /// Every combination of assignment and stub policy, played out.
@@ -312,11 +339,11 @@ mod tests {
         games
     }
 
-    /// The outcome broadcast among some messages.
-    fn broadcast_outcome(sent: &[Outgoing<Message>]) -> &Outcome {
+    /// The outcome broadcast among some actions.
+    fn broadcast_outcome(sent: &[Action<WerewolfDomain>]) -> &Outcome {
         sent.iter()
-            .find_map(|message| match message {
-                Outgoing {
+            .find_map(|action| match action {
+                Action {
                     recipients: Recipients::Broadcast,
                     payload: Message::Narration(Narration::Outcome(outcome)),
                 } => Some(outcome),
@@ -325,11 +352,11 @@ mod tests {
             .expect("no outcome was broadcast")
     }
 
-    fn narrate<const N: usize>(to: [&str; N], narration: Narration) -> Outgoing<Message> {
-        Outgoing::to(to, Message::Narration(narration))
+    fn narrate<const N: usize>(to: [&str; N], narration: Narration) -> Action<WerewolfDomain> {
+        Action::to(to, Message::Narration(narration))
     }
 
-    fn assigned<const N: usize>(to: &str, role: Role, pack: [&str; N]) -> Outgoing<Message> {
+    fn assigned<const N: usize>(to: &str, role: Role, pack: [&str; N]) -> Action<WerewolfDomain> {
         narrate(
             [to],
             Narration::Assigned {
@@ -339,8 +366,8 @@ mod tests {
         )
     }
 
-    fn ask(to: &str, id: u64, round: u32, kind: RequestKind) -> Outgoing<Message> {
-        Outgoing::to(
+    fn ask(to: &str, id: u64, round: u32, kind: RequestKind) -> Action<WerewolfDomain> {
+        Action::to(
             [to],
             Message::Request(Request {
                 id: RequestId(id),
@@ -351,11 +378,11 @@ mod tests {
     }
 
     #[test]
-    fn start_begins_the_game_with_addressed_messages() {
+    fn starting_the_moderator_begins_the_game_with_addressed_messages() {
         let everyone = ["alice", "bob", "carol", "dave", "erin"];
         let (mut moderator, _receiver) = moderator(village());
         assert_eq!(
-            moderator.handle(&[start()]),
+            moderator.start(),
             [
                 assigned("alice", Villager, []),
                 assigned("bob", Werewolf, ["bob"]),
@@ -378,13 +405,13 @@ mod tests {
     }
 
     #[test]
-    fn stop_and_think_produce_nothing() {
+    fn a_cycle_with_no_observations_produces_nothing() {
+        // What a timeout cycle looks like from inside the handler. Controls
+        // never reach it at all, so there is nothing else a cycle can hold
+        // that the moderator must ignore.
         let (mut moderator, _receiver) = moderator(village());
-        moderator.handle(&[start()]);
-        assert_eq!(
-            moderator.handle(&[Event::Think, Event::Control(Control::Stop)]),
-            []
-        );
+        moderator.start();
+        assert_eq!(moderator.handle(&[]), []);
     }
 
     #[test]
@@ -435,18 +462,18 @@ mod tests {
     }
 
     #[test]
-    fn no_message_has_an_empty_recipient_set() {
+    fn no_action_has_an_empty_recipient_set() {
         for Played { sent, .. } in played_games() {
-            for message in &sent {
-                if let Recipients::To(to) = &message.recipients {
-                    assert!(!to.is_empty(), "{message:?} is addressed to nobody");
+            for action in &sent {
+                if let Recipients::To(to) = &action.recipients {
+                    assert!(!to.is_empty(), "{action:?} is addressed to nobody");
                 }
             }
         }
     }
 
     #[test]
-    fn no_message_addresses_a_dead_player() {
+    fn no_action_addresses_a_dead_player() {
         for Played { sent, .. } in played_games() {
             let mut dead = BTreeSet::new();
             for message in &sent {
@@ -507,12 +534,7 @@ mod tests {
                 _ => None,
             })
             .unwrap();
-        let late = [
-            response(&who, request, Move::Target(id("bob"))),
-            Event::Control(Control::Stop),
-            Event::Think,
-            start(),
-        ];
+        let late = [response(&who, request, Move::Target(id("bob")))];
         assert_eq!(moderator.handle(&late), []);
     }
 
@@ -523,18 +545,20 @@ mod tests {
         // it, in the same batch, and must say nothing for it.
         let (mut reference, _receiver) = moderator(village());
         let (mut padded, _receiver) = moderator(village());
-        let mut pending = vec![start()];
+        let opening = reference.start();
+        assert_eq!(padded.start(), opening);
+        let mut pending = respond(&opening, first_other, reference.game.living());
         while !pending.is_empty() {
-            let outgoing = reference.handle(&pending);
-            let mut batch = pending.clone();
-            if outgoing
+            let actions = reference.handle(&pending);
+            let mut cycle = pending.clone();
+            if actions
                 .last()
                 .is_some_and(|last| last.recipients == Recipients::Broadcast)
             {
-                batch.push(pending.last().unwrap().clone());
+                cycle.push(pending.last().unwrap().clone());
             }
-            assert_eq!(padded.handle(&batch), outgoing);
-            pending = respond(&outgoing, first_other, reference.game.living());
+            assert_eq!(padded.handle(&cycle), actions);
+            pending = respond(&actions, first_other, reference.game.living());
         }
         assert!(reference.game.outcome().is_some() && padded.game.outcome().is_some());
     }
@@ -543,7 +567,7 @@ mod tests {
     #[should_panic(expected = "erin sent the moderator a narration")]
     fn a_narration_from_a_player_panics() {
         let (mut moderator, _receiver) = moderator(village());
-        moderator.handle(&[start()]);
+        moderator.start();
         moderator.handle(&[from_player(
             "erin",
             Message::Narration(Narration::NoDeath { round: Round(1) }),
@@ -554,7 +578,7 @@ mod tests {
     #[should_panic(expected = "carol sent the moderator a request")]
     fn a_request_from_a_player_panics() {
         let (mut moderator, _receiver) = moderator(village());
-        moderator.handle(&[start()]);
+        moderator.start();
         moderator.handle(&[from_player(
             "carol",
             Message::Request(Request {

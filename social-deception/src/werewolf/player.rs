@@ -1,9 +1,11 @@
 //! A player as an agent: a role's rules, the policy that decides for it, and
 //! the one handler body every role shares.
 //!
-//! A player's turn is a fold, the same as any agent's: every event that
-//! arrives is folded into its [`Knowledge`], and every [`Request`] among them
-//! is answered with one [`Response`] to the moderator. The two halves of
+//! A player's turn is a fold, the same as any agent's: every observation is
+//! folded into its [`Knowledge`], and every [`Request`] among them is
+//! answered with one [`Response`] to the moderator. A seat has no opening
+//! move: it says nothing until it is asked, so it needs no
+//! [`start`](Handler::start). The two halves of
 //! answering are kept apart, and ADR-0005 says why: a [`Player`] is a role,
 //! and computes the action space the rules permit it and nothing else; a
 //! [`Policy`] is the strategy, and picks one move from that space. The
@@ -17,16 +19,17 @@
 //!
 //! # Players only ever address the moderator
 //!
-//! Every message a seat sends is addressed to the moderator alone. A player
+//! Every action a seat takes is addressed to the moderator alone. A player
 //! is a peer of every other player, so a broadcast would reach them all,
 //! and that must never happen: a response is a sealed ballot, and the others
 //! learn of it only from the tally the moderator narrates.
 
+use super::WerewolfDomain;
 use super::knowledge::Knowledge;
 use super::message::{Message, Move, Request, Response};
 use super::policy::{Policy, View};
-use crate::agent::{Handler, Outgoing};
-use crate::event::{AgentId, Event};
+use crate::agent::{self, Handler, Observation};
+use crate::event::AgentId;
 
 /// What a role contributes to a player: its state, and the moves the
 /// rules permit it.
@@ -100,32 +103,31 @@ impl<R: Player, P: Policy> Seat<R, P> {
     }
 }
 
-impl<R: Player, P: Policy> Handler<Message> for Seat<R, P> {
-    /// Folds each event into the role's state in order and answers each
-    /// request among them, so that a request is answered from the state
-    /// every event before it produced, including those in the same batch.
-    /// A batch with two requests produces two responses, in request order;
-    /// a batch with none produces nothing.
+impl<R: Player, P: Policy> Handler<WerewolfDomain> for Seat<R, P> {
+    /// Folds each observation into the role's state in order and answers
+    /// each request among them, so that a request is answered from the state
+    /// every observation before it produced, including those in the same
+    /// cycle. A cycle with two requests produces two responses, in request
+    /// order; a cycle with none produces nothing.
     ///
     /// # Panics
     ///
     /// If the policy chooses an action outside the action space, or if the
     /// request is of a kind this role is never asked; see
     /// [`Player::action_space`].
-    fn handle(&mut self, events: &[Event<Message>]) -> Vec<Outgoing<Message>> {
-        let mut outgoing = Vec::new();
-        for event in events {
-            self.player.knowledge_mut().observe(event);
-            if let Event::Message {
-                payload: Message::Request(request),
-                ..
-            } = event
-            {
+    fn handle(
+        &mut self,
+        observations: &[Observation<WerewolfDomain>],
+    ) -> Vec<agent::Action<WerewolfDomain>> {
+        let mut actions = Vec::new();
+        for observation in observations {
+            self.player.knowledge_mut().observe(observation);
+            if let Message::Request(request) = &observation.event.payload {
                 let response = Message::Response(self.answer(request));
-                outgoing.push(Outgoing::to([self.moderator.clone()], response));
+                actions.push(agent::Action::to([self.moderator.clone()], response));
             }
         }
-        outgoing
+        actions
     }
 }
 
@@ -135,11 +137,13 @@ mod tests {
 
     use super::*;
     use crate::agent::Recipients;
-    use crate::event::Control;
-    use crate::testing::{ME, id, ids, narrated, phase_began, target};
+    use crate::event::Event;
+    use crate::testing::{ME, from, id, ids, narrated, observed, phase_began, target};
     use crate::werewolf::message::{Cause, Narration, Phase, RequestId, RequestKind, Round};
     use crate::werewolf::role::Role;
     use crate::werewolf::roles::{Doctor, Villager};
+
+    use crate::agent::Action;
 
     const MODERATOR: &str = "moderator";
 
@@ -170,7 +174,7 @@ mod tests {
         }
     }
 
-    fn eliminated(who: &str, round: u32) -> Event<Message> {
+    fn eliminated(who: &str, round: u32) -> Event<WerewolfDomain> {
         narrated(Narration::Eliminated {
             who: id(who),
             role: Role::Villager,
@@ -179,10 +183,9 @@ mod tests {
         })
     }
 
-    fn request(id: u64, round: u32, kind: RequestKind) -> Event<Message> {
-        Event::message(
+    fn request(id: u64, round: u32, kind: RequestKind) -> Event<WerewolfDomain> {
+        from(
             MODERATOR,
-            [ME],
             Message::Request(Request {
                 id: RequestId(id),
                 round: Round(round),
@@ -191,15 +194,25 @@ mod tests {
         )
     }
 
-    /// The response to the moderator that `Seat` sends.
-    fn response(id: u64, chosen: Move) -> Outgoing<Message> {
-        Outgoing::to(
+    /// The action `Seat` takes in reply to a request: a response to the
+    /// moderator.
+    fn response(id: u64, chosen: Move) -> Action<WerewolfDomain> {
+        Action::to(
             [MODERATOR],
             Message::Response(Response {
                 request: RequestId(id),
                 chosen,
             }),
         )
+    }
+
+    /// What a seat does with a cycle's worth of events.
+    fn handling<R: Player, P: Policy, const N: usize>(
+        seat: &mut Seat<R, P>,
+        events: [Event<WerewolfDomain>; N],
+    ) -> Vec<Action<WerewolfDomain>> {
+        let observations: Vec<_> = events.into_iter().map(observed).collect();
+        seat.handle(&observations)
     }
 
     fn villager<P: Policy>(policy: P) -> Seat<Villager, P> {
@@ -213,8 +226,7 @@ mod tests {
     #[test]
     fn each_request_in_a_batch_is_answered_in_order_from_the_state_before_it() {
         let mut seat = villager(Last);
-        let batch = [
-            Event::Control(Control::Start),
+        let cycle = [
             narrated(Narration::Assigned {
                 role: Role::Villager,
                 pack: BTreeSet::new(),
@@ -225,46 +237,61 @@ mod tests {
             request(2, 1, RequestKind::Nominate),
         ];
         assert_eq!(
-            seat.handle(&batch),
+            handling(&mut seat, cycle),
             [response(1, target("bob")), response(2, target("alice"))]
         );
     }
 
     #[test]
-    fn a_batch_without_a_request_produces_nothing_and_still_updates_the_state() {
+    fn a_cycle_without_a_request_produces_nothing_and_still_updates_the_state() {
         let mut seat = villager(Last);
-        let silent = seat.handle(&[
-            Event::Control(Control::Start),
-            phase_began(1, Phase::Night, ids(["alice", "bob", ME])),
-            eliminated("bob", 1),
-            Event::Think,
-        ]);
+        let silent = handling(
+            &mut seat,
+            [
+                phase_began(1, Phase::Night, ids(["alice", "bob", ME])),
+                eliminated("bob", 1),
+            ],
+        );
         assert!(silent.is_empty(), "{silent:?}");
 
-        // The elimination folded in the silent batch shapes the next answer.
+        // The elimination folded in the silent cycle shapes the next answer.
         assert_eq!(
-            seat.handle(&[request(1, 1, RequestKind::Nominate)]),
+            handling(&mut seat, [request(1, 1, RequestKind::Nominate)]),
             [response(1, target("alice"))]
         );
     }
 
     #[test]
-    fn every_message_is_a_response_addressed_to_the_moderator_alone() {
+    fn a_seat_opens_with_nothing() {
+        // A player says nothing until the moderator asks it something, so
+        // the default start hook is the right one for every role.
+        assert!(villager(First).start().is_empty());
+        assert!(doctor(First).start().is_empty());
+    }
+
+    #[test]
+    fn a_cycle_with_no_observations_produces_nothing() {
+        // What a timeout cycle looks like from inside a handler.
+        let mut seat = villager(Last);
+        assert!(seat.handle(&[]).is_empty());
+    }
+
+    #[test]
+    fn every_action_is_a_response_addressed_to_the_moderator_alone() {
         let mut seat = doctor(First);
-        let batch = [
-            phase_began(1, Phase::Night, ids(["alice", "bob", "carol", ME])),
-            request(1, 1, RequestKind::Protect),
-            phase_began(1, Phase::Day, ids(["alice", "bob", "carol", ME])),
-            request(2, 1, RequestKind::Nominate),
-        ];
-        let outgoing = seat.handle(&batch);
-        assert_eq!(outgoing.len(), 2);
-        for message in &outgoing {
-            assert_eq!(message.recipients, Recipients::To(ids([MODERATOR])));
-            assert!(
-                matches!(message.payload, Message::Response(_)),
-                "{message:?}"
-            );
+        let actions = handling(
+            &mut seat,
+            [
+                phase_began(1, Phase::Night, ids(["alice", "bob", "carol", ME])),
+                request(1, 1, RequestKind::Protect),
+                phase_began(1, Phase::Day, ids(["alice", "bob", "carol", ME])),
+                request(2, 1, RequestKind::Nominate),
+            ],
+        );
+        assert_eq!(actions.len(), 2);
+        for action in &actions {
+            assert_eq!(action.recipients, Recipients::To(ids([MODERATOR])));
+            assert!(matches!(action.payload, Message::Response(_)), "{action:?}");
         }
     }
 
@@ -279,9 +306,15 @@ mod tests {
                 request(u64::from(round), round, RequestKind::Protect),
             ]
         };
-        assert_eq!(seat.handle(&night(1)), [response(1, target("alice"))]);
-        assert_eq!(seat.handle(&night(2)), [response(2, target("bob"))]);
-        assert_eq!(seat.handle(&night(3)), [response(3, target("alice"))]);
+        assert_eq!(
+            handling(&mut seat, night(1)),
+            [response(1, target("alice"))]
+        );
+        assert_eq!(handling(&mut seat, night(2)), [response(2, target("bob"))]);
+        assert_eq!(
+            handling(&mut seat, night(3)),
+            [response(3, target("alice"))]
+        );
     }
 
     #[test]
@@ -290,19 +323,25 @@ mod tests {
     )]
     fn an_action_outside_the_action_space_panics() {
         let mut seat = villager(Outside);
-        seat.handle(&[
-            phase_began(1, Phase::Day, ids(["alice", ME])),
-            request(1, 1, RequestKind::Nominate),
-        ]);
+        handling(
+            &mut seat,
+            [
+                phase_began(1, Phase::Day, ids(["alice", ME])),
+                request(1, 1, RequestKind::Nominate),
+            ],
+        );
     }
 
     #[test]
     #[should_panic(expected = "a Villager is never asked to Devour")]
     fn a_request_of_a_kind_the_role_is_never_asked_panics() {
         let mut seat = villager(First);
-        seat.handle(&[
-            phase_began(1, Phase::Night, ids(["alice", ME])),
-            request(1, 1, RequestKind::Devour),
-        ]);
+        handling(
+            &mut seat,
+            [
+                phase_began(1, Phase::Night, ids(["alice", ME])),
+                request(1, 1, RequestKind::Devour),
+            ],
+        );
     }
 }
