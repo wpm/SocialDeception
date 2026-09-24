@@ -6,12 +6,12 @@
 //!
 //! # Two record types
 //!
-//! An agent handles a batch of events per pass, draining its whole inbox at
-//! the start. Each pass produces:
+//! An agent handles a batch of events per cycle, draining its whole inbox at
+//! the start. Each cycle produces:
 //!
 //! - an [`EventRecord`] per event: the agent it belongs to, the agent's
 //!   sequence number for it, its [`Stamp`], and the event itself;
-//! - a [`CycleRecord`] per pass: the handling window, the sequence numbers of
+//! - a [`CycleRecord`] per cycle: the handling window, the sequence numbers of
 //!   the events that were in the drain, and the sequence numbers of whatever
 //!   the fold emitted.
 //!
@@ -22,12 +22,12 @@
 //!
 //! # Ordering
 //!
-//! Within one agent's records, each pass is a contiguous run: one event
+//! Within one agent's records, each cycle is a contiguous run: one event
 //! record per input in drain order, with `Think` last if a deadline fired;
 //! then one event record per output in the order the handler returned them;
-//! then the pass's cycle record. Nothing else from that agent appears between
-//! them: the agent is one thread, and its next pass cannot start until the
-//! cycle record has been sent.
+//! then that cycle's own record. Nothing else from that agent appears
+//! between them: the agent is one thread, and its next cycle cannot start
+//! until the cycle record has been sent.
 //!
 //! So a cycle record always follows every event record it references, and,
 //! filtered to one agent, the event records between two cycle records belong
@@ -36,15 +36,15 @@
 //! cycle; the lists are a consistency check on the grouping, not the only way
 //! to recover it.
 //!
-//! Every pass has at least one input, since a pass runs only after a delivery
-//! arrived or a deadline produced a `Think`. Outputs can be empty, so the
-//! smallest pass is one event record then one cycle record.
+//! Every cycle has at least one input, since a cycle runs only after a
+//! delivery arrived or a deadline produced a `Think`. Outputs can be empty, so
+//! the smallest cycle is one event record then one cycle record.
 //!
 //! These guarantees are per agent. Every agent sends to the same writer, so
 //! records from different agents interleave arbitrarily, and a recipient's
 //! cycle can precede the sender's output record that caused it.
 //!
-//! If the writer fails mid-pass, the agent's loop exits with an error and its
+//! If the writer fails mid-cycle, the agent's loop exits with an error and its
 //! records end with event records and no closing cycle record.
 //!
 //! # On-disk format
@@ -105,10 +105,10 @@ pub struct EventRecord<P> {
     pub event: Event<P>,
 }
 
-/// One pass of an agent's loop: drain the inbox, fold, send.
+/// One cycle of an agent's loop: drain the inbox, fold, send.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CycleRecord {
-    /// The agent whose pass this was.
+    /// The agent whose cycle this was.
     pub agent: AgentId,
     /// When the agent began handling the batch.
     pub t_start: Timestamp,
@@ -130,7 +130,7 @@ pub struct CycleRecord {
 pub enum LogRecord<P> {
     /// An event in some agent's trajectory.
     Event(EventRecord<P>),
-    /// A pass of some agent's loop.
+    /// A cycle of some agent's loop.
     Cycle(CycleRecord),
 }
 
@@ -233,7 +233,7 @@ mod tests {
     }
 
     /// A handful of records of both kinds: agent `a` receives a start and a
-    /// message in one pass and replies to `b`.
+    /// message in one cycle and replies to `b`.
     fn sample() -> Vec<LogRecord<TestPayload>> {
         let a = AgentId::new("a");
         vec![

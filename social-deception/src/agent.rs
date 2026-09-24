@@ -1,7 +1,7 @@
 //! The agent: one thread, one inbox, and a drain-and-fold loop.
 //!
 //! An agent's life is a fold over the events that arrive on its inbox. Each
-//! pass of the loop:
+//! cycle of the loop:
 //!
 //! 1. waits until something arrives or its deadline fires;
 //! 2. drains the whole inbox, whichever of the two woke it, and adds a
@@ -10,10 +10,10 @@
 //! 4. hands the batch to the environment's [`Handler`] and gets back what to
 //!    send;
 //! 5. records what came out, sends it to the router as one [`CycleDispatch`],
-//!    and records the pass as a cycle.
+//!    and records the cycle.
 //!
 //! An event that arrives while the agent is busy waits in the inbox and is
-//! picked up at the start of the next pass. Nothing is interrupted and
+//! picked up at the start of the next cycle. Nothing is interrupted and
 //! nothing is discarded, and every agent is always stale by exactly one
 //! handling window.
 //!
@@ -22,10 +22,10 @@
 //!
 //! # Deadlines
 //!
-//! An agent may be given a think interval. From the pass in which it receives
+//! An agent may be given a think interval. From the cycle in which it receives
 //! [`Control::Start`], a deadline is pending one interval ahead; when it
 //! passes, the agent wakes with a `Think`, and the next deadline is one
-//! interval after the pass that handled it. Deadlines are absolute, and the
+//! interval after the cycle that handled it. Deadlines are absolute, and the
 //! wake channel for one is asked of the [`TimerSource`] once and kept until it
 //! fires, so a message arriving before the deadline leaves the deadline where
 //! it was. An agent without an interval blocks until something arrives.
@@ -33,9 +33,9 @@
 //! # Termination
 //!
 //! The loop exits when its inbox closes, meaning every sender has been
-//! dropped and nothing is left to drain, or after the pass in which it
+//! dropped and nothing is left to drain, or after the cycle in which it
 //! received [`Control::Stop`], whichever comes first. Every record of that
-//! last pass has been sent to the writer before the thread returns.
+//! last cycle has been sent to the writer before the thread returns.
 //!
 //! # Example
 //!
@@ -101,7 +101,7 @@ use crate::trajectory::{CycleRecord, EventRecord, LogRecord, Seq, Stamp};
 
 /// An environment's behavior for one agent.
 ///
-/// The loop calls [`handle`](Handler::handle) once per pass with everything
+/// The loop calls [`handle`](Handler::handle) once per cycle with everything
 /// that came out of the drain, in arrival order, with a `Think` last if the
 /// agent's deadline has passed. The handler returns what the agent sends in
 /// reply; the loop attaches the agent's own id as the sender, records it, and
@@ -183,21 +183,21 @@ impl<P> Delivery<P> {
     }
 }
 
-/// What one pass of an agent's loop hands the router.
+/// What one cycle of an agent's loop hands the router.
 ///
-/// One dispatch is sent per pass, after the pass's outputs have been recorded
+/// One dispatch is sent per cycle, after the cycle's outputs have been recorded
 /// and before its cycle record is written. Because the number of deliveries
 /// consumed and the messages produced arrive together, whoever counts
-/// in-flight deliveries never sees a pass's inputs settled before its outputs
+/// in-flight deliveries never sees a cycle's inputs settled before its outputs
 /// exist.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CycleDispatch<P> {
-    /// The agent whose pass this was.
+    /// The agent whose cycle this was.
     pub agent: AgentId,
-    /// How many deliveries the pass took off the inbox. A `Think` is not a
+    /// How many deliveries the cycle took off the inbox. A `Think` is not a
     /// delivery.
     pub deliveries: usize,
-    /// The messages the pass produced, as events with this agent as sender,
+    /// The messages the cycle produced, as events with this agent as sender,
     /// in the order the handler returned them.
     pub sent: Vec<Event<P>>,
 }
@@ -212,7 +212,7 @@ pub struct Wiring<P> {
     pub clock: Clock,
     /// The agent's one receiver.
     pub inbox: Receiver<Delivery<P>>,
-    /// Where each pass's dispatch goes.
+    /// Where each cycle's dispatch goes.
     pub dispatches: Sender<CycleDispatch<P>>,
     /// Where the agent's trajectory goes.
     pub records: Sender<LogRecord<P>>,
@@ -331,7 +331,7 @@ struct Loop<P, H, T> {
     /// one here.
     deadlines: BinaryHeap<Reverse<Timestamp>>,
     /// The earliest deadline and the wake channel asked for it, kept across
-    /// passes until it fires.
+    /// cycles until it fires.
     pending: Option<(Timestamp, Receiver<Instant>)>,
 }
 
@@ -361,7 +361,7 @@ where
                 None
             };
             let t_start = self.wiring.clock.now();
-            let stop = self.pass(t_start, batch, due)?;
+            let stop = self.cycle(t_start, batch, due)?;
             if stop || closed {
                 break;
             }
@@ -433,7 +433,7 @@ where
     /// Handles one batch. `due` is the deadline that fired, if one did, and
     /// becomes a `Think` at the end of the batch. Returns whether the batch
     /// contained a stop.
-    fn pass(
+    fn cycle(
         &mut self,
         t_start: Timestamp,
         batch: Vec<Delivery<P>>,
@@ -601,9 +601,9 @@ mod tests {
         }
     }
 
-    /// A recorder that, on entering each pass, tells the test it is busy and
+    /// A recorder that, on entering each cycle, tells the test it is busy and
     /// then waits to be released. That is how a test makes events arrive
-    /// while the agent is provably mid-pass.
+    /// while the agent is provably mid-cycle.
     #[derive(Debug)]
     struct Gated {
         inner: Recorder,
@@ -619,7 +619,7 @@ mod tests {
         }
     }
 
-    /// Broadcasts a step on every pass.
+    /// Broadcasts a step on every cycle.
     struct Town;
 
     impl Handler<TestPayload> for Town {
@@ -702,9 +702,9 @@ mod tests {
             recv(&self.dispatches)
         }
 
-        /// The records of one pass: its event records and then its cycle
+        /// The records of one cycle: its event records and then its cycle
         /// record.
-        fn cycle(&self) -> (Vec<EventRecord<TestPayload>>, CycleRecord) {
+        fn records_of_a_cycle(&self) -> (Vec<EventRecord<TestPayload>>, CycleRecord) {
             let mut events = Vec::new();
             loop {
                 match recv(&self.records) {
@@ -715,7 +715,7 @@ mod tests {
         }
 
         fn kinds(&self) -> Vec<TestEvent> {
-            self.cycle()
+            self.records_of_a_cycle()
                 .0
                 .into_iter()
                 .map(|record| record.event)
@@ -735,7 +735,7 @@ mod tests {
     }
 
     #[test]
-    fn a_pass_drains_everything_waiting_in_the_inbox() {
+    fn a_cycle_drains_everything_waiting_in_the_inbox() {
         let wires = wires(None);
         for event in [start(), step("b", 6), step("c", 3), step("b", 5)] {
             wires
@@ -767,7 +767,7 @@ mod tests {
     }
 
     #[test]
-    fn events_arriving_mid_pass_wait_for_the_next_pass() {
+    fn events_arriving_mid_cycle_wait_for_the_next_cycle() {
         let (rig, busy, release) = gated();
         rig.send(start());
         recv(&busy);
@@ -792,7 +792,7 @@ mod tests {
     }
 
     #[test]
-    fn exits_after_the_pass_that_contained_stop() {
+    fn exits_after_the_cycle_that_contained_stop() {
         let wires = wires(None);
         for event in [start(), stop(), step("b", 1)] {
             wires
@@ -810,7 +810,7 @@ mod tests {
     }
 
     #[test]
-    fn exits_when_the_inbox_closes_without_a_pass() {
+    fn exits_when_the_inbox_closes_before_any_cycle_runs() {
         let rig = rig(Recorder::default(), Some(EVERY));
         drop(rig.inbox);
         let handler = rig.agent.join().unwrap();
@@ -824,7 +824,7 @@ mod tests {
         let rig = rig(Recorder::default(), Some(EVERY));
         rig.send(start());
         assert_eq!(rig.dispatch().deliveries, 1);
-        let (_, started) = rig.cycle();
+        let (_, started) = rig.records_of_a_cycle();
         let first = recv(rig.timer.requests());
         assert_eq!(first, started.t_start + EVERY);
 
@@ -840,7 +840,7 @@ mod tests {
 
         rig.timer.fire().unwrap();
         assert_eq!(rig.dispatch().deliveries, 0);
-        let (events, thought) = rig.cycle();
+        let (events, thought) = rig.records_of_a_cycle();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event, Event::Think);
         assert_eq!(
@@ -918,17 +918,17 @@ mod tests {
         rig.dispatch();
         // The first request is made only after the start was handled, so it
         // is the first thing on the channel either way; what the test can
-        // check is which pass it was measured from.
+        // check is which cycle it was measured from.
         let deadline = recv(rig.timer.requests());
-        rig.cycle();
-        let (_, started) = rig.cycle();
+        rig.records_of_a_cycle();
+        let (_, started) = rig.records_of_a_cycle();
         assert_eq!(deadline, started.t_start + EVERY);
         rig.send(stop());
         rig.agent.join().unwrap();
     }
 
     #[test]
-    fn a_pass_is_recorded_as_events_then_a_cycle() {
+    fn a_cycle_records_its_events_before_its_cycle_record() {
         let mut wires = wires(None);
         let (records, writer) = Writer::spawn(Vec::new());
         wires.wiring.records = records;
@@ -971,14 +971,14 @@ mod tests {
     }
 
     #[test]
-    fn sequence_numbers_run_on_across_passes() {
+    fn sequence_numbers_run_on_across_cycles() {
         let rig = rig(Recorder::default(), None);
         rig.send(start());
-        let (first, cycle) = rig.cycle();
+        let (first, cycle) = rig.records_of_a_cycle();
         assert_eq!(first.iter().map(|r| r.seq).collect::<Vec<_>>(), [Seq(0)]);
         assert_eq!((cycle.inputs, cycle.outputs), (vec![Seq(0)], vec![]));
         rig.send(step("b", 1));
-        let (second, cycle) = rig.cycle();
+        let (second, cycle) = rig.records_of_a_cycle();
         assert_eq!(
             second.iter().map(|r| r.seq).collect::<Vec<_>>(),
             [Seq(1), Seq(2)]
@@ -995,7 +995,7 @@ mod tests {
         rig.send(start());
         let expected = Event::message("a", ["b", "c"], TestPayload::Step(0));
         assert_eq!(rig.dispatch().sent, std::slice::from_ref(&expected));
-        let (records, cycle) = rig.cycle();
+        let (records, cycle) = rig.records_of_a_cycle();
         assert_eq!(records[1].event, expected);
         assert_eq!(cycle.outputs, [Seq(1)]);
         rig.send(stop());

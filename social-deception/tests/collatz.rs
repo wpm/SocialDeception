@@ -260,8 +260,8 @@ fn chains_that_share_a_value_stay_apart() {
 }
 
 /// A hand-written trajectory of a ring of two in which `a` opens 4 and 2,
-/// `b` drains both opening steps in one pass, and `a` drains both replies in
-/// one pass. The runtime makes such passes likely but not certain, so the
+/// `b` drains both opening steps in one cycle, and `a` drains both replies in
+/// one cycle. The runtime makes such cycles likely but not certain, so the
 /// case is pinned down here rather than hoped for in a live episode.
 fn mixed_drains() -> Vec<Value> {
     let control = |agent: &str, seq: u64, time: u64, control: &str| {

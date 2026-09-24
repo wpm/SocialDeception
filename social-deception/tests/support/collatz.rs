@@ -61,7 +61,7 @@ pub fn next(n: u64) -> u64 {
 ///
 /// It passes every value it receives one step on to a single other agent,
 /// and opens chains of its own when the episode starts. It keeps no state
-/// between passes: the chain's name and value travel with the message.
+/// between cycles: the chain's name and value travel with the message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Collatz {
     to: AgentId,
