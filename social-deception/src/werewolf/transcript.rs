@@ -345,7 +345,11 @@ fn moderator_record<'a>(
     let direction = match record.get("type").and_then(Value::as_str) {
         Some("action") => Some(Direction::Sent),
         Some("observation") => Some(Direction::Received),
-        Some("control") => None,
+        // A control and a dropped action both carry a sequence number and
+        // say nothing about the game: a control is out-of-domain, and a
+        // dropped action never traveled, so nobody heard it. Counted, not
+        // read, so that skipping them does not look like a gap.
+        Some("control" | "dropped") => None,
         Some("cycle") => return Ok(None),
         found => {
             return Err(TranscriptError::UnknownRecordType {
@@ -1026,6 +1030,32 @@ mod tests {
             .count();
         assert_eq!(controls, 2, "the moderator was started and stopped");
         read(&lines).unwrap();
+    }
+
+    #[test]
+    fn a_dropped_record_says_nothing_about_the_game_and_is_skipped() {
+        // No `Stop` preempts a moderator cycle in this fixture, so none
+        // occurs naturally; forge one. A dropped action carries a sequence
+        // number like any other record, so the reader must count it and
+        // read nothing from it, exactly as it does a control. Until the
+        // environment ends episodes by sending `Stop`, this is the only
+        // place that says so.
+        let mut lines = fixture();
+        let index = moderator_record(&lines, is_response);
+        let mut dropped = lines[index].clone();
+        dropped["type"] = json!("dropped");
+        dropped["seq"] = json!(lines[index]["seq"].as_u64().unwrap() + 1);
+        dropped.as_object_mut().unwrap().remove("received");
+        for line in &mut lines[index + 1..] {
+            if line["agent"] == MODERATOR
+                && let Some(seq) = line["seq"].as_u64()
+            {
+                line["seq"] = json!(seq + 1);
+            }
+        }
+        lines.insert(index + 1, dropped);
+        let transcript = read(&lines).unwrap();
+        assert_eq!(transcript, read(&fixture()).unwrap());
     }
 
     #[test]

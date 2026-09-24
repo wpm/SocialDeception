@@ -89,7 +89,7 @@ impl Cancel {
     /// forever, which is what happens to the cancel of a cycle nobody
     /// interrupted.
     #[must_use]
-    pub fn new() -> (Self, Trip) {
+    pub(crate) fn new() -> (Self, Trip) {
         let (sender, tripped) = bounded(0);
         (Self { tripped }, Trip { _sender: sender })
     }
@@ -134,13 +134,13 @@ impl Cancel {
 /// goes away. Pulling it is therefore the same as dropping it, and the
 /// method exists so that the code that does it says what it means.
 #[derive(Debug)]
-pub struct Trip {
+pub(crate) struct Trip {
     _sender: Sender<Never>,
 }
 
 impl Trip {
     /// Trips the cancel this wire belongs to.
-    pub fn pull(self) {
+    pub(crate) fn pull(self) {
         drop(self);
     }
 }

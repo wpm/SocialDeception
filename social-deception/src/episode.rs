@@ -1,7 +1,7 @@
 //! An episode: one run of an environment with a fixed roster of agents, from
 //! coordinated startup to coordinated shutdown.
 //!
-//! The episode constructs the roster, wires each agent's inbox, dispatch
+//! The episode constructs the roster, wires each agent's queues, dispatch
 //! channel and record channel, spawns one thread per agent, tells every
 //! agent to start, routes what the agents send until the episode is over,
 //! tells every agent to stop, and joins the threads. A [`Control`] is how it
@@ -16,7 +16,7 @@
 //! sees both halves of the work in progress: the deliveries it has routed
 //! and the cycles the agents have reported. It keeps one count, of
 //! deliveries routed and not yet reported handled. A cycle in progress is
-//! exactly a set of deliveries taken off an inbox and not yet reported, and
+//! exactly a set of deliveries taken off a queue and not yet reported, and
 //! an agent dispatches a cycle's deliveries and its outputs together, so the
 //! count never reads zero while a cycle that might still send is under way.
 //! When it reaches zero the episode is quiescent and shutdown begins.
@@ -734,8 +734,8 @@ mod tests {
             "agent a is in the roster twice"
         );
         assert_eq!(
-            EpisodeError::Control(RouteError::InboxClosed(AgentId::new("a"))).to_string(),
-            "could not deliver a control: the inbox of agent a is closed"
+            EpisodeError::Control(RouteError::QueueClosed(AgentId::new("a"))).to_string(),
+            "could not deliver a control: the queue of agent a is closed"
         );
         assert_eq!(
             EpisodeError::Route {

@@ -73,7 +73,7 @@ pub mod werewolf;
 pub use agent::{
     Action, Agent, CycleDispatch, Error, Handler, Instruction, Observation, Recipients, Wiring,
 };
-pub use cancel::{Arm, Cancel, ControlSender, Never, Signal, Trip};
+pub use cancel::{Arm, Cancel, ControlSender, Never, Signal};
 pub use clock::{Clock, Created, Timestamp, Timestamped};
 pub use episode::{Episode, EpisodeError, Failure};
 pub use event::{AgentId, Control, Domain, Event, Payload};

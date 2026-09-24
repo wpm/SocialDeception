@@ -50,9 +50,9 @@ pub enum RouteError {
     NoRecipients,
     /// A sender that addressed itself.
     Loopback(AgentId),
-    /// A recipient whose inbox has been dropped, so the copy for it could
+    /// A recipient whose queue has been dropped, so the copy for it could
     /// not be delivered.
-    InboxClosed(AgentId),
+    QueueClosed(AgentId),
 }
 
 impl fmt::Display for RouteError {
@@ -61,7 +61,7 @@ impl fmt::Display for RouteError {
             Self::UnknownAgent(id) => write!(f, "no agent {id} in the roster"),
             Self::NoRecipients => f.write_str("an event must have at least one recipient"),
             Self::Loopback(id) => write!(f, "agent {id} addressed itself"),
-            Self::InboxClosed(id) => write!(f, "the inbox of agent {id} is closed"),
+            Self::QueueClosed(id) => write!(f, "the queue of agent {id} is closed"),
         }
     }
 }
@@ -130,7 +130,8 @@ impl<D: Domain> Router<D> {
     /// - [`RouteError::Loopback`] if the sender is among the recipients;
     /// - [`RouteError::UnknownAgent`] if the sender or a recipient is not in
     ///   the roster;
-    /// - [`RouteError::InboxClosed`] if a recipient's inbox has been dropped.
+    /// - [`RouteError::QueueClosed`] if a recipient's event queue has been
+    ///   dropped.
     ///   Recipients before it in the set have already received the event.
     ///
     /// Nothing is delivered when a validation fails.
@@ -144,19 +145,23 @@ impl<D: Domain> Router<D> {
         if recipients.contains(sender) {
             return Err(RouteError::Loopback(sender.clone()));
         }
-        if let Some(unknown) = std::iter::once(sender)
-            .chain(recipients)
-            .find(|id| !self.queues.contains_key(*id))
-        {
-            return Err(RouteError::UnknownAgent(unknown.clone()));
+        if !self.queues.contains_key(sender) {
+            return Err(RouteError::UnknownAgent(sender.clone()));
+        }
+        // Every recipient is resolved before anything is sent, so an event
+        // addressed to a stranger delivers to nobody rather than to the
+        // agents that happened to be named before it. Resolving keeps the
+        // queues it found, so each recipient is looked up once.
+        let mut resolved = Vec::with_capacity(recipients.len());
+        for id in recipients {
+            resolved.push((id, self.queues_of(id)?));
         }
         let mut deliveries = 0;
-        for id in recipients {
-            let queues = self.queues_of(id)?;
+        for (id, queues) in resolved {
             queues
                 .events
                 .send(event.clone())
-                .map_err(|_| RouteError::InboxClosed(id.clone()))?;
+                .map_err(|_| RouteError::QueueClosed(id.clone()))?;
             deliveries += 1;
         }
         Ok(deliveries)
@@ -170,7 +175,7 @@ impl<D: Domain> Router<D> {
     ///
     /// # Errors
     ///
-    /// [`RouteError::InboxClosed`] if some agent's control queue has been
+    /// [`RouteError::QueueClosed`] if some agent's control queue has been
     /// dropped. Agents before it in the roster have already received the
     /// control, and have already been tripped.
     pub fn control(&self, control: Control) -> Result<usize, RouteError> {
@@ -179,7 +184,7 @@ impl<D: Domain> Router<D> {
             queues
                 .controls
                 .control(self.clock, control)
-                .map_err(|_| RouteError::InboxClosed(id.clone()))?;
+                .map_err(|_| RouteError::QueueClosed(id.clone()))?;
             deliveries += 1;
         }
         Ok(deliveries)
@@ -335,11 +340,11 @@ mod tests {
         drop(queues.remove(&id("b")));
         assert_eq!(
             router.route(&event("a", ["b"], 1)),
-            Err(RouteError::InboxClosed(id("b")))
+            Err(RouteError::QueueClosed(id("b")))
         );
         assert_eq!(
             router.control(Control::Stop),
-            Err(RouteError::InboxClosed(id("b")))
+            Err(RouteError::QueueClosed(id("b")))
         );
     }
 
@@ -381,8 +386,8 @@ mod tests {
             "agent a addressed itself"
         );
         assert_eq!(
-            RouteError::InboxClosed(id("b")).to_string(),
-            "the inbox of agent b is closed"
+            RouteError::QueueClosed(id("b")).to_string(),
+            "the queue of agent b is closed"
         );
     }
 }

@@ -1,6 +1,6 @@
 //! Where an agent's wake-ups come from.
 //!
-//! An agent that has a deadline waits on its inbox and on a wake channel at
+//! An agent that has a deadline waits on its queues and on a wake channel at
 //! the same time, and the wake channel firing is what makes it run a cycle
 //! with no observations. A [`TimerSource`] is whatever hands out those wake
 //! channels. In production it is the episode [`Clock`], whose channels fire

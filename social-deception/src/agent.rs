@@ -405,7 +405,7 @@ pub trait Handler<D: Domain> {
 pub struct CycleDispatch<D: Domain> {
     /// The agent whose cycle this was.
     pub agent: AgentId,
-    /// How many deliveries the cycle took off the inbox. A timeout is not a
+    /// How many deliveries the cycle took off its queues. A timeout is not a
     /// delivery.
     pub deliveries: usize,
     /// The events the cycle sent, stamped with this agent as sender, in the
@@ -490,7 +490,7 @@ impl<D: Domain> fmt::Debug for Wiring<D> {
     }
 }
 
-/// Why an agent's loop stopped before its inbox closed or it was told to
+/// Why an agent's loop stopped before its queues closed or it was told to
 /// stop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Error {
@@ -542,6 +542,7 @@ impl<H> Agent<H> {
             handler,
             timer,
             next_seq: 0,
+            last_created: None,
             closed: Closed::default(),
             pending: None,
         };
@@ -665,6 +666,11 @@ struct Loop<D: Domain, H, T> {
     timer: T,
     /// The next sequence number to assign.
     next_seq: u64,
+    /// The last `created` this agent stamped onto an action. Per agent, not
+    /// per cycle: the join an observation makes is on the sender and the
+    /// instant over the whole trajectory, so two actions of one agent may
+    /// not share an instant even across a cycle boundary.
+    last_created: Option<Timestamp>,
 
     /// Which queues have closed. Sticky: learned from a drain and true from
     /// then on.
@@ -883,9 +889,8 @@ where
         let preempted = stopped || late.iter().any(|signal| signal.control == Control::Stop);
 
         let (mut sent, mut outputs) = (Vec::new(), Vec::new());
-        let mut last = None;
         for action in actions {
-            let event = self.stamp(action, &mut last);
+            let event = self.stamp(action);
             if preempted {
                 // Not sent, so not an output of the cycle and not routed:
                 // the episode's in-flight count never sees it.
@@ -949,26 +954,26 @@ where
     /// as it would have been, so that the two records differ only in what
     /// they say happened.
     ///
-    /// `last` is the previous stamp this cycle handed out, and the stamp
-    /// returned is always strictly later. That is not cosmetic. An
-    /// observation names the action it came from by the sender and the
-    /// creation time and by nothing else, since no event carries an
-    /// identifier (ADR-0002), so two of an agent's actions sharing an
-    /// instant would be two actions no observation could tell apart. A cycle
-    /// that returns several actions stamps them within a few hundred
-    /// nanoseconds of each other, which the clock's resolution does not
-    /// always separate, so the loop separates them.
-    fn stamp(&self, action: Action<D>, last: &mut Option<Timestamp>) -> Event<D> {
+    /// The stamp is always strictly later than the last one this agent
+    /// handed out. That is not cosmetic. An observation names the action it
+    /// came from by the sender and the creation time and by nothing else,
+    /// since no event carries an identifier (ADR-0002), so two of an agent's
+    /// actions sharing an instant would be two actions no observation could
+    /// tell apart. A cycle that returns several actions stamps them within a
+    /// few hundred nanoseconds of each other, which the clock's resolution
+    /// does not always separate, and two cycles can run that close together
+    /// too, so the guarantee is the agent's and not one cycle's.
+    fn stamp(&mut self, action: Action<D>) -> Event<D> {
         let Action {
             recipients,
             payload,
         } = action;
         let now = self.wiring.clock.now();
-        let created = match *last {
+        let created = match self.last_created {
             Some(previous) if now <= previous => previous + Duration::from_nanos(1),
             _ => now,
         };
-        *last = Some(created);
+        self.last_created = Some(created);
         Event {
             sender: self.wiring.id.clone(),
             recipients: match recipients {
@@ -2082,7 +2087,16 @@ mod tests {
         // Every poll of every cycle but the last said no. The last cycle is
         // the one that popped the stop, and its cancel was never tripped
         // either: the stop was already on the queue when the cycle began.
-        assert_eq!(handler.cycles.load(Ordering::Relaxed), 7);
+        //
+        // How many cycles that took is the scheduler's business, not the
+        // claim: a cycle drains whatever has arrived, so two steps landing
+        // together are one cycle rather than two. What must hold is that
+        // every cycle ran and none of them was cancelled.
+        let cycles = handler.cycles.load(Ordering::Relaxed);
+        assert!(
+            (2..=7).contains(&cycles),
+            "the start, at least one step and the stop each ran: {cycles}"
+        );
         assert!(
             handler.answers.iter().all(|cancelled| !cancelled),
             "no poll of any cycle saw a cancel"
