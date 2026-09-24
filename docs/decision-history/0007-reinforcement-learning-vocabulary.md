@@ -1,6 +1,6 @@
 # ADR-0007: The framework speaks the vocabulary of reinforcement learning
 
-**Status:** Proposed
+**Status:** Accepted
 **Date:** 2026-09-24
 **Deciders:** Bill McNeill
 **Supersedes:** [ADR-0003](0003-event-record-stamps.md)

@@ -5,6 +5,8 @@
 **Deciders:** Bill McNeill
 **Refined by:** [ADR-0006](0006-knowledge-holds-what-the-agent-did-in-secret.md),
 which adds the agent's own secret actions to what `Knowledge` folds
+**Amended by:** [ADR-0007](0007-reinforcement-learning-vocabulary.md), which renames the action type `Move`: an
+`Action` is now the message an agent sends, here a `Response` carrying a `Move`
 
 ## Context
 

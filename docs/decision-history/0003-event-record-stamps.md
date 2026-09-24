@@ -1,9 +1,10 @@
 # ADR-0003: An event record stamps its time as arrived, sent or due
 
-**Status:** Accepted
+**Status:** Superseded by [ADR-0007](0007-reinforcement-learning-vocabulary.md)
 **Date:** 2026-09-18
 **Deciders:** Bill McNeill
 **Amends:** [ADR-0002](0002-jsonl-trajectory-format.md)
+**Superseded by:** [ADR-0007](0007-reinforcement-learning-vocabulary.md), whose observation, action and control records carry `created` and `received` times in place of these stamps
 
 ## Context
 
