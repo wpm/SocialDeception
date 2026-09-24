@@ -704,7 +704,7 @@ mod tests {
 
         /// The records of one cycle: its event records and then its cycle
         /// record.
-        fn cycle(&self) -> (Vec<EventRecord<TestPayload>>, CycleRecord) {
+        fn records_of_a_cycle(&self) -> (Vec<EventRecord<TestPayload>>, CycleRecord) {
             let mut events = Vec::new();
             loop {
                 match recv(&self.records) {
@@ -715,7 +715,7 @@ mod tests {
         }
 
         fn kinds(&self) -> Vec<TestEvent> {
-            self.cycle()
+            self.records_of_a_cycle()
                 .0
                 .into_iter()
                 .map(|record| record.event)
@@ -810,7 +810,7 @@ mod tests {
     }
 
     #[test]
-    fn exits_when_the_inbox_closes_without_a_cycle() {
+    fn exits_when_the_inbox_closes_before_any_cycle_runs() {
         let rig = rig(Recorder::default(), Some(EVERY));
         drop(rig.inbox);
         let handler = rig.agent.join().unwrap();
@@ -824,7 +824,7 @@ mod tests {
         let rig = rig(Recorder::default(), Some(EVERY));
         rig.send(start());
         assert_eq!(rig.dispatch().deliveries, 1);
-        let (_, started) = rig.cycle();
+        let (_, started) = rig.records_of_a_cycle();
         let first = recv(rig.timer.requests());
         assert_eq!(first, started.t_start + EVERY);
 
@@ -840,7 +840,7 @@ mod tests {
 
         rig.timer.fire().unwrap();
         assert_eq!(rig.dispatch().deliveries, 0);
-        let (events, thought) = rig.cycle();
+        let (events, thought) = rig.records_of_a_cycle();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event, Event::Think);
         assert_eq!(
@@ -920,15 +920,15 @@ mod tests {
         // is the first thing on the channel either way; what the test can
         // check is which cycle it was measured from.
         let deadline = recv(rig.timer.requests());
-        rig.cycle();
-        let (_, started) = rig.cycle();
+        rig.records_of_a_cycle();
+        let (_, started) = rig.records_of_a_cycle();
         assert_eq!(deadline, started.t_start + EVERY);
         rig.send(stop());
         rig.agent.join().unwrap();
     }
 
     #[test]
-    fn a_cycle_is_recorded_as_events_then_a_cycle_record() {
+    fn a_cycle_records_its_events_before_its_cycle_record() {
         let mut wires = wires(None);
         let (records, writer) = Writer::spawn(Vec::new());
         wires.wiring.records = records;
@@ -974,11 +974,11 @@ mod tests {
     fn sequence_numbers_run_on_across_cycles() {
         let rig = rig(Recorder::default(), None);
         rig.send(start());
-        let (first, cycle) = rig.cycle();
+        let (first, cycle) = rig.records_of_a_cycle();
         assert_eq!(first.iter().map(|r| r.seq).collect::<Vec<_>>(), [Seq(0)]);
         assert_eq!((cycle.inputs, cycle.outputs), (vec![Seq(0)], vec![]));
         rig.send(step("b", 1));
-        let (second, cycle) = rig.cycle();
+        let (second, cycle) = rig.records_of_a_cycle();
         assert_eq!(
             second.iter().map(|r| r.seq).collect::<Vec<_>>(),
             [Seq(1), Seq(2)]
@@ -995,7 +995,7 @@ mod tests {
         rig.send(start());
         let expected = Event::message("a", ["b", "c"], TestPayload::Step(0));
         assert_eq!(rig.dispatch().sent, std::slice::from_ref(&expected));
-        let (records, cycle) = rig.cycle();
+        let (records, cycle) = rig.records_of_a_cycle();
         assert_eq!(records[1].event, expected);
         assert_eq!(cycle.outputs, [Seq(1)]);
         rig.send(stop());
