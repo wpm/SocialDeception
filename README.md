@@ -21,12 +21,15 @@ another's.
 One agent per episode is the **environment**: it alone starts and stops the
 others, and it alone decides what an agent's behavior was worth. Those two
 powers travel differently. A **control** — start or stop — goes on a queue
-of its own, so that it is acted on ahead of anything already waiting, and
-it preempts the cycle it interrupts. A **reward** does not travel at all:
-nothing in a running episode reads it, so the environment writes it
-straight to the trajectory, where training picks it up. Werewolf's
-environment is the moderator, and it pays +1 to every player on the winning
-faction and −1 to every player on the losing one, living and dead alike.
+of its own, so that it is acted on ahead of anything already waiting. A
+stop also ends the cycle it lands in: the handler is asked to give up
+rather than interrupted, and whatever it returns is logged as **dropped**
+and never sent, since after a stop there is nobody left to hear it. A
+**reward** does not travel at all: nothing in a running episode reads it,
+so the environment writes it straight to the trajectory, where training
+picks it up. Werewolf's environment is the moderator, and it pays +1 to
+every player on the winning faction and −1 to every player on the losing
+one, living and dead alike.
 
 ## Playing Werewolf
 
