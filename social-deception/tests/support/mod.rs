@@ -52,8 +52,19 @@ pub fn parse(bytes: &[u8]) -> Vec<Value> {
 /// - a `dropped` record appears only in a cycle whose inputs include a
 ///   `Stop`, such a cycle has no action outputs, and nothing follows an
 ///   agent's `Stop` in its trajectory but the end of that cycle;
+/// - a `reward` names an agent and a value, carries no sequence number and
+///   no receipt, and belongs to no cycle;
 /// - every observation joins exactly one action, by sender and creation
 ///   time, and every action has one matching observation per recipient.
+///
+/// A reward is outside almost all of it, and deliberately. It belongs to
+/// the agent it names and was written by the environment, so it is in no
+/// cycle of that agent's, has no sequence number to be contiguous with, and
+/// arrives in the file wherever the writer took it. What is left to check
+/// is its shape, which is what the reward clause above says, and the one
+/// ordering that does hold: it precedes the `Stop` that ends the trajectory
+/// it belongs to, since a reward assigned after an agent has been told to
+/// stop would be scoring an episode that was already over.
 ///
 /// The last is the one that makes a trajectory a single object rather than a
 /// pile of per-agent logs: an observation and the action that produced it
@@ -78,6 +89,10 @@ pub fn check(lines: &[Value]) {
                 check_record(line, kind);
                 runs.entry(agent(line)).or_default().push(seq(line));
             }
+            // A reward is in no cycle and in no run: it was written by the
+            // environment, about somebody else, outside that agent's loop
+            // entirely.
+            Some("reward") => check_reward(line),
             Some("cycle") => {
                 let run = runs.remove(agent(line)).unwrap_or_default();
                 check_cycle(line, &run, &records);
@@ -88,16 +103,74 @@ pub fn check(lines: &[Value]) {
     check_sequence_numbers(lines);
     check_grouping(lines);
     check_nothing_follows_a_stop(lines);
+    check_rewards_precede_their_stop(lines);
     check_the_join(lines);
 }
 
-/// The non-cycle records of `lines`, by agent and sequence number.
+/// A reward names the agent it belongs to, says when it was logged and what
+/// it is worth, and carries neither a sequence number nor a receipt.
+///
+/// The two absences are the point. A reward has no `seq` because sequence
+/// numbers are the agent loop's to assign and this record was not written by
+/// that loop, and no `received` because a reward is logged and never sent,
+/// so nobody ever received it.
+fn check_reward(line: &Value) {
+    agent(line);
+    time(line, "created");
+    assert!(
+        line["value"].is_number(),
+        "a reward says what it is worth: {line}"
+    );
+    assert!(
+        line["seq"].is_null(),
+        "a reward carries no sequence number: {line}"
+    );
+    assert!(
+        line["received"].is_null(),
+        "a reward is logged, never sent, so nobody received it: {line}"
+    );
+    assert!(line["event"].is_null(), "a reward carries no event: {line}");
+}
+
+/// Every reward precedes the `Stop` of the agent it belongs to.
+///
+/// An agent's trajectory ends at its `Stop`, so a reward after one would be
+/// scoring an episode that was already over for that agent. The check is on
+/// the `created` stamps and not on file order, because a reward is written
+/// by the environment's thread and its line lands wherever the writer took
+/// it.
+fn check_rewards_precede_their_stop(lines: &[Value]) {
+    let stopped: HashMap<&str, u64> = lines
+        .iter()
+        .filter(|line| line["type"] == "control" && line["control"] == "stop")
+        .map(|line| (agent(line), time(line, "created")))
+        .collect();
+    for line in lines.iter().filter(|line| line["type"] == "reward") {
+        let Some(stop) = stopped.get(agent(line)) else {
+            continue;
+        };
+        assert!(
+            time(line, "created") <= *stop,
+            "a reward is logged before the stop that ends its agent's trajectory: {line}"
+        );
+    }
+}
+
+/// The numbered records of `lines`, by agent and sequence number: every
+/// record but a cycle, which has no number, and a reward, which has none
+/// either and belongs to an agent other than the one that wrote it.
 pub fn records(lines: &[Value]) -> HashMap<(&str, u64), &Value> {
     lines
         .iter()
-        .filter(|line| line["type"] != "cycle")
+        .filter(|line| numbered(line))
         .map(|line| ((agent(line), seq(line)), line))
         .collect()
+}
+
+/// Whether a record carries a sequence number: everything its agent's own
+/// loop wrote, which is everything but a cycle and a reward.
+pub fn numbered(line: &Value) -> bool {
+    line["type"] != "cycle" && line["type"] != "reward"
 }
 
 /// The agent a record belongs to.
@@ -342,7 +415,7 @@ fn dropped_of<'a>(
 
 fn check_sequence_numbers(lines: &[Value]) {
     let mut next: HashMap<&str, u64> = HashMap::new();
-    for line in lines.iter().filter(|line| line["type"] != "cycle") {
+    for line in lines.iter().filter(|line| numbered(line)) {
         let expected = next.entry(agent(line)).or_insert(0);
         assert_eq!(
             seq(line),
@@ -369,6 +442,11 @@ fn check_grouping(lines: &[Value]) {
         .map(|line| (agent(line), seq(line)))
         .collect();
     for line in lines {
+        // A reward belongs to no cycle of the agent it names: the
+        // environment wrote it, outside that agent's loop entirely.
+        if line["type"] == "reward" {
+            continue;
+        }
         let agent = agent(line);
         let pending = pending.entry(agent).or_default();
         if line["type"] == "cycle" {
@@ -405,6 +483,14 @@ fn check_nothing_follows_a_stop(lines: &[Value]) {
     let mut stopped: HashSet<&str> = HashSet::new();
     let mut closed: HashSet<&str> = HashSet::new();
     for line in lines {
+        // A reward is not the agent's own record and is not placed by file
+        // order: the environment writes it on its own thread, so it can
+        // land after the agent's last cycle. That it was *logged* before
+        // the stop is `check_rewards_precede_their_stop`'s business, on the
+        // stamps, which is where the claim can actually be made.
+        if line["type"] == "reward" {
+            continue;
+        }
         let agent = agent(line);
         assert!(
             !closed.contains(agent),
@@ -648,6 +734,58 @@ mod tests {
             json!({"type": "cycle", "agent": "b", "t_start": 75, "t_stop": 76,
                    "woken": "queue", "inputs": [1], "outputs": []}),
         );
+        check(&lines);
+    }
+
+    /// The good trajectory with a reward for `a`, logged before its stop,
+    /// as an environment would have written it.
+    fn rewarded() -> Vec<Value> {
+        let mut lines = good();
+        lines.push(json!({"type": "reward", "agent": "a", "created": 74, "value": 1}));
+        lines
+    }
+
+    #[test]
+    fn a_reward_passes_and_belongs_to_no_cycle() {
+        // It carries no sequence number and closes no cycle, and its line
+        // sits after the cycle that ended `a`'s trajectory, because the
+        // environment wrote it on its own thread.
+        check(&rewarded());
+    }
+
+    #[test]
+    #[should_panic(expected = "carries no sequence number")]
+    fn a_reward_with_a_sequence_number_is_caught() {
+        let mut lines = rewarded();
+        let last = lines.len() - 1;
+        lines[last]["seq"] = json!(4);
+        check(&lines);
+    }
+
+    #[test]
+    #[should_panic(expected = "nobody received it")]
+    fn a_reward_that_claims_to_have_been_received_is_caught() {
+        let mut lines = rewarded();
+        let last = lines.len() - 1;
+        lines[last]["received"] = json!(75);
+        check(&lines);
+    }
+
+    #[test]
+    #[should_panic(expected = "says what it is worth")]
+    fn a_reward_without_a_value_is_caught() {
+        let mut lines = rewarded();
+        let last = lines.len() - 1;
+        lines[last].as_object_mut().unwrap().remove("value");
+        check(&lines);
+    }
+
+    #[test]
+    #[should_panic(expected = "before the stop that ends its agent's trajectory")]
+    fn a_reward_logged_after_its_agents_stop_is_caught() {
+        let mut lines = rewarded();
+        let last = lines.len() - 1;
+        lines[last]["created"] = json!(76);
         check(&lines);
     }
 

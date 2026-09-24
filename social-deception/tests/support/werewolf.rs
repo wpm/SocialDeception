@@ -31,6 +31,11 @@
 //!   announcement of its own death: no message of this game is broadcast,
 //!   and the outcome, which ADR-0004 once excepted, is narrated to the
 //!   living like everything else;
+//! - **the rewards**: every player has exactly one, +1 exactly when the
+//!   role it was dealt belongs to the winning faction and −1 otherwise,
+//!   living or dead, and logged before the `Stop` that ends its
+//!   trajectory. The moderator has none: it plays no game, so there is
+//!   nothing its behavior could be worth;
 //! - **game shape**: the phases alternate from the first night, each
 //!   eliminates at most one player and each day exactly one, the player
 //!   eliminated is one the phase's tally names most often, a night with no
@@ -103,7 +108,11 @@ pub fn check(lines: &[Value], config: &Config) {
     play.check_hidden_information();
     play.check_outcome();
     play.check_players(lines);
+    // The episode's shape first: a reward is checked against the `Stop`
+    // that ends its agent's trajectory, so "everybody was stopped" should
+    // fail by its own name rather than as a missing stop to compare with.
     check_episode(lines, config);
+    play.check_rewards(lines);
 }
 
 /// Every agent's trajectory, the moderator's included, begins with a `Start`
@@ -602,6 +611,56 @@ impl<'a> Play<'a> {
         assert!(
             outcome.rounds.0 as usize <= self.config.players.len(),
             "the game ends within as many rounds as there are players: {outcome:?}"
+        );
+    }
+
+    /// Every player has exactly one reward, worth +1 if the role it was
+    /// dealt belongs to the winning faction and −1 if it does not, logged
+    /// at or before the `Stop` that ends its trajectory. The moderator has
+    /// none.
+    ///
+    /// The roles come from the `Assigned` narrations the moderator sent,
+    /// which is the same place every other check here gets them, so the
+    /// claim is that the reward agrees with the game as it was actually
+    /// dealt and not merely with itself. There are no stalemates
+    /// (ADR-0007), so every player is paid one of the two and never zero.
+    fn check_rewards(&self, lines: &[Value]) {
+        let rewards: BTreeMap<AgentId, Vec<&Value>> = lines
+            .iter()
+            .filter(|line| line["type"] == "reward")
+            .fold(BTreeMap::new(), |mut paid, line| {
+                let who = AgentId::new(super::agent(line));
+                paid.entry(who).or_default().push(line);
+                paid
+            });
+        for who in &self.config.players {
+            let paid = rewards
+                .get(who)
+                .unwrap_or_else(|| panic!("{who} has a reward"));
+            assert_eq!(paid.len(), 1, "{who} has exactly one reward: {paid:?}");
+            let line = paid[0];
+            let expected = if self.role(who).faction() == self.outcome.winner {
+                1
+            } else {
+                -1
+            };
+            assert_eq!(
+                line["value"].as_i64(),
+                Some(expected),
+                "{who} held {} and {:?} won: {line}",
+                self.role(who),
+                self.outcome.winner
+            );
+        }
+        assert!(
+            !rewards.contains_key(&self.config.moderator),
+            "the moderator plays no game and is paid nothing: {:?}",
+            rewards.get(&self.config.moderator)
+        );
+        assert_eq!(
+            rewards.len(),
+            self.config.players.len(),
+            "the players, and nobody else, are paid"
         );
     }
 
@@ -1484,6 +1543,84 @@ mod tests {
             .position(|line| line["agent"] == "alice" && line["control"] == "stop")
             .expect("alice is stopped");
         lines.insert(stop, leaked);
+        check(&lines, &config());
+    }
+
+    /// The index of the reward belonging to `who`.
+    fn reward_of(lines: &[Value], who: &str) -> usize {
+        lines
+            .iter()
+            .position(|line| line["type"] == "reward" && line["agent"] == who)
+            .unwrap_or_else(|| panic!("{who} has a reward"))
+    }
+
+    #[test]
+    #[should_panic(expected = "has a reward")]
+    fn a_player_never_paid_is_caught() {
+        let mut lines = fixture();
+        let index = reward_of(&lines, "grace");
+        lines.remove(index);
+        check(&lines, &config());
+    }
+
+    #[test]
+    #[should_panic(expected = "exactly one reward")]
+    fn a_player_paid_twice_is_caught() {
+        let mut lines = fixture();
+        let index = reward_of(&lines, "grace");
+        let again = lines[index].clone();
+        lines.insert(index, again);
+        check(&lines, &config());
+    }
+
+    #[test]
+    #[should_panic(expected = "grace held Seer")]
+    fn a_reward_that_contradicts_the_faction_that_won_is_caught() {
+        // Grace held the seer and the werewolves won, so grace lost. A
+        // reward saying otherwise is the reward disagreeing with the game
+        // the same file records.
+        let mut lines = fixture();
+        let index = reward_of(&lines, "grace");
+        lines[index]["value"] = json!(1);
+        check(&lines, &config());
+    }
+
+    #[test]
+    #[should_panic(expected = "dave held Werewolf")]
+    fn a_winner_paid_as_a_loser_is_caught() {
+        let mut lines = fixture();
+        let index = reward_of(&lines, "dave");
+        lines[index]["value"] = json!(-1);
+        check(&lines, &config());
+    }
+
+    #[test]
+    #[should_panic(expected = "logged before the stop that ends its agent's trajectory")]
+    fn a_reward_logged_after_its_agents_stop_is_caught() {
+        // An agent's trajectory ends at its stop, so a reward stamped
+        // after one is scoring an episode that was already over for it.
+        // The claim is the shared checker's, since it holds of any
+        // environment's rewards and not only Werewolf's.
+        let mut lines = fixture();
+        let index = reward_of(&lines, "grace");
+        let stop = lines
+            .iter()
+            .find(|line| line["agent"] == "grace" && line["control"] == "stop")
+            .expect("grace is stopped");
+        lines[index]["created"] = json!(stop["created"].as_u64().unwrap() + 1);
+        super::super::check(&lines);
+    }
+
+    #[test]
+    #[should_panic(expected = "plays no game and is paid nothing")]
+    fn a_reward_for_the_moderator_is_caught() {
+        // The environment runs the game rather than playing it, so there
+        // is nothing its behavior could be worth.
+        let mut lines = fixture();
+        let index = reward_of(&lines, "grace");
+        let mut moderators = lines[index].clone();
+        moderators["agent"] = json!("moderator");
+        lines.insert(index, moderators);
         check(&lines, &config());
     }
 

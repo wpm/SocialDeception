@@ -87,6 +87,6 @@ pub use event::{AgentId, Control, Domain, Event, Payload};
 pub use router::{Queues, RouteError, Router};
 pub use timer::{ManualTimer, ManualTimerControl, TimerSource};
 pub use trajectory::{
-    ActionRecord, ControlRecord, CycleRecord, DroppedRecord, LogRecord, ObservationRecord, Seq,
-    Woken, Writer,
+    ActionRecord, ControlRecord, CycleRecord, DroppedRecord, LogRecord, ObservationRecord,
+    RewardRecord, Seq, Woken, Writer,
 };

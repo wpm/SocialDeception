@@ -47,14 +47,24 @@
 //!
 //! # How the episode ends, in order
 //!
-//! The cycle in which the game ends does three things, and the order of
+//! The cycle in which the game ends does four things, and the order of
 //! them is the whole of the shutdown:
 //!
 //! 1. **narrate** the [`Outcome`] to the living, as an ordinary
 //!    [`Effect::Act`];
 //! 2. **publish** it on the [`Sender`], for whoever ran the episode;
-//! 3. **stop** every player, living and dead, with one
+//! 3. **pay** every player, living and dead, one
+//!    [`Effect::Reward`] each: **+1** if its role's faction won and
+//!    **−1** otherwise, as [`Game::rewards`] works out;
+//! 4. **stop** every player, living and dead, with one
 //!    [`Effect::Control`].
+//!
+//! The rewards come before the stop because they are what the episode was
+//! for. They are logged rather than sent (ADR-0007), so their position
+//! among the effects changes nothing a player sees; what it does is put
+//! each reward in the trajectory ahead of the `Stop` control that closes
+//! the trajectory it belongs to, which is the ordering a reader can then
+//! rely on.
 //!
 //! The episode routes a cycle's events before the controls it asked for, so
 //! a living player observes the outcome and *then* stops, rather than
@@ -119,8 +129,8 @@ impl Moderator {
     }
 
     /// Everything the directives say, said; then, if the game has just
-    /// ended, the outcome published on the channel and every player
-    /// stopped. The order is the shutdown sequence; see the
+    /// ended, the outcome published on the channel, every player paid, and
+    /// every player stopped. The order is the shutdown sequence; see the
     /// [module documentation](self).
     fn say(&mut self, directives: Vec<Directive>) -> Vec<Effect<WerewolfDomain>> {
         let mut effects: Vec<Effect<WerewolfDomain>> =
@@ -131,7 +141,17 @@ impl Moderator {
             let _ = self.outcome.send(outcome.clone());
             // Once, and this is the once: `handle` stops folding at the
             // observation that ends the game, so the outcome is seen here
-            // on the cycle it first exists and on no later one.
+            // on the cycle it first exists and on no later one. So each
+            // player is paid exactly once, and then stopped.
+            let rewards = self
+                .game
+                .rewards()
+                .expect("a game with an outcome has rewards");
+            effects.extend(
+                rewards
+                    .into_iter()
+                    .map(|(who, value)| Effect::Reward { agent: who, value }),
+            );
             effects.push(Effect::control(self.players(), Control::Stop));
         }
         effects
@@ -167,8 +187,8 @@ impl Environment<WerewolfDomain> for Moderator {
 
     /// Folds each observation into the game in order and says what the game
     /// wants said. The observation that ends the game also sends the
-    /// outcome on the channel and stops every player; after it, nothing,
-    /// whatever arrives.
+    /// outcome on the channel, pays every player and stops every player;
+    /// after it, nothing, whatever arrives.
     ///
     /// The cancel is ignored. Folding a response into the game is a few
     /// microseconds of bookkeeping with nothing to wait on, so there is no
@@ -312,7 +332,7 @@ mod tests {
             .iter()
             .filter_map(|effect| match effect {
                 Effect::Act(action) => Some(action.clone()),
-                Effect::Control { .. } => None,
+                Effect::Control { .. } | Effect::Reward { .. } => None,
             })
             .collect()
     }
@@ -323,7 +343,19 @@ mod tests {
             .iter()
             .filter_map(|effect| match effect {
                 Effect::Control { to, control } => Some((to.clone(), *control)),
-                Effect::Act(_) => None,
+                Effect::Act(_) | Effect::Reward { .. } => None,
+            })
+            .collect()
+    }
+
+    /// The rewards among some effects, by the agent paid, in the order the
+    /// moderator assigned them.
+    fn rewards(effects: &[Effect<WerewolfDomain>]) -> Vec<(AgentId, i32)> {
+        effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::Reward { agent, value } => Some((agent.clone(), *value)),
+                Effect::Act(_) | Effect::Control { .. } => None,
             })
             .collect()
     }
@@ -380,14 +412,19 @@ mod tests {
     }
 
     /// A game played out: its assignment, how the game says it ended, the
-    /// receiver of its outcome, every message the moderator sent, and every
-    /// control it asked for.
+    /// receiver of its outcome, every message the moderator sent, every
+    /// control it asked for, every reward it paid, and the whole sequence
+    /// of effects it produced.
     struct Played {
         assignment: Assignment,
         outcome: Outcome,
         receiver: Receiver<Outcome>,
         sent: Vec<Action<WerewolfDomain>>,
         commanded: Vec<(BTreeSet<AgentId>, Control)>,
+        paid: Vec<(AgentId, i32)>,
+        /// Every effect in the order the moderator produced it, which is
+        /// what the shutdown's ordering is asserted against.
+        effects: Vec<Effect<WerewolfDomain>>,
     }
 
     /// Every combination of assignment and stub policy, played out.
@@ -404,6 +441,8 @@ mod tests {
                     receiver,
                     sent: actions(&effects),
                     commanded: controls(&effects),
+                    paid: rewards(&effects),
+                    effects,
                 });
             }
         }
@@ -493,7 +532,86 @@ mod tests {
     }
 
     #[test]
-    fn the_game_ending_narrates_then_publishes_then_stops_everybody() {
+    fn the_game_ending_pays_every_player_for_its_faction() {
+        // Living or dead, +1 for the winning side and −1 for the losing
+        // one, once each. There are no stalemates, so nobody is paid zero
+        // and nobody goes unpaid.
+        for Played {
+            assignment,
+            outcome,
+            paid,
+            ..
+        } in played_games()
+        {
+            let expected: Vec<(AgentId, i32)> = assignment
+                .players()
+                .map(|(who, role)| {
+                    let value = if role.faction() == outcome.winner {
+                        1
+                    } else {
+                        -1
+                    };
+                    (who.clone(), value)
+                })
+                .collect();
+            assert_eq!(paid, expected, "{outcome:?}");
+            let dead: Vec<&AgentId> = paid
+                .iter()
+                .map(|(who, _)| who)
+                .filter(|who| !outcome.living.contains(who))
+                .collect();
+            assert!(!dead.is_empty(), "the dead are paid too: {outcome:?}");
+            assert!(
+                !paid.iter().any(|(who, _)| *who == id(MODERATOR)),
+                "the moderator plays no game and is paid nothing: {paid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_rewards_come_after_the_outcome_and_before_the_stop() {
+        // The shutdown's order, read off the effects as the loop sees
+        // them: the narration is said, then every reward is logged, then
+        // everybody is stopped. Nothing follows the stop.
+        for Played { effects, .. } in played_games() {
+            let kinds: Vec<&str> = effects
+                .iter()
+                .map(|effect| match effect {
+                    Effect::Act(Action {
+                        payload: Message::Narration(Narration::Outcome(_)),
+                        ..
+                    }) => "outcome",
+                    Effect::Act(_) => "act",
+                    Effect::Reward { .. } => "reward",
+                    Effect::Control { control, .. } => match control {
+                        Control::Start => "start",
+                        Control::Stop => "stop",
+                    },
+                })
+                .collect();
+            let outcome = kinds.iter().position(|kind| *kind == "outcome").unwrap();
+            let stop = kinds.iter().position(|kind| *kind == "stop").unwrap();
+            let rewards: Vec<usize> = kinds
+                .iter()
+                .enumerate()
+                .filter(|(_, kind)| **kind == "reward")
+                .map(|(at, _)| at)
+                .collect();
+            assert!(!rewards.is_empty());
+            assert!(
+                rewards.iter().all(|at| outcome < *at && *at < stop),
+                "every reward falls between the outcome and the stop: {kinds:?}"
+            );
+            assert_eq!(
+                stop,
+                kinds.len() - 1,
+                "the stop is the last word: {kinds:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_game_ending_narrates_then_publishes_then_pays_then_stops_everybody() {
         for Played {
             assignment,
             outcome,

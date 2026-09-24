@@ -19,9 +19,20 @@
 //! [`config::effective_path`](super::config::effective_path)), and whoever
 //! prints a transcript prints the seed from there.
 //!
-//! # Only the moderator's records
+//! # Only the moderator's records, and every agent's rewards
 //!
-//! [`Transcript::read`] reads the moderator's records and nobody else's. The
+//! [`Transcript::read`] reads the moderator's records and nobody else's,
+//! with one exception: a **reward** record is read whoever it belongs to.
+//! It has to be. A reward belongs to the agent rewarded and is written by
+//! the environment, so it appears under a player's name and never under
+//! the moderator's, and reading only the moderator's records would find
+//! none of them. It is no exception to the principle, though: a reward is
+//! the environment's own statement about a player, not a partial view
+//! recovered from one, and it is identified by its `type` rather than by
+//! whose trajectory it sits in.
+//!
+//! A reward is also the one record here with no sequence number, so it is
+//! outside the contiguity check the moderator's records are held to. The
 //! moderator is the authoritative view: its `action` records are every
 //! narration and every request it sent, and its `observation` records are
 //! every response it received, each naming the responding player as its
@@ -67,6 +78,16 @@ pub struct Transcript {
     pub rounds: Vec<RoundRecord>,
     /// How the game ended.
     pub outcome: Outcome,
+    /// What each player's game was worth: +1 for a player on the winning
+    /// side and −1 for every other, living or dead, as the moderator
+    /// logged it when the game ended (ADR-0007).
+    ///
+    /// It is read from the `reward` records, which belong to the players
+    /// and not to the moderator; see the [module documentation](self). It
+    /// is part of the logical game and so part of what two runs of one
+    /// seed must agree on, which is why it is here and not left to a
+    /// reader of the raw file.
+    pub rewards: BTreeMap<AgentId, i32>,
 }
 
 /// One round: a night, then a day unless the game ended at night.
@@ -264,13 +285,30 @@ enum Direction {
     Received,
 }
 
-/// One record of the moderator's, still as JSON.
+/// One record the reader takes an interest in.
 ///
-/// `direction` is `None` for a control, which carries a sequence number and
-/// so must be counted, but says nothing about the game and is not decoded.
-struct Line<'a> {
-    record: &'a Map<String, Value>,
-    direction: Option<Direction>,
+/// A [`Numbered`](Line::Numbered) line is one of the moderator's, which
+/// carries a sequence number the reader checks. Its `direction` is `None`
+/// for a control or a dropped action, which must be counted but say
+/// nothing about the game and are not decoded.
+///
+/// A [`Reward`](Line::Reward) line is anybody's: it belongs to the agent
+/// rewarded, carries no sequence number, and is recognized by its `type`.
+enum Line<'a> {
+    /// One of the moderator's numbered records.
+    Numbered {
+        /// The record.
+        record: &'a Map<String, Value>,
+        /// Which way its event went, or `None` if it carries no event.
+        direction: Option<Direction>,
+    },
+    /// A reward: the agent paid and what it was paid.
+    Reward {
+        /// The agent rewarded.
+        agent: AgentId,
+        /// What its game was worth.
+        value: i32,
+    },
 }
 
 /// One message record of the moderator's, with its envelope decoded.
@@ -297,25 +335,34 @@ impl Transcript {
     pub fn read(lines: &[Value], moderator: &AgentId) -> Result<Self, TranscriptError> {
         let mut reader = Reader::default();
         let mut next_seq = 0;
+        let mut rewards = BTreeMap::new();
         for (index, value) in lines.iter().enumerate() {
             let line = index + 1;
-            let Some(Line { record, direction }) = moderator_record(value, line, moderator)? else {
-                continue;
-            };
-            // The moderator's controls are counted but not read: they carry
-            // a sequence number, so skipping them without counting would
-            // look like a gap, and they say nothing about the game.
-            let seq = integer(record, "seq", line)?;
-            if seq != next_seq {
-                return Err(TranscriptError::SeqGap {
-                    line,
-                    expected: next_seq,
-                    found: seq,
-                });
-            }
-            next_seq += 1;
-            if let Some(direction) = direction {
-                reader.fold(message(record, direction, line)?)?;
+            match read_line(value, line, moderator)? {
+                None => {}
+                // A reward belongs to the agent it names, whoever wrote it,
+                // and has no sequence number to check.
+                Some(Line::Reward { agent, value }) => {
+                    rewards.insert(agent, value);
+                }
+                Some(Line::Numbered { record, direction }) => {
+                    // The moderator's controls are counted but not read:
+                    // they carry a sequence number, so skipping them
+                    // without counting would look like a gap, and they say
+                    // nothing about the game.
+                    let seq = integer(record, "seq", line)?;
+                    if seq != next_seq {
+                        return Err(TranscriptError::SeqGap {
+                            line,
+                            expected: next_seq,
+                            found: seq,
+                        });
+                    }
+                    next_seq += 1;
+                    if let Some(direction) = direction {
+                        reader.fold(message(record, direction, line)?)?;
+                    }
+                }
             }
         }
         let outcome = reader.outcome.ok_or(TranscriptError::NoOutcome)?;
@@ -323,18 +370,25 @@ impl Transcript {
             assignment: reader.assignment,
             rounds: reader.rounds,
             outcome,
+            rewards,
         })
     }
 }
 
-/// One of the moderator's records, and which way its event went; `None` for
-/// a cycle record or another agent's, and an error for something that is not
+/// The record on one line, if the reader has any use for it; `None` for a
+/// cycle record or another agent's, and an error for something that is not
 /// a record at all.
 ///
-/// The direction is `None` for the moderator's own controls. They say
-/// nothing about the game, but they carry sequence numbers, so the caller
-/// must count them or the numbers look full of gaps.
-fn moderator_record<'a>(
+/// Every line is checked to be a record of a kind the runtime writes, even
+/// the ones nothing is read from, so that a file with something else in it
+/// is not silently read as a game.
+///
+/// The direction is `None` for the moderator's own controls and dropped
+/// actions. They say nothing about the game, but they carry sequence
+/// numbers, so the caller must count them or the numbers look full of gaps.
+/// A reward is the one kind read whoever wrote it, and the one with no
+/// sequence number to count.
+fn read_line<'a>(
     value: &'a Value,
     line: usize,
     moderator: &AgentId,
@@ -350,6 +404,15 @@ fn moderator_record<'a>(
         // dropped action never traveled, so nobody heard it. Counted, not
         // read, so that skipping them does not look like a gap.
         Some("control" | "dropped") => None,
+        Some("reward") => {
+            let agent: AgentId = decode(record, "agent", line)?;
+            let value = record
+                .get("value")
+                .and_then(Value::as_i64)
+                .and_then(|value| i32::try_from(value).ok())
+                .ok_or_else(|| malformed(line, "no value"))?;
+            return Ok(Some(Line::Reward { agent, value }));
+        }
         Some("cycle") => return Ok(None),
         found => {
             return Err(TranscriptError::UnknownRecordType {
@@ -359,7 +422,7 @@ fn moderator_record<'a>(
         }
     };
     let agent = string(record, "agent", line)?;
-    Ok((agent == moderator.as_str()).then_some(Line { record, direction }))
+    Ok((agent == moderator.as_str()).then_some(Line::Numbered { record, direction }))
 }
 
 /// Decodes an event record's envelope and payload.
@@ -566,8 +629,14 @@ const COLUMNS: usize = 4;
 
 impl fmt::Display for Transcript {
     /// The game at a glance: the roster with its roles, then each phase with
-    /// its moves and its elimination, then the outcome. Only what the
-    /// moderator recorded, in the order it recorded it. Ends with a newline.
+    /// its moves and its elimination, then the outcome, then what each
+    /// player's game was worth. Only what the trajectory records, in the
+    /// order it records it. Ends with a newline.
+    ///
+    /// The rewards come last because they are the game's verdict on the
+    /// players, which only the outcome above them explains. A game read
+    /// from a trajectory with no reward records renders without the
+    /// section rather than with an empty one.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let width = self
             .assignment
@@ -606,10 +675,21 @@ impl fmt::Display for Transcript {
         write!(f, " after {rounds} round{plural}.  Survivors: ")?;
         let survivors: Vec<&str> = self.outcome.living.iter().map(AgentId::as_str).collect();
         if survivors.is_empty() {
-            writeln!(f, "none")
+            writeln!(f, "none")?;
         } else {
-            writeln!(f, "{}", survivors.join(", "))
+            writeln!(f, "{}", survivors.join(", "))?;
         }
+        if self.rewards.is_empty() {
+            return Ok(());
+        }
+        writeln!(f)?;
+        writeln!(f, "Rewards")?;
+        columns(
+            f,
+            self.rewards
+                .iter()
+                .map(|(who, value)| format!("{:<width$} {value:>+2}", who.as_str())),
+        )
     }
 }
 
@@ -831,6 +911,20 @@ mod tests {
                 rounds: Round(2),
                 living: ids(["bob", "dave", "erin", "frank"]),
             },
+            // The werewolves dave and erin won; everybody else, living or
+            // dead, lost with the village.
+            rewards: [
+                ("alice", -1),
+                ("bob", -1),
+                ("carol", -1),
+                ("dave", 1),
+                ("erin", 1),
+                ("frank", -1),
+                ("grace", -1),
+            ]
+            .into_iter()
+            .map(|(who, value)| (id(who), value))
+            .collect(),
         }
     }
 
@@ -846,6 +940,122 @@ mod tests {
             assert_eq!(actual.day, expected.day, "day {:?}", actual.round);
         }
         assert_eq!(transcript.outcome, expected.outcome);
+        assert_eq!(transcript.rewards, expected.rewards);
+    }
+
+    #[test]
+    fn every_player_has_a_reward_and_it_agrees_with_its_faction() {
+        // Read from the `reward` records, which belong to the players and
+        // are written by the moderator, so a reader that looked only at
+        // the moderator's trajectory would find none of them.
+        let transcript = read(&fixture()).unwrap();
+        assert_eq!(
+            transcript.rewards.keys().collect::<BTreeSet<_>>(),
+            transcript.assignment.keys().collect::<BTreeSet<_>>(),
+            "every player is paid, and nobody else"
+        );
+        for (who, value) in &transcript.rewards {
+            let expected = if transcript.assignment[who].faction() == transcript.outcome.winner {
+                1
+            } else {
+                -1
+            };
+            assert_eq!(*value, expected, "{who}");
+        }
+        assert!(
+            !transcript.rewards.contains_key(&moderator()),
+            "the moderator plays no game and is paid nothing"
+        );
+    }
+
+    #[test]
+    fn a_reward_is_read_whoever_it_belongs_to_and_is_never_counted() {
+        // Two claims at once. Every reward in the fixture belongs to a
+        // player, not to the moderator, and they are all read: that is
+        // what distinguishes a reward from every other record here, which
+        // is read only if the moderator wrote it.
+        let lines = fixture();
+        let rewards: Vec<&Value> = lines
+            .iter()
+            .filter(|line| line["type"] == "reward")
+            .collect();
+        assert!(!rewards.is_empty());
+        assert!(
+            rewards.iter().all(|line| line["agent"] != MODERATOR),
+            "the fixture's rewards belong to the players"
+        );
+        assert_eq!(read(&lines).unwrap().rewards.len(), rewards.len());
+
+        // And a reward carries no sequence number, so it is outside the
+        // contiguity check: one relabeled to the moderator is read as a
+        // reward for the moderator and does not make its numbering look
+        // full of gaps.
+        let mut moved = fixture();
+        let index = moved
+            .iter()
+            .position(|line| line["type"] == "reward")
+            .unwrap();
+        moved[index]["agent"] = json!(MODERATOR);
+        let transcript = read(&moved).unwrap();
+        assert_eq!(
+            transcript.rewards.get(&moderator()),
+            Some(&-1),
+            "the reward is read, and belongs to whoever it names"
+        );
+        assert_eq!(
+            transcript.rounds,
+            read(&fixture()).unwrap().rounds,
+            "and the game itself is untouched"
+        );
+    }
+
+    #[test]
+    fn a_reward_without_a_value_or_an_agent_is_an_error() {
+        let index = fixture()
+            .iter()
+            .position(|line| line["type"] == "reward")
+            .unwrap();
+        for key in ["agent", "value"] {
+            let mut lines = fixture();
+            lines[index].as_object_mut().unwrap().remove(key);
+            let error = read(&lines).unwrap_err();
+            assert!(
+                matches!(&error, TranscriptError::Malformed { line, what }
+                    if *line == index + 1 && what.starts_with(&format!("no {key}"))),
+                "{key}: {error:?}"
+            );
+        }
+        // A value too large for the reward type is malformed, not silently
+        // truncated.
+        let mut lines = fixture();
+        lines[index]["value"] = json!(i64::from(i32::MAX) + 1);
+        let error = read(&lines).unwrap_err();
+        assert!(
+            matches!(&error, TranscriptError::Malformed { what, .. } if what == "no value"),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn a_game_whose_trajectory_records_no_reward_reads_and_renders_without_them() {
+        // Nothing in the reader requires a reward: a truncated or
+        // hand-written trajectory that has none is still the game it
+        // records, and renders with no rewards section rather than an
+        // empty one.
+        let lines: Vec<Value> = fixture()
+            .into_iter()
+            .filter(|line| line["type"] != "reward")
+            .collect();
+        let transcript = read(&lines).unwrap();
+        assert!(transcript.rewards.is_empty());
+        let rendered = transcript.to_string();
+        assert!(!rendered.contains("Rewards"), "{rendered}");
+        assert!(
+            rendered.ends_with("Survivors: bob, dave, erin, frank\n"),
+            "{rendered}"
+        );
+        // And is otherwise the same game.
+        assert_eq!(transcript.rounds, read(&fixture()).unwrap().rounds);
     }
 
     #[test]
