@@ -39,3 +39,4 @@ from the earlier attempt at the project are not part of its history.
 | [0004](0004-moderator-agent-runs-the-game.md) | A moderator agent runs the game, and the seam with the episode is construction | Accepted |
 | [0005](0005-policy-separates-decisions-from-rules.md) | A policy separates decisions from rules | Accepted |
 | [0006](0006-knowledge-holds-what-the-agent-did-in-secret.md) | Knowledge holds what the agent did in secret | Accepted |
+| [0007](0007-reinforcement-learning-vocabulary.md) | The framework speaks the vocabulary of reinforcement learning | Proposed |
