@@ -15,9 +15,8 @@
 //!   was asked of, with an action inside the action space the rules allowed
 //!   it; the dead are neither asked nor heard from; players only ever
 //!   address the moderator; and the moderator's last word is the outcome. A
-//!   trajectory whose last narration is not an outcome is a truncated game,
-//!   and it presents as a short file rather than as a hang, so the last of
-//!   these is the only thing that catches it;
+//!   trajectory whose last narration is not an outcome is a game the
+//!   moderator never ended, which the episode also catches as a stall;
 //! - **hidden information**: the realized observations stay inside each
 //!   role's observation space. Every message goes to exactly the players
 //!   the rules address it to: the pack is named only to werewolves, a
@@ -25,12 +24,13 @@
 //!   seer alone, and a narration to the living goes to exactly the living.
 //!   Routing is the whole of the hidden-information mechanism, so these are
 //!   what the design exists to guarantee;
-//! - **broadcast discipline**: exactly one message reaches a dead player,
-//!   the outcome, which goes to everyone because it is the reward signal. On
-//!   the first night the living are the whole roster, so a trajectory cannot
-//!   tell a narration to the living from a broadcast by its recipient set
-//!   alone; what it can tell is that nothing but the outcome ever reaches
-//!   the dead;
+//! - **the episode's shape**: every trajectory, the moderator's included,
+//!   begins with a `Start` control and ends with a `Stop`, because the
+//!   moderator is the episode's environment and starting and stopping the
+//!   players is its doing. Nothing at all reaches a dead player after the
+//!   announcement of its own death: no message of this game is broadcast,
+//!   and the outcome, which ADR-0004 once excepted, is narrated to the
+//!   living like everything else;
 //! - **game shape**: the phases alternate from the first night, each
 //!   eliminates at most one player and each day exactly one, the player
 //!   eliminated is one the phase's tally names most often, a night with no
@@ -103,6 +103,44 @@ pub fn check(lines: &[Value], config: &Config) {
     play.check_hidden_information();
     play.check_outcome();
     play.check_players(lines);
+    check_episode(lines, config);
+}
+
+/// Every agent's trajectory, the moderator's included, begins with a `Start`
+/// control and ends with a `Stop`, and nobody is started or stopped twice.
+///
+/// It is the moderator that sends both, being the episode's environment, so
+/// this is the check that the game's own shutdown happened: a trajectory
+/// whose players were stopped by the episode picking up the pieces would
+/// look the same here, but one where somebody was never stopped at all
+/// would not.
+fn check_episode(lines: &[Value], config: &Config) {
+    let everybody = config
+        .players
+        .iter()
+        .chain([&config.moderator])
+        .cloned()
+        .collect::<BTreeSet<AgentId>>();
+    for who in &everybody {
+        let controls: Vec<&str> = lines
+            .iter()
+            .filter(|line| line["type"] == "control" && super::agent(line) == who.as_str())
+            .map(|line| line["control"].as_str().expect("a control names itself"))
+            .collect();
+        assert_eq!(
+            controls,
+            ["start", "stop"],
+            "{who}'s trajectory begins with a start and ends with a stop"
+        );
+    }
+    let agents: BTreeSet<AgentId> = lines
+        .iter()
+        .map(|line| AgentId::new(super::agent(line)))
+        .collect();
+    assert_eq!(
+        agents, everybody,
+        "the roster is every player and the moderator, and nobody else"
+    );
 }
 
 /// The payload of a message record, as a [`Message`].
@@ -402,10 +440,14 @@ impl<'a> Play<'a> {
     /// Every message goes to exactly the players the rules address it to.
     /// A request and a role assignment go to one player, which `read`
     /// checked. A finding goes to the seer alone; a night tally to the
-    /// werewolves who cast it; a phase, a day tally, a death and a quiet
-    /// night to the living; and the outcome, once, to everyone.
+    /// werewolves who cast it; and a phase, a day tally, a death, a quiet
+    /// night and the outcome to the living.
+    ///
+    /// The outcome is in the last group, not a group of its own: the
+    /// broadcast exception ADR-0004 made for it is withdrawn, so it is a
+    /// narration to the living like any other and the only thing left to
+    /// say about it is that it happens once.
     fn check_recipients(&self) {
-        let everyone: BTreeSet<AgentId> = self.config.players.iter().cloned().collect();
         let seers = self.holders(Role::Seer);
         let mut outcomes = 0;
         for said in &self.said {
@@ -436,8 +478,9 @@ impl<'a> Play<'a> {
                 ),
                 Message::Narration(Narration::Outcome(_)) => {
                     assert_eq!(
-                        said.to, everyone,
-                        "the outcome goes to everyone, living and dead: {line}"
+                        said.to,
+                        self.living_at(said.seq),
+                        "the outcome goes to exactly the living: {line}"
                     );
                     outcomes += 1;
                 }
@@ -564,9 +607,10 @@ impl<'a> Play<'a> {
 
     /// What the players' own records show: each took no action but a
     /// response, to the moderator alone; each observed its role exactly
-    /// once, the one the moderator dealt it, and the outcome as the last
-    /// thing; and a dead player observed nothing between its own death and
-    /// the outcome. And the roles dealt are the ones configured.
+    /// once, the one the moderator dealt it; a survivor's last observation
+    /// is the outcome; and a dead player observed nothing at all after the
+    /// announcement of its own death. And the roles dealt are the ones
+    /// configured.
     fn check_players(&self, lines: &[Value]) {
         let moderator = BTreeSet::from([self.config.moderator.clone()]);
         for who in &self.config.players {
@@ -593,24 +637,29 @@ impl<'a> Play<'a> {
             let last = received
                 .last()
                 .unwrap_or_else(|| panic!("{who} received nothing"));
-            assert_eq!(
-                outcome(last),
-                Some(&self.outcome),
-                "the last thing {who} received is the outcome"
-            );
             let death = received.iter().position(|message| {
                 matches!(message, Message::Narration(Narration::Eliminated { who: dead, .. }) if dead == who)
             });
-            match death {
-                Some(death) => assert_eq!(
+            if let Some(death) = death {
+                assert_eq!(
                     received.len(),
-                    death + 2,
-                    "a dead player observes nothing between its death and the outcome: {who}"
-                ),
-                None => assert!(
+                    death + 1,
+                    "a dead player observes nothing after its own death: {who}"
+                );
+                assert!(
+                    !self.outcome.living.contains(who),
+                    "a player told it was eliminated is not among the survivors: {who}"
+                );
+            } else {
+                assert!(
                     self.outcome.living.contains(who),
                     "a player never eliminated survives: {who}"
-                ),
+                );
+                assert_eq!(
+                    outcome(last),
+                    Some(&self.outcome),
+                    "the last thing the survivor {who} received is the outcome"
+                );
             }
         }
         let counts = &self.config.roles;
@@ -1196,14 +1245,14 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "the outcome goes to everyone")]
-    fn an_outcome_kept_from_a_dead_player_is_caught() {
-        let survivors_of_alice: Vec<String> = everyone()
-            .into_iter()
-            .filter(|who| who != "alice")
-            .collect();
+    #[should_panic(expected = "the outcome goes to exactly the living")]
+    fn an_outcome_sent_to_a_dead_player_is_caught() {
+        // The broadcast the design used to make: the outcome to everyone,
+        // living and dead. It is what the withdrawal of the exception rules
+        // out, so it is what this catches.
+        let everyone = everyone();
         let lines = said(narration("Outcome"), |line| {
-            line["event"]["recipients"] = json!(survivors_of_alice);
+            line["event"]["recipients"] = json!(everyone);
         });
         check(&lines, &config());
     }
@@ -1413,23 +1462,56 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "the last thing alice received is the outcome")]
-    fn a_player_that_never_hears_the_outcome_is_caught() {
+    #[should_panic(expected = "the last thing the survivor bob received is the outcome")]
+    fn a_survivor_that_never_hears_the_outcome_is_caught() {
         check(
-            &without("alice", "observation", narration("Outcome")),
+            &without("bob", "observation", narration("Outcome")),
             &config(),
         );
     }
 
     #[test]
-    #[should_panic(expected = "a dead player observes nothing between its death and the outcome")]
+    #[should_panic(expected = "a dead player observes nothing after its own death")]
     fn a_dead_player_that_hears_more_is_caught() {
-        // bob's copy of the day 2 tally, delivered to the dead alice too.
+        // bob's copy of the day 2 tally, delivered to the dead alice too,
+        // after the narration of alice's own elimination.
         let mut lines = fixture();
-        let mut leaked = lines[find(&lines, "bob", "observation", tally(2, "Day"))].clone();
+        let leaked = lines[find(&lines, "bob", "observation", tally(2, "Day"))].clone();
+        let mut leaked = leaked;
         leaked["agent"] = json!("alice");
-        let outcome = find(&lines, "alice", "observation", narration("Outcome"));
-        lines.insert(outcome, leaked);
+        let stop = lines
+            .iter()
+            .position(|line| line["agent"] == "alice" && line["control"] == "stop")
+            .expect("alice is stopped");
+        lines.insert(stop, leaked);
+        check(&lines, &config());
+    }
+
+    #[test]
+    #[should_panic(expected = "begins with a start and ends with a stop")]
+    fn an_agent_never_stopped_is_caught() {
+        // The moderator ends the episode by stopping every player. One left
+        // running is a game the moderator did not finish ending.
+        let mut lines = fixture();
+        let stop = lines
+            .iter()
+            .position(|line| line["agent"] == "grace" && line["control"] == "stop")
+            .expect("grace is stopped");
+        lines.remove(stop);
+        check(&lines, &config());
+    }
+
+    #[test]
+    #[should_panic(expected = "begins with a start and ends with a stop")]
+    fn a_moderator_never_stopped_is_caught() {
+        // The environment's own trajectory has the same shape as everyone
+        // else's; the episode is what stops it, once the players have gone.
+        let mut lines = fixture();
+        let stop = lines
+            .iter()
+            .position(|line| line["agent"] == "moderator" && line["control"] == "stop")
+            .expect("the moderator is stopped");
+        lines.remove(stop);
         check(&lines, &config());
     }
 
