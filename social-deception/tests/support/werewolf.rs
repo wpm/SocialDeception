@@ -1284,16 +1284,15 @@ mod tests {
         });
         target(&mut lines[index], "erin");
         // The pack is told the tally, so it moves with dave's response.
-        // Looked up by index each time: indexing a `Value` mutably would
-        // insert the key it looked up into every record without one.
-        while let Some(index) = lines.iter().position(|line| {
+        // The test reads through `&line[..]`, which yields `Null` for a key
+        // that is not there; only the assignment, reached once the record is
+        // known to be a night-2 tally, indexes mutably.
+        for line in &mut lines {
             let tally = &line["event"]["payload"]["Narration"]["Tally"];
-            tally["round"] == 2
-                && tally["phase"] == "Night"
-                && tally["votes"]["dave"] != json!({"Target": "erin"})
-        }) {
-            lines[index]["event"]["payload"]["Narration"]["Tally"]["votes"]["dave"] =
-                json!({"Target": "erin"});
+            if tally["round"] == 2 && tally["phase"] == "Night" {
+                line["event"]["payload"]["Narration"]["Tally"]["votes"]["dave"] =
+                    json!({"Target": "erin"});
+            }
         }
         let index = find(&lines, "moderator", "sent", |payload| {
             payload["Narration"]["Eliminated"]["cause"] == "Devoured"

@@ -1,5 +1,5 @@
 //! The decision boundary: a [`Policy`] is handed what an agent sees and
-//! returns one action.
+//! returns one [`Move`](super::Move).
 //!
 //! A policy is a conditional distribution over the action space given the
 //! state, in the vocabulary the [module](super) documentation states and
@@ -58,7 +58,7 @@
 //! from the master seed and the agent's id, so its actions depend on its own
 //! history alone and adding a player perturbs nobody else's; the [`seed`]
 //! module says why that, and the choice of generator, make an experiment
-//! reproducible. The golden test in this module pins the first actions of
+//! reproducible. The golden test in this module pins the first moves of
 //! one seeded policy, so that a change to the mixing or the sampling fails
 //! a test rather than silently becoming a different experiment.
 //!

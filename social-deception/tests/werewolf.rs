@@ -135,6 +135,10 @@ fn the_fixture_is_a_trajectory_the_runtime_could_have_written() {
 
 #[test]
 fn seven_players_with_two_werewolves_a_seer_and_a_doctor() {
+    // Nothing to assert beyond the invariants: reaching an `Outcome` at
+    // all is reaching a winner, now that a game cannot end without one,
+    // and `run` checks the announcement against the channel and puts the
+    // trajectory through the full suite.
     run(&town(SEED));
 }
 

@@ -77,6 +77,16 @@ use crate::werewolf::role::{Faction, Role};
 use crate::werewolf::roles;
 use crate::werewolf::seed::{TIES, pick, seed_for};
 
+/// Termination rests on the day always eliminating someone, so a
+/// `Nominate` must never be allowed to abstain: a living set that could
+/// abstain unanimously would leave a game to run forever. The check sits
+/// next to the rules it protects, and it is a compile-time one because
+/// [`RequestKind::may_abstain`] is `const`.
+const NOMINATE_DECIDES: () = assert!(
+    !RequestKind::Nominate.may_abstain(),
+    "a Nominate that may abstain would let a game run forever"
+);
+
 /// What the game wants said, in the order it wants it said.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Directive {
@@ -327,9 +337,12 @@ impl Game {
     /// Resolves a day from its nominations: the full tally to the living,
     /// then the lynching.
     fn resolve_day(&mut self, answers: BTreeMap<AgentId, (RequestKind, Move)>) -> Vec<Directive> {
+        // The lynching below is what makes a game end, and it is certain
+        // only because a `Nominate` cannot abstain.
+        let () = NOMINATE_DECIDES;
         let votes: BTreeMap<AgentId, Move> = answers
             .into_iter()
-            .map(|(who, (_, action))| (who, action))
+            .map(|(who, chosen)| (who, chosen.1))
             .collect();
         let lynched = plurality(votes.values(), &mut self.ties)
             .expect("every living player nominates someone");

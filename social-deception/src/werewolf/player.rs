@@ -6,7 +6,7 @@
 //! is answered with one [`Response`] to the moderator. The two halves of
 //! answering are kept apart, and ADR-0005 says why: a [`Player`] is a role,
 //! and computes the action space the rules permit it and nothing else; a
-//! [`Policy`] is the strategy, and picks one action from that space. The
+//! [`Policy`] is the strategy, and picks one move from that space. The
 //! roles are in [`roles`](super::roles), the baseline policy in
 //! [`policy`](super::policy).
 //!
@@ -28,7 +28,7 @@ use super::policy::{Policy, View};
 use crate::agent::{Handler, Outgoing};
 use crate::event::{AgentId, Event};
 
-/// What a role contributes to a player: its state, and the actions the
+/// What a role contributes to a player: its state, and the moves the
 /// rules permit it.
 ///
 /// Implemented once per role by the types in [`roles`](super::roles). A
