@@ -1,5 +1,5 @@
 //! Cooperative cancellation: the [`Cancel`] a handler is given, and the
-//! [`Trip`] whoever sends it a control pulls.
+//! trip-wire whoever sends it a control pulls.
 //!
 //! Rust cannot kill a thread, so a cycle cannot be preempted; it can only be
 //! *asked* to stop, and the asking has to cost nothing when nobody asks.
@@ -31,7 +31,7 @@
 //! Nobody watches for a control to arrive: whoever *puts* one on an agent's
 //! control queue trips that agent's current cancel in the same step. That is
 //! what [`ControlSender`] is — the sending half of the control queue, which
-//! is a channel sender and a shared slot holding the cycle's live [`Trip`] —
+//! is a channel sender and a shared slot holding the cycle's live trip-wire —
 //! and it is why a control cannot be queued without the cycle in progress
 //! hearing about it.
 //!

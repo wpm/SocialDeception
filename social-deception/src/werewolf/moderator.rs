@@ -85,9 +85,6 @@ use crate::event::{AgentId, Control};
 pub struct Moderator {
     game: Game,
     outcome: Sender<Outcome>,
-    /// Whether the players have been stopped, so that a game whose outcome
-    /// is seen twice does not stop them twice.
-    stopped: bool,
 }
 
 impl Moderator {
@@ -98,11 +95,7 @@ impl Moderator {
     /// episode starts it.
     #[must_use]
     pub const fn new(game: Game, outcome: Sender<Outcome>) -> Self {
-        Self {
-            game,
-            outcome,
-            stopped: false,
-        }
+        Self { game, outcome }
     }
 
     /// Every player in the game, living and dead: whom the moderator starts
@@ -136,13 +129,10 @@ impl Moderator {
             // The caller may have dropped the receiver. That is not the
             // game's problem: the in-world announcement is the record.
             let _ = self.outcome.send(outcome.clone());
-            if !self.stopped {
-                self.stopped = true;
-                effects.push(Effect::Control {
-                    to: self.players(),
-                    control: Control::Stop,
-                });
-            }
+            // Once, and this is the once: `handle` stops folding at the
+            // observation that ends the game, so the outcome is seen here
+            // on the cycle it first exists and on no later one.
+            effects.push(Effect::control(self.players(), Control::Stop));
         }
         effects
     }
@@ -170,10 +160,7 @@ impl Environment<WerewolfDomain> for Moderator {
     /// the opening narrations.
     fn start(&mut self) -> Vec<Effect<WerewolfDomain>> {
         let opening = self.game.begin();
-        let mut effects = vec![Effect::Control {
-            to: self.players(),
-            control: Control::Start,
-        }];
+        let mut effects = vec![Effect::control(self.players(), Control::Start)];
         effects.extend(self.say(opening));
         effects
     }

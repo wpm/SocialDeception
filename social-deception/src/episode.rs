@@ -91,6 +91,14 @@ impl fmt::Display for Failure {
 }
 
 /// Why an episode could not be built or did not run cleanly.
+///
+/// An episode that ends in any of these but [`Stalled`](Self::Stalled) was
+/// abandoned rather than finished: the episode stops whoever is left so
+/// that the trajectory is complete up to the failure, and it cannot wait
+/// for quiescence to do it, so that `Stop` may preempt a cycle and reach an
+/// agent with events still queued. Such a trajectory may therefore carry
+/// `dropped` records and end with observations nobody made. A `Stalled`
+/// episode is quiescent by definition, so its shutdown is orderly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EpisodeError {
     /// An id was added to the roster twice.
@@ -808,6 +816,19 @@ mod tests {
         lines.iter().filter(move |line| line["agent"] == agent)
     }
 
+    /// The controls in `lines`, in order. With an `agent`, that agent's;
+    /// without one, the whole trajectory's. Every agent's reads
+    /// `["start", "stop"]`: the environment starts it and stops it, and
+    /// nothing else is a control.
+    fn controls_of<'a>(lines: &'a [Value], agent: Option<&str>) -> Vec<&'a Value> {
+        lines
+            .iter()
+            .filter(|line| agent.is_none_or(|agent| line["agent"] == agent))
+            .filter(|line| line["type"] == "control")
+            .map(|line| &line["control"])
+            .collect()
+    }
+
     /// An episode refereed over the named agents, whose trajectory goes to
     /// the writer returned beside it.
     fn refereed<const N: usize>(agents: [&str; N]) -> (Episode<Counting>, Writer<Vec<u8>>) {
@@ -867,10 +888,7 @@ mod tests {
                 .map(|line| line["seq"].as_u64().unwrap())
                 .collect();
             assert_eq!(seqs, (0..seqs.len() as u64).collect::<Vec<_>>());
-            let controls: Vec<&Value> = of(&lines, agent)
-                .filter(|line| line["type"] == "control")
-                .map(|line| &line["control"])
-                .collect();
+            let controls = controls_of(&lines, Some(agent));
             assert_eq!(
                 controls,
                 ["start", "stop"],
@@ -1001,11 +1019,7 @@ mod tests {
             .run()
             .unwrap();
         let lines = parse_lines(&writer.join().unwrap());
-        let controls: Vec<&Value> = lines
-            .iter()
-            .filter(|line| line["type"] == "control")
-            .map(|line| &line["control"])
-            .collect();
+        let controls = controls_of(&lines, None);
         assert_eq!(controls, ["start", "stop"]);
         assert!(lines.iter().all(|line| line["agent"] == REFEREE));
     }
@@ -1028,10 +1042,7 @@ mod tests {
         // and everybody, the environment last, was stopped and joined.
         let lines = parse_lines(&writer.join().unwrap());
         for agent in ["a", "b", REFEREE] {
-            let controls: Vec<&Value> = of(&lines, agent)
-                .filter(|line| line["type"] == "control")
-                .map(|line| &line["control"])
-                .collect();
+            let controls = controls_of(&lines, Some(agent));
             assert_eq!(controls, ["start", "stop"], "{agent}");
         }
     }

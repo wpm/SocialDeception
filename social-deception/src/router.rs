@@ -201,6 +201,23 @@ impl<D: Domain> Router<D> {
     /// environment, and is not an agent. What an *agent* asks for goes
     /// through [`command`](Router::command).
     ///
+    /// # A `Stop` discards whatever the recipient has not popped
+    ///
+    /// An agent that pops a `Stop` leaves the events still on its queue
+    /// unpopped, because an agent that has stopped did not observe them,
+    /// and a cycle already in progress sends nothing and logs what it
+    /// produced as `dropped`. So a `Stop` sent while anything is in flight
+    /// silently swallows deliveries, and *which* ones depends on the
+    /// scheduler.
+    ///
+    /// A caller that wants an orderly stop must therefore establish that
+    /// nothing is in flight first, as [`Episode`](crate::Episode) does by
+    /// holding a `Stop` back until its count of routed-and-unhandled
+    /// deliveries reads zero (ADR-0007). The episode's other `Stop`, the
+    /// one it sends to abandon an episode that has already failed, does
+    /// not and cannot wait for that: the trajectory it leaves is a record
+    /// of the failure, and may contain `dropped` records because of it.
+    ///
     /// # Errors
     ///
     /// [`RouteError::UnknownAgent`] for a recipient not in the roster, and
