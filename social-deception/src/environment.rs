@@ -207,11 +207,26 @@ pub trait Environment<D: Domain> {
     /// opening effects are decided from nothing.
     fn start(&mut self) -> Vec<Effect<D>>;
 
-    /// Folds one cycle's observations into the environment's state and says
-    /// what to send, whom to control, and whom to reward.
+    /// Folds one observation into the environment's state and says what to
+    /// send, whom to control, and whom to reward.
+    ///
+    /// One observation, because a cycle handles exactly one (ADR-0008), and
+    /// an environment's cycle is an agent's cycle. A cycle that popped no
+    /// observation does not call this at all.
     ///
     /// `cancel` is this cycle's, and means what it means for any handler.
-    fn handle(&mut self, observations: &[Observation<D>], cancel: &Cancel) -> Vec<Effect<D>>;
+    fn handle(&mut self, observation: &Observation<D>, cancel: &Cancel) -> Vec<Effect<D>>;
+
+    /// What the environment does when its deadline passes and nothing has
+    /// arrived.
+    ///
+    /// Its own method for the reason [`Handler::timeout`] is: waking on a
+    /// deadline is not observing anything. The default does nothing, which
+    /// is what both of the environments in the tree want — neither is
+    /// configured with a timeout at all.
+    fn timeout(&mut self, _cancel: &Cancel) -> Vec<Effect<D>> {
+        Vec::new()
+    }
 }
 
 /// A boxed environment is an environment, so that an [`Episode`] can hold
@@ -223,8 +238,12 @@ impl<D: Domain, E: Environment<D> + ?Sized> Environment<D> for Box<E> {
         (**self).start()
     }
 
-    fn handle(&mut self, observations: &[Observation<D>], cancel: &Cancel) -> Vec<Effect<D>> {
-        (**self).handle(observations, cancel)
+    fn handle(&mut self, observation: &Observation<D>, cancel: &Cancel) -> Vec<Effect<D>> {
+        (**self).handle(observation, cancel)
+    }
+
+    fn timeout(&mut self, cancel: &Cancel) -> Vec<Effect<D>> {
+        (**self).timeout(cancel)
     }
 }
 
@@ -393,8 +412,13 @@ impl<D: Domain, E: Environment<D>> Handler<D> for Adapter<D, E> {
         self.split(effects)
     }
 
-    fn handle(&mut self, observations: &[Observation<D>], cancel: &Cancel) -> Vec<Action<D>> {
-        let effects = self.environment.handle(observations, cancel);
+    fn handle(&mut self, observation: &Observation<D>, cancel: &Cancel) -> Vec<Action<D>> {
+        let effects = self.environment.handle(observation, cancel);
+        self.split(effects)
+    }
+
+    fn timeout(&mut self, cancel: &Cancel) -> Vec<Action<D>> {
+        let effects = self.environment.timeout(cancel);
         self.split(effects)
     }
 }
@@ -410,7 +434,24 @@ mod tests {
     use crossbeam_channel::{Receiver, unbounded};
 
     use super::*;
+    use crate::clock::Timestamp;
+    use crate::event::Event;
     use crate::testing::{TestDomain, TestPayload, id, ids};
+
+    /// The one observation a cycle hands the adapter. What it says never
+    /// matters here: `Opener` answers whatever it is told with the same
+    /// three effects, and these tests are about where each effect goes.
+    fn observation() -> Observation<TestDomain> {
+        Observation {
+            event: Event::new(
+                "a",
+                ["environment"],
+                Timestamp::default(),
+                TestPayload::Step(1),
+            ),
+            received: Timestamp::default(),
+        }
+    }
 
     /// An environment that starts two agents, says one thing, rewards one
     /// of them, and stops them.
@@ -424,7 +465,7 @@ mod tests {
             ]
         }
 
-        fn handle(&mut self, _: &[Observation<TestDomain>], _: &Cancel) -> Vec<Effect<TestDomain>> {
+        fn handle(&mut self, _: &Observation<TestDomain>, _: &Cancel) -> Vec<Effect<TestDomain>> {
             vec![
                 Effect::reward("a", 1),
                 Effect::control(["a", "b"], Control::Stop),
@@ -474,7 +515,11 @@ mod tests {
                 control: Control::Start
             })
         );
-        assert!(rig.adapter.handle(&[], &Cancel::cancelled()).is_empty());
+        assert!(
+            rig.adapter
+                .handle(&observation(), &Cancel::cancelled())
+                .is_empty()
+        );
         assert_eq!(
             rig.commanded.try_recv(),
             Ok(Commanded {
@@ -493,7 +538,7 @@ mod tests {
         let mut rig = rig();
         rig.adapter.start();
         assert!(rig.records.try_recv().is_err(), "the start rewards nobody");
-        let actions = rig.adapter.handle(&[], &Cancel::cancelled());
+        let actions = rig.adapter.handle(&observation(), &Cancel::cancelled());
         assert!(actions.is_empty(), "a reward is not an action: {actions:?}");
         let LogRecord::Reward(record) = rig.records.try_recv().unwrap() else {
             panic!("a reward is written as a reward record");
@@ -520,7 +565,7 @@ mod tests {
             vec![Effect::reward("nobody", 1)]
         }
 
-        fn handle(&mut self, _: &[Observation<TestDomain>], _: &Cancel) -> Vec<Effect<TestDomain>> {
+        fn handle(&mut self, _: &Observation<TestDomain>, _: &Cancel) -> Vec<Effect<TestDomain>> {
             Vec::new()
         }
     }
@@ -564,7 +609,11 @@ mod tests {
             rig.adapter.start(),
             [Action::to(["a"], TestPayload::Step(1))]
         );
-        assert!(rig.adapter.handle(&[], &Cancel::cancelled()).is_empty());
+        assert!(
+            rig.adapter
+                .handle(&observation(), &Cancel::cancelled())
+                .is_empty()
+        );
     }
 
     #[test]

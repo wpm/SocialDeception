@@ -189,13 +189,10 @@ impl Handler<CollatzDomain> for Collatz {
     /// so there is nothing a preemption could interrupt.
     fn handle(
         &mut self,
-        observations: &[Observation<CollatzDomain>],
+        observation: &Observation<CollatzDomain>,
         _: &Cancel,
     ) -> Vec<Action<CollatzDomain>> {
-        observations
-            .iter()
-            .flat_map(|observation| self.reply(observation))
-            .collect()
+        self.reply(observation)
     }
 }
 
@@ -297,17 +294,15 @@ impl Environment<CollatzDomain> for CollatzEnvironment {
     /// only ever travels around the ring.
     fn handle(
         &mut self,
-        observations: &[Observation<CollatzDomain>],
+        observation: &Observation<CollatzDomain>,
         _: &Cancel,
     ) -> Vec<Effect<CollatzDomain>> {
-        for observation in observations {
-            match observation.event.payload {
-                CollatzPayload::Finished { chain } => self.finished(chain),
-                CollatzPayload::Step { chain, value } => panic!(
-                    "{} sent the environment step {value} of chain {chain}",
-                    observation.event.sender
-                ),
-            }
+        match observation.event.payload {
+            CollatzPayload::Finished { chain } => self.finished(chain),
+            CollatzPayload::Step { chain, value } => panic!(
+                "{} sent the environment step {value} of chain {chain}",
+                observation.event.sender
+            ),
         }
         self.stop_if_done()
     }
@@ -345,11 +340,13 @@ mod tests {
         observing(sender, 27, value)
     }
 
-    fn sent<const N: usize>(
+    /// What an agent does with one cycle's observation, which is all a
+    /// cycle has.
+    fn sent(
         agent: &mut Collatz,
-        observations: &[Observation<CollatzDomain>; N],
+        observation: &Observation<CollatzDomain>,
     ) -> Vec<Action<CollatzDomain>> {
-        agent.handle(observations, &Cancel::cancelled())
+        agent.handle(observation, &Cancel::cancelled())
     }
 
     fn to_b(chain: u64, value: u64) -> Action<CollatzDomain> {
@@ -387,20 +384,20 @@ mod tests {
     #[test]
     fn a_value_is_passed_on_one_step_further() {
         let mut agent = agent();
-        assert_eq!(sent(&mut agent, &[step("c", 6)]), [to_b(27, 3)]);
-        assert_eq!(sent(&mut agent, &[step("c", 3)]), [to_b(27, 10)]);
+        assert_eq!(sent(&mut agent, &step("c", 6)), [to_b(27, 3)]);
+        assert_eq!(sent(&mut agent, &step("c", 3)), [to_b(27, 10)]);
     }
 
     #[test]
     fn one_ends_the_chain_and_the_environment_is_told() {
         let mut agent = agent();
-        assert_eq!(sent(&mut agent, &[step("c", 1)]), [finished(27)]);
+        assert_eq!(sent(&mut agent, &step("c", 1)), [finished(27)]);
     }
 
     #[test]
     fn a_step_keeps_its_chain() {
         let mut agent = agent();
-        assert_eq!(sent(&mut agent, &[observing("c", 7, 10)]), [to_b(7, 5)]);
+        assert_eq!(sent(&mut agent, &observing("c", 7, 10)), [to_b(7, 5)]);
     }
 
     #[test]
@@ -414,21 +411,22 @@ mod tests {
     }
 
     #[test]
-    fn a_cycle_is_answered_in_order() {
+    fn each_cycle_answers_its_one_observation() {
+        // One observation per cycle, so three steps are three cycles, and
+        // each answer is the one its own step called for.
         let mut agent = agent();
-        assert_eq!(
-            sent(&mut agent, &[step("c", 8), step("c", 1), step("c", 3)]),
-            [to_b(27, 4), finished(27), to_b(27, 10)]
-        );
+        assert_eq!(sent(&mut agent, &step("c", 8)), [to_b(27, 4)]);
+        assert_eq!(sent(&mut agent, &step("c", 1)), [finished(27)]);
+        assert_eq!(sent(&mut agent, &step("c", 3)), [to_b(27, 10)]);
     }
 
     #[test]
-    fn a_cycle_with_no_observations_sends_nothing() {
-        // What a timeout cycle looks like from inside the handler. A start
-        // is not among these: the loop calls the start hook instead of
-        // handing the handler a control.
+    fn a_timeout_sends_nothing() {
+        // What a timeout cycle looks like from inside the handler: the loop
+        // calls `timeout`, not `handle`, and this agent has nothing to do on
+        // a deadline.
         let mut agent = agent().opening(5);
-        assert!(agent.handle(&[], &Cancel::cancelled()).is_empty());
+        assert!(agent.timeout(&Cancel::cancelled()).is_empty());
     }
 
     #[test]
@@ -443,11 +441,7 @@ mod tests {
         let mut agent = agent();
         let _ = sent(
             &mut agent,
-            &[observation(
-                ENVIRONMENT,
-                "a",
-                CollatzPayload::Finished { chain: 6 },
-            )],
+            &observation(ENVIRONMENT, "a", CollatzPayload::Finished { chain: 6 }),
         );
     }
 
@@ -472,18 +466,18 @@ mod tests {
 
     fn folded(
         environment: &mut CollatzEnvironment,
-        observations: &[Observation<CollatzDomain>],
+        observation: &Observation<CollatzDomain>,
     ) -> Vec<Effect<CollatzDomain>> {
-        environment.handle(observations, &Cancel::cancelled())
+        environment.handle(observation, &Cancel::cancelled())
     }
 
     #[test]
     fn the_environment_starts_the_ring_and_stops_it_when_every_chain_is_over() {
         let mut environment = environment([6, 7]);
         assert_eq!(environment.start(), [start(["a", "b"])]);
-        assert!(folded(&mut environment, &[reports("a", 6)]).is_empty());
+        assert!(folded(&mut environment, &reports("a", 6)).is_empty());
         assert_eq!(
-            folded(&mut environment, &[reports("b", 7)]),
+            folded(&mut environment, &reports("b", 7)),
             [stop(["a", "b"])]
         );
     }
@@ -494,9 +488,9 @@ mod tests {
         // leaves one running.
         let mut environment = environment([6, 6]);
         environment.start();
-        assert!(folded(&mut environment, &[reports("a", 6)]).is_empty());
+        assert!(folded(&mut environment, &reports("a", 6)).is_empty());
         assert_eq!(
-            folded(&mut environment, &[reports("a", 6)]),
+            folded(&mut environment, &reports("a", 6)),
             [stop(["a", "b"])]
         );
     }
@@ -512,7 +506,7 @@ mod tests {
     fn a_chain_nobody_opened_panics() {
         let mut environment = environment([6, 7]);
         environment.start();
-        let _ = folded(&mut environment, &[reports("a", 9)]);
+        let _ = folded(&mut environment, &reports("a", 9));
     }
 
     #[test]
@@ -522,11 +516,11 @@ mod tests {
         environment.start();
         let _ = folded(
             &mut environment,
-            &[observation(
+            &observation(
                 "a",
                 ENVIRONMENT,
                 CollatzPayload::Step { chain: 6, value: 3 },
-            )],
+            ),
         );
     }
 }

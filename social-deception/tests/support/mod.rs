@@ -44,8 +44,8 @@ pub fn parse(bytes: &[u8]) -> Vec<Value> {
 ///   cycle;
 /// - per-agent sequence numbers are contiguous and strictly increasing from
 ///   zero, in file order;
-/// - a cycle woken by the queue has at least one input, and one woken by the
-///   timeout has no observations at all;
+/// - a cycle lists **at most one** observation among its inputs, and a
+///   cycle woken by the queue has at least one input;
 /// - no event has its sender among its recipients; an observation lists the
 ///   agent that recorded it among the recipients, and an action names it as
 ///   the sender;
@@ -295,12 +295,21 @@ fn check_cycle(cycle: &Value, run: &[u64], records: &HashMap<(&str, u64), &Value
         .iter()
         .filter(|input| input["type"] == "observation")
         .count();
-    if woken == "timeout" {
-        assert_eq!(
-            observations, 0,
-            "a cycle woken by the timeout has no observations: {cycle}"
-        );
-    } else {
+    // A cycle is one decision, so it observed one thing or nothing at all
+    // (ADR-0008). This is what makes `t_start` and `t_stop` bracket a single
+    // decision rather than the time to work through an arbitrary pile, and
+    // so what lets a reader take the gap between them for deliberation.
+    //
+    // It is asserted of every cycle, whatever woke it. `timeout` says the
+    // deadline had passed when the cycle began, not that the cycle observed
+    // nothing: a deadline that passes while an event is waiting joins that
+    // event's cycle. What no cycle does is observe twice.
+    assert!(
+        observations <= 1,
+        "a cycle handles at most one observation, but this one lists \
+         {observations}: {cycle}"
+    );
+    if woken == "queue" {
         assert!(
             !inputs.is_empty(),
             "a cycle woken by the queue popped something: {cycle}"
@@ -821,12 +830,36 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "woken by the timeout has no observations")]
-    fn a_timeout_cycle_with_an_observation_is_caught() {
+    fn a_timeout_cycle_that_also_observed_passes() {
+        // `timeout` says the deadline had passed when the cycle began, not
+        // that the cycle observed nothing. A deadline that passes while an
+        // event is waiting joins that event's cycle, which observes it and
+        // calls `handle` like any other, so this is a shape the loop really
+        // produces and the checker must accept.
         let mut lines = good();
-        // `b`'s observation of `a`'s reply, filed under the cycle that b
-        // ran on its timeout.
         lines[10]["woken"] = json!("timeout");
+        check(&lines);
+    }
+
+    #[test]
+    #[should_panic(expected = "at most one observation")]
+    fn a_cycle_that_observed_twice_is_caught() {
+        // A cycle is one decision, so it conditions on one observation or
+        // on none. Two would be the batch ADR-0008 removed, and a reader
+        // taking the window for deliberation would be reading the time to
+        // work through a pile.
+        let mut lines = good();
+        lines.insert(
+            2,
+            json!({"type": "observation", "agent": "a", "seq": 2, "created": 20, "received": 30,
+                   "event": {"sender": "b", "recipients": ["a"], "payload": {"Step": 8}}}),
+        );
+        // Renumber the rest of `a`'s records around the extra one.
+        lines[3]["seq"] = json!(3);
+        lines[4]["inputs"] = json!([0, 1, 2]);
+        lines[4]["outputs"] = json!([3]);
+        lines[6]["seq"] = json!(4);
+        lines[7]["inputs"] = json!([4]);
         check(&lines);
     }
 

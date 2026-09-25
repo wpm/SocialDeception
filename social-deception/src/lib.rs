@@ -16,7 +16,7 @@
 //! | [`Observation`] | an [`Event`] popped off an agent's queue |
 //! | [`Action`] | what a handler returns for the loop to send |
 //! | [`Domain`] | the types one game contributes: its payload and its reward |
-//! | cycle | one turn of an agent's loop: pop, hand to the handler, send |
+//! | cycle | one turn of an agent's loop: pop one observation, hand it to the handler, send |
 //! | [`Cancel`] | the handler's view of whether its cycle has been preempted |
 //! | [`Environment`] | the one agent per episode that starts and stops the others |
 //!

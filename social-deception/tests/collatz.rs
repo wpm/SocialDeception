@@ -320,16 +320,21 @@ fn chains_that_share_a_value_stay_apart() {
     check_outcome(&lines, ring);
 }
 
-/// A hand-written trajectory of a ring of two in which `a` opens 4 and 2,
-/// `b` drains both opening steps in one cycle, and `a` drains both replies in
-/// one cycle. The runtime makes such cycles likely but not certain, so the
-/// case is pinned down here rather than hoped for in a live episode.
+/// A hand-written trajectory of a ring of two in which `a` opens 4 and 2
+/// in one cycle and the two chains then run side by side, a cycle per step.
+/// Two chains are in flight between the same pair of agents throughout, and
+/// nothing but the chain name tells a step of one from a step of the other.
+///
+/// A cycle handles one observation (ADR-0008), so each of `b`'s two opening
+/// steps gets a cycle of its own and so does each of `a`'s two replies. The
+/// opening is the one cycle that emits two actions, because a start hook
+/// may open as many chains as it likes.
 ///
 /// The environment is here too, with its own records: it starts the ring,
 /// hears one report per chain, and stops the ring. Its `Stop` reaches `a`
 /// and `b` after the last step they exchanged, which is the ordering the
 /// episode guarantees.
-fn mixed_drains() -> Vec<Value> {
+fn interleaved_chains() -> Vec<Value> {
     let control = |agent: &str, seq: u64, created: u64, received: u64, control: &str| {
         serde_json::json!({"type": "control", "agent": agent, "seq": seq, "created": created,
                            "received": received, "control": control})
@@ -373,20 +378,23 @@ fn mixed_drains() -> Vec<Value> {
         action("a", 2, 21, 2, 2),
         cycle("a", 15, 25, &[0], &[1, 2]),
         control("b", 0, 10, 30, "start"),
-        observation("b", 1, 20, 30, 4, 4),
-        observation("b", 2, 21, 30, 2, 2),
-        action("b", 3, 40, 4, 2),
-        action("b", 4, 41, 2, 1),
-        cycle("b", 30, 45, &[0, 1, 2], &[3, 4]),
+        cycle("b", 30, 31, &[0], &[]),
+        observation("b", 1, 20, 32, 4, 4),
+        action("b", 2, 40, 4, 2),
+        cycle("b", 32, 42, &[1], &[2]),
+        observation("b", 3, 21, 43, 2, 2),
+        action("b", 4, 44, 2, 1),
+        cycle("b", 43, 45, &[3], &[4]),
         observation("a", 3, 40, 50, 4, 2),
-        observation("a", 4, 41, 50, 2, 1),
-        action("a", 5, 60, 4, 1),
-        reported("a", 6, 61, 2),
-        cycle("a", 50, 65, &[3, 4], &[5, 6]),
+        action("a", 4, 60, 4, 1),
+        cycle("a", 50, 62, &[3], &[4]),
+        observation("a", 5, 44, 63, 2, 1),
+        reported("a", 6, 64, 2),
+        cycle("a", 63, 65, &[5], &[6]),
         observation("b", 5, 60, 70, 4, 1),
         reported("b", 6, 71, 4),
         cycle("b", 70, 75, &[5], &[6]),
-        heard(1, 61, 80, "a", 2),
+        heard(1, 64, 80, "a", 2),
         cycle(ENVIRONMENT, 80, 81, &[1], &[]),
         heard(2, 71, 85, "b", 4),
         cycle(ENVIRONMENT, 85, 86, &[2], &[]),
@@ -400,8 +408,8 @@ fn mixed_drains() -> Vec<Value> {
 }
 
 #[test]
-fn chains_are_told_apart_within_one_drain() {
-    let lines = mixed_drains();
+fn two_chains_in_flight_at_once_are_told_apart() {
+    let lines = interleaved_chains();
     support::check(&lines);
     let ring: &Ring = &[("a", &[4, 2]), ("b", &[])];
     check_outcome(&lines, ring);
@@ -413,11 +421,11 @@ fn chains_are_told_apart_within_one_drain() {
 #[test]
 #[should_panic(expected = "the outputs of")]
 fn a_step_sent_on_the_wrong_chain_is_caught() {
-    let mut lines = mixed_drains();
+    let mut lines = interleaved_chains();
     // b's reply to chain 4's step is filed under chain 2.
     let wrong = lines
         .iter()
-        .position(|line| line["agent"] == "b" && line["seq"] == 3)
+        .position(|line| line["agent"] == "b" && line["seq"] == 2)
         .unwrap();
     lines[wrong]["event"]["payload"]["Step"]["chain"] = serde_json::json!(2);
     let ring: &Ring = &[("a", &[4, 2]), ("b", &[])];
@@ -427,7 +435,7 @@ fn a_step_sent_on_the_wrong_chain_is_caught() {
 #[test]
 #[should_panic(expected = "next agent in the ring")]
 fn a_step_sent_to_the_wrong_agent_is_caught() {
-    let mut lines = mixed_drains();
+    let mut lines = interleaved_chains();
     // a's opening step for chain 4 is addressed to c, who is not in the ring.
     let opening = lines
         .iter()

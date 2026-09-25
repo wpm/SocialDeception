@@ -10,9 +10,12 @@ reinforcement learning does, because that is what the trajectories it
 writes are read in (see
 [ADR-0007](docs/decision-history/0007-reinforcement-learning-vocabulary.md)).
 
-An **agent** runs a loop whose one turn is a **cycle**: it pops its two
-queues, folds what it popped into its own state, and sends what its handler
-returns. What travels between agents is an **event** — sender, recipients,
+An **agent** runs a loop whose one turn is a **cycle**: it pops every
+control waiting and one event, folds that one observation into its own
+state, and sends what its handler returns. One observation per cycle, so an
+agent with a full queue runs a cycle per event and is stale by at most one
+decision (see
+[ADR-0008](docs/decision-history/0008-one-observation-per-cycle.md)). What travels between agents is an **event** — sender, recipients,
 creation time and a payload the game defines. The same event is an
 **action** of the agent that sent it and an **observation** of each agent
 that pops it, which is what lets one agent's trajectory be joined to

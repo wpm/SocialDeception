@@ -6,13 +6,14 @@
 //!
 //! # Six record types
 //!
-//! An agent runs one cycle per wake-up: it pops everything waiting, hands
-//! the observations to its handler, and sends the actions that come back.
-//! Each cycle produces:
+//! An agent runs one cycle per wake-up: it pops every control waiting and
+//! at most one event, hands that one observation to its handler, and sends
+//! the actions that come back. Each cycle produces:
 //!
-//! - an [`ObservationRecord`] per observation popped, written the instant it
-//!   is popped, carrying both the instant its sender created it and the
-//!   instant this agent received it;
+//! - an [`ObservationRecord`] for the observation it popped, if it popped
+//!   one, written the instant it is popped, carrying both the instant its
+//!   sender created it and the instant this agent received it. At most one
+//!   per cycle: a cycle handles one observation (ADR-0008);
 //! - a [`ControlRecord`] per control popped, likewise;
 //! - an [`ActionRecord`] per action sent, written the instant it is sent,
 //!   carrying the `created` stamp the loop has just given it;
@@ -59,9 +60,10 @@
 //! lists are a consistency check on the grouping, not the only way to
 //! recover it.
 //!
-//! A cycle woken by the timeout has no inputs at all, so the smallest cycle
-//! is a cycle record alone. Every other cycle has at least one input, since
-//! it ran only because something was waiting.
+//! A cycle woken by the timeout with nothing waiting has no inputs at all,
+//! so the smallest cycle is a cycle record alone. Every cycle woken by the
+//! queue has at least one input, since it ran only because something was
+//! waiting, and no cycle has more than one observation among them.
 //!
 //! These guarantees are per agent. Every agent sends to the same writer, so
 //! records from different agents interleave arbitrarily, and a recipient's
@@ -117,7 +119,16 @@ pub struct Seq(pub u64);
 pub enum Woken {
     /// Something was waiting on the agent's queue.
     Queue,
-    /// The agent's timeout fired, and the cycle ran with no observations.
+    /// The agent's deadline had passed when the cycle began.
+    ///
+    /// It says when the cycle ran, not what it decided from. A deadline
+    /// that passes while nothing is waiting runs a cycle that observes
+    /// nothing and calls [`Handler::timeout`](crate::Handler::timeout); one
+    /// that passes while an event is waiting joins that event's cycle,
+    /// which observes it and calls
+    /// [`Handler::handle`](crate::Handler::handle) like any other. Either
+    /// way the deadline is retired and the next is measured from this
+    /// cycle, which is what the mark is for.
     Timeout,
 }
 

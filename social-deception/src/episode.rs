@@ -603,8 +603,12 @@ impl<D: Domain> Handler<D> for Watched<D> {
         self.handler.start()
     }
 
-    fn handle(&mut self, observations: &[Observation<D>], cancel: &Cancel) -> Vec<Action<D>> {
-        self.handler.handle(observations, cancel)
+    fn handle(&mut self, observation: &Observation<D>, cancel: &Cancel) -> Vec<Action<D>> {
+        self.handler.handle(observation, cancel)
+    }
+
+    fn timeout(&mut self, cancel: &Cancel) -> Vec<Action<D>> {
+        self.handler.timeout(cancel)
     }
 }
 
@@ -704,13 +708,11 @@ mod tests {
 
         fn handle(
             &mut self,
-            observations: &[Observation<Counting>],
+            observation: &Observation<Counting>,
             _: &Cancel,
         ) -> Vec<Effect<Counting>> {
-            for observation in observations {
-                if observation.event.payload == Done {
-                    self.working.remove(&observation.event.sender);
-                }
+            if observation.event.payload == Done {
+                self.working.remove(&observation.event.sender);
             }
             if self.working.is_empty() && !self.agents.is_empty() {
                 let agents = std::mem::take(&mut self.agents);
@@ -750,7 +752,7 @@ mod tests {
             ]
         }
 
-        fn handle(&mut self, _: &[Observation<Counting>], _: &Cancel) -> Vec<Effect<Counting>> {
+        fn handle(&mut self, _: &Observation<Counting>, _: &Cancel) -> Vec<Effect<Counting>> {
             Vec::new()
         }
     }
@@ -842,7 +844,7 @@ mod tests {
             vec![Effect::control(self.0, Control::Start)]
         }
 
-        fn handle(&mut self, _: &[Observation<Counting>], _: &Cancel) -> Vec<Effect<Counting>> {
+        fn handle(&mut self, _: &Observation<Counting>, _: &Cancel) -> Vec<Effect<Counting>> {
             Vec::new()
         }
     }
@@ -850,16 +852,13 @@ mod tests {
     /// The name the counting games' environment goes by.
     const REFEREE: &str = "referee";
 
-    /// The numbers among a batch of observations, which is everything a
+    /// The number an observation carries, if it is one: everything a
     /// counting agent hears that is not a [`Done`].
-    fn counts(observations: &[Observation<Counting>]) -> Vec<u64> {
-        observations
-            .iter()
-            .filter_map(|observation| match observation.event.payload {
-                Say(n) => Some(n),
-                Done => None,
-            })
-            .collect()
+    fn count(observation: &Observation<Counting>) -> Option<u64> {
+        match observation.event.payload {
+            Say(n) => Some(n),
+            Done => None,
+        }
     }
 
     /// An agent's way of telling the environment it has finished.
@@ -897,18 +896,17 @@ mod tests {
 
         fn handle(
             &mut self,
-            observations: &[Observation<Counting>],
+            observation: &Observation<Counting>,
             _: &Cancel,
         ) -> Vec<Action<Counting>> {
-            let heard = counts(observations);
-            let mut actions: Vec<Action<Counting>> = heard
-                .iter()
-                .filter(|n| **n < self.limit)
-                .map(|n| self.to_partner(n + 1))
-                .collect();
-            let reached =
-                heard.iter().any(|n| *n >= self.limit) || heard.iter().any(|n| n + 1 >= self.limit);
-            if reached {
+            let Some(heard) = count(observation) else {
+                return Vec::new();
+            };
+            let mut actions = Vec::new();
+            if heard < self.limit {
+                actions.push(self.to_partner(heard + 1));
+            }
+            if heard + 1 >= self.limit {
                 actions.push(done());
             }
             actions
@@ -935,10 +933,12 @@ mod tests {
 
         fn handle(
             &mut self,
-            observations: &[Observation<Counting>],
+            observation: &Observation<Counting>,
             _: &Cancel,
         ) -> Vec<Action<Counting>> {
-            self.heard += counts(observations).len();
+            if count(observation).is_some() {
+                self.heard += 1;
+            }
             if self.heard >= self.expects {
                 vec![done()]
             } else {
@@ -953,18 +953,16 @@ mod tests {
     impl Handler<Counting> for Spoke {
         fn handle(
             &mut self,
-            observations: &[Observation<Counting>],
+            observation: &Observation<Counting>,
             _: &Cancel,
         ) -> Vec<Action<Counting>> {
-            let mut actions: Vec<Action<Counting>> = observations
-                .iter()
-                .filter(|observation| matches!(observation.event.payload, Say(_)))
-                .map(|observation| Action::to([observation.event.sender.clone()], Say(1)))
-                .collect();
-            if !actions.is_empty() {
-                actions.push(done());
+            if count(observation).is_none() {
+                return Vec::new();
             }
-            actions
+            vec![
+                Action::to([observation.event.sender.clone()], Say(1)),
+                done(),
+            ]
         }
     }
 
@@ -976,7 +974,7 @@ mod tests {
             vec![Action::to([self.0], Say(1))]
         }
 
-        fn handle(&mut self, _: &[Observation<Counting>], _: &Cancel) -> Vec<Action<Counting>> {
+        fn handle(&mut self, _: &Observation<Counting>, _: &Cancel) -> Vec<Action<Counting>> {
             Vec::new()
         }
     }
@@ -985,7 +983,7 @@ mod tests {
     struct Mute;
 
     impl Handler<Counting> for Mute {
-        fn handle(&mut self, _: &[Observation<Counting>], _: &Cancel) -> Vec<Action<Counting>> {
+        fn handle(&mut self, _: &Observation<Counting>, _: &Cancel) -> Vec<Action<Counting>> {
             Vec::new()
         }
     }
@@ -997,7 +995,7 @@ mod tests {
             panic!("the handler is broken")
         }
 
-        fn handle(&mut self, _: &[Observation<Counting>], _: &Cancel) -> Vec<Action<Counting>> {
+        fn handle(&mut self, _: &Observation<Counting>, _: &Cancel) -> Vec<Action<Counting>> {
             panic!("the handler is broken")
         }
     }

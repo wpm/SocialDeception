@@ -112,11 +112,10 @@ impl<R: Player, P: Policy> Seat<R, P> {
 }
 
 impl<R: Player, P: Policy> Handler<WerewolfDomain> for Seat<R, P> {
-    /// Folds each observation into the role's state in order and answers
-    /// each request among them, so that a request is answered from the state
-    /// every observation before it produced, including those in the same
-    /// cycle. A cycle with two requests produces two responses, in request
-    /// order; a cycle with none produces nothing.
+    /// Folds the observation into the role's state and answers it if it was
+    /// a request, so that the answer is given from the state every earlier
+    /// observation produced, this one included. An observation that is not a
+    /// request produces nothing but the fold.
     ///
     /// # Panics
     ///
@@ -125,18 +124,17 @@ impl<R: Player, P: Policy> Handler<WerewolfDomain> for Seat<R, P> {
     /// [`Player::action_space`].
     fn handle(
         &mut self,
-        observations: &[Observation<WerewolfDomain>],
+        observation: &Observation<WerewolfDomain>,
         cancel: &Cancel,
     ) -> Vec<agent::Action<WerewolfDomain>> {
-        let mut actions = Vec::new();
-        for observation in observations {
-            self.player.knowledge_mut().observe(observation);
-            if let Message::Request(request) = &observation.event.payload {
+        self.player.knowledge_mut().observe(observation);
+        match &observation.event.payload {
+            Message::Request(request) => {
                 let response = Message::Response(self.answer(request, cancel));
-                actions.push(agent::Action::to([self.moderator.clone()], response));
+                vec![agent::Action::to([self.moderator.clone()], response)]
             }
+            _ => Vec::new(),
         }
-        actions
     }
 }
 
@@ -215,13 +213,17 @@ mod tests {
         )
     }
 
-    /// What a seat does with a cycle's worth of events.
+    /// What a seat does with a run of events, each in a cycle of its own,
+    /// as the loop hands them over (ADR-0008): every action they produced,
+    /// in order.
     fn handling<R: Player, P: Policy, const N: usize>(
         seat: &mut Seat<R, P>,
         events: [Event<WerewolfDomain>; N],
     ) -> Vec<Action<WerewolfDomain>> {
-        let observations: Vec<_> = events.into_iter().map(observed).collect();
-        seat.handle(&observations, &Cancel::cancelled())
+        events
+            .into_iter()
+            .flat_map(|event| seat.handle(&observed(event), &Cancel::cancelled()))
+            .collect()
     }
 
     fn villager<P: Policy>(policy: P) -> Seat<Villager, P> {
@@ -233,7 +235,7 @@ mod tests {
     }
 
     #[test]
-    fn each_request_in_a_batch_is_answered_in_order_from_the_state_before_it() {
+    fn each_request_is_answered_from_the_state_every_earlier_observation_left() {
         let mut seat = villager(Last);
         let cycle = [
             narrated(Narration::Assigned {
@@ -252,7 +254,7 @@ mod tests {
     }
 
     #[test]
-    fn a_cycle_without_a_request_produces_nothing_and_still_updates_the_state() {
+    fn an_observation_that_is_not_a_request_produces_nothing_and_still_updates_the_state() {
         let mut seat = villager(Last);
         let silent = handling(
             &mut seat,
@@ -279,10 +281,12 @@ mod tests {
     }
 
     #[test]
-    fn a_cycle_with_no_observations_produces_nothing() {
-        // What a timeout cycle looks like from inside a handler.
+    fn a_timeout_produces_nothing() {
+        // What a timeout cycle looks like from inside a handler: the loop
+        // calls `timeout`, not `handle`, and a player has nothing to say on
+        // a deadline.
         let mut seat = villager(Last);
-        assert!(seat.handle(&[], &Cancel::cancelled()).is_empty());
+        assert!(seat.timeout(&Cancel::cancelled()).is_empty());
     }
 
     #[test]

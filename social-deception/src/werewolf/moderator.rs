@@ -185,10 +185,10 @@ impl Environment<WerewolfDomain> for Moderator {
         effects
     }
 
-    /// Folds each observation into the game in order and says what the game
-    /// wants said. The observation that ends the game also sends the
-    /// outcome on the channel, pays every player and stops every player;
-    /// after it, nothing, whatever arrives.
+    /// Folds the observation into the game and says what the game wants
+    /// said. The observation that ends the game also sends the outcome on
+    /// the channel, pays every player and stops every player; after it,
+    /// nothing, whatever arrives.
     ///
     /// The cancel is ignored. Folding a response into the game is a few
     /// microseconds of bookkeeping with nothing to wait on, so there is no
@@ -200,22 +200,20 @@ impl Environment<WerewolfDomain> for Moderator {
     /// response is one the game cannot accept; see [`Game::record`].
     fn handle(
         &mut self,
-        observations: &[Observation<WerewolfDomain>],
+        observation: &Observation<WerewolfDomain>,
         _: &Cancel,
     ) -> Vec<Effect<WerewolfDomain>> {
-        let mut effects = Vec::new();
-        for observation in observations {
-            // Whether the game is over is the game's to say, and it is
-            // asked before every observation, so the one that ends it is the
-            // last folded and the only one after which the outcome is seen
-            // for the first time.
-            if self.game.outcome().is_some() {
-                break;
-            }
-            let directives = self.fold(observation);
-            effects.extend(self.say(directives));
+        // Whether the game is over is the game's to say, and it is asked
+        // before every observation, so the one that ends it is the last
+        // folded and the only one after which the outcome is seen for the
+        // first time. A response that arrives after that — one a player sent
+        // before its stop reached it — is not folded, and the moderator says
+        // nothing about it.
+        if self.game.outcome().is_some() {
+            return Vec::new();
         }
-        effects
+        let directives = self.fold(observation);
+        self.say(directives)
     }
 }
 
@@ -382,29 +380,19 @@ mod tests {
     /// Plays a whole game, with stub players following `policy`, and returns
     /// every effect the moderator produced in order.
     ///
-    /// The game opens with the start hook, as the agent loop opens it. Each
-    /// phase's responses then arrive as one cycle when `batched`, and one
-    /// per cycle otherwise. Either way the game runs until the moderator
-    /// asks nothing more.
-    fn play(
-        moderator: &mut Moderator,
-        policy: Policy,
-        batched: bool,
-    ) -> Vec<Effect<WerewolfDomain>> {
+    /// The game opens with the start hook, as the agent loop opens it, and
+    /// each response then arrives in a cycle of its own, as the loop hands
+    /// them over one at a time (ADR-0008). The game runs until the
+    /// moderator asks nothing more.
+    fn play(moderator: &mut Moderator, policy: Policy) -> Vec<Effect<WerewolfDomain>> {
         let opening = moderator.start();
         let mut pending = respond(&actions(&opening), policy, moderator.game.living());
         let mut produced = opening;
         while !pending.is_empty() {
-            let effects = if batched {
-                moderator.handle(&pending, &Cancel::cancelled())
-            } else {
-                pending
-                    .iter()
-                    .flat_map(|observation| {
-                        moderator.handle(std::slice::from_ref(observation), &Cancel::cancelled())
-                    })
-                    .collect()
-            };
+            let effects: Vec<Effect<WerewolfDomain>> = pending
+                .iter()
+                .flat_map(|observation| moderator.handle(observation, &Cancel::cancelled()))
+                .collect();
             pending = respond(&actions(&effects), policy, moderator.game.living());
             produced.extend(effects);
         }
@@ -434,7 +422,7 @@ mod tests {
         for assignment in [village(), town()] {
             for policy in policies {
                 let (mut moderator, receiver) = moderator(assignment.clone());
-                let effects = play(&mut moderator, policy, true);
+                let effects = play(&mut moderator, policy);
                 games.push(Played {
                     assignment: assignment.clone(),
                     outcome: moderator.game.outcome().unwrap().clone(),
@@ -522,13 +510,14 @@ mod tests {
     }
 
     #[test]
-    fn a_cycle_with_no_observations_produces_nothing() {
-        // What a timeout cycle looks like from inside the handler. Controls
-        // never reach it at all, so there is nothing else a cycle can hold
-        // that the moderator must ignore.
+    fn a_timeout_produces_nothing() {
+        // What a timeout cycle looks like from inside the handler: the loop
+        // calls `timeout`, not `handle`, and the moderator has nothing to
+        // say on a deadline. Controls never reach it either, so there is
+        // nothing a cycle can hold that it must ignore.
         let (mut moderator, _receiver) = moderator(village());
         moderator.start();
-        assert_eq!(moderator.handle(&[], &Cancel::cancelled()), []);
+        assert_eq!(moderator.timeout(&Cancel::cancelled()), []);
     }
 
     #[test]
@@ -751,7 +740,7 @@ mod tests {
     #[test]
     fn nothing_is_emitted_after_the_outcome() {
         let (mut moderator, _receiver) = moderator(village());
-        let sent = actions(&play(&mut moderator, first_other, true));
+        let sent = actions(&play(&mut moderator, first_other));
         let (who, request) = sent
             .iter()
             .rev()
@@ -760,33 +749,38 @@ mod tests {
                 _ => None,
             })
             .unwrap();
-        let late = [response(&who, request, Move::Target(id("bob")))];
+        let late = response(&who, request, Move::Target(id("bob")));
         assert_eq!(moderator.handle(&late, &Cancel::cancelled()), []);
     }
 
     #[test]
-    fn a_batch_ending_the_game_emits_nothing_for_the_rest_of_it() {
-        // Two moderators play the same game in lockstep. The one whose
-        // batch ends the game gets a duplicate of the response that ended
-        // it, in the same batch, and must say nothing for it.
+    fn a_response_repeated_after_the_game_ended_emits_nothing() {
+        // Two moderators play the same game in lockstep. One of them is
+        // handed each response a second time, in a cycle of its own, and
+        // must say nothing for the repeat: before the game ends the fold is
+        // the game's to refuse, and after it ends the outcome guard stops
+        // the fold before it starts.
         let (mut reference, _receiver) = moderator(village());
-        let (mut padded, _receiver) = moderator(village());
+        let (mut doubled, _receiver) = moderator(village());
         let opening = reference.start();
-        assert_eq!(padded.start(), opening);
+        assert_eq!(doubled.start(), opening);
         let mut pending = respond(&actions(&opening), first_other, reference.game.living());
         while !pending.is_empty() {
-            let effects = reference.handle(&pending, &Cancel::cancelled());
-            let mut cycle = pending.clone();
-            if effects
-                .iter()
-                .any(|effect| matches!(effect, Effect::Control { .. }))
-            {
-                cycle.push(pending.last().unwrap().clone());
+            let mut effects = Vec::new();
+            for observation in &pending {
+                let produced = reference.handle(observation, &Cancel::cancelled());
+                assert_eq!(doubled.handle(observation, &Cancel::cancelled()), produced);
+                // The repeat is only safe once the game has ended; before
+                // that the game would refuse a response it has already
+                // recorded, which is a different claim and its own test.
+                if doubled.game.outcome().is_some() {
+                    assert_eq!(doubled.handle(observation, &Cancel::cancelled()), []);
+                }
+                effects.extend(produced);
             }
-            assert_eq!(padded.handle(&cycle, &Cancel::cancelled()), effects);
             pending = respond(&actions(&effects), first_other, reference.game.living());
         }
-        assert!(reference.game.outcome().is_some() && padded.game.outcome().is_some());
+        assert!(reference.game.outcome().is_some() && doubled.game.outcome().is_some());
     }
 
     #[test]
@@ -795,10 +789,10 @@ mod tests {
         let (mut moderator, _receiver) = moderator(village());
         moderator.start();
         moderator.handle(
-            &[from_player(
+            &from_player(
                 "erin",
                 Message::Narration(Narration::NoDeath { round: Round(1) }),
-            )],
+            ),
             &Cancel::cancelled(),
         );
     }
@@ -809,14 +803,14 @@ mod tests {
         let (mut moderator, _receiver) = moderator(village());
         moderator.start();
         moderator.handle(
-            &[from_player(
+            &from_player(
                 "carol",
                 Message::Request(Request {
                     id: RequestId(1),
                     round: Round(1),
                     kind: RequestKind::Nominate,
                 }),
-            )],
+            ),
             &Cancel::cancelled(),
         );
     }
@@ -825,20 +819,7 @@ mod tests {
     fn a_dropped_receiver_is_not_an_error() {
         let (mut moderator, receiver) = moderator(town());
         drop(receiver);
-        let sent = actions(&play(&mut moderator, last_other, true));
+        let sent = actions(&play(&mut moderator, last_other));
         assert_eq!(moderator.game.outcome(), Some(announced_outcome(&sent).1));
-    }
-
-    #[test]
-    fn responses_in_one_batch_or_several_produce_the_same_game() {
-        for assignment in [village(), town()] {
-            let (mut batched, batched_receiver) = moderator(assignment.clone());
-            let (mut separate, separate_receiver) = moderator(assignment);
-            assert_eq!(
-                play(&mut batched, last_other, true),
-                play(&mut separate, last_other, false)
-            );
-            assert_eq!(batched_receiver.try_recv(), separate_receiver.try_recv());
-        }
     }
 }

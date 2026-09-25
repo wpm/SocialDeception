@@ -157,7 +157,7 @@
     <div class="col">
       <div class="box agentbox">
         <div class="boxhead"><span>agent <b>a</b> · one thread</span><span id="state" class="pill wait">waiting</span></div>
-        <div class="row"><span class="lbl">popped</span><div id="batch" class="chips"></div></div>
+        <div class="row"><span class="lbl">popped</span><div id="popped" class="chips"></div></div>
         <div class="row"><span class="lbl">cancel</span><div id="cancel" class="chips"></div></div>
         <div class="row"><span class="lbl">handler</span><div id="handler" class="handler"></div></div>
         <div class="row"><span class="lbl">actions</span><div id="outputs" class="chips"></div></div>
@@ -219,7 +219,7 @@
   const cyLine = (ts, te, woken, i, o) => ({ cls: 'cycle', text: '{"type":"cycle","agent":"a","t_start":' + ts + ',"t_stop":' + te + ',"woken":"' + woken + '","inputs":[' + i + '],"outputs":[' + o + ']}' });
 
   // ---- Scenario ------------------------------------------------------
-  const base = { controls: [], events: [], state: 'waiting', batch: [], cancel: 'armed', handler: '', outputs: [], dispatch: null, log: [], seq: 0, clock: 0, exited: false };
+  const base = { controls: [], events: [], state: 'waiting', popped: [], cancel: 'armed', handler: '', outputs: [], dispatch: null, log: [], seq: 0, clock: 0, exited: false };
   const frames = [];
   let cur = base;
   function frame(title, body, patch) {
@@ -234,17 +234,17 @@
 
   frame('The environment sends Start', 'Nothing runs until the environment says so. It sends a-Start at t 10; the router puts it on the control queue, not the event queue, because a control is out-of-domain data: an instruction about the episode rather than a move within the game.', s => { s.controls = [ctl('Start', 10)]; s.clock = 10; });
 
-  frame('Wake and pop, controls first', 'The loop wakes, arms a fresh cancel for this cycle, and pops both queues — the control queue first, always. t_start is read once, after the pop: 12. Everything popped in this cycle is received at that one instant.', s => { s.controls = []; s.batch = [ctl('Start', 10)]; s.state = 'popping'; s.clock = 12; });
+  frame('Wake and pop, controls first', 'The loop wakes, arms a fresh cancel for this cycle, and pops every control waiting and at most one event — the control queue first, always. t_start is read once, after the pop: 12. Everything popped in this cycle is received at that one instant.', s => { s.controls = []; s.popped = [ctl('Start', 10)]; s.state = 'popping'; s.clock = 12; });
 
   frame('Record the control', 'A control gets a control record. It carries both instants: created 10, when the environment sent it, and received 12, when this agent popped it. The gap is how long it waited.', s => { s.state = 'recording'; s.log.push(ctlLine(0, 10, 12, 'start')); s.seq = 1; });
 
   frame('Start calls the start hook', 'The handler never sees a control; the loop acts on it. Start calls the handler’s start hook, whose opening actions are sent like any others. This agent opens with nothing.', s => { s.state = 'folding'; s.handler = 'start() → []'; });
 
-  frame('Close the cycle', 'The cycle record names what woke it — queue, meaning something was waiting — the handling window, and the sequence numbers it saw. Inputs [0], outputs none.', s => { s.state = 'dispatching'; s.dispatch = { deliveries: 1, sent: 0 }; s.clock = 14; s.handler = ''; s.log.push(cyLine(12, 14, 'queue', '0', '')); s.batch = []; });
+  frame('Close the cycle', 'The cycle record names what woke it — queue, meaning something was waiting — the handling window, and the sequence numbers it saw. Inputs [0], outputs none.', s => { s.state = 'dispatching'; s.dispatch = { deliveries: 1, sent: 0 }; s.clock = 14; s.handler = ''; s.log.push(cyLine(12, 14, 'queue', '0', '')); s.popped = []; });
 
   frame('An event arrives', 'Agent b sends Step(6) to a, created at t 20. The router validates the recipient set and copies it onto a’s event queue.', s => { s.state = 'waiting'; s.events = [msg('b', 'a', 6, 20)]; s.clock = 20; });
 
-  frame('Pop it as an observation', 'An event popped off the queue is an observation. Same rule as before: pop everything, then read t_start, 22.', s => { s.events = []; s.batch = [msg('b', 'a', 6, 20)]; s.state = 'popping'; s.clock = 22; });
+  frame('Pop it as an observation', 'An event popped off the queue is an observation. Same rule as before: pop, then read t_start, 22. One event, because a cycle handles one observation.', s => { s.events = []; s.popped = [msg('b', 'a', 6, 20)]; s.state = 'popping'; s.clock = 22; });
 
   frame('Record the observation', 'Seq 1. created 20 is when b sent it; received 22 is when a popped it. The difference is the observation’s latency: its whole staleness, routing and queuing together.', s => { s.state = 'recording'; s.log.push(obsLine(1, 20, 22, envelope('b', 'a', 6))); s.seq = 2; });
 
@@ -252,41 +252,41 @@
 
   frame('Stamp, record, send', 'The loop checks the control queue, finds nothing, and sends. Each action is stamped with this agent as sender and t 24 as created — that stamp is what makes it an event on the wire — and logged as an action record. An action has no received: when b receives it is in b’s own trajectory.', s => { s.state = 'dispatching'; s.clock = 24; s.log.push(actLine(2, 24, envelope('a', 'b', 3))); s.seq = 3; s.dispatch = { deliveries: 1, sent: 1 }; });
 
-  frame('Close the cycle', 'Inputs [1], outputs [2]. Per agent a cycle always follows every record it names, and nothing of this agent’s lands between them: it is one thread, and the next cycle cannot start until this record is sent.', s => { s.clock = 25; s.log.push(cyLine(22, 25, 'queue', '1', '2')); s.state = 'waiting'; s.batch = []; s.handler = ''; s.outputs = []; });
+  frame('Close the cycle', 'Inputs [1], outputs [2]. Per agent a cycle always follows every record it names, and nothing of this agent’s lands between them: it is one thread, and the next cycle cannot start until this record is sent.', s => { s.clock = 25; s.log.push(cyLine(22, 25, 'queue', '1', '2')); s.state = 'waiting'; s.popped = []; s.handler = ''; s.outputs = []; });
 
-  frame('A slow fold', 'Agent c sends Step(40) at t 30. The agent pops it at 31, records it, and this time the handler is slow — the way a model call would be.', s => { s.clock = 31; s.batch = [msg('c', 'a', 40, 30)]; s.state = 'folding'; s.log.push(obsLine(3, 30, 31, envelope('c', 'a', 40))); s.seq = 4; s.handler = 'handle([c→a Step(40)], cancel) … still folding'; });
+  frame('A slow fold', 'Agent c sends Step(40) at t 30. The agent pops it at 31, records it, and this time the handler is slow — the way a model call would be.', s => { s.clock = 31; s.popped = [msg('c', 'a', 40, 30)]; s.state = 'folding'; s.log.push(obsLine(3, 30, 31, envelope('c', 'a', 40))); s.seq = 4; s.handler = 'handle(c→a Step(40), cancel) … still folding'; });
 
-  frame('Events arrive while busy', 'Two more events land at t 60 and t 80. Nothing interrupts a fold. They wait on the event queue and are picked up at the start of the next cycle: the one-window staleness the design accepts.', s => { s.events = [msg('b', 'a', 2, 60), msg('c', 'a', 9, 80)]; s.clock = 80; });
+  frame('Events arrive while busy', 'Two more events land at t 60 and t 80. Nothing interrupts a fold. They wait on the event queue. A cycle takes one of them, so they are picked up by a cycle each, in turn.', s => { s.events = [msg('b', 'a', 2, 60), msg('c', 'a', 9, 80)]; s.clock = 80; });
 
-  frame('The slow fold finishes', 'The handler returns at last. The action is stamped created 130 and sent. t_stop minus t_start is 100 units, so how long the agent deliberated is in the log without a stamp of its own: it is the action’s created minus the received of the observations in the same cycle.', s => { s.clock = 131; s.handler = 'handle([c→a Step(40)], cancel) → [to c: Step(20)]'; s.outputs = [out('c', 20, 130)]; s.log.push(actLine(4, 130, envelope('a', 'c', 20))); s.seq = 5; s.dispatch = { deliveries: 1, sent: 1 }; s.log.push(cyLine(31, 131, 'queue', '3', '4')); s.state = 'dispatching'; });
+  frame('The slow fold finishes', 'The handler returns at last. The action is stamped created 130 and sent. t_stop minus t_start is 100 units, so how long the agent deliberated is in the log without a stamp of its own: it is the action’s created minus the received of the observations in the same cycle.', s => { s.clock = 131; s.handler = 'handle(c→a Step(40), cancel) → [to c: Step(20)]'; s.outputs = [out('c', 20, 130)]; s.log.push(actLine(4, 130, envelope('a', 'c', 20))); s.seq = 5; s.dispatch = { deliveries: 1, sent: 1 }; s.log.push(cyLine(31, 131, 'queue', '3', '4')); s.state = 'dispatching'; });
 
-  frame('Everything waiting is one cycle', 'Back at the top of the loop. A cycle pops whatever is there, so both events that arrived during the slow fold are handled together, and both are received at t_start 132.', s => { s.events = []; s.batch = [msg('b', 'a', 2, 60), msg('c', 'a', 9, 80)]; s.state = 'popping'; s.handler = ''; s.outputs = []; s.clock = 132; });
+  frame('One event, one cycle', 'Back at the top of the loop. A cycle takes one event and leaves the rest, so the first of the two that arrived during the slow fold is popped on its own, at t_start 132. The other stays on the queue.', s => { s.events = [msg('c', 'a', 9, 80)]; s.popped = [msg('b', 'a', 2, 60)]; s.state = 'popping'; s.handler = ''; s.outputs = []; s.clock = 132; });
 
-  frame('Record both observations', 'Seq 5 and 6, both received 132 and both created well before it, so the wait each one suffered is readable from its own line.', s => { s.state = 'recording'; s.log.push(obsLine(5, 60, 132, envelope('b', 'a', 2)), obsLine(6, 80, 132, envelope('c', 'a', 9))); s.seq = 7; });
+  frame('Record it and answer it', 'Seq 5, received 132 and created at 60, so the wait it suffered is readable from its own line. The handler is asked about this one thing and nothing else: t_start to t_stop brackets one decision, which is what makes the gap deliberation time.', s => { s.state = 'dispatching'; s.clock = 134; s.handler = 'handle(b→a Step(2), cancel) → [to b: Step(1)]'; s.log.push(obsLine(5, 60, 132, envelope('b', 'a', 2))); s.outputs = [out('b', 1, 133)]; s.log.push(actLine(6, 133, envelope('a', 'b', 1))); s.seq = 7; s.dispatch = { deliveries: 1, sent: 1 }; s.log.push(cyLine(132, 134, 'queue', '5', '6')); });
 
-  frame('Fold the batch, send, close', 'One call to the handler with both observations. Outputs are seq 7 and 8; the dispatch reports two deliveries consumed and two actions sent, together, so the episode never sees a cycle half-done.', s => { s.state = 'dispatching'; s.clock = 136; s.handler = 'handle([b→a Step(2), c→a Step(9)], cancel) → [to b: Step(1), to c: Step(28)]'; s.outputs = [out('b', 1, 134), out('c', 28, 135)]; s.log.push(actLine(7, 134, envelope('a', 'b', 1)), actLine(8, 135, envelope('a', 'c', 28))); s.seq = 9; s.dispatch = { deliveries: 2, sent: 2 }; s.log.push(cyLine(132, 136, 'queue', '5,6', '7,8')); });
+  frame('The next event gets its own cycle', 'The loop comes back round for the one it left. Same shape again: one observation popped at t_start 135, one call to the handler, one action out. An agent with a full queue runs a cycle per event, so it is stale by at most one decision rather than by however much arrived while it was busy.', s => { s.events = []; s.popped = [msg('c', 'a', 9, 80)]; s.state = 'dispatching'; s.clock = 137; s.handler = 'handle(c→a Step(9), cancel) → [to c: Step(28)]'; s.log.push(obsLine(7, 80, 135, envelope('c', 'a', 9))); s.outputs = [out('c', 28, 136)]; s.log.push(actLine(8, 136, envelope('a', 'c', 28))); s.seq = 9; s.dispatch = { deliveries: 1, sent: 1 }; s.log.push(cyLine(135, 137, 'queue', '7', '8')); });
 
-  frame('One more fold begins', 'Agent b sends Step(1) at t 140. The agent pops it at 141, records it as seq 9, and starts folding. This fold is going to be interrupted.', s => { s.state = 'folding'; s.batch = [msg('b', 'a', 1, 140)]; s.handler = 'handle([b→a Step(1)], cancel) … still folding'; s.outputs = []; s.clock = 141; s.log.push(obsLine(9, 140, 141, envelope('b', 'a', 1))); s.seq = 10; });
+  frame('One more fold begins', 'Agent b sends Step(1) at t 140. The agent pops it at 141, records it as seq 9, and starts folding. This fold is going to be interrupted.', s => { s.state = 'folding'; s.popped = [msg('b', 'a', 1, 140)]; s.handler = 'handle(b→a Step(1), cancel) … still folding'; s.outputs = []; s.clock = 141; s.log.push(obsLine(9, 140, 141, envelope('b', 'a', 1))); s.seq = 10; });
 
-  frame('The environment ends the episode', 'The game is over, so the environment sends Stop. Two queues get it past any events waiting ahead of it — but the handler is running, and a queue cannot interrupt that. So the router also trips this cycle’s cancel, in the same step it queues the control.', s => { s.controls = [ctl('Stop', 150)]; s.cancel = 'tripped'; s.clock = 150; s.handler = 'handle([b→a Step(1)], cancel) … cancel tripped'; });
+  frame('The environment ends the episode', 'The game is over, so the environment sends Stop. Two queues get it past any events waiting ahead of it — but the handler is running, and a queue cannot interrupt that. So the router also trips this cycle’s cancel, in the same step it queues the control.', s => { s.controls = [ctl('Stop', 150)]; s.cancel = 'tripped'; s.clock = 150; s.handler = 'handle(b→a Step(1), cancel) … cancel tripped'; });
 
-  frame('The handler notices and returns', 'Cancel wraps a channel that is closed when it trips, not merely a flag, so a policy blocked on a slow result can wait on the result and the cancellation together and wake on whichever comes first. This one gives up and returns its fallback.', s => { s.clock = 151; s.handler = 'handle([b→a Step(1)], cancel) → [to b: Step(4)]'; s.outputs = [dropped('b', 4, 151)]; });
+  frame('The handler notices and returns', 'Cancel wraps a channel that is closed when it trips, not merely a flag, so a policy blocked on a slow result can wait on the result and the cancellation together and wake on whichever comes first. This one gives up and returns its fallback.', s => { s.clock = 151; s.handler = 'handle(b→a Step(1), cancel) → [to b: Step(4)]'; s.outputs = [dropped('b', 4, 151)]; });
 
   frame('The cycle sends nothing', 'Before sending, the loop looks at the control queue again and finds Stop waiting. So none of this cycle’s actions is sent. Each is stamped as it would have been and logged as dropped instead: created 151, the instant the handler returned it. Nothing is routed, so the episode’s in-flight count never sees it.', s => { s.state = 'dropping'; s.log.push(dropLine(10, 151, envelope('a', 'b', 4))); s.seq = 11; });
 
   frame('Why dropped is the honest record', 'After Stop the recipients have stopped too, so the action would go nowhere; and what a cancelled policy returns is typically its fallback’s choice rather than its own. Logging it lets a training pipeline see the agent was mid-decision when the episode ended, and exclude the truncated decision rather than mistake its absence for silence.', s => {});
 
-  frame('Pop the Stop and close', 'Only now is the Stop popped and recorded, among this cycle’s inputs — with received 152, after the handler returned, which is the one time a cycle’s records do not all share t_start. The cycle closes with inputs 9 and 11 and no outputs at all.', s => { s.controls = []; s.batch = [msg('b', 'a', 1, 140), ctl('Stop', 150)]; s.state = 'dispatching'; s.clock = 152; s.handler = ''; s.log.push(ctlLine(11, 150, 152, 'stop')); s.seq = 12; s.dispatch = { deliveries: 2, sent: 0 }; s.log.push(cyLine(141, 152, 'queue', '9,11', '')); });
+  frame('Pop the Stop and close', 'Only now is the Stop popped and recorded, among this cycle’s inputs — with received 152, after the handler returned, which is the one time a cycle’s records do not all share t_start. The cycle closes with inputs 9 and 11 and no outputs at all.', s => { s.controls = []; s.popped = [msg('b', 'a', 1, 140), ctl('Stop', 150)]; s.state = 'dispatching'; s.clock = 152; s.handler = ''; s.log.push(ctlLine(11, 150, 152, 'stop')); s.seq = 12; s.dispatch = { deliveries: 2, sent: 0 }; s.log.push(cyLine(141, 152, 'queue', '9,11', '')); });
 
-  frame('Exit', 'The loop exits after the cycle that popped Stop. Events still on the event queue are never popped, so they never become observations and are never logged: an agent that has stopped did not see them, and a trajectory that said otherwise would be claiming it did.', s => { s.state = 'exited'; s.exited = true; s.batch = []; s.outputs = []; s.cancel = 'armed'; });
+  frame('Exit', 'The loop exits after the cycle that popped Stop. Events still on the event queue are never popped, so they never become observations and are never logged: an agent that has stopped did not see them, and a trajectory that said otherwise would be claiming it did.', s => { s.state = 'exited'; s.exited = true; s.popped = []; s.outputs = []; s.cancel = 'armed'; });
 
   frame('The reward, written by somebody else', 'One line in this agent’s trajectory was not written by this agent. A reward is what the environment decided the agent’s behavior was worth; nothing in a running episode reads it, so it is never sent — the environment writes it straight to the log, naming the agent rewarded. It has no seq, because sequence numbers are the agent loop’s to assign, and no received, because nobody received it. Its created is what places it.', s => { s.log.push(rwdLine(153, 1)); });
 
-  frame('What always holds', 'Per agent: inputs in pop order, then outputs in the order the handler returned them, then the cycle record, contiguous. A cycle follows every record it names. Controls come before events in every cycle that has both. Only a cycle woken by a timeout has no inputs. Every trajectory opens with a start control and ends with a stop, and a dropped record appears only in a cycle that popped Stop. Across agents, lines interleave freely: the file is one stream, and a reader filters on agent.', s => {});
+  frame('What always holds', 'Per agent: inputs in pop order, then outputs in the order the handler returned them, then the cycle record, contiguous. A cycle follows every record it names. Controls come before events in every cycle that has both, and no cycle holds more than one observation. Only a cycle woken by a timeout can have no inputs at all. Every trajectory opens with a start control and ends with a stop, and a dropped record appears only in a cycle that popped Stop. Across agents, lines interleave freely: the file is one stream, and a reader filters on agent.', s => {});
 
   // ---- Rendering -----------------------------------------------------
   const $ = (id) => document.getElementById(id);
-  const el = { controls: $('controls'), events: $('events'), dispatch: $('dispatch'), state: $('state'), batch: $('batch'), cancel: $('cancel'), handler: $('handler'), outputs: $('outputs'), seq: $('seq'), clock: $('clock'), log: $('log'), stepno: $('stepno'), ctitle: $('ctitle'), cbody: $('cbody'), bar: $('bar'), play: $('play'), prev: $('prev'), next: $('next'), reset: $('reset'), speed: $('speed') };
+  const el = { controls: $('controls'), events: $('events'), dispatch: $('dispatch'), state: $('state'), popped: $('popped'), cancel: $('cancel'), handler: $('handler'), outputs: $('outputs'), seq: $('seq'), clock: $('clock'), log: $('log'), stepno: $('stepno'), ctitle: $('ctitle'), cbody: $('cbody'), bar: $('bar'), play: $('play'), prev: $('prev'), next: $('next'), reset: $('reset'), speed: $('speed') };
   let i = 0, timer = null, lastLog = 0;
 
   function chips(container, list, animate) {
@@ -303,7 +303,7 @@
     const s = frames[idx];
     chips(el.controls, s.controls, direction > 0);
     chips(el.events, s.events, direction > 0);
-    chips(el.batch, s.batch, direction > 0);
+    chips(el.popped, s.popped, direction > 0);
     chips(el.outputs, s.outputs, direction > 0);
     chips(el.cancel, [{ k: s.cancel === 'tripped' ? 'tripped' : 'armed', text: s.cancel === 'tripped' ? 'tripped · this cycle sends nothing' : 'armed · not tripped' }], direction > 0);
     chips(el.dispatch, s.dispatch ? [{ k: 'disp', text: 'deliveries ' + s.dispatch.deliveries + ' · sent ' + s.dispatch.sent }] : [], direction > 0);

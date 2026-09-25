@@ -427,7 +427,7 @@ mod tests {
     impl Handler<WerewolfDomain> for Silent {
         fn handle(
             &mut self,
-            _: &[Observation<WerewolfDomain>],
+            _: &Observation<WerewolfDomain>,
             _: &Cancel,
         ) -> Vec<Action<WerewolfDomain>> {
             Vec::new()
