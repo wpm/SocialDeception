@@ -39,7 +39,7 @@ it knows which messages belong together and a queue does not.
 
 ## Decision
 
-**A cycle handles exactly one observation, and a timeout is not an
+**A cycle handles at most one observation, and a timeout is not an
 observation.**
 
 ```rust
@@ -56,11 +56,25 @@ being two queues. What changes is the event side. A cycle takes **one** event
 and leaves the rest, so an agent with a full queue runs a cycle per event
 rather than one cycle for all of them.
 
-A cycle woken by the timeout calls `timeout` instead of `handle`. It is a
-separate method because waking on a deadline is not observing anything, and
-saying so with an empty slice made "no observation" a kind of observation.
-The default implementation does nothing, which is what an agent without a
-timeout wants and what every agent in the tree wants today.
+A cycle that observed nothing and whose deadline passed calls `timeout`. It
+is a separate method because waking on a deadline is not observing anything,
+and saying so with an empty slice made "no observation" a kind of
+observation. The default implementation does nothing, which is what an agent
+without a timeout wants and what every agent in the tree wants today.
+
+**A deadline is not exclusive of an observation.** A deadline that passes
+while an event is waiting joins that event's cycle, and that cycle observes
+the event and calls `handle` like any other: the observation is what the
+agent decides from, and the deadline only says when it decided. So exactly
+one hook runs per cycle — `handle` if an observation was popped, `timeout`
+if none was and the deadline fired, and neither for a cycle that popped only
+controls — and `handle` wins when both are true.
+
+The cycle record's `woken` mark follows the same rule: it says `timeout`
+whenever the deadline was what the loop noticed, whether or not the cycle
+also observed something. It records when the cycle ran, not what it decided
+from, which is what makes it the right thing to measure the next deadline
+against.
 
 ### What the trajectory says
 
