@@ -262,6 +262,21 @@ pub struct Rewarded {
 /// and a reward is **written to the trajectory here**, the instant the
 /// handler returns it, if it names somebody this episode can reward.
 ///
+/// # What preemption does to each of the three
+///
+/// The split happens inside the handler call, which is before the loop
+/// asks whether a `Stop` arrived while the handler was deciding. So the
+/// three effects of a preempted cycle do not share a fate: the actions are
+/// dropped, because the loop holds them and drops them, while the controls
+/// are already on `commands` and the rewards are already written.
+///
+/// Nothing preempts a live environment cycle today — the episode stops the
+/// environment only once every other agent has ended, and a `Stop` is held
+/// until nothing is in flight — so the asymmetry is not reachable. It is
+/// stated because it would not be obvious to whoever first makes it
+/// reachable, and because the honest fix then is to split the effects
+/// after the preemption question is asked rather than before.
+///
 /// # Why a reward is written here and not by the episode
 ///
 /// Everything else an environment produces has somewhere else to be: an

@@ -601,6 +601,11 @@ enum Wake<D: Domain> {
 struct Batch<D: Domain> {
     controls: Vec<Signal>,
     events: Vec<Event<D>>,
+    /// Events taken off the queue and then forgotten, because a `Stop` was
+    /// in the same drain. They are no part of the cycle and are not
+    /// recorded, but they were routed, so they are still deliveries and the
+    /// episode is still waiting to hear that they happened.
+    discarded: usize,
 }
 
 impl<D: Domain> Batch<D> {
@@ -609,6 +614,7 @@ impl<D: Domain> Batch<D> {
         Self {
             controls: Vec::new(),
             events: Vec::new(),
+            discarded: 0,
         }
     }
 
@@ -619,9 +625,11 @@ impl<D: Domain> Batch<D> {
     }
 
     /// How many deliveries the cycle took off its queues, which is the unit
-    /// the episode's in-flight count is kept in.
+    /// the episode's in-flight count is kept in. A discarded event counts:
+    /// the router made that delivery, and an episode that never hears of it
+    /// waits for it forever.
     fn deliveries(&self) -> usize {
-        self.controls.len() + self.events.len()
+        self.controls.len() + self.events.len() + self.discarded
     }
 }
 
@@ -789,6 +797,7 @@ where
             // fact as the ones still queued — an event the agent never
             // observed — and the trajectory says the same thing about both,
             // which is nothing.
+            batch.discarded = batch.events.len();
             batch.events.clear();
             return batch;
         }
@@ -837,7 +846,11 @@ where
         cancel: &Cancel,
     ) -> Result<bool, Error> {
         let mut deliveries = batch.deliveries();
-        let Batch { controls, events } = batch;
+        let Batch {
+            controls,
+            events,
+            discarded: _,
+        } = batch;
         let (mut inputs, mut started, mut stopped) = (Vec::new(), false, false);
         // Controls first, and in one pass, so that a `Stop` already waiting
         // is acted on ahead of every event behind it rather than after them.
@@ -907,8 +920,17 @@ where
         // `t_start`, and the trajectory checker knows it.
         let received = self.wiring.clock.now();
         for Signal { control, created } in late {
-            if control == Control::Stop {
-                stopped = true;
+            match control {
+                Control::Stop => stopped = true,
+                // The start hook ran before the handler did, so a start
+                // arriving behind it cannot be honored: the agent would be
+                // recorded as started with its opening actions never asked
+                // for. An agent is started once, before anything is
+                // addressed to it, and whoever sent this one twice or late
+                // has a bug the trajectory must not paper over.
+                Control::Start => {
+                    panic!("{} was started during a cycle", self.wiring.id)
+                }
             }
             inputs.push(self.record_control(&Instruction {
                 control,
@@ -1892,6 +1914,21 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "was started during a cycle")]
+    fn an_agent_started_during_a_cycle_is_a_bug_in_whoever_started_it() {
+        // An agent is started once, before anything is addressed to it, so
+        // the start hook runs before the handler. A start behind it cannot
+        // be honored — the opening actions would never be asked for — and
+        // recording the agent as started anyway would put a claim in the
+        // trajectory the loop did not act on.
+        let (rig, inside, _woke) = waiting();
+        rig.start();
+        recv(&inside);
+        rig.control(Control::Start);
+        rig.agent.join().unwrap();
+    }
+
+    #[test]
     fn a_preempted_cycles_actions_are_dropped_and_none_reaches_the_router() {
         let (rig, inside, woke) = waiting();
         rig.start();
@@ -1951,9 +1988,16 @@ mod tests {
             1,
             "one cycle, not one per queued event: {dispatches:?}"
         );
-        assert_eq!(
-            dispatches[0].deliveries, 2,
-            "the cycle took the two controls off its queues and no events"
+        // The two controls, and whichever single event the wake-up had
+        // already taken before the stop was seen — that one is forgotten
+        // rather than observed, but it was routed, so the cycle still
+        // reports it. Which of the two happened is the scheduler's
+        // business; that every routed delivery is reported exactly once is
+        // not, because an episode that never hears of one waits forever.
+        assert!(
+            matches!(dispatches[0].deliveries, 2 | 3),
+            "the cycle reports the controls it took and any event it dropped: {:?}",
+            dispatches[0]
         );
         drop((wires.events, wires.controls));
     }
