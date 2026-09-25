@@ -66,6 +66,18 @@ This removes:
 the handler. What changes is how it travels and what it can interrupt,
 which is nothing.
 
+One thing moves rather than goes. The post-handler drain was also where a
+late `Start` was caught, so deleting it deletes that check, and the check
+has to be rebuilt somewhere. It becomes a flag on the loop: an agent
+records that it has started, and a second `Start` fails against that rather
+than against its position in a cycle. This is stronger than what it
+replaces, which is the point. The old check fired only for a `Start` that
+arrived while a handler was running, because that is the only path it sat
+on; one that arrived between cycles ran the start hook a second time and
+said nothing. With one queue there is no "during a cycle" for a positional
+check to key on, and the rule was never about timing anyway: an agent is
+started once, before anything is addressed to it.
+
 ### What an agent's queue carries
 
 One channel carrying both kinds. That is an enum on the wire again, which
