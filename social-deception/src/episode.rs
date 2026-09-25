@@ -513,6 +513,16 @@ fn drive<D: Domain>(
                 }));
             }
             for to in held.drain(..) {
+                // Only whoever is still running. An agent stopped in an
+                // earlier cycle has ended its thread, but its queue is held
+                // open until the episode joins it, so a second `Stop` would
+                // be delivered and counted and then never reported handled:
+                // the in-flight count would not come back to zero and the
+                // episode would wait on a dispatch that is never coming.
+                let to: BTreeSet<AgentId> = to.intersection(running).cloned().collect();
+                if to.is_empty() {
+                    continue;
+                }
                 in_flight += router
                     .command(environment, &to, Control::Stop)
                     .map_err(|error| {
