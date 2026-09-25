@@ -601,10 +601,11 @@ enum Wake<D: Domain> {
 struct Batch<D: Domain> {
     controls: Vec<Signal>,
     events: Vec<Event<D>>,
-    /// Events taken off the queue and then forgotten, because a `Stop` was
-    /// in the same drain. They are no part of the cycle and are not
-    /// recorded, but they were routed, so they are still deliveries and the
-    /// episode is still waiting to hear that they happened.
+    /// Events the wake-up took off the queue and the cycle then forgot,
+    /// because the drain that followed found a `Stop`. They are no part of
+    /// the cycle and are not recorded, but they were routed, so they are
+    /// still deliveries and the episode is still waiting to hear that they
+    /// happened.
     discarded: usize,
 }
 
