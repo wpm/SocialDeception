@@ -11,8 +11,9 @@
 //! An `Event` is a struct rather than an enum because there is now only one
 //! thing it can be. It was an enum when it also had to carry controls and
 //! timer wake-ups; a wake-up is neither in-domain nor out-of-domain nor
-//! anything that traveled, so it is gone, and a timeout now simply runs a
-//! cycle with no observations.
+//! anything that traveled, so it is gone, and a deadline now calls the
+//! handler's own [`timeout`](crate::Handler::timeout) rather than pretending
+//! to be something observed.
 
 use std::collections::BTreeSet;
 use std::fmt;

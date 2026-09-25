@@ -470,8 +470,10 @@ pub struct Wiring<D: Domain> {
     pub dispatches: Sender<CycleDispatch<D>>,
     /// Where the agent's trajectory goes.
     pub records: Sender<LogRecord<D>>,
-    /// How long the agent waits before running a cycle with no observations,
-    /// or `None` for an agent that only ever reacts.
+    /// How long the agent waits before its deadline fires, or `None` for an
+    /// agent that only ever reacts. A deadline that passes with nothing
+    /// waiting runs a cycle that calls [`Handler::timeout`]; one that passes
+    /// while an event waits joins that event's cycle instead.
     pub timeout: Option<Duration>,
     /// The other agents in the roster: what a broadcast goes to.
     pub peers: BTreeSet<AgentId>,
@@ -889,7 +891,7 @@ where
         }
     }
 
-    /// Runs one cycle: record what was popped, hand the observations and the
+    /// Runs one cycle: record what was popped, hand the observation and the
     /// cancel to the handler, send and record what comes back unless a
     /// `Stop` arrived meanwhile, and close with the cycle record. Returns
     /// whether the cycle popped a stop.

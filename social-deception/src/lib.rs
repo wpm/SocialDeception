@@ -41,8 +41,8 @@
 //! - [`cancel`]: the [`Cancel`] a handler is given each cycle and the
 //!   [`ControlSender`] that trips it;
 //! - [`agent`]: the [`Agent`] thread that pops its two queues, folds the
-//!   [`Observation`]s through a [`Handler`], and records what it saw and
-//!   sent;
+//!   [`Observation`] it took through a [`Handler`], and records what it saw
+//!   and sent;
 //! - [`router`]: the [`Router`] from agent ids to their channels;
 //! - [`environment`]: the [`Environment`], the one agent per episode whose
 //!   cycle may produce a [`Control`] as well as an [`Action`];

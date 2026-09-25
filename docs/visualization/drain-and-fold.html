@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>Drain and Fold</title>
+<title>Pop and Fold</title>
 </head>
 <body style="margin:0">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
@@ -130,7 +130,7 @@
 
 <main class="wrap">
   <header>
-    <h1>Drain and Fold</h1>
+    <h1>Pop and Fold</h1>
     <p>One agent's cycle, step by step: what the router puts on its two queues, what the agent pops, how the handler folds it, and the lines it writes to the trajectory. Play it through, or step with the arrow keys.</p>
   </header>
 
@@ -258,7 +258,7 @@
 
   frame('Events arrive while busy', 'Two more events land at t 60 and t 80. Nothing interrupts a fold. They wait on the event queue. A cycle takes one of them, so they are picked up by a cycle each, in turn.', s => { s.events = [msg('b', 'a', 2, 60), msg('c', 'a', 9, 80)]; s.clock = 80; });
 
-  frame('The slow fold finishes', 'The handler returns at last. The action is stamped created 130 and sent. t_stop minus t_start is 100 units, so how long the agent deliberated is in the log without a stamp of its own: it is the action’s created minus the received of the observations in the same cycle.', s => { s.clock = 131; s.handler = 'handle(c→a Step(40), cancel) → [to c: Step(20)]'; s.outputs = [out('c', 20, 130)]; s.log.push(actLine(4, 130, envelope('a', 'c', 20))); s.seq = 5; s.dispatch = { deliveries: 1, sent: 1 }; s.log.push(cyLine(31, 131, 'queue', '3', '4')); s.state = 'dispatching'; });
+  frame('The slow fold finishes', 'The handler returns at last. The action is stamped created 130 and sent. t_stop minus t_start is 100 units, so how long the agent deliberated is in the log without a stamp of its own: it is the action’s created minus the received of the observation in the same cycle.', s => { s.clock = 131; s.handler = 'handle(c→a Step(40), cancel) → [to c: Step(20)]'; s.outputs = [out('c', 20, 130)]; s.log.push(actLine(4, 130, envelope('a', 'c', 20))); s.seq = 5; s.dispatch = { deliveries: 1, sent: 1 }; s.log.push(cyLine(31, 131, 'queue', '3', '4')); s.state = 'dispatching'; });
 
   frame('One event, one cycle', 'Back at the top of the loop. A cycle takes one event and leaves the rest, so the first of the two that arrived during the slow fold is popped on its own, at t_start 132. The other stays on the queue.', s => { s.events = [msg('c', 'a', 9, 80)]; s.popped = [msg('b', 'a', 2, 60)]; s.state = 'popping'; s.handler = ''; s.outputs = []; s.clock = 132; });
 
