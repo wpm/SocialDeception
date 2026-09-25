@@ -13,13 +13,13 @@
 //! Every action space in the game is computed by one function,
 //! [`action_space`]: a target for each living player other than the agent
 //! itself, in sorted agent order, less the one the doctor protected last
-//! night, then [`Action::Abstain`] exactly where [`RequestKind::may_abstain`]
+//! night, then [`Move::Abstain`] exactly where [`RequestKind::may_abstain`]
 //! permits it. The two universal rules fall out of that, since the target
 //! must be living and no action may target the agent taking it; neither is
 //! strategy, and nothing can do them. The order is canonical and
 //! load-bearing: an index into the vector is a stable action label, the
 //! same on every run and in every episode with the same living set, which
-//! is why the action space is a `Vec<Action>` and not a set.
+//! is why the action space is a `Vec<Move>` and not a set.
 //!
 //! The roles here compute their action spaces from what they know, and the
 //! [`Game`](super::Game) checks every response against the same function
@@ -50,7 +50,7 @@
 use std::collections::BTreeSet;
 
 use super::knowledge::Knowledge;
-use super::message::{Action, Request, RequestKind};
+use super::message::{Move, Request, RequestKind};
 use super::player::Player;
 use super::role::Role;
 use crate::event::AgentId;
@@ -58,7 +58,7 @@ use crate::event::AgentId;
 /// The action space the rules permit `me` for a request of `kind` while
 /// `living` are alive: a target for each living player other than `me`, in
 /// sorted agent order, less `last_protected` if the request is a `Protect`,
-/// then [`Action::Abstain`] if and only if the kind
+/// then [`Move::Abstain`] if and only if the kind
 /// [may be abstained from](RequestKind::may_abstain).
 ///
 /// This is the whole of the rules about what a player may do, and the one
@@ -73,18 +73,18 @@ pub fn action_space(
     living: &BTreeSet<AgentId>,
     kind: RequestKind,
     last_protected: Option<&AgentId>,
-) -> Vec<Action> {
+) -> Vec<Move> {
     let excluded = |who: &&AgentId| {
         *who != me && !(kind == RequestKind::Protect && Some(*who) == last_protected)
     };
-    let mut space: Vec<Action> = living
+    let mut space: Vec<Move> = living
         .iter()
         .filter(excluded)
         .cloned()
-        .map(Action::Target)
+        .map(Move::Target)
         .collect();
     if kind.may_abstain() {
-        space.push(Action::Abstain);
+        space.push(Move::Abstain);
     }
     space
 }
@@ -98,7 +98,7 @@ pub fn action_space(
 /// If the request is of a kind the player's role is never asked, by
 /// [`Role::asked_in`]: a bug in the moderator, not a runtime condition.
 #[must_use]
-pub fn base_action_space(knowledge: &Knowledge, request: &Request) -> Vec<Action> {
+pub fn base_action_space(knowledge: &Knowledge, request: &Request) -> Vec<Move> {
     let kind = request.kind;
     assert!(
         knowledge.role.asked_in(kind.phase()) == Some(kind),
@@ -138,7 +138,7 @@ impl Player for Villager {
         &mut self.knowledge
     }
 
-    fn action_space(&self, request: &Request) -> Vec<Action> {
+    fn action_space(&self, request: &Request) -> Vec<Move> {
         base_action_space(&self.knowledge, request)
     }
 }
@@ -171,7 +171,7 @@ impl Player for Werewolf {
 
     /// Eating a packmate is in the action space; see the
     /// [module documentation](self).
-    fn action_space(&self, request: &Request) -> Vec<Action> {
+    fn action_space(&self, request: &Request) -> Vec<Move> {
         base_action_space(&self.knowledge, request)
     }
 }
@@ -203,7 +203,7 @@ impl Player for Seer {
 
     /// Re-investigating someone is in the action space: permitted but
     /// pointless, and "pointless" is the policy's judgment to make.
-    fn action_space(&self, request: &Request) -> Vec<Action> {
+    fn action_space(&self, request: &Request) -> Vec<Move> {
         base_action_space(&self.knowledge, request)
     }
 }
@@ -238,7 +238,7 @@ impl Player for Doctor {
     /// For `Protect`, everyone living but itself and whoever it protected
     /// last night, which its knowledge remembers. `Abstain` is always there,
     /// so the space is never empty.
-    fn action_space(&self, request: &Request) -> Vec<Action> {
+    fn action_space(&self, request: &Request) -> Vec<Move> {
         base_action_space(&self.knowledge, request)
     }
 }
@@ -271,7 +271,7 @@ mod tests {
     }
 
     /// Answers a `Protect` with `action`, the way a seat would.
-    fn protected(doctor: &mut Doctor, action: &Action) {
+    fn protected(doctor: &mut Doctor, action: &Move) {
         doctor
             .knowledge_mut()
             .acted(&request(RequestKind::Protect), action);
@@ -293,7 +293,7 @@ mod tests {
         let targets = || ["alice", "bob", "carol"].map(target).to_vec();
         let with_abstain = || {
             let mut space = targets();
-            space.push(Action::Abstain);
+            space.push(Move::Abstain);
             space
         };
 
@@ -371,7 +371,7 @@ mod tests {
         let seer = seer(["alice", "bob"], ["alice"]);
         assert_eq!(
             seer.action_space(&request(RequestKind::Investigate)),
-            [target("alice"), target("bob"), Action::Abstain]
+            [target("alice"), target("bob"), Move::Abstain]
         );
     }
 
@@ -381,27 +381,27 @@ mod tests {
         let protect = request(RequestKind::Protect);
         assert_eq!(
             doctor.action_space(&protect),
-            [target("alice"), target("bob"), Action::Abstain]
+            [target("alice"), target("bob"), Move::Abstain]
         );
 
         protected(&mut doctor, &target("alice"));
         assert_eq!(
             doctor.action_space(&protect),
-            [target("bob"), Action::Abstain]
+            [target("bob"), Move::Abstain]
         );
 
         // The night after, alice is available again.
         protected(&mut doctor, &target("bob"));
         assert_eq!(
             doctor.action_space(&protect),
-            [target("alice"), Action::Abstain]
+            [target("alice"), Move::Abstain]
         );
 
         // After an abstain there was no protection to repeat.
-        protected(&mut doctor, &Action::Abstain);
+        protected(&mut doctor, &Move::Abstain);
         assert_eq!(
             doctor.action_space(&protect),
-            [target("alice"), target("bob"), Action::Abstain]
+            [target("alice"), target("bob"), Move::Abstain]
         );
     }
 
@@ -411,7 +411,7 @@ mod tests {
         protected(&mut doctor, &target("alice"));
         assert_eq!(
             doctor.action_space(&request(RequestKind::Protect)),
-            [Action::Abstain]
+            [Move::Abstain]
         );
     }
 

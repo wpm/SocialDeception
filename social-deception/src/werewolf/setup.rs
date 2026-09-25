@@ -16,15 +16,15 @@
 //! but passing one value around makes it impossible for that to stop being
 //! true.
 //!
-//! # A missing outcome is an error
+//! # A missing outcome is the runtime's error, not this module's
 //!
-//! [`Episode::run`] returning `Ok(())` means the episode went quiescent,
-//! which normally means the moderator announced the outcome and fell silent.
-//! It can also mean a player failed to answer a request, in which case the
-//! game stopped mid-way and the trajectory is simply short. There is no hang
-//! to notice, so this is the only place it can be caught: [`run`] takes the
-//! outcome from the moderator's channel, and finding none there is
-//! [`RunError::Truncated`].
+//! The moderator is the episode's [`Environment`](crate::Environment), so
+//! an episode ends when the moderator says it does, which is when it has
+//! announced the outcome. A player that fails to answer a request leaves
+//! nothing in flight and nobody stopped, which the episode reports as
+//! [`EpisodeError::Stalled`] naming the players still running. So there is
+//! nothing for this module to detect: [`run`] takes the outcome from the
+//! moderator's channel and a clean run always has one.
 //!
 //! # The seed never enters the game
 //!
@@ -32,9 +32,9 @@
 //! and the public algorithm, anyone could recompute the deal and every
 //! agent's random stream, which is to say every piece of hidden information
 //! in the game. So it lies outside every player's observation space: no
-//! [`Message`] has a field that could carry it, and this module never puts
-//! it in one. It is recorded beside the trajectory, in the effective
-//! configuration the `werewolf` binary writes, never in it.
+//! [`Message`](super::Message) has a field that could carry it, and this
+//! module never puts it in one. It is recorded beside the trajectory, in the
+//! effective configuration the `werewolf` binary writes, never in it.
 
 use std::error;
 use std::fmt;
@@ -44,10 +44,11 @@ use std::path::{Path, PathBuf};
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
 
+use super::WerewolfDomain;
 use super::assignment::Assignment;
 use super::config::Config;
 use super::game::Game;
-use super::message::{Message, Outcome};
+use super::message::Outcome;
 use super::moderator::Moderator;
 use super::player::Seat;
 use super::policy::RandomPolicy;
@@ -68,11 +69,17 @@ pub enum RunError {
         /// What went wrong.
         source: io::Error,
     },
-    /// The episode did not run cleanly.
+    /// The episode did not run cleanly. A game in which some player did not
+    /// answer a request arrives here as
+    /// [`EpisodeError::Stalled`].
     Episode(EpisodeError),
-    /// The episode ended without the moderator announcing an outcome: some
-    /// player failed to answer a request, and the game stopped there.
-    Truncated,
+    /// The episode ran cleanly and the moderator announced no outcome.
+    ///
+    /// Nothing known produces this: an episode the moderator did not end is
+    /// a stall, and one it did end it ended by announcing the outcome. It is
+    /// here because `run` cannot prove that from the types, and a silent
+    /// `unwrap` would be a worse answer than a named error.
+    NoOutcome,
 }
 
 impl fmt::Display for RunError {
@@ -87,9 +94,9 @@ impl fmt::Display for RunError {
                 source,
             } => write!(f, "cannot write the trajectory: {source}"),
             Self::Episode(error) => error.fmt(f),
-            Self::Truncated => f.write_str(
-                "the episode ended without an outcome: a player did not answer a request",
-            ),
+            Self::NoOutcome => {
+                f.write_str("the episode ended cleanly but the moderator announced no outcome")
+            }
         }
     }
 }
@@ -99,7 +106,7 @@ impl error::Error for RunError {
         match self {
             Self::Io { source, .. } => Some(source),
             Self::Episode(error) => Some(error),
-            Self::Truncated => None,
+            Self::NoOutcome => None,
         }
     }
 }
@@ -125,32 +132,36 @@ impl From<EpisodeError> for RunError {
 #[must_use]
 pub fn episode(
     config: &Config,
-    records: Sender<LogRecord<Message>>,
-) -> (Episode<Message>, Receiver<Outcome>) {
+    records: Sender<LogRecord<WerewolfDomain>>,
+) -> (Episode<WerewolfDomain>, Receiver<Outcome>) {
     let assignment = Assignment::deal(config);
-    let mut episode = Episode::new(records);
+    let (mut episode, outcomes) = moderate(config, assignment.clone(), records);
     for (who, role) in assignment.players() {
         seat(&mut episode, config, who, role);
     }
-    let outcomes = moderate(&mut episode, config, assignment);
     (episode, outcomes)
 }
 
-/// Seats the moderator in the roster, running a game over `assignment`.
-/// The receiver yields the outcome once it has been announced.
+/// An episode whose environment is a moderator running a game over
+/// `assignment`, and no players yet. The receiver yields the outcome once it
+/// has been announced.
 fn moderate(
-    episode: &mut Episode<Message>,
     config: &Config,
     assignment: Assignment,
-) -> Receiver<Outcome> {
+    records: Sender<LogRecord<WerewolfDomain>>,
+) -> (Episode<WerewolfDomain>, Receiver<Outcome>) {
     let (outcome, outcomes) = unbounded();
-    let game = Game::new(assignment, config.max_rounds, config.seed);
-    add(episode, &config.moderator, Moderator::new(game, outcome));
-    outcomes
+    let game = Game::new(assignment, config.seed);
+    let episode = Episode::new(
+        records,
+        config.moderator.clone(),
+        Moderator::new(game, outcome),
+    );
+    (episode, outcomes)
 }
 
 /// Seats `who` in the roster as its role, with a policy seeded for it.
-fn seat(episode: &mut Episode<Message>, config: &Config, who: &AgentId, role: Role) {
+fn seat(episode: &mut Episode<WerewolfDomain>, config: &Config, who: &AgentId, role: Role) {
     let policy = RandomPolicy::for_agent(config.seed, who);
     let moderator = config.moderator.clone();
     let me = who.clone();
@@ -177,9 +188,9 @@ fn seat(episode: &mut Episode<Message>, config: &Config, who: &AgentId, role: Ro
 /// is the configuration's check to make, so a failure here is a panic and
 /// not an error of its own.
 fn add(
-    episode: &mut Episode<Message>,
+    episode: &mut Episode<WerewolfDomain>,
     who: &AgentId,
-    handler: impl Handler<Message> + Send + 'static,
+    handler: impl Handler<WerewolfDomain> + Send + 'static,
 ) {
     episode
         .add(who.clone(), handler)
@@ -198,9 +209,10 @@ fn add(
 /// # Errors
 ///
 /// [`RunError::Io`] if the trajectory cannot be created or written,
-/// [`RunError::Episode`] if the episode did not run cleanly, and
-/// [`RunError::Truncated`] if it ran to quiescence without the moderator
-/// announcing an outcome.
+/// [`RunError::Episode`] if the episode did not run cleanly — a player that
+/// did not answer a request arrives as
+/// [`EpisodeError::Stalled`] — and
+/// [`RunError::NoOutcome`] if a clean run left no outcome on the channel.
 ///
 /// # Panics
 ///
@@ -224,7 +236,7 @@ pub fn run(config: &Config) -> Result<Outcome, RunError> {
 /// trajectory to `trajectory` if anywhere, and takes the outcome off the
 /// moderator's channel.
 fn play<W: Write + Send + 'static>(
-    episode: Episode<Message>,
+    episode: Episode<WerewolfDomain>,
     outcomes: &Receiver<Outcome>,
     writer: Writer<W>,
     trajectory: Option<&Path>,
@@ -241,7 +253,7 @@ fn play<W: Write + Send + 'static>(
     })?;
     // The moderator's sender went with its handler when the episode joined
     // it, so the receiver holds the outcome now or never will.
-    outcomes.try_recv().map_err(|_| RunError::Truncated)
+    outcomes.try_recv().map_err(|_| RunError::NoOutcome)
 }
 
 #[cfg(test)]
@@ -251,10 +263,9 @@ mod tests {
     use std::path::Path;
 
     use super::*;
-    use crate::agent::Outgoing;
-    use crate::event::Event;
+    use crate::agent::{Action, Observation};
     use crate::testing::{TempDir, id, ids, parse_lines};
-    use crate::werewolf::config::{DEFAULT_MAX_ROUNDS, DEFAULT_MODERATOR, RoleCounts};
+    use crate::werewolf::config::{DEFAULT_MODERATOR, RoleCounts};
     use crate::werewolf::message::Round;
     use crate::werewolf::transcript::{self, Transcript};
 
@@ -277,7 +288,6 @@ mod tests {
                 doctors,
             },
             trajectory: None,
-            max_rounds: DEFAULT_MAX_ROUNDS,
             moderator: id(DEFAULT_MODERATOR),
         };
         config.validate().unwrap();
@@ -300,11 +310,15 @@ mod tests {
         Transcript::read(&transcript::lines(&text).unwrap(), &config.moderator).unwrap()
     }
 
-    /// Asserts that `outcome` is a finished game among `config`'s players.
+    /// Asserts that `outcome` is a finished game among `config`'s players,
+    /// decided within as many rounds as there are players.
     fn check(config: &Config, outcome: &Outcome) {
         let players: BTreeSet<&AgentId> = config.players.iter().collect();
         assert!(outcome.rounds >= Round(1), "{outcome:?}");
-        assert!(outcome.rounds.0 <= config.max_rounds, "{outcome:?}");
+        assert!(
+            outcome.rounds.0 as usize <= config.players.len(),
+            "{outcome:?}"
+        );
         assert!(!outcome.living.is_empty(), "{outcome:?}");
         assert!(
             outcome.living.iter().all(|who| players.contains(who)),
@@ -337,7 +351,6 @@ mod tests {
         let config = town();
         let outcome = run(&config).unwrap();
         check(&config, &outcome);
-        assert!(outcome.winner.is_some(), "{outcome:?}");
     }
 
     #[test]
@@ -356,21 +369,7 @@ mod tests {
         ] {
             let outcome = run(&config).unwrap();
             check(&config, &outcome);
-            assert!(outcome.winner.is_some(), "{outcome:?}");
         }
-    }
-
-    #[test]
-    fn the_round_cap_is_a_stalemate() {
-        // Seven players and two werewolves cannot finish in one round: the
-        // night takes at most one player and the day exactly one, which
-        // leaves the pack neither dead nor at parity.
-        let mut config = town();
-        config.max_rounds = 1;
-        let outcome = run(&config).unwrap();
-        check(&config, &outcome);
-        assert_eq!(outcome.winner, None, "{outcome:?}");
-        assert_eq!(outcome.rounds, Round(1));
     }
 
     #[test]
@@ -424,22 +423,23 @@ mod tests {
     /// A player that never answers.
     struct Silent;
 
-    impl Handler<Message> for Silent {
-        fn handle(&mut self, _: &[Event<Message>]) -> Vec<Outgoing<Message>> {
+    impl Handler<WerewolfDomain> for Silent {
+        fn handle(&mut self, _: &Observation<WerewolfDomain>) -> Vec<Action<WerewolfDomain>> {
             Vec::new()
         }
     }
 
     #[test]
-    fn a_silent_player_truncates_the_run() {
+    fn a_silent_player_stalls_the_run() {
         // The same roster `episode` would build, except that one werewolf
         // never answers. The first night's request to it goes unanswered,
-        // the episode goes quiescent, and there is no outcome to take.
+        // nothing is left in flight, and the moderator has stopped nobody,
+        // which is a stall naming every player.
         let config = config(["alice", "bob", "carol"], 1, 0, 0);
         let assignment = Assignment::deal(&config);
         let silent = assignment.pack().iter().next().unwrap().clone();
         let (records, writer) = Writer::spawn(io::sink());
-        let mut episode = Episode::new(records);
+        let (mut episode, outcomes) = moderate(&config, assignment.clone(), records);
         for (who, role) in assignment.players() {
             if *who == silent {
                 add(&mut episode, who, Silent);
@@ -447,10 +447,12 @@ mod tests {
                 seat(&mut episode, &config, who, role);
             }
         }
-        let outcomes = moderate(&mut episode, &config, assignment);
 
         let error = play(episode, &outcomes, writer, None).unwrap_err();
-        assert!(matches!(error, RunError::Truncated), "{error:?}");
-        assert!(error.to_string().contains("without an outcome"));
+        let RunError::Episode(EpisodeError::Stalled { running }) = &error else {
+            panic!("unexpected error: {error:?}");
+        };
+        assert_eq!(*running, config.players.iter().cloned().collect());
+        assert!(error.to_string().contains("stalled"), "{error}");
     }
 }

@@ -19,12 +19,25 @@
 //! [`config::effective_path`](super::config::effective_path)), and whoever
 //! prints a transcript prints the seed from there.
 //!
-//! # Only the moderator's records
+//! # Only the moderator's records, and every agent's rewards
 //!
-//! [`Transcript::read`] reads the moderator's records and nobody else's. The
-//! moderator is the authoritative view: its sent records are every narration
-//! and every request, and its arrived records are every response, with the
-//! responding player as sender. Reassembling the game from the players'
+//! [`Transcript::read`] reads the moderator's records and nobody else's,
+//! with one exception: a **reward** record is read whoever it belongs to.
+//! It has to be. A reward belongs to the agent rewarded and is written by
+//! the environment, so it appears under a player's name and never under
+//! the moderator's, and reading only the moderator's records would find
+//! none of them. It is no exception to the principle, though: a reward is
+//! the environment's own statement about a player, not a partial view
+//! recovered from one, and it is identified by its `type` rather than by
+//! whose trajectory it sits in.
+//!
+//! A reward is also the one record here with no sequence number, so it is
+//! outside the contiguity check the moderator's records are held to. The
+//! moderator is the authoritative view: its `action` records are every
+//! narration and every request it sent, and its `observation` records are
+//! every response it received, each naming the responding player as its
+//! sender. Which record type a line is *is* the direction, so the reader
+//! needs no direction of its own. Reassembling the game from the players'
 //! records would mean recovering hidden information from partial views,
 //! which is the thing the design prevents. Within one agent's records the
 //! runtime guarantees that sequence numbers are contiguous and increasing in
@@ -47,7 +60,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use super::message::{
-    Action, Cause, Message, Narration, Outcome, Phase, Request, RequestId, RequestKind, Response,
+    Cause, Message, Move, Narration, Outcome, Phase, Request, RequestId, RequestKind, Response,
     Round,
 };
 use super::role::{Faction, Role};
@@ -65,6 +78,16 @@ pub struct Transcript {
     pub rounds: Vec<RoundRecord>,
     /// How the game ended.
     pub outcome: Outcome,
+    /// What each player's game was worth: +1 for a player on the winning
+    /// side and −1 for every other, living or dead, as the moderator
+    /// logged it when the game ended (ADR-0007).
+    ///
+    /// It is read from the `reward` records, which belong to the players
+    /// and not to the moderator; see the [module documentation](self). It
+    /// is part of the logical game and so part of what two runs of one
+    /// seed must agree on, which is why it is here and not left to a
+    /// reader of the raw file.
+    pub rewards: BTreeMap<AgentId, i32>,
 }
 
 /// One round: a night, then a day unless the game ended at night.
@@ -83,13 +106,15 @@ pub struct RoundRecord {
 pub struct PhaseRecord {
     /// Everyone in the game when the phase began.
     pub living: BTreeSet<AgentId>,
-    /// Every action taken this phase, by the agent that took it, paired
-    /// with the kind of request it answered. The action alone does not say
+    /// Every move made this phase, by the agent that made it, paired
+    /// with the kind of request it answered. The move alone does not say
     /// whether a target was devoured, protected, investigated or nominated.
-    pub actions: BTreeMap<AgentId, (RequestKind, Action)>,
-    /// The seer's finding: the seer, whom it investigated, and what it
-    /// learned. `None` when there is no living seer or it abstained.
-    pub investigation: Option<(AgentId, AgentId, Faction)>,
+    pub moves: BTreeMap<AgentId, (RequestKind, Move)>,
+    /// What each seer learned: whom it investigated and the faction that
+    /// came back, by seer. Empty on a phase where no seer investigated,
+    /// and holding one entry per seer that did, since a game may deal
+    /// more than one.
+    pub investigations: BTreeMap<AgentId, (AgentId, Faction)>,
     /// Who was eliminated, the role their death revealed, and how. `None`
     /// on a night when nobody died.
     pub eliminated: Option<(AgentId, Role, Cause)>,
@@ -100,8 +125,8 @@ impl PhaseRecord {
     fn begun(living: BTreeSet<AgentId>) -> Self {
         Self {
             living,
-            actions: BTreeMap::new(),
-            investigation: None,
+            moves: BTreeMap::new(),
+            investigations: BTreeMap::new(),
             eliminated: None,
         }
     }
@@ -125,7 +150,7 @@ pub enum TranscriptError {
         /// The line.
         line: usize,
     },
-    /// A record's `type` is neither `event` nor `cycle`.
+    /// A record's `type` is not one the runtime writes.
     UnknownRecordType {
         /// The line.
         line: usize,
@@ -173,7 +198,7 @@ pub enum TranscriptError {
         line: usize,
     },
     /// A message the moderator never records: a narration or a request
-    /// arriving at it, or a response sent by it.
+    /// observed by it, or a response it took as an action.
     Misdirected {
         /// The line.
         line: usize,
@@ -252,11 +277,40 @@ pub fn lines(text: &str) -> Result<Vec<Value>, TranscriptError> {
         .collect()
 }
 
-/// Which way a message crossed the moderator's boundary.
+/// Which way a message crossed the moderator's boundary, which is which of
+/// the two record types it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Direction {
+    /// An `action` record: something the moderator sent.
     Sent,
-    Arrived,
+    /// An `observation` record: something the moderator received.
+    Received,
+}
+
+/// One record the reader takes an interest in.
+///
+/// A [`Numbered`](Line::Numbered) line is one of the moderator's, which
+/// carries a sequence number the reader checks. Its `direction` is `None`
+/// for a control, which must be counted but says nothing about the game and
+/// is not decoded.
+///
+/// A [`Reward`](Line::Reward) line is anybody's: it belongs to the agent
+/// rewarded, carries no sequence number, and is recognized by its `type`.
+enum Line<'a> {
+    /// One of the moderator's numbered records.
+    Numbered {
+        /// The record.
+        record: &'a Map<String, Value>,
+        /// Which way its event went, or `None` if it carries no event.
+        direction: Option<Direction>,
+    },
+    /// A reward: the agent paid and what it was paid.
+    Reward {
+        /// The agent rewarded.
+        agent: AgentId,
+        /// What its game was worth.
+        value: i32,
+    },
 }
 
 /// One message record of the moderator's, with its envelope decoded.
@@ -283,22 +337,34 @@ impl Transcript {
     pub fn read(lines: &[Value], moderator: &AgentId) -> Result<Self, TranscriptError> {
         let mut reader = Reader::default();
         let mut next_seq = 0;
+        let mut rewards = BTreeMap::new();
         for (index, value) in lines.iter().enumerate() {
             let line = index + 1;
-            let Some(record) = moderator_event(value, line, moderator)? else {
-                continue;
-            };
-            let seq = integer(record, "seq", line)?;
-            if seq != next_seq {
-                return Err(TranscriptError::SeqGap {
-                    line,
-                    expected: next_seq,
-                    found: seq,
-                });
-            }
-            next_seq += 1;
-            if let Some(record) = message(record, line)? {
-                reader.fold(record)?;
+            match read_line(value, line, moderator)? {
+                None => {}
+                // A reward belongs to the agent it names, whoever wrote it,
+                // and has no sequence number to check.
+                Some(Line::Reward { agent, value }) => {
+                    rewards.insert(agent, value);
+                }
+                Some(Line::Numbered { record, direction }) => {
+                    // The moderator's controls are counted but not read:
+                    // they carry a sequence number, so skipping them
+                    // without counting would look like a gap, and they say
+                    // nothing about the game.
+                    let seq = integer(record, "seq", line)?;
+                    if seq != next_seq {
+                        return Err(TranscriptError::SeqGap {
+                            line,
+                            expected: next_seq,
+                            found: seq,
+                        });
+                    }
+                    next_seq += 1;
+                    if let Some(direction) = direction {
+                        reader.fold(message(record, direction, line)?)?;
+                    }
+                }
             }
         }
         let outcome = reader.outcome.ok_or(TranscriptError::NoOutcome)?;
@@ -306,22 +372,48 @@ impl Transcript {
             assignment: reader.assignment,
             rounds: reader.rounds,
             outcome,
+            rewards,
         })
     }
 }
 
-/// The event record on `value` if it is the moderator's, `None` if it is a
-/// cycle record or another agent's, and an error if it is not a record.
-fn moderator_event<'a>(
+/// The record on one line, if the reader has any use for it; `None` for a
+/// cycle record or another agent's, and an error for something that is not
+/// a record at all.
+///
+/// Every line is checked to be a record of a kind the runtime writes, even
+/// the ones nothing is read from, so that a file with something else in it
+/// is not silently read as a game.
+///
+/// The direction is `None` for the moderator's own controls. They say
+/// nothing about the game, but they carry sequence numbers, so the caller
+/// must count them or the numbers look full of gaps.
+/// A reward is the one kind read whoever wrote it, and the one with no
+/// sequence number to count.
+fn read_line<'a>(
     value: &'a Value,
     line: usize,
     moderator: &AgentId,
-) -> Result<Option<&'a Map<String, Value>>, TranscriptError> {
+) -> Result<Option<Line<'a>>, TranscriptError> {
     let record = value
         .as_object()
         .ok_or(TranscriptError::NotAnObject { line })?;
-    match record.get("type").and_then(Value::as_str) {
-        Some("event") => {}
+    let direction = match record.get("type").and_then(Value::as_str) {
+        Some("action") => Some(Direction::Sent),
+        Some("observation") => Some(Direction::Received),
+        // A control carries a sequence number and says nothing about the
+        // game, being out-of-domain. Counted, not read, so that skipping
+        // it does not look like a gap.
+        Some("control") => None,
+        Some("reward") => {
+            let agent: AgentId = decode(record, "agent", line)?;
+            let value = record
+                .get("value")
+                .and_then(Value::as_i64)
+                .and_then(|value| i32::try_from(value).ok())
+                .ok_or_else(|| malformed(line, "no value"))?;
+            return Ok(Some(Line::Reward { agent, value }));
+        }
         Some("cycle") => return Ok(None),
         found => {
             return Err(TranscriptError::UnknownRecordType {
@@ -329,26 +421,21 @@ fn moderator_event<'a>(
                 found: found.map(str::to_owned),
             });
         }
-    }
+    };
     let agent = string(record, "agent", line)?;
-    Ok((agent == moderator.as_str()).then_some(record))
+    Ok((agent == moderator.as_str()).then_some(Line::Numbered { record, direction }))
 }
 
-/// Decodes an event record's envelope and payload, or returns `None` for a
-/// control event or a think, which say nothing about the game.
-fn message(record: &Map<String, Value>, line: usize) -> Result<Option<Record>, TranscriptError> {
+/// Decodes an event record's envelope and payload.
+fn message(
+    record: &Map<String, Value>,
+    direction: Direction,
+    line: usize,
+) -> Result<Record, TranscriptError> {
     let event = record
         .get("event")
         .and_then(Value::as_object)
         .ok_or_else(|| malformed(line, "no event"))?;
-    if string(event, "kind", line)? != "message" {
-        return Ok(None);
-    }
-    let direction = match (record.get("sent"), record.get("arrived")) {
-        (Some(_), None) => Direction::Sent,
-        (None, Some(_)) => Direction::Arrived,
-        _ => return Err(malformed(line, "a message is stamped sent or arrived")),
-    };
     let sender: AgentId = decode(event, "sender", line)?;
     let recipients: BTreeSet<AgentId> = decode(event, "recipients", line)?;
     let payload = event
@@ -356,13 +443,13 @@ fn message(record: &Map<String, Value>, line: usize) -> Result<Option<Record>, T
         .ok_or_else(|| malformed(line, "no payload"))?;
     let message = Message::deserialize(payload)
         .map_err(|source| TranscriptError::Payload { line, source })?;
-    Ok(Some(Record {
+    Ok(Record {
         line,
         direction,
         sender,
         recipients,
         message,
-    }))
+    })
 }
 
 fn malformed(line: usize, what: &str) -> TranscriptError {
@@ -440,7 +527,7 @@ impl Reader {
                 self.narrated(line, recipients, narration)
             }
             (Direction::Sent, Message::Request(request)) => self.asked(line, recipients, &request),
-            (Direction::Arrived, Message::Response(response)) => {
+            (Direction::Received, Message::Response(response)) => {
                 self.answered(line, sender, response)
             }
             _ => Err(TranscriptError::Misdirected { line }),
@@ -480,7 +567,9 @@ impl Reader {
             },
             Narration::Investigated { target, faction } => {
                 let seer = only(line, recipients, "a finding is addressed to one seer")?;
-                self.current(line)?.investigation = Some((seer, target, faction));
+                self.current(line)?
+                    .investigations
+                    .insert(seer, (target, faction));
             }
             Narration::Eliminated {
                 who, role, cause, ..
@@ -522,8 +611,8 @@ impl Reader {
             }
         };
         self.current(line)?
-            .actions
-            .insert(from, (kind, response.action));
+            .moves
+            .insert(from, (kind, response.chosen));
         Ok(())
     }
 
@@ -543,8 +632,14 @@ const COLUMNS: usize = 4;
 
 impl fmt::Display for Transcript {
     /// The game at a glance: the roster with its roles, then each phase with
-    /// its actions and its elimination, then the outcome. Only what the
-    /// moderator recorded, in the order it recorded it. Ends with a newline.
+    /// its moves and its elimination, then the outcome, then what each
+    /// player's game was worth. Only what the trajectory records, in the
+    /// order it records it. Ends with a newline.
+    ///
+    /// The rewards come last because they are the game's verdict on the
+    /// players, which only the outcome above them explains. A game read
+    /// from a trajectory with no reward records renders without the
+    /// section rather than with an empty one.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let width = self
             .assignment
@@ -576,22 +671,32 @@ impl fmt::Display for Transcript {
         writeln!(f)?;
         let Round(rounds) = self.outcome.rounds;
         match self.outcome.winner {
-            Some(Faction::Village) => write!(f, "Village wins")?,
-            Some(Faction::Werewolves) => write!(f, "Werewolves win")?,
-            None => write!(f, "Stalemate")?,
+            Faction::Village => write!(f, "Village wins")?,
+            Faction::Werewolves => write!(f, "Werewolves win")?,
         }
         let plural = if rounds == 1 { "" } else { "s" };
         write!(f, " after {rounds} round{plural}.  Survivors: ")?;
         let survivors: Vec<&str> = self.outcome.living.iter().map(AgentId::as_str).collect();
         if survivors.is_empty() {
-            writeln!(f, "none")
+            writeln!(f, "none")?;
         } else {
-            writeln!(f, "{}", survivors.join(", "))
+            writeln!(f, "{}", survivors.join(", "))?;
         }
+        if self.rewards.is_empty() {
+            return Ok(());
+        }
+        writeln!(f)?;
+        writeln!(f, "Rewards")?;
+        columns(
+            f,
+            self.rewards
+                .iter()
+                .map(|(who, value)| format!("{:<width$} {value:>+2}", who.as_str())),
+        )
     }
 }
 
-/// Writes a phase: its header with the living count, one line per action,
+/// Writes a phase: its header with the living count, one line per move,
 /// and who died.
 fn phase(
     f: &mut fmt::Formatter<'_>,
@@ -602,33 +707,33 @@ fn phase(
     writeln!(f)?;
     writeln!(f, "{name}  ({} living)", record.living.len())?;
     let (votes, deeds): (Vec<_>, Vec<_>) = record
-        .actions
+        .moves
         .iter()
         .partition(|(_, (kind, _))| *kind == RequestKind::Nominate);
-    // Nominations are a ballot, laid out in columns; night actions differ
+    // Nominations are a ballot, laid out in columns; night moves differ
     // by kind and get a line each.
     columns(
         f,
-        votes.iter().map(|(who, (_, action))| {
+        votes.iter().map(|(who, (_, chosen))| {
             format!(
                 "{:<width$} -> {:<width$}",
                 who.as_str(),
-                action.target().map_or("no one", AgentId::as_str)
+                chosen.target().map_or("no one", AgentId::as_str)
             )
         }),
     )?;
-    for (who, (kind, action)) in deeds {
+    for (who, (kind, chosen)) in deeds {
         let verb = match kind {
             RequestKind::Devour => "devours",
             RequestKind::Investigate => "investigates",
             RequestKind::Protect => "protects",
             RequestKind::Nominate => "nominates",
         };
-        let whom = action.target().map_or("no one", AgentId::as_str);
+        let whom = chosen.target().map_or("no one", AgentId::as_str);
         write!(f, "  {:<width$} {verb} {whom}", who.as_str())?;
-        match &record.investigation {
-            Some((seer, _, faction)) if seer == who => writeln!(f, "  ->  {faction}")?,
-            _ => writeln!(f)?,
+        match record.investigations.get(who) {
+            Some((_, faction)) => writeln!(f, "  ->  {faction}")?,
+            None => writeln!(f)?,
         }
     }
     match &record.eliminated {
@@ -657,10 +762,13 @@ mod tests {
     use crate::werewolf::game::{Directive, Game};
     use crate::werewolf::role::Role::{Doctor, Seer, Villager, Werewolf};
 
-    /// The fixture: a seven-player game played to a village win, with its
-    /// effective config and its expected rendering beside it. It is chosen
-    /// for what it covers: a saved night, a werewolf devoured on its
-    /// packmate's vote, a tie-break, and an abstention.
+    /// The fixture: a seven-player game played to a werewolf win in two
+    /// rounds, with its effective config and its expected rendering beside
+    /// it. Between them the two rounds cover a saved night, a night the
+    /// doctor's own rule bars it from repeating a protection on, the
+    /// tie-break on both a split pack and a split ballot, a game that ends
+    /// by parity rather than by the pack being wiped out, and the
+    /// elimination of a doctor and a seer.
     const FIXTURE: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/werewolf.jsonl"
@@ -684,22 +792,22 @@ mod tests {
         Transcript::read(lines, &moderator())
     }
 
-    fn target(who: &str) -> Action {
-        Action::Target(id(who))
+    fn target(who: &str) -> Move {
+        Move::Target(id(who))
     }
 
-    fn actions<const N: usize>(
-        actions: [(&str, RequestKind, Action); N],
-    ) -> BTreeMap<AgentId, (RequestKind, Action)> {
-        actions
+    fn moves<const N: usize>(
+        moves: [(&str, RequestKind, Move); N],
+    ) -> BTreeMap<AgentId, (RequestKind, Move)> {
+        moves
             .into_iter()
-            .map(|(who, kind, action)| (id(who), (kind, action)))
+            .map(|(who, kind, chosen)| (id(who), (kind, chosen)))
             .collect()
     }
 
     fn nominations<const N: usize>(
         votes: [(&str, &str); N],
-    ) -> BTreeMap<AgentId, (RequestKind, Action)> {
+    ) -> BTreeMap<AgentId, (RequestKind, Move)> {
         votes
             .into_iter()
             .map(|(who, whom)| (id(who), (RequestKind::Nominate, target(whom))))
@@ -708,14 +816,17 @@ mod tests {
 
     fn phase<const N: usize>(
         living: [&str; N],
-        actions: BTreeMap<AgentId, (RequestKind, Action)>,
+        moves: BTreeMap<AgentId, (RequestKind, Move)>,
         investigation: Option<(&str, &str, Faction)>,
         eliminated: Option<(&str, Role, Cause)>,
     ) -> PhaseRecord {
         PhaseRecord {
             living: ids(living),
-            actions,
-            investigation: investigation.map(|(seer, whom, faction)| (id(seer), id(whom), faction)),
+            moves,
+            investigations: investigation
+                .map(|(seer, whom, faction)| (id(seer), (id(whom), faction)))
+                .into_iter()
+                .collect(),
             eliminated: eliminated.map(|(who, role, cause)| (id(who), role, cause)),
         }
     }
@@ -746,13 +857,13 @@ mod tests {
                     // doctor has protected her: a saved night.
                     night: phase(
                         everyone,
-                        actions([
+                        moves([
                             ("carol", Protect, target("alice")),
                             ("dave", Devour, target("alice")),
                             ("erin", Devour, target("bob")),
-                            ("grace", Investigate, target("bob")),
+                            ("grace", Investigate, target("alice")),
                         ]),
-                        Some(("grace", "bob", Faction::Village)),
+                        Some(("grace", "alice", Faction::Village)),
                         None,
                     ),
                     day: Some(phase(
@@ -772,55 +883,54 @@ mod tests {
                 },
                 RoundRecord {
                     round: Round(2),
+                    // The pack agrees on carol, whom the doctor did not
+                    // protect, and the seer finds a werewolf too late.
                     night: phase(
                         ["bob", "carol", "dave", "erin", "frank", "grace"],
-                        actions([
-                            ("carol", Protect, target("frank")),
-                            ("dave", Devour, target("erin")),
+                        moves([
+                            ("carol", Protect, target("erin")),
+                            ("dave", Devour, target("carol")),
                             ("erin", Devour, target("carol")),
-                            ("grace", Investigate, target("erin")),
+                            ("grace", Investigate, target("dave")),
                         ]),
-                        Some(("grace", "erin", Faction::Werewolves)),
-                        Some(("erin", Werewolf, Devoured)),
+                        Some(("grace", "dave", Faction::Werewolves)),
+                        Some(("carol", Doctor, Devoured)),
                     ),
+                    // Grace and frank tie, and the tie-break lynches grace:
+                    // two werewolves among four living is parity.
                     day: Some(phase(
-                        ["bob", "carol", "dave", "frank", "grace"],
+                        ["bob", "dave", "erin", "frank", "grace"],
                         nominations([
                             ("bob", "grace"),
-                            ("carol", "frank"),
                             ("dave", "bob"),
+                            ("erin", "frank"),
                             ("frank", "grace"),
                             ("grace", "frank"),
                         ]),
                         None,
-                        Some(("frank", Villager, Lynched)),
-                    )),
-                },
-                RoundRecord {
-                    round: Round(3),
-                    night: phase(
-                        ["bob", "carol", "dave", "grace"],
-                        actions([
-                            ("carol", Protect, target("dave")),
-                            ("dave", Devour, target("carol")),
-                            ("grace", Investigate, Action::Abstain),
-                        ]),
-                        None,
-                        Some(("carol", Doctor, Devoured)),
-                    ),
-                    day: Some(phase(
-                        ["bob", "dave", "grace"],
-                        nominations([("bob", "dave"), ("dave", "bob"), ("grace", "dave")]),
-                        None,
-                        Some(("dave", Werewolf, Lynched)),
+                        Some(("grace", Seer, Lynched)),
                     )),
                 },
             ],
             outcome: Outcome {
-                winner: Some(Faction::Village),
-                rounds: Round(3),
-                living: ids(["bob", "grace"]),
+                winner: Faction::Werewolves,
+                rounds: Round(2),
+                living: ids(["bob", "dave", "erin", "frank"]),
             },
+            // The werewolves dave and erin won; everybody else, living or
+            // dead, lost with the village.
+            rewards: [
+                ("alice", -1),
+                ("bob", -1),
+                ("carol", -1),
+                ("dave", 1),
+                ("erin", 1),
+                ("frank", -1),
+                ("grace", -1),
+            ]
+            .into_iter()
+            .map(|(who, value)| (id(who), value))
+            .collect(),
         }
     }
 
@@ -836,6 +946,122 @@ mod tests {
             assert_eq!(actual.day, expected.day, "day {:?}", actual.round);
         }
         assert_eq!(transcript.outcome, expected.outcome);
+        assert_eq!(transcript.rewards, expected.rewards);
+    }
+
+    #[test]
+    fn every_player_has_a_reward_and_it_agrees_with_its_faction() {
+        // Read from the `reward` records, which belong to the players and
+        // are written by the moderator, so a reader that looked only at
+        // the moderator's trajectory would find none of them.
+        let transcript = read(&fixture()).unwrap();
+        assert_eq!(
+            transcript.rewards.keys().collect::<BTreeSet<_>>(),
+            transcript.assignment.keys().collect::<BTreeSet<_>>(),
+            "every player is paid, and nobody else"
+        );
+        for (who, value) in &transcript.rewards {
+            let expected = if transcript.assignment[who].faction() == transcript.outcome.winner {
+                1
+            } else {
+                -1
+            };
+            assert_eq!(*value, expected, "{who}");
+        }
+        assert!(
+            !transcript.rewards.contains_key(&moderator()),
+            "the moderator plays no game and is paid nothing"
+        );
+    }
+
+    #[test]
+    fn a_reward_is_read_whoever_it_belongs_to_and_is_never_counted() {
+        // Two claims at once. Every reward in the fixture belongs to a
+        // player, not to the moderator, and they are all read: that is
+        // what distinguishes a reward from every other record here, which
+        // is read only if the moderator wrote it.
+        let lines = fixture();
+        let rewards: Vec<&Value> = lines
+            .iter()
+            .filter(|line| line["type"] == "reward")
+            .collect();
+        assert!(!rewards.is_empty());
+        assert!(
+            rewards.iter().all(|line| line["agent"] != MODERATOR),
+            "the fixture's rewards belong to the players"
+        );
+        assert_eq!(read(&lines).unwrap().rewards.len(), rewards.len());
+
+        // And a reward carries no sequence number, so it is outside the
+        // contiguity check: one relabeled to the moderator is read as a
+        // reward for the moderator and does not make its numbering look
+        // full of gaps.
+        let mut moved = fixture();
+        let index = moved
+            .iter()
+            .position(|line| line["type"] == "reward")
+            .unwrap();
+        moved[index]["agent"] = json!(MODERATOR);
+        let transcript = read(&moved).unwrap();
+        assert_eq!(
+            transcript.rewards.get(&moderator()),
+            Some(&-1),
+            "the reward is read, and belongs to whoever it names"
+        );
+        assert_eq!(
+            transcript.rounds,
+            read(&fixture()).unwrap().rounds,
+            "and the game itself is untouched"
+        );
+    }
+
+    #[test]
+    fn a_reward_without_a_value_or_an_agent_is_an_error() {
+        let index = fixture()
+            .iter()
+            .position(|line| line["type"] == "reward")
+            .unwrap();
+        for key in ["agent", "value"] {
+            let mut lines = fixture();
+            lines[index].as_object_mut().unwrap().remove(key);
+            let error = read(&lines).unwrap_err();
+            assert!(
+                matches!(&error, TranscriptError::Malformed { line, what }
+                    if *line == index + 1 && what.starts_with(&format!("no {key}"))),
+                "{key}: {error:?}"
+            );
+        }
+        // A value too large for the reward type is malformed, not silently
+        // truncated.
+        let mut lines = fixture();
+        lines[index]["value"] = json!(i64::from(i32::MAX) + 1);
+        let error = read(&lines).unwrap_err();
+        assert!(
+            matches!(&error, TranscriptError::Malformed { what, .. } if what == "no value"),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn a_game_whose_trajectory_records_no_reward_reads_and_renders_without_them() {
+        // Nothing in the reader requires a reward: a truncated or
+        // hand-written trajectory that has none is still the game it
+        // records, and renders with no rewards section rather than an
+        // empty one.
+        let lines: Vec<Value> = fixture()
+            .into_iter()
+            .filter(|line| line["type"] != "reward")
+            .collect();
+        let transcript = read(&lines).unwrap();
+        assert!(transcript.rewards.is_empty());
+        let rendered = transcript.to_string();
+        assert!(!rendered.contains("Rewards"), "{rendered}");
+        assert!(
+            rendered.ends_with("Survivors: bob, dave, erin, frank\n"),
+            "{rendered}"
+        );
+        // And is otherwise the same game.
+        assert_eq!(transcript.rounds, read(&fixture()).unwrap().rounds);
     }
 
     #[test]
@@ -850,7 +1076,7 @@ mod tests {
         let transcript = read(&fixture()).unwrap();
         let roles = &transcript.assignment;
         for round in &transcript.rounds {
-            for (who, (kind, _)) in &round.night.actions {
+            for (who, (kind, _)) in &round.night.moves {
                 let expected = match roles[who] {
                     Werewolf => RequestKind::Devour,
                     Seer => RequestKind::Investigate,
@@ -859,7 +1085,7 @@ mod tests {
                 };
                 assert_eq!(*kind, expected, "{who} in round {:?}", round.round);
             }
-            for (who, (kind, _)) in &round.day.as_ref().unwrap().actions {
+            for (who, (kind, _)) in &round.day.as_ref().unwrap().moves {
                 assert_eq!(
                     *kind,
                     RequestKind::Nominate,
@@ -875,7 +1101,7 @@ mod tests {
     fn rewritten() -> Vec<Value> {
         let mut lines = fixture();
         for (offset, line) in lines.iter_mut().enumerate() {
-            for key in ["arrived", "sent", "due", "t_start", "t_stop"] {
+            for key in ["created", "received", "t_start", "t_stop"] {
                 if let Some(time) = line.get_mut(key) {
                     *time = json!(1_000_000 + offset);
                 }
@@ -908,14 +1134,14 @@ mod tests {
         assert!(matches!(error, TranscriptError::NoOutcome), "{error:?}");
     }
 
-    /// The index of the first moderator event record whose payload
-    /// satisfies `matching`, and the record itself.
+    /// The index of the first of the moderator's records that carries an
+    /// event whose payload satisfies `matching`.
     fn moderator_record(lines: &[Value], matching: impl Fn(&Value) -> bool) -> usize {
         lines
             .iter()
             .position(|line| {
                 line["agent"] == MODERATOR
-                    && line["type"] == "event"
+                    && (line["type"] == "action" || line["type"] == "observation")
                     && matching(&line["event"]["payload"])
             })
             .expect("the fixture has such a record")
@@ -996,14 +1222,30 @@ mod tests {
                 "{key}: {error:?}"
             );
         }
-        let mut lines = fixture();
-        lines[index]["sent"] = lines[index]["arrived"].clone();
-        let error = read(&lines).unwrap_err();
-        assert!(
-            matches!(error, TranscriptError::Malformed { .. }),
-            "{error:?}"
-        );
-        assert!(error.to_string().contains("sent or arrived"), "{error}");
+        for key in ["sender", "recipients", "payload"] {
+            let mut lines = fixture();
+            lines[index]["event"].as_object_mut().unwrap().remove(key);
+            let error = read(&lines).unwrap_err();
+            assert!(
+                matches!(&error, TranscriptError::Malformed { line, what }
+                    if *line == index + 1 && what.starts_with(&format!("no {key}"))),
+                "{key}: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_control_record_says_nothing_about_the_game_and_is_skipped() {
+        // The moderator's own start and stop are in the file and count
+        // toward its sequence numbers, and the reader steps over them
+        // without taking them for messages.
+        let lines = fixture();
+        let controls = lines
+            .iter()
+            .filter(|line| line["agent"] == MODERATOR && line["type"] == "control")
+            .count();
+        assert_eq!(controls, 2, "the moderator was started and stopped");
+        read(&lines).unwrap();
     }
 
     #[test]
@@ -1094,7 +1336,7 @@ mod tests {
             assert!(error.to_string().contains("non-empty agent id"), "{error}");
         }
         let mut lines = fixture();
-        lines[index]["event"]["payload"]["Response"]["action"]["Target"] = json!("");
+        lines[index]["event"]["payload"]["Response"]["chosen"]["Target"] = json!("");
         let error = read(&lines).unwrap_err();
         assert!(
             matches!(&error, TranscriptError::Payload { line, .. } if *line == index + 1),
@@ -1195,12 +1437,11 @@ mod tests {
 
     #[test]
     fn a_message_the_moderator_never_records_is_an_error() {
-        // A response the moderator sent.
+        // A response the moderator took as an action of its own.
         let mut lines = fixture();
         let index = moderator_record(&lines, is_response);
-        let record = lines[index].as_object_mut().unwrap();
-        let time = record.remove("arrived").unwrap();
-        record.insert("sent".to_owned(), time);
+        lines[index]["type"] = json!("action");
+        lines[index].as_object_mut().unwrap().remove("received");
         let error = read(&lines).unwrap_err();
         assert!(
             matches!(error, TranscriptError::Misdirected { line } if line == index + 1),
@@ -1208,12 +1449,11 @@ mod tests {
         );
         assert!(error.to_string().contains("never records"), "{error}");
 
-        // A narration that arrived at the moderator.
+        // A narration the moderator observed rather than sent.
         let mut lines = fixture();
         let index = moderator_record(&lines, |payload| !payload["Narration"].is_null());
-        let record = lines[index].as_object_mut().unwrap();
-        let time = record.remove("sent").unwrap();
-        record.insert("arrived".to_owned(), time);
+        lines[index]["type"] = json!("observation");
+        lines[index]["received"] = lines[index]["created"].clone();
         let error = read(&lines).unwrap_err();
         assert!(
             matches!(error, TranscriptError::Misdirected { .. }),
@@ -1226,37 +1466,39 @@ mod tests {
     /// would record, with nobody else's records and made-up stamps.
     struct Scribe {
         lines: Vec<Value>,
-        players: BTreeSet<AgentId>,
     }
 
     impl Scribe {
-        fn new(assignment: &Assignment) -> Self {
-            Self {
-                lines: Vec::new(),
-                players: assignment.players().map(|(who, _)| who.clone()).collect(),
-            }
+        fn new() -> Self {
+            Self { lines: Vec::new() }
         }
 
+        /// One record of the moderator's, of the given type, with stamps
+        /// invented from the sequence number: every record needs a
+        /// `created`, and an `observation` a `received` as well.
         fn record(
             &mut self,
-            stamp: &str,
+            kind: &str,
             sender: &str,
             recipients: &BTreeSet<AgentId>,
             payload: &Message,
         ) {
             let seq = self.lines.len();
-            self.lines.push(json!({
-                "type": "event",
+            let mut line = json!({
+                "type": kind,
                 "agent": MODERATOR,
                 "seq": seq,
-                stamp: seq * 10,
+                "created": seq * 10,
                 "event": {
-                    "kind": "message",
                     "sender": sender,
                     "recipients": recipients,
                     "payload": payload,
                 },
-            }));
+            });
+            if kind == "observation" {
+                line["received"] = json!(seq * 10 + 1);
+            }
+            self.lines.push(line);
         }
 
         fn directives(&mut self, directives: Vec<Directive>) {
@@ -1264,17 +1506,14 @@ mod tests {
                 let (to, payload) = match directive {
                     Directive::Narrate { to, narration } => (to, Message::Narration(narration)),
                     Directive::Ask { to, request } => ([to].into(), Message::Request(request)),
-                    Directive::Broadcast(narration) => {
-                        (self.players.clone(), Message::Narration(narration))
-                    }
                 };
-                self.record("sent", MODERATOR, &to, &payload);
+                self.record("action", MODERATOR, &to, &payload);
             }
         }
 
         fn response(&mut self, from: &str, response: Response) {
             self.record(
-                "arrived",
+                "observation",
                 from,
                 &ids([MODERATOR]),
                 &Message::Response(response),
@@ -1283,15 +1522,10 @@ mod tests {
     }
 
     /// Plays `script`, one phase's answers per entry, through a game over
-    /// `assignment` capped at `max_rounds`, and returns the moderator's
-    /// records.
-    fn scripted(
-        assignment: Assignment,
-        max_rounds: u32,
-        script: &[Vec<(&str, Action)>],
-    ) -> Vec<Value> {
-        let mut scribe = Scribe::new(&assignment);
-        let mut game = Game::new(assignment, max_rounds, 1);
+    /// `assignment`, and returns the moderator's records.
+    fn scripted(assignment: Assignment, script: &[Vec<(&str, Move)>]) -> Vec<Value> {
+        let mut scribe = Scribe::new();
+        let mut game = Game::new(assignment, 1);
         let mut latest = game.begin();
         scribe.directives(latest.clone());
         for answers in script {
@@ -1299,13 +1533,13 @@ mod tests {
                 .iter()
                 .filter_map(|directive| match directive {
                     Directive::Ask { to, request } => Some((to.clone(), request.id)),
-                    _ => None,
+                    Directive::Narrate { .. } => None,
                 })
                 .collect();
-            for (who, action) in answers {
+            for (who, chosen) in answers {
                 let response = Response {
                     request: asked[&id(who)],
-                    action: action.clone(),
+                    chosen: chosen.clone(),
                 };
                 scribe.response(who, response.clone());
                 latest = game.record(&id(who), &response);
@@ -1315,14 +1549,14 @@ mod tests {
         scribe.lines
     }
 
-    fn answers<const N: usize>(answers: [(&'static str, &str); N]) -> Vec<(&'static str, Action)> {
+    fn answers<const N: usize>(answers: [(&'static str, &str); N]) -> Vec<(&'static str, Move)> {
         answers
             .into_iter()
             .map(|(who, whom)| {
                 (
                     who,
                     if whom == "-" {
-                        Action::Abstain
+                        Move::Abstain
                     } else {
                         target(whom)
                     },
@@ -1349,7 +1583,6 @@ mod tests {
         // the doctor abstains: the werewolves win at parity on night two.
         let lines = scripted(
             village(),
-            100,
             &[
                 answers([("bob", "carol"), ("carol", "bob"), ("dave", "alice")]),
                 answers([
@@ -1366,17 +1599,17 @@ mod tests {
         let last = &transcript.rounds[1];
         assert_eq!(last.day, None);
         assert_eq!(
-            last.night.actions,
-            actions([
+            last.night.moves,
+            moves([
                 ("bob", RequestKind::Devour, target("alice")),
-                ("dave", RequestKind::Protect, Action::Abstain),
+                ("dave", RequestKind::Protect, Move::Abstain),
             ])
         );
         assert_eq!(
             last.night.eliminated,
             Some((id("alice"), Villager, Cause::Devoured))
         );
-        assert_eq!(transcript.outcome.winner, Some(Faction::Werewolves));
+        assert_eq!(transcript.outcome.winner, Faction::Werewolves);
         let rendered = transcript.to_string();
         assert!(rendered.contains("Night 2  (3 living)\n"), "{rendered}");
         assert!(!rendered.contains("Day 2"), "{rendered}");
@@ -1399,7 +1632,6 @@ mod tests {
         // Bob is devoured, carol is lynched, dave is devoured: parity.
         let lines = scripted(
             assignment,
-            100,
             &[
                 answers([("alice", "bob")]),
                 answers([
@@ -1414,41 +1646,13 @@ mod tests {
         let transcript = read(&lines).unwrap();
         assert_eq!(transcript.rounds.len(), 2);
         for round in &transcript.rounds {
-            assert_eq!(round.night.investigation, None, "{:?}", round.round);
-            assert_eq!(round.night.actions.len(), 1);
+            assert!(round.night.investigations.is_empty(), "{:?}", round.round);
+            assert_eq!(round.night.moves.len(), 1);
             if let Some(day) = &round.day {
-                assert_eq!(day.investigation, None);
+                assert!(day.investigations.is_empty());
             }
         }
         assert!(!transcript.to_string().contains("investigates"));
-    }
-
-    #[test]
-    fn a_stalemate_renders_as_one() {
-        // The doctor saves alice and the seer abstains; erin is lynched;
-        // and the cap of one round ends the game undecided.
-        let lines = scripted(
-            village(),
-            1,
-            &[
-                answers([("bob", "alice"), ("carol", "-"), ("dave", "alice")]),
-                answers([
-                    ("alice", "erin"),
-                    ("bob", "erin"),
-                    ("carol", "erin"),
-                    ("dave", "erin"),
-                    ("erin", "alice"),
-                ]),
-            ],
-        );
-        let transcript = read(&lines).unwrap();
-        assert_eq!(transcript.outcome.winner, None);
-        let rendered = transcript.to_string();
-        assert!(rendered.contains("  no one died\n"), "{rendered}");
-        assert!(
-            rendered.ends_with("Stalemate after 1 round.  Survivors: alice, bob, carol, dave\n"),
-            "{rendered}"
-        );
     }
 
     #[test]

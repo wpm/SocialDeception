@@ -19,8 +19,10 @@
 //! plays the game as a fold over players' responses, producing
 //! [`Directive`]s that say what to tell whom. The [`Moderator`]
 //! ([`moderator`]) is the agent that runs a game: the thin
-//! [`Handler`](crate::Handler) that folds the events on its inbox into the
-//! game and sends the directives as messages.
+//! [`Environment`](crate::Environment) that folds the observations it pops
+//! into the game, sends the directives as messages, and — being the
+//! episode's environment — starts the players when it begins and stops them
+//! when the game is over.
 //!
 //! The seam with the runtime is [`setup`]: [`episode`] builds a populated
 //! [`Episode`](crate::Episode) from a [`Config`], seating every player and
@@ -40,12 +42,13 @@
 //! |---|---|---|
 //! | [`Narration`] | moderator → a chosen set of players | a true statement the recipients now observe |
 //! | [`Request`] | moderator → one player | a decision point: the moment a policy is invoked |
-//! | [`Response`] | player → moderator | the reply, echoing the request's id and carrying one [`Action`] |
+//! | [`Response`] | player → moderator | the reply, echoing the request's id and carrying one [`Move`] |
 //!
 //! In the reinforcement-learning vocabulary of the design, `Event<Message>`
-//! is the observation type and [`Action`] is the action type. The set of
-//! moves the rules permit for one request is the *action space*, a
-//! `Vec<Action>` computed by the rules; an action outside it is a policy bug.
+//! is the observation type and [`Move`] is the move a player's action
+//! carries: the choice inside the response, not the response itself. The
+//! set of moves the rules permit for one request is the *action space*, a
+//! `Vec<Move>` computed by the rules; a move outside it is a policy bug.
 //! A request and its response are correlated by [`RequestId`] on purpose:
 //! they are RPC-shaped, and a response naming an id the moderator is not
 //! waiting for is a bug rather than a judgment call.
@@ -59,23 +62,29 @@
 //! request, which is what gives an agent in a turnless runtime its decision
 //! points.
 //!
+//! Nothing is excepted. ADR-0004 broadcast the final [`Outcome`] to every
+//! player, living and dead, because it was a dead player's terminal reward
+//! signal; a reward is now logged rather than said (ADR-0007), so the
+//! outcome is narrated to the living like everything else and a dead
+//! player hears nothing after the announcement of its own death.
+//!
 //! Every narration is true. Player-to-player dialogue, which may be false,
 //! would be a fourth kind of message and is not defined here.
 //!
 //! # What a player knows, and how it decides
 //!
-//! [`Knowledge`] is the state a player carries between passes: the fold of
+//! [`Knowledge`] is the state a player carries between cycles: the fold of
 //! every observation it has received, and what a policy conditions on. It
 //! records only what the moderator said, so nothing in it can be false.
 //!
 //! A [`Policy`] is handed a [`View`] of that state, the request in front of
-//! it and the action space, and returns one [`Action`]. [`RandomPolicy`] is
+//! it and the action space, and returns one [`Move`]. [`RandomPolicy`] is
 //! the uniform random baseline; a language-model policy is the same trait
 //! ([`policy`]).
 //!
 //! The action space is the rules' to compute, and the rules are a role's:
 //! [`Villager`], [`Werewolf`], [`Seer`] and [`Doctor`] ([`roles`]) each
-//! carry their own [`Knowledge`] and say which actions a request permits
+//! carry their own [`Knowledge`] and say which moves a request permits
 //! them, and nothing else. A [`Seat`] ([`player`]) pairs a role with the
 //! policy that decides for it and is the agent the episode runs: it folds
 //! every event into the role's state, answers each request with the
@@ -103,6 +112,8 @@
 //! whatever reads a trajectory back; the payload's shape belongs to the
 //! environment alone.
 
+use crate::event::Domain;
+
 pub mod assignment;
 pub mod config;
 pub mod game;
@@ -117,12 +128,29 @@ pub mod seed;
 pub mod setup;
 pub mod transcript;
 
+/// Werewolf as a [`Domain`]: the types this game contributes to the
+/// runtime.
+///
+/// Its events carry a [`Message`], and a player's reward is an integer,
+/// because a game of Werewolf is won or lost and nothing finer is scored.
+///
+/// The name is not `Werewolf`, which is the role a player may be dealt. A
+/// domain is the whole game; the role is one thing inside it, and the two
+/// would be hard to tell apart in a signature if they shared a name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct WerewolfDomain;
+
+impl Domain for WerewolfDomain {
+    type Payload = Message;
+    type Reward = i32;
+}
+
 pub use assignment::Assignment;
 pub use config::{Config, ConfigError, RoleCounts};
 pub use game::{Directive, Game};
 pub use knowledge::{Death, Heard, Knowledge};
 pub use message::{
-    Action, Cause, Message, Narration, Outcome, Phase, Request, RequestId, RequestKind, Response,
+    Cause, Message, Move, Narration, Outcome, Phase, Request, RequestId, RequestKind, Response,
     Round,
 };
 pub use moderator::Moderator;

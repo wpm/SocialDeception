@@ -1,5 +1,5 @@
 //! Everything said in a Werewolf episode: the [`Message`] payload and the
-//! vocabulary of rounds, phases, requests and actions it is built from.
+//! vocabulary of rounds, phases, requests and moves it is built from.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -44,7 +44,7 @@ pub enum Message {
     Narration(Narration),
     /// Moderator to one player: act now.
     Request(Request),
-    /// Player to moderator: the action taken.
+    /// Player to moderator: the move chosen.
     Response(Response),
 }
 
@@ -82,8 +82,8 @@ pub enum Narration {
         round: Round,
         /// Which half of the round.
         phase: Phase,
-        /// Each responding player's action, in canonical order.
-        votes: BTreeMap<AgentId, Action>,
+        /// Each responding player's move, in canonical order.
+        votes: BTreeMap<AgentId, Move>,
     },
     /// To the living, and to the eliminated player itself: someone is out
     /// of the game, and their role is revealed.
@@ -119,11 +119,9 @@ pub enum Cause {
 /// How a game ended. The one narration addressed to every player.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Outcome {
-    /// The winning side, or `None` for a stalemate at the round cap.
-    ///
-    /// An `Option` rather than a third `Faction` variant, so that "nobody
-    /// won" cannot be mistaken for a side anywhere a faction is matched.
-    pub winner: Option<Faction>,
+    /// The winning side. Every game has one: a day always eliminates
+    /// someone, so no game can run out of rounds undecided.
+    pub winner: Faction,
     /// The round the game ended in.
     pub rounds: Round,
     /// Everyone still in the game at the end.
@@ -167,7 +165,7 @@ impl RequestKind {
         }
     }
 
-    /// Whether [`Action::Abstain`] is in the action space for this kind:
+    /// Whether [`Move::Abstain`] is in the action space for this kind:
     /// true for `Protect` and `Investigate` only.
     ///
     /// `Nominate` and `Devour` always have at least one valid target when
@@ -189,17 +187,17 @@ impl RequestKind {
 pub struct Response {
     /// The id of the request being answered.
     pub request: RequestId,
-    /// The action taken.
-    pub action: Action,
+    /// The move chosen.
+    pub chosen: Move,
 }
 
-/// The action type. One of these, drawn from the action space, is what a
-/// policy returns.
+/// The move a player's action carries: one of these, drawn from the action
+/// space, is what a policy returns and what a [`Response`] reports.
 ///
 /// The derived ordering puts every `Target` before `Abstain`, targets in
 /// agent-id order, which is the order the action space lists them in.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub enum Action {
+pub enum Move {
     /// Act on this player. Serializes as `{"Target": "<agent id>"}`.
     Target(AgentId),
     /// Decline to act. In the action space only where
@@ -207,8 +205,8 @@ pub enum Action {
     Abstain,
 }
 
-impl Action {
-    /// The player this action targets, if it is not an abstention.
+impl Move {
+    /// The player this move targets, if it is not an abstention.
     #[must_use]
     pub const fn target(&self) -> Option<&AgentId> {
         match self {
@@ -256,8 +254,8 @@ mod tests {
                     round: Round(2),
                     phase: Phase::Day,
                     votes: BTreeMap::from([
-                        (AgentId::new("alice"), Action::Target(AgentId::new("bob"))),
-                        (AgentId::new("bob"), Action::Abstain),
+                        (AgentId::new("alice"), Move::Target(AgentId::new("bob"))),
+                        (AgentId::new("bob"), Move::Abstain),
                     ]),
                 },
                 json!({"Tally": {
@@ -281,19 +279,11 @@ mod tests {
             ),
             (
                 Narration::Outcome(Outcome {
-                    winner: Some(Faction::Werewolves),
+                    winner: Faction::Werewolves,
                     rounds: Round(3),
                     living: ["wanda"].map(AgentId::new).into(),
                 }),
                 json!({"Outcome": {"winner": "Werewolves", "rounds": 3, "living": ["wanda"]}}),
-            ),
-            (
-                Narration::Outcome(Outcome {
-                    winner: None,
-                    rounds: Round(9),
-                    living: ["alice", "wanda"].map(AgentId::new).into(),
-                }),
-                json!({"Outcome": {"winner": null, "rounds": 9, "living": ["alice", "wanda"]}}),
             ),
         ]
     }
@@ -318,9 +308,9 @@ mod tests {
         messages.push((
             Message::Response(Response {
                 request: RequestId(7),
-                action: Action::Target(AgentId::new("alice")),
+                chosen: Move::Target(AgentId::new("alice")),
             }),
-            json!({"Response": {"request": 7, "action": {"Target": "alice"}}}),
+            json!({"Response": {"request": 7, "chosen": {"Target": "alice"}}}),
         ));
         messages
     }
@@ -379,35 +369,35 @@ mod tests {
     #[test]
     fn a_target_carries_a_bare_agent_id() {
         assert_eq!(
-            json(&Action::Target(AgentId::new("alice"))),
+            json(&Move::Target(AgentId::new("alice"))),
             json!({"Target": "alice"})
         );
-        assert_eq!(json(&Action::Abstain), json!("Abstain"));
+        assert_eq!(json(&Move::Abstain), json!("Abstain"));
     }
 
     #[test]
     fn only_a_target_names_a_player() {
         assert_eq!(
-            Action::Target(AgentId::new("alice")).target(),
+            Move::Target(AgentId::new("alice")).target(),
             Some(&AgentId::new("alice"))
         );
-        assert_eq!(Action::Abstain.target(), None);
+        assert_eq!(Move::Abstain.target(), None);
     }
 
     #[test]
     fn targets_sort_by_agent_and_precede_abstain() {
-        let mut actions = vec![
-            Action::Abstain,
-            Action::Target(AgentId::new("bob")),
-            Action::Target(AgentId::new("alice")),
+        let mut moves = vec![
+            Move::Abstain,
+            Move::Target(AgentId::new("bob")),
+            Move::Target(AgentId::new("alice")),
         ];
-        actions.sort();
+        moves.sort();
         assert_eq!(
-            actions,
+            moves,
             [
-                Action::Target(AgentId::new("alice")),
-                Action::Target(AgentId::new("bob")),
-                Action::Abstain,
+                Move::Target(AgentId::new("alice")),
+                Move::Target(AgentId::new("bob")),
+                Move::Abstain,
             ]
         );
     }
@@ -419,7 +409,7 @@ mod tests {
             phase: Phase::Night,
             votes: ["carol", "alice", "bob"]
                 .into_iter()
-                .map(|who| (AgentId::new(who), Action::Target(AgentId::new("dave"))))
+                .map(|who| (AgentId::new(who), Move::Target(AgentId::new("dave"))))
                 .collect(),
         };
         // A `serde_json::Value` object sorts its own keys, so the order has

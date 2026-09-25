@@ -4,7 +4,6 @@
 # the file it describes.
 seed = 26
 players = ["alice", "bob", "carol", "dave", "erin", "frank", "grace"]
-max_rounds = 100
 moderator = "moderator"
 
 [roles]
