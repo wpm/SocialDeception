@@ -29,7 +29,6 @@ use super::knowledge::Knowledge;
 use super::message::{Message, Move, Request, Response};
 use super::policy::{Policy, View};
 use crate::agent::{self, Handler, Observation};
-use crate::cancel::Cancel;
 use crate::event::AgentId;
 
 /// What a role contributes to a player: its state, and the moves the
@@ -85,19 +84,13 @@ impl<R: Player, P: Policy> Seat<R, P> {
     /// The response to one request: the policy's choice from the role's
     /// action space, checked against it and folded into the role's state.
     ///
-    /// `cancel` is the cycle's, passed straight through: the seat has no
-    /// opinion about preemption, and every request in a cycle is decided
-    /// under the same one.
-    fn answer(&mut self, request: &Request, cancel: &Cancel) -> Response {
+    fn answer(&mut self, request: &Request) -> Response {
         let action_space = self.player.action_space(request);
-        let chosen = self.policy.choose(
-            View {
-                knowledge: self.player.knowledge(),
-                request,
-                action_space: &action_space,
-            },
-            cancel,
-        );
+        let chosen = self.policy.choose(View {
+            knowledge: self.player.knowledge(),
+            request,
+            action_space: &action_space,
+        });
         assert!(
             action_space.contains(&chosen),
             "{}'s policy chose {chosen:?}, which is outside the action space {action_space:?}",
@@ -125,12 +118,11 @@ impl<R: Player, P: Policy> Handler<WerewolfDomain> for Seat<R, P> {
     fn handle(
         &mut self,
         observation: &Observation<WerewolfDomain>,
-        cancel: &Cancel,
     ) -> Vec<agent::Action<WerewolfDomain>> {
         self.player.knowledge_mut().observe(observation);
         match &observation.event.payload {
             Message::Request(request) => {
-                let response = Message::Response(self.answer(request, cancel));
+                let response = Message::Response(self.answer(request));
                 vec![agent::Action::to([self.moderator.clone()], response)]
             }
             _ => Vec::new(),
@@ -158,7 +150,7 @@ mod tests {
     struct First;
 
     impl Policy for First {
-        fn choose(&mut self, view: View<'_>, _: &Cancel) -> Move {
+        fn choose(&mut self, view: View<'_>) -> Move {
             view.action_space[0].clone()
         }
     }
@@ -167,7 +159,7 @@ mod tests {
     struct Last;
 
     impl Policy for Last {
-        fn choose(&mut self, view: View<'_>, _: &Cancel) -> Move {
+        fn choose(&mut self, view: View<'_>) -> Move {
             view.action_space.last().unwrap().clone()
         }
     }
@@ -176,7 +168,7 @@ mod tests {
     struct Outside;
 
     impl Policy for Outside {
-        fn choose(&mut self, _: View<'_>, _: &Cancel) -> Move {
+        fn choose(&mut self, _: View<'_>) -> Move {
             target("nobody")
         }
     }
@@ -222,7 +214,7 @@ mod tests {
     ) -> Vec<Action<WerewolfDomain>> {
         events
             .into_iter()
-            .flat_map(|event| seat.handle(&observed(event), &Cancel::cancelled()))
+            .flat_map(|event| seat.handle(&observed(event)))
             .collect()
     }
 
@@ -286,7 +278,7 @@ mod tests {
         // calls `timeout`, not `handle`, and a player has nothing to say on
         // a deadline.
         let mut seat = villager(Last);
-        assert!(seat.timeout(&Cancel::cancelled()).is_empty());
+        assert!(seat.timeout().is_empty());
     }
 
     #[test]

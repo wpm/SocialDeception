@@ -65,10 +65,9 @@ use std::panic::{self, AssertUnwindSafe};
 use crossbeam_channel::{Receiver, Sender, select, unbounded};
 
 use crate::agent::{self, Action, Agent, CycleDispatch, Handler, Observation, Wiring};
-use crate::cancel::{Cancel, ControlSender};
 use crate::clock::Clock;
 use crate::environment::{Adapter, Commanded, Environment, Rewarded};
-use crate::event::{AgentId, Control, Domain};
+use crate::event::{AgentId, Control, Delivery, Domain};
 use crate::router::{Queues, RouteError, Router};
 use crate::trajectory::LogRecord;
 
@@ -95,10 +94,12 @@ impl fmt::Display for Failure {
 /// An episode that ends in any of these but [`Stalled`](Self::Stalled) was
 /// abandoned rather than finished: the episode stops whoever is left so
 /// that the trajectory is complete up to the failure, and it cannot wait
-/// for quiescence to do it, so that `Stop` may preempt a cycle and reach an
-/// agent with events still queued. Such a trajectory may therefore carry
-/// `dropped` records and end with observations nobody made. A `Stalled`
-/// episode is quiescent by definition, so its shutdown is orderly.
+/// for quiescence to do it, so that `Stop` lands behind events the agent
+/// has not reached yet. Such a trajectory may therefore end with an agent
+/// answering for an episode that had already failed, and with observations
+/// nobody made — the events still behind the stop when it was popped
+/// (ADR-0009). A `Stalled` episode is quiescent by definition, so its
+/// shutdown is orderly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EpisodeError {
     /// An id was added to the roster twice.
@@ -371,7 +372,7 @@ struct Spawned<D: Domain> {
     /// A receiving half of every queue, kept alive until every thread has
     /// been joined, so that a message to an agent that has already stopped
     /// is delivered and never read rather than failing its sender.
-    held: Vec<(Receiver<crate::Event<D>>, Receiver<crate::Signal>)>,
+    held: Vec<Receiver<Delivery<D>>>,
     /// The threads themselves.
     agents: Threads<D>,
 }
@@ -389,22 +390,13 @@ fn spawn<D: Domain>(
     let mut held = Vec::with_capacity(ids.len());
     let mut agents = Vec::with_capacity(ids.len());
     for (id, handler) in handlers {
-        let (sender, events) = unbounded();
-        let (commander, controls, arm) = ControlSender::new();
-        held.push((events.clone(), controls.clone()));
-        queues.insert(
-            id.clone(),
-            Queues {
-                events: sender,
-                controls: commander,
-            },
-        );
+        let (sender, queue) = unbounded();
+        held.push(queue.clone());
+        queues.insert(id.clone(), Queues { queue: sender });
         let wiring = Wiring {
             id: id.clone(),
             clock,
-            events,
-            controls,
-            arm,
+            queue,
             dispatches: dispatch.clone(),
             records: records.clone(),
             timeout: None,
@@ -487,14 +479,15 @@ use Halt::Departure;
 ///
 /// A [`Stop`](Control::Stop) is issued **once nothing is in flight**, which
 /// is to say once everything already said has been handled. It has to be,
-/// and not merely after the cycle's events: an agent that pops a `Stop`
-/// leaves the events still on its queue unpopped, because an agent that has
-/// stopped did not observe them (see [`agent`](crate::agent)). So a `Stop`
-/// racing a delivery would silently swallow it, and which deliveries were
-/// swallowed would depend on the scheduler. Holding the stop back until the
-/// count reads zero makes "an agent hears everything said to it before it
-/// is told to stop" a guarantee rather than a hope, and it is what lets the
-/// moderator narrate an outcome and end the episode in one cycle.
+/// and not merely after the cycle's events. An agent has one queue, so a
+/// `Stop` sent early either waits behind work the agent has not reached or,
+/// once popped, leaves the rest of that queue unobserved — an agent that
+/// has stopped did not observe it (see [`agent`](crate::agent)) — and which
+/// of the two depends on the scheduler. Holding the stop back until the
+/// count reads zero means there is nothing for it to land behind, which
+/// makes "an agent hears everything said to it before it is told to stop" a
+/// guarantee rather than a hope, and it is what lets the moderator narrate
+/// an outcome and end the episode in one cycle.
 ///
 /// Nothing in flight, no stop waiting to be issued, and some agent still
 /// running is a stall; see the [module documentation](self).
@@ -603,12 +596,12 @@ impl<D: Domain> Handler<D> for Watched<D> {
         self.handler.start()
     }
 
-    fn handle(&mut self, observation: &Observation<D>, cancel: &Cancel) -> Vec<Action<D>> {
-        self.handler.handle(observation, cancel)
+    fn handle(&mut self, observation: &Observation<D>) -> Vec<Action<D>> {
+        self.handler.handle(observation)
     }
 
-    fn timeout(&mut self, cancel: &Cancel) -> Vec<Action<D>> {
-        self.handler.timeout(cancel)
+    fn timeout(&mut self) -> Vec<Action<D>> {
+        self.handler.timeout()
     }
 }
 
@@ -706,11 +699,7 @@ mod tests {
             vec![Effect::control(self.agents.clone(), Control::Start)]
         }
 
-        fn handle(
-            &mut self,
-            observation: &Observation<Counting>,
-            _: &Cancel,
-        ) -> Vec<Effect<Counting>> {
+        fn handle(&mut self, observation: &Observation<Counting>) -> Vec<Effect<Counting>> {
             if observation.event.payload == Done {
                 self.working.remove(&observation.event.sender);
             }
@@ -752,7 +741,7 @@ mod tests {
             ]
         }
 
-        fn handle(&mut self, _: &Observation<Counting>, _: &Cancel) -> Vec<Effect<Counting>> {
+        fn handle(&mut self, _: &Observation<Counting>) -> Vec<Effect<Counting>> {
             Vec::new()
         }
     }
@@ -844,7 +833,7 @@ mod tests {
             vec![Effect::control(self.0, Control::Start)]
         }
 
-        fn handle(&mut self, _: &Observation<Counting>, _: &Cancel) -> Vec<Effect<Counting>> {
+        fn handle(&mut self, _: &Observation<Counting>) -> Vec<Effect<Counting>> {
             Vec::new()
         }
     }
@@ -894,11 +883,7 @@ mod tests {
             }
         }
 
-        fn handle(
-            &mut self,
-            observation: &Observation<Counting>,
-            _: &Cancel,
-        ) -> Vec<Action<Counting>> {
+        fn handle(&mut self, observation: &Observation<Counting>) -> Vec<Action<Counting>> {
             let Some(heard) = count(observation) else {
                 return Vec::new();
             };
@@ -931,11 +916,7 @@ mod tests {
             vec![Action::broadcast(Say(0))]
         }
 
-        fn handle(
-            &mut self,
-            observation: &Observation<Counting>,
-            _: &Cancel,
-        ) -> Vec<Action<Counting>> {
+        fn handle(&mut self, observation: &Observation<Counting>) -> Vec<Action<Counting>> {
             if count(observation).is_some() {
                 self.heard += 1;
             }
@@ -951,11 +932,7 @@ mod tests {
     struct Spoke;
 
     impl Handler<Counting> for Spoke {
-        fn handle(
-            &mut self,
-            observation: &Observation<Counting>,
-            _: &Cancel,
-        ) -> Vec<Action<Counting>> {
+        fn handle(&mut self, observation: &Observation<Counting>) -> Vec<Action<Counting>> {
             if count(observation).is_none() {
                 return Vec::new();
             }
@@ -974,7 +951,7 @@ mod tests {
             vec![Action::to([self.0], Say(1))]
         }
 
-        fn handle(&mut self, _: &Observation<Counting>, _: &Cancel) -> Vec<Action<Counting>> {
+        fn handle(&mut self, _: &Observation<Counting>) -> Vec<Action<Counting>> {
             Vec::new()
         }
     }
@@ -983,7 +960,7 @@ mod tests {
     struct Mute;
 
     impl Handler<Counting> for Mute {
-        fn handle(&mut self, _: &Observation<Counting>, _: &Cancel) -> Vec<Action<Counting>> {
+        fn handle(&mut self, _: &Observation<Counting>) -> Vec<Action<Counting>> {
             Vec::new()
         }
     }
@@ -995,7 +972,7 @@ mod tests {
             panic!("the handler is broken")
         }
 
-        fn handle(&mut self, _: &Observation<Counting>, _: &Cancel) -> Vec<Action<Counting>> {
+        fn handle(&mut self, _: &Observation<Counting>) -> Vec<Action<Counting>> {
             panic!("the handler is broken")
         }
     }
@@ -1094,13 +1071,14 @@ mod tests {
             }
             // Every action lies within the window of the cycle that sent it,
             // and every observation and control was received at a t_start,
-            // but for a stop that preempted its cycle.
+            // with no exception: everything a cycle pops, it pops at its
+            // start (ADR-0009).
             let starts: BTreeSet<u64> = of(&lines, agent)
                 .filter(|line| line["type"] == "cycle")
                 .map(|line| line["t_start"].as_u64().unwrap())
                 .collect();
             for line in of(&lines, agent).filter(|line| line["type"] != "cycle") {
-                if line["type"] == "action" || line["type"] == "dropped" {
+                if line["type"] == "action" {
                     continue;
                 }
                 let (created, received) = (

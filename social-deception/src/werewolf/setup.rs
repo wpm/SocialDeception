@@ -264,7 +264,6 @@ mod tests {
 
     use super::*;
     use crate::agent::{Action, Observation};
-    use crate::cancel::Cancel;
     use crate::testing::{TempDir, id, ids, parse_lines};
     use crate::werewolf::config::{DEFAULT_MODERATOR, RoleCounts};
     use crate::werewolf::message::Round;
@@ -425,11 +424,7 @@ mod tests {
     struct Silent;
 
     impl Handler<WerewolfDomain> for Silent {
-        fn handle(
-            &mut self,
-            _: &Observation<WerewolfDomain>,
-            _: &Cancel,
-        ) -> Vec<Action<WerewolfDomain>> {
+        fn handle(&mut self, _: &Observation<WerewolfDomain>) -> Vec<Action<WerewolfDomain>> {
             Vec::new()
         }
     }

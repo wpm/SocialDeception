@@ -1,5 +1,6 @@
-//! What travels on the wire: [`Event`] and [`Control`], and the [`Domain`]
-//! that names a game's types.
+//! What travels on the wire: [`Event`], [`Control`] and the [`Delivery`]
+//! that carries either of them, and the [`Domain`] that names a game's
+//! types.
 //!
 //! Two kinds of thing reach an agent, and the distinction is the one
 //! ADR-0007 draws. An [`Event`] is *in-domain* data: something an agent said
@@ -7,6 +8,12 @@
 //! game. A [`Control`] is *out-of-domain*: an instruction about the episode
 //! rather than a move within it. Handlers see the first and never the
 //! second, because a handler plays the game and the loop runs the episode.
+//!
+//! Both travel on one queue, so the thing actually sent is a [`Delivery`],
+//! which is one or the other (ADR-0009). The distinction survives the
+//! transport rather than being erased by it: the enum has two variants and
+//! the loop matches on them, so a control is never mistaken for something a
+//! handler should see.
 //!
 //! An `Event` is a struct rather than an enum because there is now only one
 //! thing it can be. It was an enum when it also had to carry controls and
@@ -211,6 +218,105 @@ where
 
 impl<D: Domain> Eq for Event<D> where D::Payload: Eq {}
 
+/// One thing on an agent's queue: an event, or a control and when it was
+/// sent.
+///
+/// An agent has **one** queue, and it carries both kinds, so the queue's
+/// message type has to be able to be either. That is an enum, and ADR-0009
+/// reinstates the one ADR-0007 had for exactly this. ADR-0007's objection
+/// was to an `Event` that *meant* three unlike things at once — a message,
+/// an instruction, a timer wake-up — which made every handler ask what it
+/// had been given before it could act. This is not that. It is a transport
+/// carrying two things that stay clearly separate: the loop matches on the
+/// variant and nothing else ever holds a `Delivery`, so an [`Observation`]
+/// is still only ever an event and a control is still never observed.
+///
+/// One queue rather than two because the reasons for two are gone
+/// (ADR-0009). A control no longer preempts anything, so there is nothing
+/// for it to reach the agent ahead of, and a cycle handles one observation
+/// (ADR-0008), so there is no batch for it to be queued behind. What is
+/// left is a FIFO whose order is the order things were sent, which is the
+/// order an agent handles them in.
+///
+/// A control carries its `created` here because nothing else does: an
+/// [`Event`] has a field for the instant its sender made it and a
+/// [`Control`] is a bare two-variant enum, so the stamp travels beside it.
+/// `Debug`, `Clone` and equality are written out rather than derived, for
+/// the reason [`Event`]'s are: a derive would ask them of `D`.
+///
+/// [`Observation`]: crate::Observation
+pub enum Delivery<D: Domain> {
+    /// In-domain data: what becomes the recipient's [`Observation`].
+    ///
+    /// [`Observation`]: crate::Observation
+    Event(Event<D>),
+    /// An out-of-domain instruction, and the instant the sender sent it.
+    Control {
+        /// What the agent is told.
+        control: Control,
+        /// When whoever sent it sent it. An [`Event`] carries its own; a
+        /// [`Control`] has nowhere to put one, so it is here.
+        created: Timestamp,
+    },
+}
+
+impl<D: Domain> Delivery<D> {
+    /// A control delivery stamped with `created`.
+    #[must_use]
+    pub const fn control(control: Control, created: Timestamp) -> Self {
+        Self::Control { control, created }
+    }
+}
+
+impl<D: Domain> fmt::Debug for Delivery<D>
+where
+    D::Payload: fmt::Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Event(event) => f.debug_tuple("Event").field(event).finish(),
+            Self::Control { control, created } => f
+                .debug_struct("Control")
+                .field("control", control)
+                .field("created", created)
+                .finish(),
+        }
+    }
+}
+
+impl<D: Domain> Clone for Delivery<D> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Event(event) => Self::Event(event.clone()),
+            Self::Control { control, created } => Self::Control {
+                control: *control,
+                created: *created,
+            },
+        }
+    }
+}
+
+impl<D: Domain> PartialEq for Delivery<D>
+where
+    D::Payload: PartialEq,
+{
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Event(mine), Self::Event(theirs)) => mine == theirs,
+            (
+                Self::Control { control, created },
+                Self::Control {
+                    control: other_control,
+                    created: other_created,
+                },
+            ) => control == other_control && created == other_created,
+            _ => false,
+        }
+    }
+}
+
+impl<D: Domain> Eq for Delivery<D> where D::Payload: Eq {}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -252,6 +358,31 @@ mod tests {
     fn an_event_knows_when_it_was_created() {
         let event = Event::<TestDomain>::new("a", ["b"], at(40), TestPayload::Step(7));
         assert_eq!(Created::created(&event), at(40));
+    }
+
+    #[test]
+    fn a_delivery_is_one_kind_or_the_other_and_says_which() {
+        // The whole point of the enum: one queue carries both, and what
+        // came off it is still unambiguously an event or a control.
+        let event = Event::<TestDomain>::new("a", ["b"], at(40), TestPayload::Step(7));
+        let carried = Delivery::Event(event.clone());
+        let Delivery::Event(back) = &carried else {
+            panic!("an event delivery is an event: {carried:?}");
+        };
+        assert_eq!(back, &event);
+        assert_eq!(carried, Delivery::Event(event));
+
+        // A control has nowhere of its own to keep the instant it was sent,
+        // so the delivery keeps it.
+        let stop = Delivery::<TestDomain>::control(Control::Stop, at(10));
+        let Delivery::Control { control, created } = stop else {
+            panic!("a control delivery is a control: {stop:?}");
+        };
+        assert_eq!((control, created), (Control::Stop, at(10)));
+        assert_ne!(
+            Delivery::<TestDomain>::control(Control::Stop, at(10)),
+            Delivery::control(Control::Start, at(10))
+        );
     }
 
     #[test]

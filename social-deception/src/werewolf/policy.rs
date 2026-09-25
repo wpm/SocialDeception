@@ -50,16 +50,18 @@
 //! action in the space can be extracted from what the model said.
 //!
 //! A policy may also block: an agent owns a thread (ADR-0001), so a policy
-//! waiting on a model provider delays only its own agent. What it owes in
-//! return is the [`Cancel`] it is handed. ADR-0007 states the shape the
-//! first model-backed policy is written to: it makes its call on its own
-//! thread, **streams** the response, waits on the stream and
-//! [`Cancel::receiver`] together, and on cancellation closes the connection
-//! so that generation stops rather than running to completion unread. The
-//! same wait is where its per-call deadline and its [`RandomPolicy`]
-//! fallback live. A policy that blocks and ignores its cancel makes a
-//! `Stop` wait for it; that is a bug in the policy, not in the runtime,
-//! which preempts the cycle either way.
+//! waiting on a model provider delays only its own agent — and its own
+//! agent's stop, because nothing interrupts a running handler (ADR-0009).
+//! A policy that blocks for thirty seconds delays its episode's shutdown by
+//! thirty seconds, and nothing in the loop will shorten it.
+//!
+//! So a model-backed policy bounds its own call. It makes the call on its
+//! own thread, **streams** the response, and gives up on a deadline it
+//! sets, closing the connection so that generation stops rather than
+//! running to completion unread. That wait is where its per-call deadline
+//! and its [`RandomPolicy`] fallback live. The obligation is the policy's
+//! because the knowledge is: only it knows what its call costs and when
+//! waiting longer has stopped being worth it.
 //!
 //! # Determinism
 //!
@@ -80,7 +82,6 @@ use super::knowledge::Knowledge;
 use super::message::{Move, Request, RequestKind};
 use super::role::Role;
 use super::seed::{pick, seed_for};
-use crate::cancel::Cancel;
 use crate::event::AgentId;
 
 /// What a policy sees when it decides: the agent's state, the request in
@@ -107,13 +108,13 @@ pub trait Policy {
     /// Picks an action. The result must be in `view.action_space`.
     ///
     /// Infallible, and free to block; the [module documentation](self) says
-    /// why, and what a policy that blocks owes `cancel`. A policy that never
-    /// blocks may ignore it: nothing is asked of a decision that is already
-    /// made by the time anybody could preempt it.
+    /// why, and what a policy that blocks owes its own deadline. Nothing
+    /// here can be interrupted (ADR-0009), so a policy that blocks is the
+    /// only thing that can bound how long it blocks for.
     ///
     /// [`View`] is `Copy` and is passed by value, so a policy that hands it
     /// on does not have to thread a reference through.
-    fn choose(&mut self, view: View<'_>, cancel: &Cancel) -> Move;
+    fn choose(&mut self, view: View<'_>) -> Move;
 }
 
 /// The uniform random baseline: a policy that samples uniformly from its own
@@ -143,11 +144,11 @@ impl RandomPolicy {
 }
 
 impl Policy for RandomPolicy {
-    /// Ignores `cancel`: sampling from a list cannot block, so there is
-    /// never anything for a preemption to interrupt. That is also what keeps
-    /// a deterministic episode deterministic, since nothing about the draw
-    /// depends on when a control happened to arrive.
-    fn choose(&mut self, view: View<'_>, _: &Cancel) -> Move {
+    /// Sampling from a list cannot block, so this needs no deadline of its
+    /// own and the question the [module documentation](self) raises does
+    /// not arise. That is also what keeps a deterministic episode
+    /// deterministic: nothing about the draw depends on timing at all.
+    fn choose(&mut self, view: View<'_>) -> Move {
         (*pick(&mut self.rng, &candidates(&view))).clone()
     }
 }
@@ -205,14 +206,11 @@ mod tests {
         kind: RequestKind,
         space: &[Move],
     ) -> Move {
-        policy.choose(
-            View {
-                knowledge,
-                request: &request(kind),
-                action_space: space,
-            },
-            &Cancel::cancelled(),
-        )
+        policy.choose(View {
+            knowledge,
+            request: &request(kind),
+            action_space: space,
+        })
     }
 
     /// The first action a fresh policy under each of [`SEEDS`] takes for

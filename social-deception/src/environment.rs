@@ -1,8 +1,7 @@
 //! The environment: the one agent in an episode that controls it.
 //!
-//! An [`Environment`] is an agent like any other — one thread, two queues,
-//! a [`Cancel`] per cycle, and a trajectory of its own — with one power
-//! nobody else has. Where an ordinary [`Handler`] returns only
+//! An [`Environment`] is an agent like any other — one thread, one queue,
+//! and a trajectory of its own — with one power nobody else has. Where an ordinary [`Handler`] returns only
 //! [`Action`]s, an environment returns [`Effect`]s, and an `Effect` is
 //! either an action or a [`Control`] addressed to some of the agents. That
 //! is how an episode starts and how it ends: the episode starts the
@@ -43,11 +42,11 @@
 //! # The environment's cycle is an agent's cycle
 //!
 //! The environment runs in [`Agent`](crate::Agent)'s loop, wrapped in the
-//! adapter this module provides, so everything ADR-0007 says about a cycle
-//! is true of it: it pops controls before events, its `Effect::Act`
-//! actions are stamped and logged exactly as an agent's, and a `Stop` that
-//! arrives while it is deciding preempts the cycle and drops what it
-//! produced. The one thing the adapter adds is the seam the controls leave
+//! adapter this module provides, so everything said about a cycle is true
+//! of it: it takes the controls at the head of its queue before the one
+//! event behind them, it observes one thing per cycle, and its
+//! `Effect::Act` actions are stamped, logged and sent exactly as an
+//! agent's. The one thing the adapter adds is the seam the controls leave
 //! by, and it is built so they leave **after** the cycle's events: a
 //! player told to stop in the same cycle it is told something first
 //! observes the message and then stops, which is what lets the moderator
@@ -58,7 +57,6 @@ use std::collections::BTreeSet;
 use crossbeam_channel::Sender;
 
 use crate::agent::{Action, Handler, Observation};
-use crate::cancel::Cancel;
 use crate::clock::Clock;
 use crate::event::{AgentId, Control, Domain};
 use crate::trajectory::{LogRecord, RewardRecord};
@@ -203,8 +201,8 @@ pub trait Environment<D: Domain> {
     /// episode nobody may act in, which goes quiescent at once and is a
     /// [`Stalled`](crate::EpisodeError::Stalled) episode.
     ///
-    /// It takes no [`Cancel`], for the reason [`Handler::start`] does not:
-    /// opening effects are decided from nothing.
+    /// Opening effects are decided from nothing, for the reason
+    /// [`Handler::start`]'s are.
     fn start(&mut self) -> Vec<Effect<D>>;
 
     /// Folds one observation into the environment's state and says what to
@@ -214,8 +212,10 @@ pub trait Environment<D: Domain> {
     /// an environment's cycle is an agent's cycle. A cycle that popped no
     /// observation does not call this at all.
     ///
-    /// `cancel` is this cycle's, and means what it means for any handler.
-    fn handle(&mut self, observation: &Observation<D>, cancel: &Cancel) -> Vec<Effect<D>>;
+    /// Nothing interrupts it, for the reason nothing interrupts
+    /// [`Handler::handle`]: an agent does not know it is being stopped
+    /// (ADR-0009), and the environment is the one deciding when anybody is.
+    fn handle(&mut self, observation: &Observation<D>) -> Vec<Effect<D>>;
 
     /// What the environment does when its deadline passes and nothing has
     /// arrived.
@@ -224,7 +224,7 @@ pub trait Environment<D: Domain> {
     /// deadline is not observing anything. The default does nothing, which
     /// is what both of the environments in the tree want — neither is
     /// configured with a timeout at all.
-    fn timeout(&mut self, _cancel: &Cancel) -> Vec<Effect<D>> {
+    fn timeout(&mut self) -> Vec<Effect<D>> {
         Vec::new()
     }
 }
@@ -238,12 +238,12 @@ impl<D: Domain, E: Environment<D> + ?Sized> Environment<D> for Box<E> {
         (**self).start()
     }
 
-    fn handle(&mut self, observation: &Observation<D>, cancel: &Cancel) -> Vec<Effect<D>> {
-        (**self).handle(observation, cancel)
+    fn handle(&mut self, observation: &Observation<D>) -> Vec<Effect<D>> {
+        (**self).handle(observation)
     }
 
-    fn timeout(&mut self, cancel: &Cancel) -> Vec<Effect<D>> {
-        (**self).timeout(cancel)
+    fn timeout(&mut self) -> Vec<Effect<D>> {
+        (**self).timeout()
     }
 }
 
@@ -280,21 +280,6 @@ pub struct Rewarded {
 /// agent's; the controls go on `commands`, a channel the episode drains;
 /// and a reward is **written to the trajectory here**, the instant the
 /// handler returns it, if it names somebody this episode can reward.
-///
-/// # What preemption does to each of the three
-///
-/// The split happens inside the handler call, which is before the loop
-/// asks whether a `Stop` arrived while the handler was deciding. So the
-/// three effects of a preempted cycle do not share a fate: the actions are
-/// dropped, because the loop holds them and drops them, while the controls
-/// are already on `commands` and the rewards are already written.
-///
-/// Nothing preempts a live environment cycle today — the episode stops the
-/// environment only once every other agent has ended, and a `Stop` is held
-/// until nothing is in flight — so the asymmetry is not reachable. It is
-/// stated because it would not be obvious to whoever first makes it
-/// reachable, and because the honest fix then is to split the effects
-/// after the preemption question is asked rather than before.
 ///
 /// # Why a reward is written here and not by the episode
 ///
@@ -412,13 +397,13 @@ impl<D: Domain, E: Environment<D>> Handler<D> for Adapter<D, E> {
         self.split(effects)
     }
 
-    fn handle(&mut self, observation: &Observation<D>, cancel: &Cancel) -> Vec<Action<D>> {
-        let effects = self.environment.handle(observation, cancel);
+    fn handle(&mut self, observation: &Observation<D>) -> Vec<Action<D>> {
+        let effects = self.environment.handle(observation);
         self.split(effects)
     }
 
-    fn timeout(&mut self, cancel: &Cancel) -> Vec<Action<D>> {
-        let effects = self.environment.timeout(cancel);
+    fn timeout(&mut self) -> Vec<Action<D>> {
+        let effects = self.environment.timeout();
         self.split(effects)
     }
 }
@@ -465,7 +450,7 @@ mod tests {
             ]
         }
 
-        fn handle(&mut self, _: &Observation<TestDomain>, _: &Cancel) -> Vec<Effect<TestDomain>> {
+        fn handle(&mut self, _: &Observation<TestDomain>) -> Vec<Effect<TestDomain>> {
             vec![
                 Effect::reward("a", 1),
                 Effect::control(["a", "b"], Control::Stop),
@@ -515,11 +500,7 @@ mod tests {
                 control: Control::Start
             })
         );
-        assert!(
-            rig.adapter
-                .handle(&observation(), &Cancel::cancelled())
-                .is_empty()
-        );
+        assert!(rig.adapter.handle(&observation()).is_empty());
         assert_eq!(
             rig.commanded.try_recv(),
             Ok(Commanded {
@@ -538,7 +519,7 @@ mod tests {
         let mut rig = rig();
         rig.adapter.start();
         assert!(rig.records.try_recv().is_err(), "the start rewards nobody");
-        let actions = rig.adapter.handle(&observation(), &Cancel::cancelled());
+        let actions = rig.adapter.handle(&observation());
         assert!(actions.is_empty(), "a reward is not an action: {actions:?}");
         let LogRecord::Reward(record) = rig.records.try_recv().unwrap() else {
             panic!("a reward is written as a reward record");
@@ -565,7 +546,7 @@ mod tests {
             vec![Effect::reward("nobody", 1)]
         }
 
-        fn handle(&mut self, _: &Observation<TestDomain>, _: &Cancel) -> Vec<Effect<TestDomain>> {
+        fn handle(&mut self, _: &Observation<TestDomain>) -> Vec<Effect<TestDomain>> {
             Vec::new()
         }
     }
@@ -609,11 +590,7 @@ mod tests {
             rig.adapter.start(),
             [Action::to(["a"], TestPayload::Step(1))]
         );
-        assert!(
-            rig.adapter
-                .handle(&observation(), &Cancel::cancelled())
-                .is_empty()
-        );
+        assert!(rig.adapter.handle(&observation()).is_empty());
     }
 
     #[test]

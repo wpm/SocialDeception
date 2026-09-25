@@ -8,20 +8,17 @@
 //!
 //! The router validates at the boundary rather than trusting handlers. An
 //! unknown agent id, an empty recipient set, and a sender in its own
-//! recipient set are each rejected loudly. There is no loopback. What it no
-//! longer has to reject is a wake-up or a control arriving where an event
-//! belongs: an event and a control travel on different channels, so the
-//! router holds two senders per agent and the type says which is which.
+//! recipient set are each rejected loudly. There is no loopback.
 //!
-//! # A control preempts as it is sent
+//! # One sender per agent, carrying both kinds
 //!
-//! An agent's control sender is a [`ControlSender`], not a plain channel
-//! sender, so [`control`](Router::control) queues the control *and* trips
-//! the recipient's current cycle in one step. The router does not know or
-//! care that it is doing so; it is a property of the sending half it was
-//! handed, which is what keeps a control on a queue and a cycle unaware of
-//! it from being a state anything here can produce. See
-//! [`cancel`](crate::cancel).
+//! An agent has one queue (ADR-0009), so the router holds one sender per
+//! agent and wraps what it sends in a [`Delivery`], which says which kind
+//! it is. Nothing here reorders anything: a control the router sends takes
+//! its place behind whatever was sent to that agent before it, and the
+//! agent reaches it there. Getting a `Stop` to an agent with an empty queue
+//! is the [`Episode`](crate::Episode)'s business, and it does it by holding
+//! the stop until nothing is in flight.
 //!
 //! # Only the environment commands, and only the environment rewards
 //!
@@ -50,9 +47,8 @@ use std::fmt;
 
 use crossbeam_channel::Sender;
 
-use crate::cancel::ControlSender;
 use crate::clock::Clock;
-use crate::event::{AgentId, Control, Domain, Event};
+use crate::event::{AgentId, Control, Delivery, Domain, Event};
 
 /// Why an event could not be routed.
 ///
@@ -90,35 +86,30 @@ impl fmt::Display for RouteError {
 
 impl Error for RouteError {}
 
-/// The two sending halves of one agent's queues.
+/// The sending half of one agent's queue.
 ///
-/// They are held together because an agent is addressed as one thing, and
-/// kept apart because what goes on them is: an [`Event`] is in-domain data
-/// the handler will see, and a [`Control`] is an instruction to the loop
-/// that preempts the cycle it lands in.
+/// One sender, because an agent has one queue: what distinguishes an
+/// [`Event`] from a [`Control`] is the [`Delivery`] variant they travel in
+/// rather than which channel they were put on (ADR-0009). It is a struct of
+/// one field so that the router's map says what it holds, and so that a
+/// second thing an agent must be addressed by has somewhere to go.
 /// `Debug` and `Clone` are written out rather than derived, for the reason
 /// [`Event`]'s are: a derive would ask them of `D`.
 pub struct Queues<D: Domain> {
-    /// Where the agent's events go.
-    pub events: Sender<Event<D>>,
-    /// Where the agent's controls go, tripping its current cycle as they
-    /// land.
-    pub controls: ControlSender,
+    /// Where everything said to the agent goes.
+    pub queue: Sender<Delivery<D>>,
 }
 
 impl<D: Domain> fmt::Debug for Queues<D> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Queues")
-            .field("controls", &self.controls)
-            .finish_non_exhaustive()
+        f.debug_struct("Queues").finish_non_exhaustive()
     }
 }
 
 impl<D: Domain> Clone for Queues<D> {
     fn clone(&self) -> Self {
         Self {
-            events: self.events.clone(),
-            controls: self.controls.clone(),
+            queue: self.queue.clone(),
         }
     }
 }
@@ -158,7 +149,7 @@ impl<D: Domain> Router<D> {
     /// - [`RouteError::Loopback`] if the sender is among the recipients;
     /// - [`RouteError::UnknownAgent`] if the sender or a recipient is not in
     ///   the roster;
-    /// - [`RouteError::QueueClosed`] if a recipient's event queue has been
+    /// - [`RouteError::QueueClosed`] if a recipient's queue has been
     ///   dropped.
     ///   Recipients before it in the set have already received the event.
     ///
@@ -187,8 +178,8 @@ impl<D: Domain> Router<D> {
         let mut deliveries = 0;
         for (id, queues) in resolved {
             queues
-                .events
-                .send(event.clone())
+                .queue
+                .send(Delivery::Event(event.clone()))
                 .map_err(|_| RouteError::QueueClosed(id.clone()))?;
             deliveries += 1;
         }
@@ -198,22 +189,19 @@ impl<D: Domain> Router<D> {
     /// Delivers a control to each of `to`, stamped with the instant it was
     /// sent, and returns how many deliveries that was.
     ///
-    /// Each delivery trips the recipient's current cycle as it lands; see
-    /// the [module documentation](self).
-    ///
     /// This is the episode's own way of commanding, and it asks no
     /// questions about who is sending: the episode starts and stops the
     /// environment, and is not an agent. What an *agent* asks for goes
     /// through [`command`](Router::command).
     ///
-    /// # A `Stop` discards whatever the recipient has not popped
+    /// # A `Stop` behind events is reached behind them
     ///
-    /// An agent that pops a `Stop` leaves the events still on its queue
-    /// unpopped, because an agent that has stopped did not observe them,
-    /// and a cycle already in progress sends nothing and logs what it
-    /// produced as `dropped`. So a `Stop` sent while anything is in flight
-    /// silently swallows deliveries, and *which* ones depends on the
-    /// scheduler.
+    /// A control goes on the same queue as everything else, so an agent
+    /// with three events waiting handles those three and then the stop.
+    /// And an agent that pops a `Stop` leaves whatever is still behind it
+    /// unpopped, because an agent that has stopped did not observe it. So a
+    /// `Stop` sent while anything is in flight either waits for that work
+    /// or swallows it, and which depends on where in the queue it landed.
     ///
     /// A caller that wants an orderly stop must therefore establish that
     /// nothing is in flight first, as [`Episode`](crate::Episode) does by
@@ -221,20 +209,20 @@ impl<D: Domain> Router<D> {
     /// deliveries reads zero (ADR-0007). The episode's other `Stop`, the
     /// one it sends to abandon an episode that has already failed, does
     /// not and cannot wait for that: the trajectory it leaves is a record
-    /// of the failure, and may contain `dropped` records because of it.
+    /// of the failure, and the agent may answer events queued ahead of the
+    /// stop before it reaches it (ADR-0009).
     ///
     /// # Errors
     ///
     /// [`RouteError::UnknownAgent`] for a recipient not in the roster, and
-    /// [`RouteError::QueueClosed`] if a recipient's control queue has been
-    /// dropped. Recipients before it in the set have already received the
-    /// control, and have already been tripped.
+    /// [`RouteError::QueueClosed`] if a recipient's queue has been dropped.
+    /// Recipients before it in the set have already received the control.
     pub fn control(&self, to: &BTreeSet<AgentId>, control: Control) -> Result<usize, RouteError> {
         let mut deliveries = 0;
         for id in to {
             self.queues_of(id)?
-                .controls
-                .control(self.clock, control)
+                .queue
+                .send(Delivery::control(control, self.clock.now()))
                 .map_err(|_| RouteError::QueueClosed(id.clone()))?;
             deliveries += 1;
         }
@@ -284,7 +272,7 @@ impl<D: Domain> Router<D> {
         }
         // Every recipient is resolved before anything is sent, for the
         // reason `route` resolves first: a control addressed to a stranger
-        // preempts nobody rather than everybody named before it.
+        // reaches nobody rather than everybody named before it.
         for id in to {
             self.queues_of(id)?;
         }
@@ -338,20 +326,12 @@ mod tests {
     use crossbeam_channel::{Receiver, unbounded};
 
     use super::*;
-    use crate::cancel::{Arm, Cancel, Signal};
     use crate::clock::Timestamp;
     use crate::testing::{TestDomain, TestPayload, id};
 
-    /// The receiving ends of one agent's two queues, and the arm an agent
-    /// loop would hold. Nothing here runs a loop, so a cycle is armed only
-    /// where a test asks for one, but the arm is kept either way so that the
-    /// slot it shares lives as long as the sending half does, exactly as an
-    /// agent's would.
-    struct Ends {
-        events: Receiver<Event<TestDomain>>,
-        controls: Receiver<Signal>,
-        arm: Arm,
-    }
+    /// The receiving end of one agent's queue: what an agent's loop would
+    /// be waiting on.
+    type Ends = Receiver<Delivery<TestDomain>>;
 
     /// A world whose agents are `names` and whose environment is the first
     /// of them, which is the only one allowed to command.
@@ -359,28 +339,22 @@ mod tests {
         let mut queues = BTreeMap::new();
         let mut ends = BTreeMap::new();
         for name in names {
-            let (sender, events) = unbounded();
-            let (commander, controls, arm) = ControlSender::new();
-            queues.insert(
-                AgentId::new(*name),
-                Queues {
-                    events: sender,
-                    controls: commander,
-                },
-            );
-            ends.insert(
-                AgentId::new(*name),
-                Ends {
-                    events,
-                    controls,
-                    arm,
-                },
-            );
+            let (sender, receiver) = unbounded();
+            queues.insert(AgentId::new(*name), Queues { queue: sender });
+            ends.insert(AgentId::new(*name), receiver);
         }
         (
             Router::new(queues, AgentId::new(names[0]), Clock::start()),
             ends,
         )
+    }
+
+    /// The event of a delivery, or a panic saying what it was instead.
+    fn as_event(delivery: &Delivery<TestDomain>) -> &Event<TestDomain> {
+        match delivery {
+            Delivery::Event(event) => event,
+            other @ Delivery::Control { .. } => panic!("expected an event: {other:?}"),
+        }
     }
 
     /// Every agent of a world, which is what the episode's own controls go
@@ -406,14 +380,15 @@ mod tests {
         let sent = event("a", ["b", "c"], 7);
         assert_eq!(router.route(&sent), Ok(2));
         for name in ["b", "c"] {
-            assert_eq!(queues[&id(name)].events.try_recv().unwrap(), sent);
+            let delivered = queues[&id(name)].try_recv().unwrap();
+            assert_eq!(delivered, Delivery::Event(sent.clone()));
             assert!(
-                queues[&id(name)].controls.try_recv().is_err(),
-                "an event goes on the event queue and nowhere else"
+                queues[&id(name)].try_recv().is_err(),
+                "one copy each, and nothing else"
             );
         }
         assert!(
-            queues[&id("a")].events.try_recv().is_err(),
+            queues[&id("a")].try_recv().is_err(),
             "the sender gets no copy"
         );
     }
@@ -426,8 +401,8 @@ mod tests {
         let created = Timestamp::from(std::time::Duration::from_nanos(40));
         let sent = Event::new("a", ["b"], created, TestPayload::Step(1));
         router.route(&sent).unwrap();
-        let delivered = queues[&id("b")].events.try_recv().unwrap();
-        assert_eq!(delivered.created, created);
+        let delivered = queues[&id("b")].try_recv().unwrap();
+        assert_eq!(as_event(&delivered).created, created);
     }
 
     #[test]
@@ -435,7 +410,7 @@ mod tests {
         let (router, queues) = world(&["a", "b"]);
         let error = router.route(&event("a", ["b", "nobody"], 1)).unwrap_err();
         assert_eq!(error, RouteError::UnknownAgent(id("nobody")));
-        assert!(queues[&id("b")].events.try_recv().is_err());
+        assert!(queues[&id("b")].try_recv().is_err());
     }
 
     #[test]
@@ -457,7 +432,7 @@ mod tests {
         let (router, queues) = world(&["a", "b"]);
         let error = router.route(&event("a", ["a", "b"], 1)).unwrap_err();
         assert_eq!(error, RouteError::Loopback(id("a")));
-        assert!(queues[&id("b")].events.try_recv().is_err());
+        assert!(queues[&id("b")].try_recv().is_err());
     }
 
     #[test]
@@ -470,13 +445,13 @@ mod tests {
         );
         let after = router.clock.now();
         for ends in queues.values() {
-            let delivered = ends.controls.try_recv().expect("a control was delivered");
-            assert_eq!(delivered.control, Control::Start);
-            assert!(before <= delivered.created && delivered.created <= after);
-            assert!(
-                ends.events.try_recv().is_err(),
-                "a control goes on the control queue and nowhere else"
-            );
+            let delivered = ends.try_recv().expect("a control was delivered");
+            let Delivery::Control { control, created } = delivered else {
+                panic!("a control is delivered as a control: {delivered:?}");
+            };
+            assert_eq!(control, Control::Start);
+            assert!(before <= created && created <= after);
+            assert!(ends.try_recv().is_err(), "one control each, and no more");
         }
         assert_eq!(
             router.ids().collect::<Vec<_>>(),
@@ -522,8 +497,7 @@ mod tests {
         );
         for name in ["a", "b"] {
             assert!(
-                queues[&id(name)].controls.try_recv().is_err()
-                    && queues[&id(name)].events.try_recv().is_err(),
+                queues[&id(name)].try_recv().is_err(),
                 "checking a reward delivers nothing to {name}"
             );
         }
@@ -540,7 +514,7 @@ mod tests {
             Err(RouteError::NotTheEnvironment(id("a")))
         );
         assert!(
-            queues[&id("b")].controls.try_recv().is_err(),
+            queues[&id("b")].try_recv().is_err(),
             "a refused control reaches nobody"
         );
         assert_eq!(
@@ -548,9 +522,16 @@ mod tests {
             Ok(2)
         );
         for name in ["a", "b"] {
-            assert_eq!(
-                queues[&id(name)].controls.try_recv().unwrap().control,
-                Control::Stop
+            let delivered = queues[&id(name)].try_recv().unwrap();
+            assert!(
+                matches!(
+                    delivered,
+                    Delivery::Control {
+                        control: Control::Stop,
+                        ..
+                    }
+                ),
+                "a stop was delivered to {name}: {delivered:?}"
             );
         }
         assert_eq!(router.agents(), all(&["a", "b"]));
@@ -568,32 +549,37 @@ mod tests {
             Err(RouteError::UnknownAgent(id("nobody")))
         );
         assert!(
-            queues[&id("a")].controls.try_recv().is_err(),
+            queues[&id("a")].try_recv().is_err(),
             "a refused control reaches nobody, not even the recipients it named first"
         );
     }
 
     #[test]
-    fn a_control_trips_the_cycle_of_the_agent_it_goes_to_and_nobody_elses() {
-        // This is the coupling the router itself knows nothing about: it
-        // calls `send` on the sending half it was handed, and the preemption
-        // is that half's doing.
+    fn events_and_controls_share_one_queue_in_the_order_they_were_sent() {
+        // One queue per agent, so a control takes its place behind whatever
+        // was sent to that agent before it (ADR-0009). The router does no
+        // reordering: getting a stop to an agent with an empty queue is the
+        // episode's business, and it does it by holding the stop back until
+        // nothing is in flight.
         let (router, queues) = world(&["a", "b"]);
-        let cycles: BTreeMap<&AgentId, _> = queues
-            .iter()
-            .map(|(who, ends)| (who, ends.arm.arm()))
-            .collect();
-        assert!(cycles.values().all(|cancel| !cancel.is_cancelled()));
-        router.control(&all(&["a", "b"]), Control::Stop).unwrap();
-        assert!(cycles.values().all(Cancel::is_cancelled));
-
-        // Routing an event trips nobody: only a control preempts.
-        let fresh: BTreeMap<&AgentId, _> = queues
-            .iter()
-            .map(|(who, ends)| (who, ends.arm.arm()))
-            .collect();
         router.route(&event("a", ["b"], 1)).unwrap();
-        assert!(fresh.values().all(|cancel| !cancel.is_cancelled()));
+        router.control(&all(&["b"]), Control::Stop).unwrap();
+        router.route(&event("a", ["b"], 2)).unwrap();
+
+        let delivered: Vec<Delivery<TestDomain>> = queues[&id("b")].try_iter().collect();
+        assert_eq!(delivered.len(), 3);
+        assert_eq!(as_event(&delivered[0]).payload, TestPayload::Step(1));
+        assert!(
+            matches!(
+                delivered[1],
+                Delivery::Control {
+                    control: Control::Stop,
+                    ..
+                }
+            ),
+            "the stop is second, where it was sent: {delivered:?}"
+        );
+        assert_eq!(as_event(&delivered[2]).payload, TestPayload::Step(2));
     }
 
     #[test]

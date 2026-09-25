@@ -13,11 +13,11 @@
 //! |---|---|
 //! | [`Event`] | in-domain data on the wire: sender, recipients, creation time and a payload |
 //! | [`Control`] | out-of-domain data on the wire: start and stop |
+//! | [`Delivery`] | either of the two, which is what an agent's one queue carries |
 //! | [`Observation`] | an [`Event`] popped off an agent's queue |
 //! | [`Action`] | what a handler returns for the loop to send |
 //! | [`Domain`] | the types one game contributes: its payload and its reward |
 //! | cycle | one turn of an agent's loop: pop one observation, hand it to the handler, send |
-//! | [`Cancel`] | the handler's view of whether its cycle has been preempted |
 //! | [`Environment`] | the one agent per episode that starts and stops the others |
 //!
 //! [`Observation`] and [`Action`] are relative to an agent; on the wire
@@ -33,14 +33,13 @@
 //! - [`clock`]: the episode [`Clock`] everything is timestamped with, and
 //!   the [`Created`] and [`Timestamped`] traits that say what is known about
 //!   a thing's time;
-//! - [`event`]: the [`Domain`] a game names its types with, and the
-//!   [`Event`] and [`Control`] that travel on the wire;
+//! - [`event`]: the [`Domain`] a game names its types with, the [`Event`]
+//!   and [`Control`] that travel on the wire, and the [`Delivery`] that
+//!   carries either of them to an agent;
 //! - [`trajectory`]: the records an agent's loop produces and the [`Writer`]
 //!   that puts them on disk;
 //! - [`timer`]: the [`TimerSource`] an agent's deadlines come from;
-//! - [`cancel`]: the [`Cancel`] a handler is given each cycle and the
-//!   [`ControlSender`] that trips it;
-//! - [`agent`]: the [`Agent`] thread that pops its two queues, folds the
+//! - [`agent`]: the [`Agent`] thread that pops its queue, folds the
 //!   [`Observation`] it took through a [`Handler`], and records what it saw
 //!   and sent;
 //! - [`router`]: the [`Router`] from agent ids to their channels;
@@ -64,7 +63,6 @@
 //! line for that.
 
 pub mod agent;
-pub mod cancel;
 pub mod clock;
 pub mod environment;
 pub mod episode;
@@ -79,14 +77,13 @@ pub mod werewolf;
 pub use agent::{
     Action, Agent, CycleDispatch, Error, Handler, Instruction, Observation, Recipients, Wiring,
 };
-pub use cancel::{Arm, Cancel, ControlSender, Never, Signal};
 pub use clock::{Clock, Created, Timestamp, Timestamped};
 pub use environment::{Effect, Environment};
 pub use episode::{Episode, EpisodeError, Failure};
-pub use event::{AgentId, Control, Domain, Event, Payload};
+pub use event::{AgentId, Control, Delivery, Domain, Event, Payload};
 pub use router::{Queues, RouteError, Router};
 pub use timer::{ManualTimer, ManualTimerControl, TimerSource};
 pub use trajectory::{
-    ActionRecord, ControlRecord, CycleRecord, DroppedRecord, LogRecord, ObservationRecord,
-    RewardRecord, Seq, Woken, Writer,
+    ActionRecord, ControlRecord, CycleRecord, LogRecord, ObservationRecord, RewardRecord, Seq,
+    Woken, Writer,
 };

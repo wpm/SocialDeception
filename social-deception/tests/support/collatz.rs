@@ -34,7 +34,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Serialize;
 use social_deception::{
-    Action, AgentId, Cancel, Control, Domain, Effect, Environment, Handler, Observation,
+    Action, AgentId, Control, Domain, Effect, Environment, Handler, Observation,
 };
 
 /// The Collatz environment as a [`Domain`].
@@ -185,13 +185,7 @@ impl Handler<CollatzDomain> for Collatz {
             .collect()
     }
 
-    /// Ignores `cancel`: computing the next value of a chain cannot block,
-    /// so there is nothing a preemption could interrupt.
-    fn handle(
-        &mut self,
-        observation: &Observation<CollatzDomain>,
-        _: &Cancel,
-    ) -> Vec<Action<CollatzDomain>> {
+    fn handle(&mut self, observation: &Observation<CollatzDomain>) -> Vec<Action<CollatzDomain>> {
         self.reply(observation)
     }
 }
@@ -286,17 +280,12 @@ impl Environment<CollatzDomain> for CollatzEnvironment {
     /// Strikes each finished chain off, and stops the ring once none is
     /// left.
     ///
-    /// Ignores `cancel`: striking a chain off a map cannot block.
     ///
     /// # Panics
     ///
     /// If an agent sends the environment a step, which is a message that
     /// only ever travels around the ring.
-    fn handle(
-        &mut self,
-        observation: &Observation<CollatzDomain>,
-        _: &Cancel,
-    ) -> Vec<Effect<CollatzDomain>> {
+    fn handle(&mut self, observation: &Observation<CollatzDomain>) -> Vec<Effect<CollatzDomain>> {
         match observation.event.payload {
             CollatzPayload::Finished { chain } => self.finished(chain),
             CollatzPayload::Step { chain, value } => panic!(
@@ -346,7 +335,7 @@ mod tests {
         agent: &mut Collatz,
         observation: &Observation<CollatzDomain>,
     ) -> Vec<Action<CollatzDomain>> {
-        agent.handle(observation, &Cancel::cancelled())
+        agent.handle(observation)
     }
 
     fn to_b(chain: u64, value: u64) -> Action<CollatzDomain> {
@@ -426,7 +415,7 @@ mod tests {
         // calls `timeout`, not `handle`, and this agent has nothing to do on
         // a deadline.
         let mut agent = agent().opening(5);
-        assert!(agent.timeout(&Cancel::cancelled()).is_empty());
+        assert!(agent.timeout().is_empty());
     }
 
     #[test]
@@ -468,7 +457,7 @@ mod tests {
         environment: &mut CollatzEnvironment,
         observation: &Observation<CollatzDomain>,
     ) -> Vec<Effect<CollatzDomain>> {
-        environment.handle(observation, &Cancel::cancelled())
+        environment.handle(observation)
     }
 
     #[test]
