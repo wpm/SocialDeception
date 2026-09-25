@@ -596,41 +596,27 @@ enum Wake<D: Domain> {
     TimerGone,
 }
 
-/// Everything one cycle popped, in the order the loop records it: controls
-/// first, then events.
-struct Batch<D: Domain> {
+/// What one cycle took off its queues, in the order the loop records it:
+/// controls first, then events.
+///
+/// `deliveries` is not `controls.len() + events.len()`. Everything taken off
+/// a queue is a delivery the router made and the episode is waiting to hear
+/// about, including an event this cycle took and then forgot because a
+/// `Stop` came with it. Counting what survived rather than what was taken
+/// would leave the episode waiting forever for a delivery that had already
+/// happened, so the count is made where the taking is and carried from
+/// there.
+struct Popped<D: Domain> {
     controls: Vec<Signal>,
     events: Vec<Event<D>>,
-    /// Events the wake-up took off the queue and the cycle then forgot,
-    /// because the drain that followed found a `Stop`. They are no part of
-    /// the cycle and are not recorded, but they were routed, so they are
-    /// still deliveries and the episode is still waiting to hear that they
-    /// happened.
-    discarded: usize,
+    deliveries: usize,
 }
 
-impl<D: Domain> Batch<D> {
-    /// Nothing popped yet.
-    fn empty() -> Self {
-        Self {
-            controls: Vec::new(),
-            events: Vec::new(),
-            discarded: 0,
-        }
-    }
-
+impl<D: Domain> Popped<D> {
     /// Whether the cycle popped nothing at all, which is how a wake-up that
     /// was only a queue closing is told from one that brought work.
     fn is_empty(&self) -> bool {
         self.controls.is_empty() && self.events.is_empty()
-    }
-
-    /// How many deliveries the cycle took off its queues, which is the unit
-    /// the episode's in-flight count is kept in. A discarded event counts:
-    /// the router made that delivery, and an episode that never hears of it
-    /// waits for it forever.
-    fn deliveries(&self) -> usize {
-        self.controls.len() + self.events.len() + self.discarded
     }
 }
 
@@ -698,19 +684,11 @@ where
 {
     fn run(mut self) -> Result<H, Error> {
         loop {
-            let mut woke_with = Batch::empty();
-            let woken_by_deadline = match self.wait() {
-                Wake::Control(control) => {
-                    woke_with.controls.push(control);
-                    false
-                }
-                Wake::Event(event) => {
-                    woke_with.events.push(event);
-                    false
-                }
+            let woke_with = self.wait();
+            let woken_by_deadline = match woke_with {
                 Wake::Deadline => true,
-                Wake::Closed => false,
                 Wake::TimerGone => return Err(Error::TimerClosed),
+                Wake::Control(_) | Wake::Event(_) | Wake::Closed => false,
             };
             // The cancel is armed before the drain, so that a control
             // arriving from here on trips this cycle rather than one that is
@@ -718,8 +696,8 @@ where
             // the arming is found by the drain, which is the same cycle's
             // business either way.
             let cancel = self.wiring.arm.arm();
-            let batch = self.drain(woke_with);
-            if batch.is_empty() && !woken_by_deadline {
+            let popped = self.drain(woke_with);
+            if popped.is_empty() && !woken_by_deadline {
                 // A queue closed and brought nothing with it. There is no
                 // cycle to run; whether there is anything left to wait for
                 // is the next wait's question.
@@ -733,7 +711,7 @@ where
                 self.take_deadline();
             }
             let t_start = self.wiring.clock.now();
-            let stop = self.cycle(t_start, batch, timed_out, &cancel)?;
+            let stop = self.cycle(t_start, popped, timed_out, &cancel)?;
             if stop || self.closed.both() {
                 break;
             }
@@ -782,12 +760,19 @@ where
     /// observation and is not logged. Taking it only to hand it to a handler
     /// whose output will be dropped would put a decision in the trajectory
     /// that went nowhere and was made after the episode had ended.
-    fn drain(&mut self, mut batch: Batch<D>) -> Batch<D> {
+    fn drain(&mut self, woke_with: Wake<D>) -> Popped<D> {
+        let (mut controls, mut events) = match woke_with {
+            Wake::Control(control) => (vec![control], Vec::new()),
+            Wake::Event(event) => (Vec::new(), vec![event]),
+            // A deadline or a closed queue brings nothing with it; what the
+            // drain finds is the whole of the cycle.
+            Wake::Deadline | Wake::Closed => (Vec::new(), Vec::new()),
+            Wake::TimerGone => unreachable!("the caller returns on a gone timer"),
+        };
         if !self.closed.controls {
-            self.closed.controls = drain_queue(&self.wiring.controls, &mut batch.controls);
+            self.closed.controls = drain_queue(&self.wiring.controls, &mut controls);
         }
-        if batch
-            .controls
+        if controls
             .iter()
             .any(|signal| signal.control == Control::Stop)
         {
@@ -797,15 +782,25 @@ where
             // back the only way it can: it is forgotten. That is the same
             // fact as the ones still queued — an event the agent never
             // observed — and the trajectory says the same thing about both,
-            // which is nothing.
-            batch.discarded = batch.events.len();
-            batch.events.clear();
-            return batch;
+            // which is nothing. It was still delivered, though, so it is
+            // still counted.
+            let deliveries = controls.len() + events.len();
+            events.clear();
+            return Popped {
+                controls,
+                events,
+                deliveries,
+            };
         }
         if !self.closed.events {
-            self.closed.events = drain_queue(&self.wiring.events, &mut batch.events);
+            self.closed.events = drain_queue(&self.wiring.events, &mut events);
         }
-        batch
+        let deliveries = controls.len() + events.len();
+        Popped {
+            controls,
+            events,
+            deliveries,
+        }
     }
 
     /// Whether the pending deadline has fired without being the reason for
@@ -842,16 +837,15 @@ where
     fn cycle(
         &mut self,
         t_start: Timestamp,
-        batch: Batch<D>,
+        popped: Popped<D>,
         timed_out: bool,
         cancel: &Cancel,
     ) -> Result<bool, Error> {
-        let mut deliveries = batch.deliveries();
-        let Batch {
+        let Popped {
             controls,
             events,
-            discarded: _,
-        } = batch;
+            mut deliveries,
+        } = popped;
         let (mut inputs, mut started, mut stopped) = (Vec::new(), false, false);
         // Controls first, and in one pass, so that a `Stop` already waiting
         // is acted on ahead of every event behind it rather than after them.
