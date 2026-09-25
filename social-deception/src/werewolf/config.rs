@@ -132,8 +132,6 @@ pub enum ConfigError {
         /// `players.len()`.
         players: usize,
     },
-    /// `roles.seers` is more than one.
-    TooManySeers(usize),
     /// `roles.doctors` is more than one.
     TooManyDoctors(usize),
     /// A player id appears more than once.
@@ -163,7 +161,6 @@ impl fmt::Display for ConfigError {
             Self::TooManyRoles { roles, players } => {
                 write!(f, "{roles} special roles but only {players} players")
             }
-            Self::TooManySeers(seers) => write!(f, "roles.seers must be 0 or 1, not {seers}"),
             Self::TooManyDoctors(doctors) => {
                 write!(f, "roles.doctors must be 0 or 1, not {doctors}")
             }
@@ -266,7 +263,7 @@ impl Config {
     pub fn validate(&self) -> Result<(), ConfigError> {
         let RoleCounts {
             werewolves,
-            seers,
+            seers: _,
             doctors,
         } = self.roles;
         let players = self.players.len();
@@ -288,9 +285,6 @@ impl Config {
                 roles: special,
                 players,
             });
-        }
-        if seers > 1 {
-            return Err(ConfigError::TooManySeers(seers));
         }
         if doctors > 1 {
             return Err(ConfigError::TooManyDoctors(doctors));
@@ -520,12 +514,13 @@ mod tests {
     }
 
     #[test]
-    fn too_many_seers() {
+    fn a_game_may_deal_more_than_one_seer() {
+        // Each seer is asked to investigate and told what it found, and the
+        // transcript keeps a finding per seer. Nothing in the rules wants
+        // there to be only one, so nothing here says there is.
         let mut config = valid();
         config.roles.seers = 2;
-        let error = config.validate().unwrap_err();
-        assert!(matches!(error, ConfigError::TooManySeers(2)), "{error:?}");
-        assert!(error.to_string().contains("seers"));
+        config.validate().unwrap();
     }
 
     #[test]

@@ -869,7 +869,12 @@ where
         if let Some(observation) = &observation {
             inputs.push(self.record_observation(observation)?);
         }
-        if timed_out {
+        // The next deadline is measured from this cycle, whether the agent
+        // has just started or the last deadline is what woke it. Once, even
+        // when both are true: asking the timer twice for the same instant
+        // leaves the loop with one deadline either way, but the second ask
+        // is on the record of any timer that keeps one.
+        if started || timed_out {
             self.schedule_timeout(t_start);
         }
 
@@ -877,7 +882,6 @@ where
         // opening actions go out ahead of whatever the cycle's observation
         // also produced, since the start was popped before it.
         let mut actions = if started {
-            self.schedule_timeout(t_start);
             self.handler.start()
         } else {
             Vec::new()

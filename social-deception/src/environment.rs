@@ -47,10 +47,13 @@
 //! event behind them, it observes one thing per cycle, and its
 //! `Effect::Act` actions are stamped, logged and sent exactly as an
 //! agent's. The one thing the adapter adds is the seam the controls leave
-//! by, and it is built so they leave **after** the cycle's events: a
-//! player told to stop in the same cycle it is told something first
-//! observes the message and then stops, which is what lets the moderator
-//! narrate an outcome and stop everybody in one breath.
+//! by, and the two controls leave it differently. A `Start` goes out as
+//! soon as the episode sees it, ahead of the events of the cycle that
+//! asked for it, so that an agent is started before anything is addressed
+//! to it. A `Stop` is held until nothing is in flight, so a player told to
+//! stop in the same cycle it is told something first observes the message
+//! and then stops — which is what lets the moderator narrate an outcome
+//! and stop everybody in one breath.
 
 use std::collections::BTreeSet;
 

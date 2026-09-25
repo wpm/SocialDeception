@@ -110,9 +110,11 @@ pub struct PhaseRecord {
     /// with the kind of request it answered. The move alone does not say
     /// whether a target was devoured, protected, investigated or nominated.
     pub moves: BTreeMap<AgentId, (RequestKind, Move)>,
-    /// The seer's finding: the seer, whom it investigated, and what it
-    /// learned. `None` when there is no living seer or it abstained.
-    pub investigation: Option<(AgentId, AgentId, Faction)>,
+    /// What each seer learned: whom it investigated and the faction that
+    /// came back, by seer. Empty on a phase where no seer investigated,
+    /// and holding one entry per seer that did, since a game may deal
+    /// more than one.
+    pub investigations: BTreeMap<AgentId, (AgentId, Faction)>,
     /// Who was eliminated, the role their death revealed, and how. `None`
     /// on a night when nobody died.
     pub eliminated: Option<(AgentId, Role, Cause)>,
@@ -124,7 +126,7 @@ impl PhaseRecord {
         Self {
             living,
             moves: BTreeMap::new(),
-            investigation: None,
+            investigations: BTreeMap::new(),
             eliminated: None,
         }
     }
@@ -565,7 +567,9 @@ impl Reader {
             },
             Narration::Investigated { target, faction } => {
                 let seer = only(line, recipients, "a finding is addressed to one seer")?;
-                self.current(line)?.investigation = Some((seer, target, faction));
+                self.current(line)?
+                    .investigations
+                    .insert(seer, (target, faction));
             }
             Narration::Eliminated {
                 who, role, cause, ..
@@ -727,9 +731,9 @@ fn phase(
         };
         let whom = chosen.target().map_or("no one", AgentId::as_str);
         write!(f, "  {:<width$} {verb} {whom}", who.as_str())?;
-        match &record.investigation {
-            Some((seer, _, faction)) if seer == who => writeln!(f, "  ->  {faction}")?,
-            _ => writeln!(f)?,
+        match record.investigations.get(who) {
+            Some((_, faction)) => writeln!(f, "  ->  {faction}")?,
+            None => writeln!(f)?,
         }
     }
     match &record.eliminated {
@@ -819,7 +823,10 @@ mod tests {
         PhaseRecord {
             living: ids(living),
             moves,
-            investigation: investigation.map(|(seer, whom, faction)| (id(seer), id(whom), faction)),
+            investigations: investigation
+                .map(|(seer, whom, faction)| (id(seer), (id(whom), faction)))
+                .into_iter()
+                .collect(),
             eliminated: eliminated.map(|(who, role, cause)| (id(who), role, cause)),
         }
     }
@@ -1639,10 +1646,10 @@ mod tests {
         let transcript = read(&lines).unwrap();
         assert_eq!(transcript.rounds.len(), 2);
         for round in &transcript.rounds {
-            assert_eq!(round.night.investigation, None, "{:?}", round.round);
+            assert!(round.night.investigations.is_empty(), "{:?}", round.round);
             assert_eq!(round.night.moves.len(), 1);
             if let Some(day) = &round.day {
-                assert_eq!(day.investigation, None);
+                assert!(day.investigations.is_empty());
             }
         }
         assert!(!transcript.to_string().contains("investigates"));

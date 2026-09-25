@@ -122,6 +122,16 @@ pub enum EpisodeError {
         /// The agents still running when everything went quiet, in order.
         running: BTreeSet<AgentId>,
     },
+    /// An agent's thread ended, or its channel to the episode closed, while
+    /// the episode was still running it.
+    ///
+    /// The episode was abandoned where it stood: the environment never
+    /// reached the shutdown it was going to ask for, so no agent was
+    /// stopped in the ordinary way and the trajectory ends mid-run. Whether
+    /// the thread that went away left a [`Failure`] behind is a separate
+    /// question — [`Agents`](Self::Agents) reports that when it did, and
+    /// this reports the departure when it did not.
+    Departed,
     /// Some agents' threads did not end cleanly, and why.
     Agents(Vec<(AgentId, Failure)>),
 }
@@ -144,6 +154,7 @@ impl fmt::Display for EpisodeError {
                 }
                 Ok(())
             }
+            Self::Departed => f.write_str("an agent left while the episode was still running it"),
             Self::Agents(failures) => {
                 f.write_str("agents failed:")?;
                 for (id, failure) in failures {
@@ -159,7 +170,9 @@ impl Error for EpisodeError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Control(error) | Self::Route { error, .. } => Some(error),
-            Self::DuplicateAgent(_) | Self::Stalled { .. } | Self::Agents(_) => None,
+            Self::DuplicateAgent(_) | Self::Stalled { .. } | Self::Departed | Self::Agents(_) => {
+                None
+            }
         }
     }
 }
@@ -355,7 +368,12 @@ impl<D: Domain> Episode<D> {
             (Err(Departure), _) | (Ok(()), Ok(_)) if !failures.is_empty() => {
                 Err(EpisodeError::Agents(failures))
             }
-            (Err(Departure), _) | (Ok(()), Ok(_)) => Ok(()),
+            // A departure with nothing to report is still a departure: the
+            // episode was abandoned where it stood rather than finished,
+            // and a caller told `Ok(())` would take a run that never
+            // reached its shutdown for a clean one.
+            (Err(Departure), _) => Err(EpisodeError::Departed),
+            (Ok(()), Ok(_)) => Ok(()),
             (Err(Halt::Error(error)), _) | (Ok(()), Err(error)) => Err(error),
         }
     }
