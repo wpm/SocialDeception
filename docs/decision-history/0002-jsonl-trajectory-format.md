@@ -4,7 +4,8 @@
 **Date:** 2026-09-18
 **Deciders:** Bill McNeill
 **Amended by:** [ADR-0003](0003-event-record-stamps.md), which replaces the event record's `time` field, and by [ADR-0007](0007-reinforcement-learning-vocabulary.md),
-which replaces the event record with observation, action, dropped, control and reward records
+which replaces the event record with observation, action, dropped, control and reward records,
+and by [ADR-0008](0008-one-observation-per-cycle.md), under which a cycle record names at most one observation
 
 ## Context
 

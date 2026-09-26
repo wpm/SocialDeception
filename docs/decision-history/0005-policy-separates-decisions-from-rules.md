@@ -6,7 +6,11 @@
 **Refined by:** [ADR-0006](0006-knowledge-holds-what-the-agent-did-in-secret.md),
 which adds the agent's own secret actions to what `Knowledge` folds
 **Amended by:** [ADR-0007](0007-reinforcement-learning-vocabulary.md), which renames the action type `Move`: an
-`Action` is now the message an agent sends, here a `Response` carrying a `Move`
+`Action` is now the message an agent sends, here a `Response` carrying a `Move`;
+by [ADR-0011](0011-werewolf-phases-are-timed-pointing-sessions.md), under which a move is a point,
+`Abstain` is gone, and determinism covers each phase's outcome rather than the full transcript;
+and by [ADR-0013](0013-speech-typing-and-a-scheduler-for-when-to-speak.md), under which a policy also
+decides what to say, and a separate scheduler decides when
 
 ## Context
 
