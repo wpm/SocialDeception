@@ -1,0 +1,323 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Timed Rounds</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+:root{
+  --bg:#F3F5F2; --surface:#FFFFFF; --sunk:#E8ECE7; --ink:#1B2320; --muted:#5B6862; --rule:#D3DAD4;
+  --amber:#B8741A; --amber-soft:#F3E3C8; --night:#35536E; --night-soft:#DCE5EE; --wolf:#A3322A; --wolf-soft:#F2DCD9;
+  --dead:#A9B2AD;
+  --display:"Bricolage Grotesque", "Avenir Next", "Segoe UI", sans-serif;
+  --body:"IBM Plex Sans", "Helvetica Neue", Arial, sans-serif;
+  --mono:"IBM Plex Mono", ui-monospace, Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    color-scheme:dark;
+    --bg:#111614; --surface:#1A201E; --sunk:#232A27; --ink:#E4E9E5; --muted:#9AA7A1; --rule:#303935;
+    --amber:#E3A24C; --amber-soft:#3A2E1C; --night:#86A8C7; --night-soft:#1F2D3A; --wolf:#E26B61; --wolf-soft:#3B2220;
+    --dead:#4E5753;
+  }
+}
+:root[data-theme="dark"]{
+  color-scheme:dark;
+  --bg:#111614; --surface:#1A201E; --sunk:#232A27; --ink:#E4E9E5; --muted:#9AA7A1; --rule:#303935;
+  --amber:#E3A24C; --amber-soft:#3A2E1C; --night:#86A8C7; --night-soft:#1F2D3A; --wolf:#E26B61; --wolf-soft:#3B2220;
+  --dead:#4E5753;
+}
+*{box-sizing:border-box}
+html{color-scheme:light}
+a{color:var(--night)}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--body);font-size:16px;line-height:1.6;padding-inline:16px;padding-block:0 64px}
+.wrap{max-width:860px;margin:0 auto;display:flex;flex-direction:column;gap:56px}
+header{padding-top:48px;display:flex;flex-direction:column;gap:14px}
+.eyebrow{font-family:var(--mono);font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
+h1{font-family:var(--display);font-weight:700;font-size:clamp(34px,6vw,52px);line-height:1.05;margin:0;text-wrap:balance;letter-spacing:-.01em}
+h2{font-family:var(--display);font-weight:700;font-size:26px;line-height:1.2;margin:0;text-wrap:balance}
+h3{font-family:var(--display);font-weight:500;font-size:19px;margin:0}
+p{margin:0;max-width:68ch}
+section{display:flex;flex-direction:column;gap:18px}
+.lede{font-size:18px;color:var(--ink);max-width:62ch}
+code,.mono{font-family:var(--mono);font-size:.88em}
+p code, li code, td code{background:var(--sunk);padding:1px 5px;border-radius:4px}
+ul{margin:0;padding-left:1.2em;display:flex;flex-direction:column;gap:6px;max-width:68ch}
+.muted{color:var(--muted)}
+.scroll{overflow-x:auto}
+table{border-collapse:collapse;width:100%;font-size:15px}
+th,td{text-align:left;vertical-align:top;padding:10px 12px;border-bottom:1px solid var(--rule)}
+th{font-family:var(--mono);font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);font-weight:500}
+td:first-child{font-weight:600;white-space:nowrap}
+.pill{display:inline-block;font-family:var(--mono);font-size:11.5px;padding:1px 8px;border-radius:99px;white-space:nowrap}
+.p-night{background:var(--night-soft);color:var(--night)}
+.p-day{background:var(--amber-soft);color:var(--amber)}
+.p-wolf{background:var(--wolf-soft);color:var(--wolf)}
+
+/* Table widget */
+.stage{background:var(--surface);border:1px solid var(--rule);border-radius:10px;display:flex;flex-direction:column}
+.stage-bar{display:flex;flex-wrap:wrap;align-items:center;gap:10px;padding:12px 14px;border-bottom:1px solid var(--rule)}
+.tabs{display:flex;gap:6px}
+.tab{font-family:var(--body);font-size:14px;font-weight:500;padding:6px 14px;border-radius:6px;border:1px solid var(--rule);background:transparent;color:var(--muted);cursor:pointer}
+.tab[aria-selected="true"]{background:var(--ink);color:var(--bg);border-color:var(--ink)}
+.play{margin-left:auto;font-family:var(--body);font-size:14px;font-weight:600;padding:6px 16px;border-radius:6px;border:0;background:var(--amber);color:#fff;cursor:pointer}
+:root[data-theme="dark"] .play{color:#1A1206}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]) .play{color:#1A1206}}
+button:focus-visible{outline:2px solid var(--night);outline-offset:2px}
+.stage-body{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.05fr);gap:0}
+@media (max-width:720px){.stage-body{grid-template-columns:1fr}}
+.table-view{padding:12px;display:flex;flex-direction:column;gap:10px;border-right:1px solid var(--rule)}
+@media (max-width:720px){.table-view{border-right:0;border-bottom:1px solid var(--rule)}}
+svg.tbl{width:100%;height:auto;max-width:100%;display:block}
+.gauges{display:flex;flex-direction:column;gap:8px;font-size:13px}
+.gauge{display:grid;grid-template-columns:100px 1fr 76px;align-items:center;gap:10px}
+.gauge .lbl{color:var(--muted)}
+.gauge .val{font-family:var(--mono);font-size:12px;text-align:right;color:var(--muted);font-variant-numeric:tabular-nums}
+.track{height:8px;border-radius:4px;background:var(--sunk);overflow:hidden}
+.fill{height:100%;width:0;border-radius:4px;background:var(--night)}
+.fill.limit{background:var(--muted);opacity:.55}
+.tally{display:flex;flex-wrap:wrap;gap:8px;min-height:24px}
+.chip{font-family:var(--mono);font-size:12px;padding:2px 8px;border-radius:5px;background:var(--sunk);font-variant-numeric:tabular-nums}
+.chip.hit{background:var(--amber);color:#fff}
+.log{padding:12px 14px;font-family:var(--mono);font-size:12.5px;line-height:1.5;max-height:420px;overflow-y:auto;display:flex;flex-direction:column;gap:6px}
+.log .row{display:grid;grid-template-columns:38px 1fr;gap:8px}
+.log .t{color:var(--muted);font-variant-numeric:tabular-nums}
+.log .who{font-weight:500}
+.log .to{color:var(--muted)}
+.log .msg{display:block;overflow-wrap:anywhere}
+.log .note{font-family:var(--body);font-style:italic;color:var(--muted);font-size:13px}
+.legend{display:flex;flex-wrap:wrap;gap:14px;font-size:12.5px;color:var(--muted);padding:10px 14px;border-top:1px solid var(--rule)}
+.legend span{display:inline-flex;align-items:center;gap:6px}
+.sw{width:18px;height:3px;border-radius:2px;display:inline-block}
+
+/* Milestones */
+.ms{display:flex;flex-direction:column;gap:0;border-top:1px solid var(--rule)}
+.m{display:grid;grid-template-columns:64px 1fr;gap:18px;padding:22px 0;border-bottom:1px solid var(--rule)}
+@media (max-width:560px){.m{grid-template-columns:1fr;gap:8px}}
+.m-id{font-family:var(--display);font-weight:700;font-size:30px;color:var(--amber);line-height:1}
+.m-body{display:flex;flex-direction:column;gap:10px;min-width:0}
+.run{background:var(--sunk);border-radius:8px;padding:10px 12px;font-family:var(--mono);font-size:12.5px;overflow-x:auto;white-space:pre;line-height:1.5}
+.run .c{color:var(--muted)}
+.kv{font-size:14px;color:var(--muted)}
+.kv b{color:var(--ink);font-weight:600}
+pre.mermaid{background:var(--surface);border:1px solid var(--rule);border-radius:10px;padding:16px;overflow-x:auto;margin:0;text-align:center}
+.two{display:grid;grid-template-columns:1fr 1fr;gap:28px}
+@media (max-width:640px){.two{grid-template-columns:1fr}}
+.two > div{display:flex;flex-direction:column;gap:10px}
+.callout{border-left:3px solid var(--night);padding:4px 0 4px 16px;display:flex;flex-direction:column;gap:8px}
+@media (prefers-reduced-motion: reduce){*{transition:none!important;animation:none!important}}
+</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+  <div class="eyebrow">Social Deception · ADR-0011 · ADR-0013</div>
+  <h1>Timed rounds</h1>
+  <p class="lede">One night and one day of Werewolf under timed pointing sessions. At night the pack, the seer and the doctor point in separate sessions that close on their own clocks. By day everyone talks and points in public until a majority casts the hammer. See <a href="../decision-history/0011-werewolf-phases-are-timed-pointing-sessions.md">ADR-0011</a> for the rules and <a href="../decision-history/0013-speech-typing-and-a-scheduler-for-when-to-speak.md">ADR-0013</a> for speech and typing.</p>
+</header>
+<section id="table">
+  
+  
+  <div class="stage">
+    <div class="stage-bar">
+      <div class="tabs" role="tablist">
+        <button class="tab" role="tab" id="tab-night" aria-selected="true">Night 1</button>
+        <button class="tab" role="tab" id="tab-day" aria-selected="false">Day 1</button>
+      </div>
+      <button class="play" id="play">Play night</button>
+    </div>
+    <div class="stage-body">
+      <div class="table-view">
+        <svg class="tbl" id="svg" viewBox="0 0 440 380" role="img" aria-label="Seven players seated in a circle, with arrows showing who points at whom">
+          <defs>
+            <marker id="ah-wolf" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--wolf)"/></marker>
+            <marker id="ah-day" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--amber)"/></marker>
+            <marker id="ah-priv" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--night)"/></marker>
+          </defs>
+          <g id="arrows"></g>
+          <g id="players"></g>
+        </svg>
+        <div class="gauges" id="gauges"></div>
+      </div>
+      <div class="log" id="log" aria-live="polite"></div>
+    </div>
+    <div class="legend">
+      <span><i class="sw" style="background:var(--wolf)"></i>Wolf point, pack and moderator</span>
+      <span><i class="sw" style="background:var(--night)"></i>Private point, moderator only</span>
+      <span><i class="sw" style="background:var(--amber)"></i>Public point</span>
+      <span class="mono">…</span><span style="margin-left:-8px">typing</span>
+    </div>
+  </div>
+  <p class="muted" style="font-size:14px">Timings are illustrative; a second on screen stands for several in a game. Roles are shown to you, not to the players.</p>
+</section>
+</div>
+<script>
+(function(){
+  const NAMES=["alice","bob","carol","dave","erin","frank","grace"];
+  const ROLE={bob:"W",frank:"W",carol:"S",erin:"D"};
+  const CX=220, CY=186, R=138, PR=24;
+  const pos={};
+  NAMES.forEach((n,i)=>{const a=-Math.PI/2+i*2*Math.PI/NAMES.length;pos[n]={x:CX+R*Math.cos(a),y:CY+R*Math.sin(a)};});
+  const SVGNS="http://www.w3.org/2000/svg";
+  const $=id=>document.getElementById(id);
+  const reduce=window.matchMedia&&window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  const Q=2.0; // quiet period, scene seconds
+  const SESS=[["pack","Pack",8],["seer","Seer",5],["doctor","Doctor",5]];
+  const scenes={
+    night:{label:"night",limit:8,end:5.6,dead:[],events:[
+      {t:0,from:"moderator",to:"living",msg:"PhaseBegan(Night 1)"},
+      {t:0.8,from:"bob",to:"pack, moderator",msg:"Point(dave)",fx:s=>s.points.bob={to:"dave",k:"wolf"}},
+      {t:1.0,from:"erin",to:"moderator",msg:"Point(alice)  protect",fx:s=>{s.points.erin={to:"alice",k:"priv"};s.sess.doctor.quiet=1.0;}},
+      {t:1.2,from:"carol",to:"moderator",msg:"Point(frank)  investigate",fx:s=>{s.points.carol={to:"frank",k:"priv"};s.sess.seer.quiet=1.2;}},
+      {t:1.6,from:"frank",to:"pack, moderator",msg:"Point(grace)",fx:s=>{s.points.frank={to:"grace",k:"wolf"};s.sess.pack.quiet=1.6;}},
+      {t:1.6,note:"Both wolves have pointed. The pack's quiet period starts."},
+      {t:2.8,from:"bob",to:"pack, moderator",msg:"Point(grace)",fx:s=>{s.points.bob={to:"grace",k:"wolf"};s.sess.pack.quiet=2.8;}},
+      {t:2.8,note:"bob changed his point, so the pack's quiet period restarts. The pack now agrees."},
+      {t:3.0,note:"The doctor's session closes on its own clock: erin protects alice.",fx:s=>s.sess.doctor.closed=true},
+      {t:3.2,from:"moderator",to:"carol",msg:"Investigated(frank: werewolf)",fx:s=>s.sess.seer.closed=true},
+      {t:3.2,note:"The seer's session closes, and carol learns her finding."},
+      {t:4.8,note:"The pack's session closes. Every session is closed, so the night resolves.",fx:s=>s.sess.pack.closed=true},
+      {t:4.8,from:"moderator",to:"living",msg:"Eliminated(grace, villager, devoured)",fx:s=>{s.dead.add("grace");s.quiet=null;s.done=true;}}
+    ]},
+    day:{label:"day",limit:12,end:6.6,dead:["grace"],events:[
+      {t:0,from:"moderator",to:"living",msg:"PhaseBegan(Day 1)"},
+      {t:0.4,from:"carol",to:"living",msg:"TypingStarted(t1)",fx:s=>s.typing.add("carol")},
+      {t:1.0,from:"frank",to:"living",msg:"TypingStarted(t1)",fx:s=>s.typing.add("frank")},
+      {t:1.8,from:"carol",to:"living",msg:"Say(t1, \"I checked frank last night. He's a werewolf.\")",fx:s=>s.flash={who:"carol",t:1.8}},
+      {t:1.8,from:"carol",to:"living",msg:"TypingEnded(t1)",fx:s=>s.typing.delete("carol")},
+      {t:2.2,from:"frank",to:"living",msg:"TypingEnded(t1)",fx:s=>s.typing.delete("frank")},
+      {t:2.2,note:"frank stopped typing without saying anything."},
+      {t:2.4,from:"bob",to:"living",msg:"TypingStarted(t1)",fx:s=>s.typing.add("bob")},
+      {t:3.4,from:"bob",to:"living",msg:"Say(t1, \"Carol is lying. A real seer wouldn't show her hand on day one.\")",fx:s=>{s.flash={who:"bob",t:3.4};s.typing.delete("bob");}},
+      {t:3.4,from:"bob",to:"living",msg:"TypingEnded(t1)"},
+      {t:3.8,from:"alice",to:"living, moderator",msg:"Point(frank)",fx:s=>s.points.alice={to:"frank",k:"day"}},
+      {t:4.2,from:"dave",to:"living, moderator",msg:"Point(frank)",fx:s=>s.points.dave={to:"frank",k:"day"}},
+      {t:4.6,from:"bob",to:"living, moderator",msg:"Point(carol)",fx:s=>s.points.bob={to:"carol",k:"day"}},
+      {t:5.0,from:"erin",to:"living, moderator",msg:"Point(frank)",fx:s=>s.points.erin={to:"frank",k:"day"}},
+      {t:5.4,from:"frank",to:"living, moderator",msg:"Point(carol)",fx:s=>s.points.frank={to:"carol",k:"day"}},
+      {t:5.8,from:"carol",to:"living, moderator",msg:"Point(frank)",fx:s=>s.points.carol={to:"frank",k:"day"}},
+      {t:5.8,note:"Four of six living players point at frank. That's a majority, and carol's point is the hammer."},
+      {t:6.0,from:"moderator",to:"living",msg:"Eliminated(frank, werewolf, lynched)",fx:s=>{s.dead.add("frank");s.done=true;}}
+    ]}
+  };
+
+  let cur="night", state=null, clock=0, raf=null, applied=0, startWall=0;
+
+  function fresh(sc){return {points:{},dead:new Set(sc.dead),typing:new Set(),quiet:null,done:false,flash:null,sess:{pack:{quiet:null,closed:false},seer:{quiet:null,closed:false},doctor:{quiet:null,closed:false}}};}
+  function fmt(t){const s=t*4;return (Math.floor(s/60))+":"+String(Math.floor(s%60)).padStart(2,"0");}
+
+  function drawPlayers(){
+    const g=$("players"); g.innerHTML="";
+    NAMES.forEach(n=>{
+      const p=pos[n], dead=state.dead.has(n), grp=document.createElementNS(SVGNS,"g");
+      const role=ROLE[n];
+      const ring=document.createElementNS(SVGNS,"circle");
+      ring.setAttribute("cx",p.x);ring.setAttribute("cy",p.y);ring.setAttribute("r",PR);
+      let stroke="var(--rule)";
+      if(role==="W")stroke="var(--wolf)"; if(role==="S"||role==="D")stroke="var(--night)";
+      const flashing=state.flash&&state.flash.who===n&&clock-state.flash.t<1.1&&clock>=state.flash.t;
+      ring.setAttribute("fill",dead?"var(--sunk)":(flashing?"var(--amber-soft)":"var(--surface)"));
+      ring.setAttribute("stroke",dead?"var(--dead)":(flashing?"var(--amber)":stroke));
+      ring.setAttribute("stroke-width",flashing?3.5:2);
+      grp.appendChild(ring);
+      const tx=document.createElementNS(SVGNS,"text");
+      tx.setAttribute("x",p.x);tx.setAttribute("y",p.y+4.5);tx.setAttribute("text-anchor","middle");
+      tx.setAttribute("font-family","IBM Plex Mono, ui-monospace, monospace");tx.setAttribute("font-size","12");
+      tx.setAttribute("fill",dead?"var(--dead)":"var(--ink)");
+      if(dead)tx.setAttribute("text-decoration","line-through");
+      tx.textContent=n; grp.appendChild(tx);
+      if(role){
+        const b=document.createElementNS(SVGNS,"text");
+        b.setAttribute("x",p.x+PR-2);b.setAttribute("y",p.y-PR+6);b.setAttribute("text-anchor","middle");
+        b.setAttribute("font-family","Bricolage Grotesque, sans-serif");b.setAttribute("font-weight","700");b.setAttribute("font-size","12");
+        b.setAttribute("fill",dead?"var(--dead)":(role==="W"?"var(--wolf)":"var(--night)"));
+        b.textContent=role; grp.appendChild(b);
+      }
+      if(state.typing.has(n)&&!dead){
+        const d=document.createElementNS(SVGNS,"text");
+        d.setAttribute("x",p.x);d.setAttribute("y",p.y-PR-7);d.setAttribute("text-anchor","middle");
+        d.setAttribute("font-family","IBM Plex Mono, monospace");d.setAttribute("font-size","16");d.setAttribute("font-weight","500");
+        d.setAttribute("fill","var(--amber)");
+        const k=reduce?3:1+Math.floor((clock*3)%3);
+        d.textContent=".".repeat(k).padEnd(3," "); grp.appendChild(d);
+      }
+      g.appendChild(grp);
+    });
+  }
+  function drawArrows(){
+    const g=$("arrows"); g.innerHTML="";
+    Object.entries(state.points).forEach(([from,pt])=>{
+      const a=pos[from], b=pos[pt.to]; const dx=b.x-a.x, dy=b.y-a.y, L=Math.hypot(dx,dy);
+      const ux=dx/L, uy=dy/L;
+      // bend slightly so opposite arrows don't overlap
+      const x1=a.x+ux*(PR+3), y1=a.y+uy*(PR+3), x2=b.x-ux*(PR+5), y2=b.y-uy*(PR+5);
+      const mx=(x1+x2)/2 - uy*18, my=(y1+y2)/2 + ux*18;
+      const path=document.createElementNS(SVGNS,"path");
+      path.setAttribute("d",`M${x1} ${y1} Q${mx} ${my} ${x2} ${y2}`);
+      path.setAttribute("fill","none");
+      const col=pt.k==="wolf"?"var(--wolf)":pt.k==="priv"?"var(--night)":"var(--amber)";
+      path.setAttribute("stroke",col);path.setAttribute("stroke-width","2.2");
+      if(pt.k==="priv")path.setAttribute("stroke-dasharray","5 4");
+      path.setAttribute("marker-end",`url(#ah-${pt.k})`);
+      g.appendChild(path);
+    });
+  }
+  function drawGauges(){
+    const sc=scenes[cur], g=$("gauges");
+    const lim=Math.min(1,clock/sc.limit);
+    let html="";
+    if(cur==="night"){
+      SESS.forEach(([k,name,L])=>{const x=state.sess[k];
+        let q=0; if(x.closed)q=1; else if(x.quiet!=null)q=Math.min(1,(clock-x.quiet)/Q);
+        const v=x.closed?"closed":"limit "+fmt(L);
+        html+=`<div class="gauge"><span class="lbl">${name} quiet</span><div class="track"><div class="fill" style="width:${q*100}%"></div></div><span class="val">${v}</span></div>`;});
+      g.innerHTML=html; return;
+    } else {
+      const living=NAMES.filter(n=>!sc.dead.includes(n)).length, need=Math.floor(living/2)+1;
+      const counts={}; Object.values(state.points).forEach(p=>counts[p.to]=(counts[p.to]||0)+1);
+      let chips=Object.entries(counts).sort((a,b)=>b[1]-a[1]).map(([w,c])=>`<span class="chip${c>=need?" hit":""}">${w} ${c}/${need}</span>`).join("");
+      if(state.done)chips=`<span class="chip hit">frank lynched 4/${need}</span>`;
+      html+=`<div class="gauge"><span class="lbl">Majority</span><div class="tally">${chips||'<span class="chip">no points yet</span>'}</div><span class="val">need ${need}</span></div>`;
+    }
+    html+=`<div class="gauge"><span class="lbl">Hard limit</span><div class="track"><div class="fill limit" style="width:${lim*100}%"></div></div><span class="val">${fmt(clock)}</span></div>`;
+    g.innerHTML=html;
+  }
+  function logEvent(e){
+    const log=$("log"), row=document.createElement("div"); row.className="row";
+    if(e.note){row.innerHTML=`<span class="t">${fmt(e.t)}</span><span class="note"></span>`;row.lastChild.textContent=e.note;}
+    else{row.innerHTML=`<span class="t">${fmt(e.t)}</span><span><span class="who"></span> <span class="to"></span><span class="msg"></span></span>`;
+      row.querySelector(".who").textContent=e.from;row.querySelector(".to").textContent="→ "+e.to;row.querySelector(".msg").textContent=e.msg;}
+    log.appendChild(row); log.scrollTop=log.scrollHeight;
+  }
+  function advance(to){
+    const ev=scenes[cur].events;
+    while(applied<ev.length&&ev[applied].t<=to){const e=ev[applied];if(e.fx)e.fx(state);logEvent(e);applied++;}
+    clock=to; drawArrows(); drawPlayers(); drawGauges();
+  }
+  function reset(){cancelAnimationFrame(raf);raf=null;state=fresh(scenes[cur]);applied=0;clock=0;$("log").innerHTML="";}
+  function showFinal(){reset();advance(scenes[cur].end);$("log").scrollTop=0;setPlayLabel();}
+  function setPlayLabel(){$("play").textContent=(raf?"Playing…":"Play "+scenes[cur].label);}
+  function play(){
+    reset(); startWall=performance.now(); drawArrows(); drawPlayers(); drawGauges();
+    const step=now=>{const t=Math.min(scenes[cur].end,(now-startWall)/1000*1.0);advance(t);
+      if(t<scenes[cur].end){raf=requestAnimationFrame(step);}else{raf=null;setPlayLabel();}};
+    raf=requestAnimationFrame(step); setPlayLabel();
+  }
+  function select(name){
+    cur=name;
+    $("tab-night").setAttribute("aria-selected",name==="night");
+    $("tab-day").setAttribute("aria-selected",name==="day");
+    showFinal();
+  }
+  $("tab-night").addEventListener("click",()=>select("night"));
+  $("tab-day").addEventListener("click",()=>select("day"));
+  $("play").addEventListener("click",()=>{if(!raf)play();});
+  select("night");
+})();
+</script>
+</body>
+</html>
