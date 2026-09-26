@@ -456,7 +456,7 @@ struct Seat {
     commanded: Receiver<Commanded>,
     /// The agents it has rewarded and the episode has not yet checked. The
     /// records are already written; see
-    /// [`Adapter`](crate::environment::Adapter).
+    /// [`Adapter`].
     rewarded: Receiver<Rewarded>,
 }
 
@@ -500,7 +500,7 @@ use Halt::Departure;
 /// and not merely after the cycle's events. An agent has one queue, so a
 /// `Stop` sent early either waits behind work the agent has not reached or,
 /// once popped, leaves the rest of that queue unobserved — an agent that
-/// has stopped did not observe it (see [`agent`](crate::agent)) — and which
+/// has stopped did not observe it (see [`agent`]) — and which
 /// of the two depends on the scheduler. Holding the stop back until the
 /// count reads zero means there is nothing for it to land behind, which
 /// makes "an agent hears everything said to it before it is told to stop" a
