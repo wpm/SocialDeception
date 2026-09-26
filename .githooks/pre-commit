@@ -6,7 +6,7 @@
 #
 #     git config core.hooksPath .githooks
 #
-# The three cargo checks are mandatory. cargo-deny and typos run when
+# The four cargo checks are mandatory. cargo-deny and typos run when
 # installed; when they are not, the hook says so and CI still enforces them.
 
 set -euo pipefail
@@ -25,6 +25,12 @@ cargo clippy --all-targets -- -D warnings
 
 step "cargo test"
 cargo test
+
+# Private items are documented heavily here, and a broken or redundant
+# intra-doc link among them is an error that a plain `cargo doc` never
+# reaches. `-D warnings` keeps a rustdoc lint from passing as a warning.
+step "cargo doc --document-private-items"
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --document-private-items
 
 if cargo deny --version >/dev/null 2>&1; then
     step "cargo deny check"

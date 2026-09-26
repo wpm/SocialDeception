@@ -267,7 +267,7 @@ fn load(
     path: &Path,
     seed: Option<u64>,
     trajectory: Option<PathBuf>,
-) -> Result<Config, config::ConfigError> {
+) -> Result<Config, ConfigError> {
     let mut config = config::load(path)?;
     if let Some(seed) = seed {
         config.seed = seed;

@@ -175,7 +175,7 @@ impl Game {
     ///
     /// If called more than once.
     pub fn begin(&mut self) -> Vec<Directive> {
-        assert!(self.issued == 0, "the game has already begun");
+        assert_eq!(self.issued, 0, "the game has already begun");
         let mut directives: Vec<Directive> = self
             .assignment
             .players()
@@ -215,8 +215,8 @@ impl Game {
         let Some((to, kind)) = self.outstanding.remove(&response.request) else {
             panic!("{from} answered request {id}, which is not outstanding");
         };
-        assert!(
-            to == *from,
+        assert_eq!(
+            to, *from,
             "{from} answered request {id}, which was asked of {to}"
         );
         let space = roles::action_space(from, &self.living, kind, self.last_protected.get(from));
@@ -513,7 +513,7 @@ mod tests {
     use rand::Rng;
 
     use super::*;
-    use crate::testing::{id, ids, target};
+    use crate::testing::{id, ids, target, town, village};
     use crate::werewolf::role::Role::{Doctor, Seer, Villager, Werewolf};
 
     const SEED: u64 = 20_260_918;
@@ -534,32 +534,6 @@ mod tests {
                 (*who, chosen)
             })
             .collect()
-    }
-
-    /// Five players and one werewolf: alice and erin are villagers, bob is
-    /// the werewolf, carol the seer and dave the doctor.
-    fn village() -> Assignment {
-        Assignment::new([
-            ("alice", Villager),
-            ("bob", Werewolf),
-            ("carol", Seer),
-            ("dave", Doctor),
-            ("erin", Villager),
-        ])
-    }
-
-    /// Seven players and two werewolves, bob and frank; carol is the seer
-    /// and dave the doctor.
-    fn town() -> Assignment {
-        Assignment::new([
-            ("alice", Villager),
-            ("bob", Werewolf),
-            ("carol", Seer),
-            ("dave", Doctor),
-            ("erin", Villager),
-            ("frank", Werewolf),
-            ("grace", Villager),
-        ])
     }
 
     /// Seven players and three werewolves, alice, bob and carol, with no

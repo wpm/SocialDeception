@@ -217,7 +217,7 @@ mod tests {
     use super::*;
     use crate::agent::Recipients;
     use crate::event::{AgentId, Event};
-    use crate::testing::{id, ids, observed};
+    use crate::testing::{id, ids, observed, town, village};
     use crate::werewolf::assignment::Assignment;
     use crate::werewolf::message::{
         Move, Narration, Phase, Request, RequestId, RequestKind, Response, Round,
@@ -229,32 +229,6 @@ mod tests {
 
     const MODERATOR: &str = "moderator";
     const SEED: u64 = 20_260_918;
-
-    /// Five players and one werewolf: alice and erin are villagers, bob is
-    /// the werewolf, carol the seer and dave the doctor.
-    fn village() -> Assignment {
-        Assignment::new([
-            ("alice", Villager),
-            ("bob", Werewolf),
-            ("carol", Seer),
-            ("dave", Doctor),
-            ("erin", Villager),
-        ])
-    }
-
-    /// Seven players and two werewolves, bob and frank; carol is the seer
-    /// and dave the doctor.
-    fn town() -> Assignment {
-        Assignment::new([
-            ("alice", Villager),
-            ("bob", Werewolf),
-            ("carol", Seer),
-            ("dave", Doctor),
-            ("erin", Villager),
-            ("frank", Werewolf),
-            ("grace", Villager),
-        ])
-    }
 
     fn moderator(assignment: Assignment) -> (Moderator, Receiver<Outcome>) {
         let (sender, receiver) = unbounded();

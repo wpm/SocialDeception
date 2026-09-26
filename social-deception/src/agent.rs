@@ -1693,20 +1693,35 @@ mod tests {
         rig.agent.join().unwrap();
     }
 
+    // Both of these drop a channel the loop depends on and expect the cycle
+    // that follows to fail its send. The drop has to happen while the agent
+    // is provably not about to send: it is otherwise a race, and the losing
+    // interleaving is a hang rather than a failure, because a loop whose
+    // queue is still open goes back to waiting. A `Gated` handler gives the
+    // fixed point — it parks inside `handle`, before the cycle writes its
+    // records or sends its dispatch — so the drop lands while the agent is
+    // held there, and releasing it walks the cycle into the closed channel.
+
     #[test]
     fn a_vanished_writer_is_an_error() {
-        let rig = rig(Recorder::default(), None);
+        let (rig, busy, release) = gated();
         rig.start();
+        rig.send(step("b", 1));
+        recv(&busy);
         drop(rig.records);
-        assert_eq!(rig.agent.join(), Err(Error::WriterClosed));
+        release.send(()).unwrap();
+        assert_eq!(rig.agent.join().err(), Some(Error::WriterClosed));
     }
 
     #[test]
     fn a_vanished_router_is_an_error() {
-        let rig = rig(Recorder::default(), None);
+        let (rig, busy, release) = gated();
         rig.start();
+        rig.send(step("b", 1));
+        recv(&busy);
         drop(rig.dispatches);
-        assert_eq!(rig.agent.join(), Err(Error::RouterClosed));
+        release.send(()).unwrap();
+        assert_eq!(rig.agent.join().err(), Some(Error::RouterClosed));
     }
 
     #[test]
