@@ -40,3 +40,9 @@ from the earlier attempt at the project are not part of its history.
 | [0005](0005-policy-separates-decisions-from-rules.md) | A policy separates decisions from rules | Accepted |
 | [0006](0006-knowledge-holds-what-the-agent-did-in-secret.md) | Knowledge holds what the agent did in secret | Accepted |
 | [0007](0007-reinforcement-learning-vocabulary.md) | The framework speaks the vocabulary of reinforcement learning | Accepted |
+| [0008](0008-one-observation-per-cycle.md) | A cycle handles one observation | Accepted |
+| [0009](0009-one-queue-and-no-cancellation.md) | One queue, and an agent that does not know it is being stopped | Accepted |
+| [0010](0010-a-handler-sets-its-own-deadline.md) | A handler sets its own deadline | Accepted |
+| [0011](0011-werewolf-phases-are-timed-pointing-sessions.md) | Werewolf phases are timed pointing sessions | Accepted |
+| [0012](0012-a-dead-player-stops.md) | A dead player stops | Accepted |
+| [0013](0013-speech-typing-and-a-scheduler-for-when-to-speak.md) | Speech and typing are events, and a scheduler decides when to speak | Accepted |
