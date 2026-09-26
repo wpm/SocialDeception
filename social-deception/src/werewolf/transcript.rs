@@ -757,7 +757,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::testing::{id, ids};
+    use crate::testing::{id, ids, village};
     use crate::werewolf::assignment::Assignment;
     use crate::werewolf::game::{Directive, Game};
     use crate::werewolf::role::Role::{Doctor, Seer, Villager, Werewolf};
@@ -1563,18 +1563,6 @@ mod tests {
                 )
             })
             .collect()
-    }
-
-    /// Five players and one werewolf: bob, with carol the seer and dave the
-    /// doctor.
-    fn village() -> Assignment {
-        Assignment::new([
-            ("alice", Villager),
-            ("bob", Werewolf),
-            ("carol", Seer),
-            ("dave", Doctor),
-            ("erin", Villager),
-        ])
     }
 
     #[test]

@@ -12,8 +12,8 @@ use crate::agent::Observation;
 use crate::clock::Timestamp;
 use crate::event::{AgentId, Domain, Event};
 use crate::werewolf::{
-    Faction, Knowledge, Message, Move, Narration, Phase, Request, RequestId, RequestKind, Role,
-    Round, WerewolfDomain,
+    Assignment, Faction, Knowledge, Message, Move, Narration, Phase, Request, RequestId,
+    RequestKind, Role, Round, WerewolfDomain,
 };
 
 pub(crate) use temp::TempDir;
@@ -156,4 +156,30 @@ pub(crate) fn seer_knowing<const N: usize, const I: usize>(
         .map(|who| (who, Faction::Village))
         .collect();
     knowledge
+}
+
+/// Five players and one werewolf: alice and erin are villagers, bob is the
+/// werewolf, carol the seer and dave the doctor.
+pub(crate) fn village() -> Assignment {
+    Assignment::new([
+        ("alice", Role::Villager),
+        ("bob", Role::Werewolf),
+        ("carol", Role::Seer),
+        ("dave", Role::Doctor),
+        ("erin", Role::Villager),
+    ])
+}
+
+/// Seven players and two werewolves, bob and frank; carol is the seer and
+/// dave the doctor.
+pub(crate) fn town() -> Assignment {
+    Assignment::new([
+        ("alice", Role::Villager),
+        ("bob", Role::Werewolf),
+        ("carol", Role::Seer),
+        ("dave", Role::Doctor),
+        ("erin", Role::Villager),
+        ("frank", Role::Werewolf),
+        ("grace", Role::Villager),
+    ])
 }
