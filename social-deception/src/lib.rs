@@ -31,7 +31,7 @@
 //! # The modules, from the bottom up
 //!
 //! - [`clock`]: the episode [`Clock`] everything is timestamped with, and
-//!   the [`Created`] and [`Timestamped`] traits that say what is known about
+//!   the [`Created`] and [`Received`] traits that say what is known about
 //!   a thing's time;
 //! - [`event`]: the [`Domain`] a game names its types with, the [`Event`]
 //!   and [`Control`] that travel on the wire, and the [`Delivery`] that
@@ -77,7 +77,7 @@ pub mod werewolf;
 pub use agent::{
     Action, Agent, CycleDispatch, Error, Handler, Instruction, Observation, Recipients, Wiring,
 };
-pub use clock::{Clock, Created, Timestamp, Timestamped};
+pub use clock::{Clock, Created, Received, Timestamp};
 pub use environment::{Effect, Environment};
 pub use episode::{Episode, EpisodeError, Failure};
 pub use event::{AgentId, Control, Delivery, Domain, Event, Payload};

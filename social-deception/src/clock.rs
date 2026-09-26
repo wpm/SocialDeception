@@ -6,18 +6,16 @@
 //!
 //! # What is known about a thing's time
 //!
-//! Two traits say what a timestamped thing knows about itself, and every
-//! type the runtime stamps implements one of them. [`Created`] is the
-//! instant something came into being: for an event, the instant its sender
-//! sent it. [`Timestamped`] adds the instant it reached whoever holds it,
-//! and with it a [`latency`](Timestamped::latency), the delay that holder
-//! actually suffered.
+//! Two traits say what a stamped thing knows about itself, and every type
+//! the runtime stamps implements one of them. [`Created`] is the instant
+//! something came into being: for an event, the instant its sender sent it.
+//! [`Received`] adds the instant it reached whoever holds it, and with it a
+//! [`latency`](Received::latency), the delay that holder actually suffered.
 //!
-//! The split is not decoration. An event on the wire has a creation time and
-//! nothing else, because it has not been received by anyone yet; the same
-//! event, popped off a queue as an observation, has both. Keeping them apart
-//! in the types means a value that cannot say when it was received cannot be
-//! asked.
+//! The split is not decoration. An event on the wire was created and not yet
+//! received; the same event, popped off a queue as an observation, is both.
+//! Keeping them apart in the types means a value that cannot say when it was
+//! received cannot be asked.
 
 use std::ops::{Add, Sub};
 use std::time::{Duration, Instant};
@@ -86,8 +84,8 @@ pub trait Created {
 ///
 /// An observation and a popped control are the two: each was created by
 /// somebody else and has since arrived here. The gap between the two is the
-/// [`latency`](Timestamped::latency).
-pub trait Timestamped: Created {
+/// [`latency`](Received::latency).
+pub trait Received: Created {
     /// When it was received: the instant the agent popped it off its queue.
     fn received(&self) -> Timestamp;
 
@@ -187,7 +185,7 @@ mod tests {
         }
     }
 
-    impl Timestamped for Late {
+    impl Received for Late {
         fn received(&self) -> Timestamp {
             at(55)
         }
