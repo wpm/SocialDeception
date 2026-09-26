@@ -5,6 +5,8 @@
 **Deciders:** Bill McNeill
 **Amends:** [ADR-0002](0002-jsonl-trajectory-format.md),
 [ADR-0007](0007-reinforcement-learning-vocabulary.md)
+**Amended by:** [ADR-0010](0010-a-handler-sets-its-own-deadline.md), under which a handler sets its own
+next deadline instead of waking on a fixed interval
 
 ## Context
 

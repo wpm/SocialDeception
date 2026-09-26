@@ -7,6 +7,10 @@
 **Amends:** [ADR-0002](0002-jsonl-trajectory-format.md),
 [ADR-0004](0004-moderator-agent-runs-the-game.md),
 [ADR-0005](0005-policy-separates-decisions-from-rules.md)
+**Amended by:** [ADR-0008](0008-one-observation-per-cycle.md), under which a cycle handles one observation;
+by [ADR-0009](0009-one-queue-and-no-cancellation.md), which returns to one queue and removes cancellation;
+and by [ADR-0012](0012-a-dead-player-stops.md), under which a `Stop` to some agents while others run
+is delivered at once rather than held until nothing is in flight
 
 ## Context
 
