@@ -187,7 +187,7 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError, never, select};
 
-use crate::clock::{Clock, Created, Timestamp, Timestamped};
+use crate::clock::{Clock, Created, Received, Timestamp};
 use crate::event::{AgentId, Control, Delivery, Domain, Event};
 use crate::timer::TimerSource;
 use crate::trajectory::{
@@ -198,7 +198,7 @@ use crate::trajectory::{
 ///
 /// The event carries the instant its sender created it; this adds the
 /// instant this agent received it. The gap between the two is the
-/// observation's [`latency`](Timestamped::latency), the whole staleness of
+/// observation's [`latency`](Received::latency), the whole staleness of
 /// what the agent is looking at.
 /// `Debug`, `Clone` and equality are written out rather than derived, for
 /// the reason [`Event`]'s are: a derive would ask them of `D`.
@@ -215,7 +215,7 @@ impl<D: Domain> Created for Observation<D> {
     }
 }
 
-impl<D: Domain> Timestamped for Observation<D> {
+impl<D: Domain> Received for Observation<D> {
     fn received(&self) -> Timestamp {
         self.received
     }
@@ -255,8 +255,8 @@ impl<D: Domain> Eq for Observation<D> where D::Payload: Eq {}
 
 /// A control this agent has popped off its queue, and when.
 ///
-/// Logged by the loop and never handed to a handler; it is a
-/// [`Timestamped`] for the same reason an observation is, so that a control
+/// Logged by the loop and never handed to a handler; it implements
+/// [`Received`] for the same reason an observation does, so that a control
 /// that waited behind whatever was queued ahead of it says so.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Instruction {
@@ -274,7 +274,7 @@ impl Created for Instruction {
     }
 }
 
-impl Timestamped for Instruction {
+impl Received for Instruction {
     fn received(&self) -> Timestamp {
         self.received
     }

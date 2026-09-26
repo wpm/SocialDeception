@@ -692,7 +692,7 @@ mod tests {
 
     #[test]
     fn a_reward_is_created_and_never_received() {
-        // `Created` and not `Timestamped`: a reward is logged, never sent,
+        // `Created` and not `Received`: a reward is logged, never sent,
         // so there is no instant at which anybody got it.
         let reward: RewardRecord<TestDomain> = RewardRecord {
             agent: AgentId::new("alice"),
