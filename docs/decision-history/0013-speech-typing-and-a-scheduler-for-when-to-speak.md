@@ -1,6 +1,6 @@
 # ADR-0013: Speech and typing are events, and a scheduler decides when to speak
 
-**Status:** Proposed
+**Status:** Accepted
 **Date:** 2026-09-26
 **Deciders:** Bill McNeill
 **Amends:** [ADR-0005](0005-policy-separates-decisions-from-rules.md)

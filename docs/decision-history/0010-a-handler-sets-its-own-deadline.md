@@ -1,6 +1,6 @@
 # ADR-0010: A handler sets its own deadline
 
-**Status:** Proposed
+**Status:** Accepted
 **Date:** 2026-09-26
 **Deciders:** Bill McNeill
 **Amends:** [ADR-0008](0008-one-observation-per-cycle.md)

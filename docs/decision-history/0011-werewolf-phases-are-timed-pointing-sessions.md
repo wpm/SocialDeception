@@ -1,6 +1,6 @@
 # ADR-0011: Werewolf phases are timed pointing sessions
 
-**Status:** Proposed
+**Status:** Accepted
 **Date:** 2026-09-26
 **Deciders:** Bill McNeill
 **Amends:** [ADR-0004](0004-moderator-agent-runs-the-game.md),
