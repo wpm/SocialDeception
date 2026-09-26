@@ -28,6 +28,19 @@ pub struct Assignment {
     pack: BTreeSet<AgentId>,
 }
 
+/// The pack a deal implies: every player whose role is of the werewolves'
+/// faction.
+///
+/// Both constructors derive the pack this way, so the two cannot disagree
+/// about who the werewolves are.
+fn pack_of(roles: &BTreeMap<AgentId, Role>) -> BTreeSet<AgentId> {
+    roles
+        .iter()
+        .filter(|(_, role)| role.faction() == Faction::Werewolves)
+        .map(|(who, _)| who.clone())
+        .collect()
+}
+
 impl Assignment {
     /// Deals the roles the configuration asks for to its players.
     ///
@@ -66,11 +79,7 @@ impl Assignment {
         // version produces.
         roles.shuffle(&mut rng);
         let roles: BTreeMap<AgentId, Role> = players.into_iter().cloned().zip(roles).collect();
-        let pack = roles
-            .iter()
-            .filter(|(_, role)| role.faction() == Faction::Werewolves)
-            .map(|(who, _)| who.clone())
-            .collect();
+        let pack = pack_of(&roles);
         Self { roles, pack }
     }
 
@@ -95,11 +104,7 @@ impl Assignment {
                 "player {who} is assigned more than one role"
             );
         }
-        let pack = dealt
-            .iter()
-            .filter(|(_, role)| role.faction() == Faction::Werewolves)
-            .map(|(who, _)| who.clone())
-            .collect();
+        let pack = pack_of(&dealt);
         Self { roles: dealt, pack }
     }
 
