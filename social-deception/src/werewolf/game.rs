@@ -175,7 +175,7 @@ impl Game {
     ///
     /// If called more than once.
     pub fn begin(&mut self) -> Vec<Directive> {
-        assert!(self.issued == 0, "the game has already begun");
+        assert_eq!(self.issued, 0, "the game has already begun");
         let mut directives: Vec<Directive> = self
             .assignment
             .players()
@@ -215,8 +215,8 @@ impl Game {
         let Some((to, kind)) = self.outstanding.remove(&response.request) else {
             panic!("{from} answered request {id}, which is not outstanding");
         };
-        assert!(
-            to == *from,
+        assert_eq!(
+            to, *from,
             "{from} answered request {id}, which was asked of {to}"
         );
         let space = roles::action_space(from, &self.living, kind, self.last_protected.get(from));

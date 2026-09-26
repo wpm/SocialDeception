@@ -173,12 +173,10 @@ impl Knowledge {
     fn narrated(&mut self, narration: &Narration) {
         match narration {
             Narration::Assigned { role, pack } => {
-                assert!(
-                    *role == self.role,
+                assert_eq!(
+                    *role, self.role,
                     "{} was constructed as a {:?} but the moderator assigned it {:?}",
-                    self.me,
-                    self.role,
-                    role
+                    self.me, self.role, role
                 );
                 self.pack.clone_from(pack);
             }

@@ -100,8 +100,9 @@ pub fn action_space(
 #[must_use]
 pub fn base_action_space(knowledge: &Knowledge, request: &Request) -> Vec<Move> {
     let kind = request.kind;
-    assert!(
-        knowledge.role.asked_in(kind.phase()) == Some(kind),
+    assert_eq!(
+        knowledge.role.asked_in(kind.phase()),
+        Some(kind),
         "a {} is never asked to {kind:?}",
         knowledge.role
     );

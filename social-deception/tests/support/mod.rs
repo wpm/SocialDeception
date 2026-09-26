@@ -217,10 +217,7 @@ fn check_record(line: &Value, kind: &str) {
     // Everything that was popped says when, and nothing is popped before it
     // was created. An action is the exception: it was never received.
     if line["received"].is_null() {
-        assert!(
-            kind == "action",
-            "only an action records no receipt: {line}"
-        );
+        assert_eq!(kind, "action", "only an action records no receipt: {line}");
     } else {
         assert!(
             time(line, "created") <= time(line, "received"),
@@ -314,8 +311,8 @@ fn check_cycle(cycle: &Value, records: &HashMap<(&str, u64), &Value>) {
     // That is what makes the gap between an input's `received` and an
     // output's `created` the agent's deliberation.
     for input in inputs {
-        assert!(
-            input["type"] != "action",
+        assert_ne!(
+            input["type"], "action",
             "an input is something popped, not an output: {input} in {cycle}"
         );
         assert_eq!(
