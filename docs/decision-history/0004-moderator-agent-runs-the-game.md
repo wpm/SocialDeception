@@ -8,7 +8,9 @@ framework's `Environment`, the environment ends the episode with `Stop`, rewards
 are logged rather than narrated, and the final `Outcome` is no longer broadcast;
 by [ADR-0011](0011-werewolf-phases-are-timed-pointing-sessions.md), which replaces one-shot requests
 with timed pointing sessions, lets a day end without a lynch, and ends a game at the day cap as a stalemate;
-and by [ADR-0012](0012-a-dead-player-stops.md), under which a dead player's agent is stopped at its death
+by [ADR-0012](0012-a-dead-player-stops.md), under which a dead player's agent is stopped at its death;
+and by [ADR-0014](0014-events-carry-information-controls-carry-instruction.md), under which the moderator
+no longer reads a player's role to decide whom to ask: a player acts on observing a phase begin
 
 ## Context
 
