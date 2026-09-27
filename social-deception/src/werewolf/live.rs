@@ -34,7 +34,7 @@ use std::fmt;
 use std::io::{self, Write};
 
 use super::WerewolfDomain;
-use super::message::{Message, Move, Narration, Phase, Request, Response};
+use super::message::{Cause, Message, Move, Narration, Phase, Request, Response};
 use crate::event::AgentId;
 use crate::trajectory::{ActionRecord, LogRecord, Sink};
 
@@ -64,17 +64,14 @@ pub fn line(record: &LogRecord<WerewolfDomain>, senders: usize) -> Option<String
 
 /// One action record as its four columns.
 fn rendered(action: &ActionRecord<WerewolfDomain>, senders: usize) -> String {
-    let recipients: Vec<&str> = action
-        .event
-        .recipients
-        .iter()
-        .map(AgentId::as_str)
-        .collect();
+    // The sender goes in as `&str`, not as the `AgentId` it is: `AgentId`'s
+    // `Display` writes straight through and so ignores the width, which is
+    // the whole point of the column.
     format!(
         "{:>TIME_WIDTH$} {:<senders$}  \u{2192} {}  {}",
         Elapsed(action.created.nanos()),
         action.agent.as_str(),
-        recipients.join(", "),
+        Ids(action.event.recipients.iter()),
         action.event.payload,
     )
 }
@@ -150,7 +147,7 @@ impl fmt::Display for Narration {
             }
             Self::Eliminated {
                 who, role, cause, ..
-            } => write!(f, "Eliminated({who}, {role}, {})", Lowercase(cause)),
+            } => write!(f, "Eliminated({who}, {role}, {cause})"),
             Self::NoDeath { round } => write!(f, "NoDeath(Night {})", round.0),
             Self::Outcome(outcome) => write!(
                 f,
@@ -187,6 +184,17 @@ impl fmt::Display for Move {
     }
 }
 
+impl fmt::Display for Cause {
+    /// How the death reads in a sentence: lower case, because it is the
+    /// manner of a death and not a proper name.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Devoured => "devoured",
+            Self::Lynched => "lynched",
+        })
+    }
+}
+
 impl fmt::Display for Phase {
     /// The phase's name as written, the same spelling it serializes as.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -209,16 +217,6 @@ impl<'a, I: Iterator<Item = &'a AgentId> + Clone> fmt::Display for Ids<I> {
             who.fmt(f)?;
         }
         Ok(())
-    }
-}
-
-/// A `Debug` rendering lowercased, for the causes and kinds whose names
-/// read as words in a sentence.
-struct Lowercase<T>(T);
-
-impl<T: fmt::Debug> fmt::Display for Lowercase<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&format!("{:?}", self.0).to_lowercase())
     }
 }
 
@@ -273,17 +271,16 @@ impl<W: Write + Send> Sink<WerewolfDomain> for Text<W> {
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
-    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use super::*;
     use crate::clock::Timestamp;
     use crate::event::{Control, Event};
-    use crate::testing::{id, ids};
+    use crate::testing::{Shared, id, ids};
     use crate::trajectory::{
         ControlRecord, CycleRecord, ObservationRecord, RewardRecord, Seq, Woken,
     };
-    use crate::werewolf::message::{Cause, Outcome, RequestId, RequestKind, Round};
+    use crate::werewolf::message::{Outcome, RequestId, RequestKind, Round};
     use crate::werewolf::role::{Faction, Role};
 
     fn at(nanos: u64) -> Timestamp {
@@ -570,30 +567,14 @@ mod tests {
         }
     }
 
-    /// A destination the test can read back after the sink has taken it.
-    #[derive(Debug, Clone, Default)]
-    struct Shown(Arc<Mutex<Vec<u8>>>);
-
-    impl Shown {
-        fn text(&self) -> String {
-            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
-        }
-    }
-
-    impl Write for Shown {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
+    /// What a sink wrote to `shown`, as text.
+    fn written(shown: &Shared) -> String {
+        String::from_utf8(shown.bytes()).unwrap()
     }
 
     #[test]
     fn the_sink_writes_a_line_per_action_and_nothing_for_the_rest() {
-        let shown = Shown::default();
+        let shown = Shared::new();
         let mut text = Text::new(shown.clone(), &ids(["alice", "moderator"]));
         let narration = action(
             "moderator",
@@ -615,7 +596,7 @@ mod tests {
         text.record(&narration).unwrap();
         text.finish().unwrap();
         assert_eq!(
-            shown.text(),
+            written(&shown),
             "0:00.000 moderator  \u{2192} alice  NoDeath(Night 1)\n\
              0:00.000 moderator  \u{2192} alice  NoDeath(Night 1)\n"
         );
@@ -623,7 +604,7 @@ mod tests {
 
     #[test]
     fn a_sink_over_an_empty_roster_still_renders() {
-        let shown = Shown::default();
+        let shown = Shared::new();
         let mut text = Text::new(shown.clone(), &BTreeSet::new());
         text.record(&action(
             "a",
@@ -632,6 +613,9 @@ mod tests {
             Message::Narration(Narration::NoDeath { round: Round(1) }),
         ))
         .unwrap();
-        assert_eq!(shown.text(), "0:00.000 a  \u{2192} b  NoDeath(Night 1)\n");
+        assert_eq!(
+            written(&shown),
+            "0:00.000 a  \u{2192} b  NoDeath(Night 1)\n"
+        );
     }
 }
