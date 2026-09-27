@@ -60,7 +60,7 @@ use std::collections::BTreeSet;
 use crossbeam_channel::Sender;
 
 use crate::agent::{Action, Handler, Observation};
-use crate::clock::Clock;
+use crate::clock::{Clock, Timestamp};
 use crate::event::{AgentId, Control, Domain};
 use crate::trajectory::{LogRecord, RewardRecord};
 
@@ -206,7 +206,7 @@ pub trait Environment<D: Domain> {
     ///
     /// Opening effects are decided from nothing, for the reason
     /// [`Handler::start`]'s are.
-    fn start(&mut self) -> Vec<Effect<D>>;
+    fn start(&mut self, now: Timestamp) -> Vec<Effect<D>>;
 
     /// Folds one observation into the environment's state and says what to
     /// send, whom to control, and whom to reward.
@@ -227,8 +227,18 @@ pub trait Environment<D: Domain> {
     /// deadline is not observing anything. The default does nothing, which
     /// is what both of the environments in the tree want — neither is
     /// configured with a timeout at all.
-    fn timeout(&mut self) -> Vec<Effect<D>> {
+    fn timeout(&mut self, _now: Timestamp) -> Vec<Effect<D>> {
         Vec::new()
+    }
+
+    /// The next instant this environment wants a cycle, or `None`.
+    ///
+    /// The same contract as [`Handler::deadline`], which the adapter
+    /// forwards this to: an absolute instant on the agent's clock, replacing
+    /// whatever was pending, with a past one firing at once. Neither
+    /// environment in the tree sets one.
+    fn deadline(&self) -> Option<Timestamp> {
+        None
     }
 }
 
@@ -237,16 +247,20 @@ pub trait Environment<D: Domain> {
 ///
 /// [`Episode`]: crate::Episode
 impl<D: Domain, E: Environment<D> + ?Sized> Environment<D> for Box<E> {
-    fn start(&mut self) -> Vec<Effect<D>> {
-        (**self).start()
+    fn start(&mut self, now: Timestamp) -> Vec<Effect<D>> {
+        (**self).start(now)
     }
 
     fn handle(&mut self, observation: &Observation<D>) -> Vec<Effect<D>> {
         (**self).handle(observation)
     }
 
-    fn timeout(&mut self) -> Vec<Effect<D>> {
-        (**self).timeout()
+    fn timeout(&mut self, now: Timestamp) -> Vec<Effect<D>> {
+        (**self).timeout(now)
+    }
+
+    fn deadline(&self) -> Option<Timestamp> {
+        (**self).deadline()
     }
 }
 
@@ -395,8 +409,8 @@ impl<D: Domain, E: Environment<D>> Adapter<D, E> {
 }
 
 impl<D: Domain, E: Environment<D>> Handler<D> for Adapter<D, E> {
-    fn start(&mut self) -> Vec<Action<D>> {
-        let effects = self.environment.start();
+    fn start(&mut self, now: Timestamp) -> Vec<Action<D>> {
+        let effects = self.environment.start(now);
         self.split(effects)
     }
 
@@ -405,9 +419,13 @@ impl<D: Domain, E: Environment<D>> Handler<D> for Adapter<D, E> {
         self.split(effects)
     }
 
-    fn timeout(&mut self) -> Vec<Action<D>> {
-        let effects = self.environment.timeout();
+    fn timeout(&mut self, now: Timestamp) -> Vec<Action<D>> {
+        let effects = self.environment.timeout(now);
         self.split(effects)
+    }
+
+    fn deadline(&self) -> Option<Timestamp> {
+        self.environment.deadline()
     }
 }
 
@@ -419,10 +437,11 @@ impl<D: Domain, E> std::fmt::Debug for Adapter<D, E> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use crossbeam_channel::{Receiver, unbounded};
 
     use super::*;
-    use crate::clock::Timestamp;
     use crate::event::Event;
     use crate::testing::{TestDomain, TestPayload, id, ids};
 
@@ -446,7 +465,7 @@ mod tests {
     struct Opener;
 
     impl Environment<TestDomain> for Opener {
-        fn start(&mut self) -> Vec<Effect<TestDomain>> {
+        fn start(&mut self, _now: Timestamp) -> Vec<Effect<TestDomain>> {
             vec![
                 Effect::control(["a", "b"], Control::Start),
                 Effect::Act(Action::to(["a"], TestPayload::Step(1))),
@@ -492,7 +511,7 @@ mod tests {
     fn the_adapter_hands_the_loop_the_actions_and_the_episode_the_controls() {
         let mut rig = rig();
         assert_eq!(
-            rig.adapter.start(),
+            rig.adapter.start(Timestamp::default()),
             [Action::to(["a"], TestPayload::Step(1))],
             "the loop sees an action and nothing else"
         );
@@ -520,7 +539,7 @@ mod tests {
         // rewarded and not the environment that decided it, and the loop
         // is handed nothing to send on its account.
         let mut rig = rig();
-        rig.adapter.start();
+        rig.adapter.start(Timestamp::default());
         assert!(rig.records.try_recv().is_err(), "the start rewards nobody");
         let actions = rig.adapter.handle(&observation());
         assert!(actions.is_empty(), "a reward is not an action: {actions:?}");
@@ -545,7 +564,7 @@ mod tests {
     struct Stranger;
 
     impl Environment<TestDomain> for Stranger {
-        fn start(&mut self) -> Vec<Effect<TestDomain>> {
+        fn start(&mut self, _now: Timestamp) -> Vec<Effect<TestDomain>> {
             vec![Effect::reward("nobody", 1)]
         }
 
@@ -570,7 +589,7 @@ mod tests {
             recorder,
             Clock::start(),
         );
-        assert!(adapter.start().is_empty());
+        assert!(adapter.start(Timestamp::default()).is_empty());
         assert_eq!(
             rewarded.try_recv(),
             Ok(Rewarded {
@@ -590,7 +609,7 @@ mod tests {
         drop(rig.rewarded);
         drop(rig.records);
         assert_eq!(
-            rig.adapter.start(),
+            rig.adapter.start(Timestamp::default()),
             [Action::to(["a"], TestPayload::Step(1))]
         );
         assert!(rig.adapter.handle(&observation()).is_empty());
@@ -627,5 +646,83 @@ mod tests {
             }
         );
         assert!(format!("{:?}", rig().adapter).starts_with("Adapter"));
+    }
+
+    /// An environment that wants waking at an instant of its own, and
+    /// remembers the `now` of each hook it is given.
+    struct Punctual {
+        deadline: Option<Timestamp>,
+        readings: Vec<Timestamp>,
+    }
+
+    impl Environment<TestDomain> for Punctual {
+        fn start(&mut self, now: Timestamp) -> Vec<Effect<TestDomain>> {
+            self.readings.push(now);
+            Vec::new()
+        }
+
+        fn handle(&mut self, _: &Observation<TestDomain>) -> Vec<Effect<TestDomain>> {
+            Vec::new()
+        }
+
+        fn timeout(&mut self, now: Timestamp) -> Vec<Effect<TestDomain>> {
+            self.readings.push(now);
+            Vec::new()
+        }
+
+        fn deadline(&self) -> Option<Timestamp> {
+            self.deadline
+        }
+    }
+
+    /// An instant, the way every other test module in the crate spells one.
+    fn at(nanos: u64) -> Timestamp {
+        Timestamp::from(Duration::from_nanos(nanos))
+    }
+
+    #[test]
+    fn the_adapter_forwards_the_environments_deadline_and_the_time() {
+        // An environment sets deadlines the way a handler does (ADR-0010);
+        // the adapter is what carries them between the two traits.
+        let wanted = at(3);
+        let (commands, _commanded) = unbounded();
+        let (paid, _rewarded) = unbounded();
+        let (recorder, _records) = unbounded();
+        let mut adapter = Adapter::new(
+            Punctual {
+                deadline: Some(wanted),
+                readings: Vec::new(),
+            },
+            ids(["a"]),
+            commands,
+            paid,
+            recorder,
+            Clock::start(),
+        );
+        assert_eq!(Handler::deadline(&adapter), Some(wanted));
+
+        let (start, timed_out) = (at(1), at(2));
+        assert!(adapter.start(start).is_empty());
+        assert!(adapter.timeout(timed_out).is_empty());
+        assert_eq!(adapter.environment.readings, [start, timed_out]);
+
+        // And an environment with no opinion says so, the same as a handler.
+        adapter.environment.deadline = None;
+        assert_eq!(Handler::deadline(&adapter), None);
+    }
+
+    /// A boxed environment forwards every hook, including the two ADR-0010
+    /// added, so that an episode holding one is not a special case.
+    #[test]
+    fn a_boxed_environment_forwards_the_new_hooks() {
+        let wanted = at(4);
+        let mut boxed: Box<dyn Environment<TestDomain>> = Box::new(Punctual {
+            deadline: Some(wanted),
+            readings: Vec::new(),
+        });
+        let now = at(1);
+        assert!(boxed.start(now).is_empty());
+        assert!(boxed.timeout(now).is_empty());
+        assert_eq!(boxed.deadline(), Some(wanted));
     }
 }
