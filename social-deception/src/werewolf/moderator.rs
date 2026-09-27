@@ -85,6 +85,7 @@ use super::WerewolfDomain;
 use super::game::{Directive, Game};
 use super::message::{Message, Outcome};
 use crate::agent::{Action, Observation, Recipients};
+use crate::clock::Timestamp;
 use crate::environment::{Effect, Environment};
 use crate::event::{AgentId, Control};
 
@@ -177,7 +178,7 @@ impl Environment<WerewolfDomain> for Moderator {
     /// cycle's events before its controls either way, so what a player
     /// actually sees is its `Start` — controls are popped first — and then
     /// the opening narrations.
-    fn start(&mut self) -> Vec<Effect<WerewolfDomain>> {
+    fn start(&mut self, _now: Timestamp) -> Vec<Effect<WerewolfDomain>> {
         let opening = self.game.begin();
         let mut effects = vec![Effect::control(self.players(), Control::Start)];
         effects.extend(self.say(opening));
@@ -350,7 +351,7 @@ mod tests {
     /// them over one at a time (ADR-0008). The game runs until the
     /// moderator asks nothing more.
     fn play(moderator: &mut Moderator, policy: Policy) -> Vec<Effect<WerewolfDomain>> {
-        let opening = moderator.start();
+        let opening = moderator.start(Timestamp::default());
         let mut pending = respond(&actions(&opening), policy, moderator.game.living());
         let mut produced = opening;
         while !pending.is_empty() {
@@ -445,7 +446,7 @@ mod tests {
     fn starting_the_moderator_starts_the_players_and_begins_the_game() {
         let everyone = ["alice", "bob", "carol", "dave", "erin"];
         let (mut moderator, _receiver) = moderator(village());
-        let opening = moderator.start();
+        let opening = moderator.start(Timestamp::default());
         assert_eq!(
             controls(&opening),
             [(ids(everyone), Control::Start)],
@@ -481,8 +482,8 @@ mod tests {
         // say on a deadline. Controls never reach it either, so there is
         // nothing a cycle can hold that it must ignore.
         let (mut moderator, _receiver) = moderator(village());
-        moderator.start();
-        assert_eq!(moderator.timeout(), []);
+        moderator.start(Timestamp::default());
+        assert_eq!(moderator.timeout(Timestamp::default()), []);
     }
 
     #[test]
@@ -727,8 +728,8 @@ mod tests {
         // the fold before it starts.
         let (mut reference, _receiver) = moderator(village());
         let (mut doubled, _receiver) = moderator(village());
-        let opening = reference.start();
-        assert_eq!(doubled.start(), opening);
+        let opening = reference.start(Timestamp::default());
+        assert_eq!(doubled.start(Timestamp::default()), opening);
         let mut pending = respond(&actions(&opening), first_other, reference.game.living());
         while !pending.is_empty() {
             let mut effects = Vec::new();
@@ -752,7 +753,7 @@ mod tests {
     #[should_panic(expected = "erin sent the moderator a narration")]
     fn a_narration_from_a_player_panics() {
         let (mut moderator, _receiver) = moderator(village());
-        moderator.start();
+        moderator.start(Timestamp::default());
         moderator.handle(&from_player(
             "erin",
             Message::Narration(Narration::NoDeath { round: Round(1) }),
@@ -763,7 +764,7 @@ mod tests {
     #[should_panic(expected = "carol sent the moderator a request")]
     fn a_request_from_a_player_panics() {
         let (mut moderator, _receiver) = moderator(village());
-        moderator.start();
+        moderator.start(Timestamp::default());
         moderator.handle(&from_player(
             "carol",
             Message::Request(Request {

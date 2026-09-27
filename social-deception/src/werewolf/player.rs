@@ -134,6 +134,8 @@ impl<R: Player, P: Policy> Handler<WerewolfDomain> for Seat<R, P> {
 mod tests {
     use std::collections::BTreeSet;
 
+    use crate::clock::Timestamp;
+
     use super::*;
     use crate::agent::Recipients;
     use crate::event::Event;
@@ -268,8 +270,8 @@ mod tests {
     fn a_seat_opens_with_nothing() {
         // A player says nothing until the moderator asks it something, so
         // the default start hook is the right one for every role.
-        assert!(villager(First).start().is_empty());
-        assert!(doctor(First).start().is_empty());
+        assert!(villager(First).start(Timestamp::default()).is_empty());
+        assert!(doctor(First).start(Timestamp::default()).is_empty());
     }
 
     #[test]
@@ -278,7 +280,7 @@ mod tests {
         // calls `timeout`, not `handle`, and a player has nothing to say on
         // a deadline.
         let mut seat = villager(Last);
-        assert!(seat.timeout().is_empty());
+        assert!(seat.timeout(Timestamp::default()).is_empty());
     }
 
     #[test]

@@ -93,27 +93,41 @@
 //! [`Start`]: Control::Start
 //! [`Stop`]: Control::Stop
 //!
-//! # Timeouts
+//! # Deadlines
 //!
-//! An agent may be given a timeout. From the cycle in which it pops
-//! [`Control::Start`], a deadline is pending one interval ahead; when it
+//! **After the start hook and after every cycle, the loop asks the handler
+//! when it next wants waking** (ADR-0010): [`Handler::deadline`] names an
+//! absolute instant on the agent's clock, or `None`. When a deadline
 //! passes, the agent runs a cycle that calls [`Handler::timeout`] rather
-//! than [`Handler::handle`], and the next deadline is one interval after
-//! that cycle. A deadline is a separate method because waking on one is not
-//! observing anything (ADR-0008); the default does nothing. The cycle record
-//! says [`Woken::Timeout`], which is the only way to tell such a cycle from
-//! one woken by an empty pop, since there is no wake-up object to record any
-//! more.
+//! than [`Handler::handle`]. A deadline is a separate method because waking
+//! on one is not observing anything (ADR-0008); the default does nothing.
+//! The cycle record says [`Woken::Timeout`], which is the only way to tell
+//! such a cycle from one woken by an empty pop, since there is no wake-up
+//! object to record any more.
+//!
+//! A handler that names a deadline owns its schedule. The instant it gives
+//! replaces whatever was pending, so a handler whose deadline moves — the
+//! moderator's session clocks, which move every time somebody points — is
+//! re-armed where it moved to, and the wake channel is asked of the
+//! [`TimerSource`] once per *distinct* deadline rather than once and kept.
+//! A deadline already in the past fires at once, which is how a handler asks
+//! for the next cycle whatever else happens; a handler that does that on
+//! every cycle spins, which is its own bug and not one the loop guards
+//! against.
+//!
+//! A handler that names none falls back on [`Wiring::timeout`], the fixed
+//! interval given when the agent is wired: from the cycle in which it pops
+//! [`Control::Start`] a deadline is pending one interval ahead, and the next
+//! is one interval after the cycle the last one woke. Such a deadline stays
+//! where it is while events arrive, so being spoken to never pushes it back.
+//! An agent with neither a handler deadline nor an interval blocks until
+//! something arrives.
 //!
 //! A cycle woken by the deadline that also found an event calls `handle`,
 //! not `timeout`: it has an observation, and an observation is what a
-//! handler decides from. The record still says the deadline woke it, which
-//! is what moves the next one.
-//!
-//! Deadlines are absolute, and the wake channel for one is asked of the
-//! [`TimerSource`] once and kept until it fires, so something arriving
-//! before the deadline leaves the deadline where it was. An agent without an
-//! interval blocks until something arrives.
+//! handler decides from. The record still says the deadline woke it. A
+//! handler that keeps its own deadlines therefore checks them in `handle`
+//! too, against the observation's `received`.
 //!
 //! # Termination
 //!
@@ -395,7 +409,7 @@ pub trait Handler<D: Domain> {
     /// Opening actions are the agent's own, decided from nothing; a handler
     /// with work to do before it can name them has state to fold and belongs
     /// in `handle`.
-    fn start(&mut self) -> Vec<Action<D>> {
+    fn start(&mut self, _now: Timestamp) -> Vec<Action<D>> {
         Vec::new()
     }
 
@@ -423,8 +437,37 @@ pub trait Handler<D: Domain> {
     /// would have had to unwrap its way back out of it (ADR-0008). The
     /// default does nothing, which is what an agent without a timeout wants
     /// and what every agent in the tree wants today.
-    fn timeout(&mut self) -> Vec<Action<D>> {
+    fn timeout(&mut self, _now: Timestamp) -> Vec<Action<D>> {
         Vec::new()
+    }
+
+    /// The next instant this handler wants a cycle, whatever arrives before
+    /// then, or `None` to fall back on the wired interval if there is one.
+    ///
+    /// The loop asks after the start hook and after every cycle, and arms a
+    /// wake-up for whatever comes back; a deadline that differs from the one
+    /// pending replaces it (ADR-0010). A handler that overrides this owns
+    /// its schedule completely, and one that returns `None` throughout
+    /// behaves exactly as it did before there was a deadline to set.
+    ///
+    /// The instant is absolute and on the agent's clock, the same clock the
+    /// `now` of [`start`](Handler::start) and [`timeout`](Handler::timeout)
+    /// and an observation's `received` are read from, so a handler may
+    /// compare them directly.
+    ///
+    /// **A deadline already in the past fires at once**, which is how a
+    /// handler asks for the next cycle whatever else happens. A handler that
+    /// returns a past deadline on *every* cycle therefore spins; that is a
+    /// bug in the handler, in the same way as a handler that blocks, and the
+    /// loop does not guard against it.
+    ///
+    /// **Check the deadline in `handle` too.** A deadline that passes while
+    /// an event is waiting joins that event's cycle, which calls `handle`
+    /// rather than `timeout` (ADR-0008), so a handler that keeps deadlines
+    /// compares them against `observation.received` as well. A due deadline
+    /// is a fact about the time, not about which method is running.
+    fn deadline(&self) -> Option<Timestamp> {
+        None
     }
 }
 
@@ -651,6 +694,16 @@ impl<D: Domain> Popped<D> {
     }
 }
 
+/// What the loop needs to know about the cycle it has just run.
+///
+/// Both answers are about deadlines and endings rather than about the game:
+/// a cycle that started the agent is where a wired interval is measured
+/// from, and a cycle that stopped it is the agent's last.
+struct Ran {
+    started: bool,
+    stopped: bool,
+}
+
 /// The state of an agent's thread.
 struct Loop<D: Domain, H, T> {
     wiring: Wiring<D>,
@@ -706,10 +759,16 @@ where
             if timed_out {
                 self.take_deadline();
             }
-            let stop = self.cycle(t_start, popped, timed_out)?;
-            if stop || self.closed {
+            let ran = self.cycle(t_start, popped, timed_out)?;
+            if ran.stopped || self.closed {
                 break;
             }
+            // After the start hook and after every cycle, the handler says
+            // when it next wants waking (ADR-0010). A handler with no
+            // opinion leaves it to the wired interval, which is measured
+            // from the cycle that started the agent or the one its last
+            // deadline woke.
+            self.arm(t_start, ran.started || timed_out);
         }
         Ok(self.handler)
     }
@@ -831,10 +890,27 @@ where
         self.pending = None;
     }
 
-    /// Schedules the next timeout one interval after `from`, if the agent
-    /// has one at all.
-    fn schedule_timeout(&mut self, from: Timestamp) {
-        if let Some(every) = self.wiring.timeout {
+    /// Settles the deadline to wait on after a cycle that began at `from`.
+    ///
+    /// The handler is asked first (ADR-0010). What it names is absolute and
+    /// replaces whatever was pending, and a wake channel is asked for only
+    /// when the instant differs from the one already armed, so a handler
+    /// that keeps naming the same deadline waits on the same channel and a
+    /// deadline that moves is re-armed where it moved to.
+    ///
+    /// A handler with no opinion falls back on the wired interval, which is
+    /// measured from `from` and armed only by the cycle that started the
+    /// agent or by one whose deadline fired — `due` says it was one of
+    /// those. That is what keeps the fixed-interval agent behaving exactly
+    /// as it did: its deadline is pending one interval after the start, it
+    /// stays where it is while events arrive, and it moves one interval on
+    /// from the cycle it woke.
+    fn arm(&mut self, from: Timestamp, due: bool) {
+        if let Some(deadline) = self.handler.deadline() {
+            if self.pending.as_ref().is_none_or(|(at, _)| *at != deadline) {
+                self.pending = Some((deadline, self.timer.wake_at(deadline)));
+            }
+        } else if due && let Some(every) = self.wiring.timeout {
             let deadline = from + every;
             self.pending = Some((deadline, self.timer.wake_at(deadline)));
         }
@@ -842,7 +918,8 @@ where
 
     /// Runs one cycle: record what was popped, hand the observation to the
     /// handler, send and record what comes back, and close with the cycle
-    /// record. Returns whether the cycle popped a stop.
+    /// record. Returns whether the cycle popped a start and whether it
+    /// popped a stop.
     ///
     /// Whatever the handler returns is sent. Nothing arriving while it runs
     /// changes that: an agent does not know it is being stopped (ADR-0009),
@@ -853,7 +930,7 @@ where
         t_start: Timestamp,
         popped: Popped<D>,
         timed_out: bool,
-    ) -> Result<bool, Error> {
+    ) -> Result<Ran, Error> {
         let Popped {
             controls,
             event,
@@ -888,20 +965,11 @@ where
         if let Some(observation) = &observation {
             inputs.push(self.record_observation(observation)?);
         }
-        // The next deadline is measured from this cycle, whether the agent
-        // has just started or the last deadline is what woke it. Once, even
-        // when both are true: asking the timer twice for the same instant
-        // leaves the loop with one deadline either way, but the second ask
-        // is on the record of any timer that keeps one.
-        if started || timed_out {
-            self.schedule_timeout(t_start);
-        }
-
         // A start is the loop's own business: it calls the start hook, whose
         // opening actions go out ahead of whatever the cycle's observation
         // also produced, since the start was popped before it.
         let mut actions = if started {
-            self.handler.start()
+            self.handler.start(t_start)
         } else {
             Vec::new()
         };
@@ -913,7 +981,7 @@ where
         if let Some(observation) = &observation {
             actions.extend(self.handler.handle(observation));
         } else if timed_out {
-            actions.extend(self.handler.timeout());
+            actions.extend(self.handler.timeout(t_start));
         }
 
         let (mut sent, mut outputs) = (Vec::new(), Vec::new());
@@ -948,7 +1016,7 @@ where
             .records
             .send(cycle.into())
             .map_err(|_| Error::WriterClosed)?;
-        Ok(stopped)
+        Ok(Ran { started, stopped })
     }
 
     /// Stamps one action with this agent as sender and the instant of the
@@ -1049,6 +1117,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use crossbeam_channel::unbounded;
@@ -1099,11 +1168,15 @@ mod tests {
         started: usize,
         timeouts: usize,
         seen: Vec<TestPayload>,
+        /// The `now` of every start and timeout, in order, so that a test
+        /// can check the hooks are told the cycle's `t_start`.
+        clock_readings: Vec<Timestamp>,
     }
 
     impl Handler<TestDomain> for Recorder {
-        fn start(&mut self) -> Vec<Action<TestDomain>> {
+        fn start(&mut self, now: Timestamp) -> Vec<Action<TestDomain>> {
             self.started += 1;
+            self.clock_readings.push(now);
             Vec::new()
         }
 
@@ -1116,9 +1189,53 @@ mod tests {
             )]
         }
 
-        fn timeout(&mut self) -> Vec<Action<TestDomain>> {
+        fn timeout(&mut self, now: Timestamp) -> Vec<Action<TestDomain>> {
             self.timeouts += 1;
+            self.clock_readings.push(now);
             Vec::new()
+        }
+    }
+
+    /// A recorder that names its own deadline (ADR-0010).
+    ///
+    /// The deadline is whatever the test last set, shared so that the test
+    /// can move it while the agent runs; the handler otherwise behaves
+    /// exactly like the [`Recorder`] it wraps.
+    #[derive(Debug)]
+    struct Punctual {
+        inner: Recorder,
+        deadline: Arc<Mutex<Option<Timestamp>>>,
+    }
+
+    impl Punctual {
+        /// The handler and the test's handle on its deadline.
+        fn new(deadline: Option<Timestamp>) -> (Self, Arc<Mutex<Option<Timestamp>>>) {
+            let deadline = Arc::new(Mutex::new(deadline));
+            (
+                Self {
+                    inner: Recorder::default(),
+                    deadline: deadline.clone(),
+                },
+                deadline,
+            )
+        }
+    }
+
+    impl Handler<TestDomain> for Punctual {
+        fn start(&mut self, now: Timestamp) -> Vec<Action<TestDomain>> {
+            self.inner.start(now)
+        }
+
+        fn handle(&mut self, observation: &Observation<TestDomain>) -> Vec<Action<TestDomain>> {
+            self.inner.handle(observation)
+        }
+
+        fn timeout(&mut self, now: Timestamp) -> Vec<Action<TestDomain>> {
+            self.inner.timeout(now)
+        }
+
+        fn deadline(&self) -> Option<Timestamp> {
+            *self.deadline.lock().unwrap()
         }
     }
 
@@ -1139,10 +1256,37 @@ mod tests {
             self.inner.handle(observation)
         }
 
-        fn timeout(&mut self) -> Vec<Action<TestDomain>> {
+        fn timeout(&mut self, now: Timestamp) -> Vec<Action<TestDomain>> {
             self.entered.send(()).unwrap();
             self.release.recv().unwrap();
-            self.inner.timeout()
+            self.inner.timeout(now)
+        }
+    }
+
+    /// A [`Punctual`] that gates each cycle the way [`Gated`] does, for the
+    /// one test that needs both its own deadline and a way to hold the
+    /// agent mid-cycle.
+    struct GatedPunctual {
+        inner: Punctual,
+        entered: Sender<()>,
+        release: Receiver<()>,
+    }
+
+    impl Handler<TestDomain> for GatedPunctual {
+        fn handle(&mut self, observation: &Observation<TestDomain>) -> Vec<Action<TestDomain>> {
+            self.entered.send(()).unwrap();
+            self.release.recv().unwrap();
+            self.inner.handle(observation)
+        }
+
+        fn timeout(&mut self, now: Timestamp) -> Vec<Action<TestDomain>> {
+            self.entered.send(()).unwrap();
+            self.release.recv().unwrap();
+            self.inner.timeout(now)
+        }
+
+        fn deadline(&self) -> Option<Timestamp> {
+            self.inner.deadline()
         }
     }
 
@@ -1150,7 +1294,7 @@ mod tests {
     struct Town;
 
     impl Handler<TestDomain> for Town {
-        fn start(&mut self) -> Vec<Action<TestDomain>> {
+        fn start(&mut self, _now: Timestamp) -> Vec<Action<TestDomain>> {
             vec![Action::broadcast(TestPayload::Step(0))]
         }
 
@@ -1167,7 +1311,7 @@ mod tests {
             panic!("handler bug");
         }
 
-        fn timeout(&mut self) -> Vec<Action<TestDomain>> {
+        fn timeout(&mut self, _now: Timestamp) -> Vec<Action<TestDomain>> {
             panic!("handler bug");
         }
     }
@@ -1496,6 +1640,226 @@ mod tests {
         assert_eq!(handler.seen, steps([1]));
         assert_eq!(handler.timeouts, 1);
         assert!(rig.timer.requests().try_recv().is_err());
+    }
+
+    #[test]
+    fn a_handler_names_the_deadline_it_is_woken_at() {
+        // No wired interval at all: the deadline is the handler's alone.
+        let (handler, _deadline) = Punctual::new(Some(at(500)));
+        let rig = rig(handler, None);
+        rig.start();
+        rig.dispatch();
+        let (_, started) = rig.cycle();
+        // Asked after the start hook, and armed at what it asked for.
+        assert_eq!(recv(rig.timer.requests()), at(500));
+
+        rig.timer.fire().unwrap();
+        assert_eq!(rig.dispatch().deliveries, 0);
+        let (_, timed_out) = rig.cycle();
+        assert_eq!(timed_out.woken, Woken::Timeout);
+        assert!(timed_out.t_start > started.t_start);
+
+        rig.stop();
+        let handler = rig.agent.join().unwrap();
+        assert_eq!(handler.inner.timeouts, 1);
+        // `now` is the cycle's `t_start`, on the same clock the records are
+        // stamped from, so a handler's deadlines and the trajectory share a
+        // timeline.
+        assert_eq!(
+            handler.inner.clock_readings,
+            [started.t_start, timed_out.t_start]
+        );
+    }
+
+    #[test]
+    fn moving_a_deadline_re_arms_the_timer_where_it_moved_to() {
+        let (handler, deadline) = Punctual::new(Some(at(500)));
+        let rig = rig(handler, None);
+        rig.start();
+        rig.dispatch();
+        rig.cycle();
+        assert_eq!(recv(rig.timer.requests()), at(500));
+
+        // Later, then earlier. Each cycle asks the handler afresh, and each
+        // distinct answer is a new wake channel at that instant.
+        for moved in [at(900), at(100)] {
+            *deadline.lock().unwrap() = Some(moved);
+            rig.send(step("b", 1));
+            rig.dispatch();
+            rig.cycle();
+            assert_eq!(recv(rig.timer.requests()), moved);
+        }
+
+        rig.stop();
+        let handler = rig.agent.join().unwrap();
+        // Only ever one deadline pending, so only the last one could have
+        // woken anything, and nothing woke: the timer was never fired.
+        assert_eq!(handler.inner.timeouts, 0);
+        assert!(rig.timer.requests().try_recv().is_err());
+    }
+
+    #[test]
+    fn a_deadline_that_has_not_moved_is_not_asked_for_again() {
+        // "Asked once per distinct deadline": a handler that keeps naming
+        // the same instant waits on the channel it already has.
+        let (handler, _deadline) = Punctual::new(Some(at(500)));
+        let rig = rig(handler, None);
+        rig.start();
+        rig.dispatch();
+        rig.cycle();
+        assert_eq!(recv(rig.timer.requests()), at(500));
+
+        for n in 1..=3 {
+            rig.send(step("b", n));
+            rig.dispatch();
+            rig.cycle();
+        }
+
+        rig.stop();
+        rig.agent.join().unwrap();
+        assert!(
+            rig.timer.requests().try_recv().is_err(),
+            "the unchanged deadline was asked for again"
+        );
+    }
+
+    #[test]
+    fn a_handler_deadline_that_has_passed_runs_the_next_cycle_at_once() {
+        // The clock starts at zero and only goes up, so a deadline of zero
+        // is always in the past. The real clock is the timer source here:
+        // nothing fires this but the instant itself having gone by.
+        let (handler, deadline) = Punctual::new(Some(Timestamp::default()));
+        let wires = wires(None);
+        let clock = wires.wiring.clock;
+        let (queue, dispatches, records) = (wires.queue, wires.dispatches, wires.records);
+        let agent = Agent::spawn(wires.wiring, handler, clock);
+        queue
+            .send(Delivery::control(Control::Start, clock.now()))
+            .unwrap();
+        // The start cycle, then a cycle the past deadline woke, with nothing
+        // having been said to the agent in between.
+        recv(&dispatches);
+        // Stop spinning before the stop is sent, or the agent would run
+        // cycles until it reached it.
+        *deadline.lock().unwrap() = None;
+        let woken = recv(&dispatches);
+        assert_eq!(woken.deliveries, 0);
+
+        queue
+            .send(Delivery::control(Control::Stop, clock.now()))
+            .unwrap();
+        drop(queue);
+        let handler = agent.join().unwrap();
+        drop(records);
+        assert!(
+            handler.inner.timeouts >= 1,
+            "a deadline in the past did not fire at once"
+        );
+    }
+
+    #[test]
+    fn a_handler_deadline_that_passed_while_an_event_waited_calls_handle() {
+        // ADR-0008 is unchanged by ADR-0010: a deadline that passes while an
+        // event is waiting joins that event's cycle, which observes. The
+        // record still says the deadline woke it, which is why a handler
+        // that keeps deadlines checks them in `handle` as well.
+        let (entered, busy) = unbounded();
+        let (release, gate) = unbounded();
+        let handler = Punctual {
+            inner: Recorder::default(),
+            deadline: Arc::new(Mutex::new(Some(at(500)))),
+        };
+        let rig = rig(
+            GatedPunctual {
+                inner: handler,
+                entered,
+                release: gate,
+            },
+            None,
+        );
+        rig.start();
+        // The start cycle first, and on its own. A cycle takes the controls
+        // at the head of its queue and then one event, so an event sent
+        // before the start was popped would be observed by that same cycle
+        // and there would be one fewer cycle than this test counts.
+        rig.dispatch();
+        let (_, started) = rig.cycle();
+        assert_eq!(started.woken, Woken::Queue);
+
+        // Hold the agent inside a cycle, so that the deadline and the second
+        // event are both queued before it next waits, for the reason the
+        // wired-interval version of this test holds it.
+        rig.send(step("b", 1));
+        recv(&busy);
+        rig.timer.fire().unwrap();
+        rig.send(step("b", 2));
+        release.send(()).unwrap();
+
+        recv(&busy);
+        release.send(()).unwrap();
+        rig.dispatch();
+        rig.dispatch();
+        let (_, first) = rig.cycle();
+        let (_, joined) = rig.cycle();
+        assert_eq!(first.woken, Woken::Queue);
+        assert_eq!(
+            joined.woken,
+            Woken::Timeout,
+            "the cycle the deadline joined says the deadline woke it"
+        );
+        rig.stop();
+
+        let handler = rig.agent.join().unwrap();
+        assert_eq!(handler.inner.inner.seen, steps([1, 2]));
+        assert_eq!(
+            handler.inner.inner.timeouts, 0,
+            "the deadline joined an observing cycle, so `timeout` was never called"
+        );
+    }
+
+    #[test]
+    fn a_handler_with_no_deadline_leaves_the_wired_interval_alone() {
+        // `deadline` returning `None` is the default, and an agent wired
+        // with an interval behaves exactly as it did before ADR-0010.
+        let (handler, _deadline) = Punctual::new(None);
+        let rig = rig(handler, Some(EVERY));
+        rig.start();
+        rig.dispatch();
+        let (_, started) = rig.cycle();
+        assert_eq!(recv(rig.timer.requests()), started.t_start + EVERY);
+
+        // Being spoken to does not move it.
+        rig.send(step("b", 1));
+        rig.dispatch();
+        rig.cycle();
+        assert!(rig.timer.requests().try_recv().is_err());
+
+        rig.timer.fire().unwrap();
+        rig.dispatch();
+        let (_, timed_out) = rig.cycle();
+        assert_eq!(timed_out.woken, Woken::Timeout);
+        assert_eq!(recv(rig.timer.requests()), timed_out.t_start + EVERY);
+
+        rig.stop();
+        let handler = rig.agent.join().unwrap();
+        assert_eq!(handler.inner.timeouts, 1);
+    }
+
+    #[test]
+    fn a_handler_deadline_overrides_the_wired_interval() {
+        // Both are set. The handler owns its schedule, so the interval never
+        // gets a look in.
+        let (handler, _deadline) = Punctual::new(Some(at(500)));
+        let rig = rig(handler, Some(EVERY));
+        rig.start();
+        rig.dispatch();
+        let (_, started) = rig.cycle();
+        let asked = recv(rig.timer.requests());
+        assert_eq!(asked, at(500));
+        assert_ne!(asked, started.t_start + EVERY);
+
+        rig.stop();
+        rig.agent.join().unwrap();
     }
 
     #[test]

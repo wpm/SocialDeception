@@ -65,7 +65,7 @@ use std::panic::{self, AssertUnwindSafe};
 use crossbeam_channel::{Receiver, Sender, select, unbounded};
 
 use crate::agent::{self, Action, Agent, CycleDispatch, Handler, Observation, Wiring};
-use crate::clock::Clock;
+use crate::clock::{Clock, Timestamp};
 use crate::environment::{Adapter, Commanded, Environment, Rewarded};
 use crate::event::{AgentId, Control, Delivery, Domain};
 use crate::router::{Queues, RouteError, Router};
@@ -620,16 +620,20 @@ struct Watched<D: Domain> {
 }
 
 impl<D: Domain> Handler<D> for Watched<D> {
-    fn start(&mut self) -> Vec<Action<D>> {
-        self.handler.start()
+    fn start(&mut self, now: Timestamp) -> Vec<Action<D>> {
+        self.handler.start(now)
     }
 
     fn handle(&mut self, observation: &Observation<D>) -> Vec<Action<D>> {
         self.handler.handle(observation)
     }
 
-    fn timeout(&mut self) -> Vec<Action<D>> {
-        self.handler.timeout()
+    fn timeout(&mut self, now: Timestamp) -> Vec<Action<D>> {
+        self.handler.timeout(now)
+    }
+
+    fn deadline(&self) -> Option<Timestamp> {
+        self.handler.deadline()
     }
 }
 
@@ -723,7 +727,7 @@ mod tests {
     }
 
     impl Environment<Counting> for Referee {
-        fn start(&mut self) -> Vec<Effect<Counting>> {
+        fn start(&mut self, _now: Timestamp) -> Vec<Effect<Counting>> {
             vec![Effect::control(self.agents.clone(), Control::Start)]
         }
 
@@ -761,7 +765,7 @@ mod tests {
     }
 
     impl Environment<Counting> for Paymaster {
-        fn start(&mut self) -> Vec<Effect<Counting>> {
+        fn start(&mut self, _now: Timestamp) -> Vec<Effect<Counting>> {
             vec![
                 Effect::control(["a", "b"], Control::Start),
                 Effect::reward(self.to.clone(), self.value),
@@ -857,7 +861,7 @@ mod tests {
     struct Absent<const N: usize>([&'static str; N]);
 
     impl<const N: usize> Environment<Counting> for Absent<N> {
-        fn start(&mut self) -> Vec<Effect<Counting>> {
+        fn start(&mut self, _now: Timestamp) -> Vec<Effect<Counting>> {
             vec![Effect::control(self.0, Control::Start)]
         }
 
@@ -903,7 +907,7 @@ mod tests {
     }
 
     impl Handler<Counting> for Rally {
-        fn start(&mut self) -> Vec<Action<Counting>> {
+        fn start(&mut self, _now: Timestamp) -> Vec<Action<Counting>> {
             if self.serves {
                 vec![self.to_partner(1)]
             } else {
@@ -940,7 +944,7 @@ mod tests {
     }
 
     impl Handler<Counting> for Hub {
-        fn start(&mut self) -> Vec<Action<Counting>> {
+        fn start(&mut self, _now: Timestamp) -> Vec<Action<Counting>> {
             vec![Action::broadcast(Say(0))]
         }
 
@@ -975,7 +979,7 @@ mod tests {
     struct Addresses(&'static str);
 
     impl Handler<Counting> for Addresses {
-        fn start(&mut self) -> Vec<Action<Counting>> {
+        fn start(&mut self, _now: Timestamp) -> Vec<Action<Counting>> {
             vec![Action::to([self.0], Say(1))]
         }
 
@@ -996,7 +1000,7 @@ mod tests {
     struct Panics;
 
     impl Handler<Counting> for Panics {
-        fn start(&mut self) -> Vec<Action<Counting>> {
+        fn start(&mut self, _now: Timestamp) -> Vec<Action<Counting>> {
             panic!("the handler is broken")
         }
 
