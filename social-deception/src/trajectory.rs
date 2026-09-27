@@ -709,16 +709,7 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
-    use crate::testing::{Shared, TestDomain, TestPayload, parse_lines};
-
-    /// A writer whose one required sink writes JSON Lines to a buffer the
-    /// test keeps, which is the shape most of these tests want.
-    fn jsonl() -> (Sender<LogRecord<TestDomain>>, Writer, Shared) {
-        let bytes = Shared::new();
-        let sink: Box<dyn Sink<TestDomain>> = Box::new(JsonLines::new(bytes.clone()));
-        let (sender, writer) = Writer::spawn(vec![(sink, Policy::Required)]);
-        (sender, writer, bytes)
-    }
+    use crate::testing::{TestDomain, TestPayload, joined, parse_lines, recording};
 
     fn at(nanos: u64) -> Timestamp {
         Timestamp::from(Duration::from_nanos(nanos))
@@ -779,13 +770,12 @@ mod tests {
 
     #[test]
     fn records_round_trip_through_the_writer_as_jsonl() {
-        let (sender, writer, bytes) = jsonl();
+        let (sender, writer, bytes) = recording();
         for record in sample() {
             sender.send(record).unwrap();
         }
         drop(sender);
-        writer.join().unwrap();
-        assert_eq!(parse_lines(&bytes.bytes()), expected_lines());
+        assert_eq!(parse_lines(&joined(writer, &bytes)), expected_lines());
     }
 
     #[test]
@@ -872,13 +862,12 @@ mod tests {
 
     #[test]
     fn every_line_is_one_object_and_the_stream_dispatches_on_type() {
-        let (sender, writer, bytes) = jsonl();
+        let (sender, writer, bytes) = recording();
         for record in sample() {
             sender.send(record).unwrap();
         }
         drop(sender);
-        writer.join().unwrap();
-        let bytes = bytes.bytes();
+        let bytes = joined(writer, &bytes);
         let text = std::str::from_utf8(&bytes).unwrap();
         assert_eq!(text.lines().count(), 4);
         let types: Vec<Value> = parse_lines(&bytes)
@@ -894,7 +883,7 @@ mod tests {
 
     #[test]
     fn writer_thread_survives_records_from_several_senders() {
-        let (sender, writer, bytes) = jsonl();
+        let (sender, writer, bytes) = recording();
         let handles: Vec<_> = (0..4u64)
             .map(|i| {
                 let sender = sender.clone();
@@ -918,8 +907,7 @@ mod tests {
         for handle in handles {
             handle.join().unwrap();
         }
-        writer.join().unwrap();
-        let lines = parse_lines(&bytes.bytes());
+        let lines = parse_lines(&joined(writer, &bytes));
         assert_eq!(lines.len(), 40);
         // Each agent's records come out in its own order, whatever the
         // interleaving between agents.
