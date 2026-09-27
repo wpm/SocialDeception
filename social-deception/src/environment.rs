@@ -675,11 +675,16 @@ mod tests {
         }
     }
 
+    /// An instant, the way every other test module in the crate spells one.
+    fn at(nanos: u64) -> Timestamp {
+        Timestamp::from(Duration::from_nanos(nanos))
+    }
+
     #[test]
     fn the_adapter_forwards_the_environments_deadline_and_the_time() {
         // An environment sets deadlines the way a handler does (ADR-0010);
         // the adapter is what carries them between the two traits.
-        let wanted = Timestamp::from(Duration::from_secs(3));
+        let wanted = at(3);
         let (commands, _commanded) = unbounded();
         let (paid, _rewarded) = unbounded();
         let (recorder, _records) = unbounded();
@@ -696,10 +701,7 @@ mod tests {
         );
         assert_eq!(Handler::deadline(&adapter), Some(wanted));
 
-        let (start, timed_out) = (
-            Timestamp::from(Duration::from_secs(1)),
-            Timestamp::from(Duration::from_secs(2)),
-        );
+        let (start, timed_out) = (at(1), at(2));
         assert!(adapter.start(start).is_empty());
         assert!(adapter.timeout(timed_out).is_empty());
         assert_eq!(adapter.environment.readings, [start, timed_out]);
@@ -713,12 +715,12 @@ mod tests {
     /// added, so that an episode holding one is not a special case.
     #[test]
     fn a_boxed_environment_forwards_the_new_hooks() {
-        let wanted = Timestamp::from(Duration::from_secs(4));
+        let wanted = at(4);
         let mut boxed: Box<dyn Environment<TestDomain>> = Box::new(Punctual {
             deadline: Some(wanted),
             readings: Vec::new(),
         });
-        let now = Timestamp::from(Duration::from_secs(1));
+        let now = at(1);
         assert!(boxed.start(now).is_empty());
         assert!(boxed.timeout(now).is_empty());
         assert_eq!(boxed.deadline(), Some(wanted));
