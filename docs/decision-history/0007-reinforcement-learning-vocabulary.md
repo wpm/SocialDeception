@@ -9,8 +9,11 @@
 [ADR-0005](0005-policy-separates-decisions-from-rules.md)
 **Amended by:** [ADR-0008](0008-one-observation-per-cycle.md), under which a cycle handles one observation;
 by [ADR-0009](0009-one-queue-and-no-cancellation.md), which returns to one queue and removes cancellation;
-and by [ADR-0012](0012-a-dead-player-stops.md), under which a `Stop` to some agents while others run
-is delivered at once rather than held until nothing is in flight
+by [ADR-0012](0012-a-dead-player-stops.md), under which a `Stop` to some agents while others run
+is delivered at once rather than held until nothing is in flight;
+and by [ADR-0014](0014-events-carry-information-controls-carry-instruction.md), which makes the observation/action split a rule rather than
+a vocabulary: an event to an agent must inform it, and an agent's state is
+its own rather than the trajectory's
 
 ## Context
 

@@ -9,8 +9,10 @@ which adds the agent's own secret actions to what `Knowledge` folds
 `Action` is now the message an agent sends, here a `Response` carrying a `Move`;
 by [ADR-0011](0011-werewolf-phases-are-timed-pointing-sessions.md), under which a move is a point,
 `Abstain` is gone, and determinism covers each phase's outcome rather than the full transcript;
-and by [ADR-0013](0013-speech-typing-and-a-scheduler-for-when-to-speak.md), under which a policy also
-decides what to say, and a separate scheduler decides when
+by [ADR-0013](0013-speech-typing-and-a-scheduler-for-when-to-speak.md), under which a policy also
+decides what to say, and a separate scheduler decides when;
+and by [ADR-0014](0014-events-carry-information-controls-carry-instruction.md), under which a role also decides whether the rules
+ask anything of it this phase, rather than being told by a request
 
 ## Context
 
