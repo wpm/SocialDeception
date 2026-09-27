@@ -23,10 +23,18 @@
 //! that a slow role cannot spend another's time: the pack devours, the seer
 //! investigates, the doctor protects. Each closes when every member has
 //! pointed and no point has changed for its quiet period — any change
-//! restarts it — or at its hard limit, whichever comes first. A session's
-//! closing tally goes to its own members and marks the close. The seer is
+//! restarts it — or at its hard limit, whichever comes first. The seer is
 //! told its finding when its own session closes, so a seer devoured that
 //! same night still learns what it learned.
+//!
+//! A session of **more than one member** closes with a tally of its
+//! members' latest points, to those members. That is what lets a pack see
+//! where it has converged. A session of one is sent none: it would tell a
+//! lone seer, doctor or wolf the one thing it already knows, having just
+//! said it. Everything the moderator sends a player is something that
+//! player observes for its own sake; what the moderator needs to remember
+//! it keeps, and a reader of the trajectory reconstructs a session from
+//! the points the moderator observed, which are the primary record.
 //!
 //! The night resolves once every session has closed: the victim is the
 //! plurality of the pack's latest points, and no wolf pointing means
@@ -574,18 +582,30 @@ impl Game {
     fn close_night_session(&mut self, session: &Session) -> Vec<Directive> {
         self.outstanding
             .retain(|_, (who, kind)| !(*kind == session.kind && session.members.contains(who)));
-        // To its members and, for the pack, to nobody else; the moderator
-        // is not a recipient of its own narrations.
-        let mut directives = vec![Directive::Narrate {
-            to: session.members.clone(),
-            narration: Narration::Tally {
-                round: self.round,
-                phase: Phase::Night,
-                kind: session.kind,
-                votes: session.points.clone(),
-                hammer: None,
-            },
-        }];
+        // To its members, and to nobody else; the moderator is not a
+        // recipient of its own narrations.
+        //
+        // A session of one is not told its own tally. The point of a
+        // tally is that a member sees where the *others* landed, which
+        // is what lets a pack converge; told to a lone seer or doctor it
+        // repeats the one thing that player already knows, having just
+        // said it. The seer's close is marked by the finding below,
+        // which says something it did not know; the doctor's is marked
+        // by nothing, which is of a piece with a protection being
+        // announced to nobody.
+        let mut directives = Vec::new();
+        if session.members.len() > 1 {
+            directives.push(Directive::Narrate {
+                to: session.members.clone(),
+                narration: Narration::Tally {
+                    round: self.round,
+                    phase: Phase::Night,
+                    kind: session.kind,
+                    votes: session.points.clone(),
+                    hammer: None,
+                },
+            });
+        }
         for (who, target) in &session.points {
             match session.kind {
                 RequestKind::Protect => {
@@ -1153,10 +1173,7 @@ mod tests {
                 ask("bob", 1, 1, RequestKind::Devour),
                 ask("carol", 2, 1, RequestKind::Investigate),
                 ask("dave", 3, 1, RequestKind::Protect),
-                tally(["bob"], 1, RequestKind::Devour, &[("bob", "alice")]),
-                tally(["carol"], 1, RequestKind::Investigate, &[("carol", "bob")]),
                 investigated("carol", "bob", Faction::Werewolves),
-                tally(["dave"], 1, RequestKind::Protect, &[("dave", "erin")]),
                 eliminated(everyone, "alice", Villager, 1, Cause::Devoured),
                 stopped("alice"),
                 phase_began(1, Phase::Day, survivors),
@@ -1198,13 +1215,10 @@ mod tests {
         assert_eq!(
             directives[9..],
             [
-                tally(["bob"], 1, RequestKind::Devour, &[("bob", "carol")]),
-                tally(["carol"], 1, RequestKind::Investigate, &[("carol", "bob")]),
                 // The seer is devoured tonight and still learns what it
                 // learned, because its own session closed before the
                 // night resolved.
                 investigated("carol", "bob", Faction::Werewolves),
-                tally(["dave"], 1, RequestKind::Protect, &[("dave", "alice")]),
                 eliminated(
                     ["alice", "bob", "carol", "dave", "erin"],
                     "carol",
@@ -1238,8 +1252,6 @@ mod tests {
                 phase_began(2, Phase::Night, ["alice", "bob", "dave"]),
                 ask("bob", 8, 2, RequestKind::Devour),
                 ask("dave", 9, 2, RequestKind::Protect),
-                tally(["bob"], 2, RequestKind::Devour, &[("bob", "alice")]),
-                tally(["dave"], 2, RequestKind::Protect, &[("dave", "bob")]),
                 eliminated(
                     ["alice", "bob", "dave"],
                     "alice",
@@ -1545,9 +1557,19 @@ mod tests {
         let deadline = game.next_deadline().expect("the sessions are open");
         assert_eq!(deadline, at(0) + fast().pack.quiet);
         let caused = game.expire(deadline);
-        assert_eq!(
-            caused[0],
-            tally(["bob"], 1, RequestKind::Devour, &[("bob", "alice")])
+        // The village's pack is one wolf, so there is no tally to send:
+        // a session of one is not told what it alone said. What the
+        // close does produce is the seer's finding, then the death.
+        assert_eq!(caused[0], investigated("carol", "bob", Faction::Werewolves));
+        assert!(
+            !caused.iter().any(|directive| matches!(
+                directive,
+                Directive::Narrate {
+                    narration: Narration::Tally { .. },
+                    ..
+                }
+            )),
+            "no session of this night had two members: {caused:?}"
         );
     }
 
@@ -1697,11 +1719,8 @@ mod tests {
         assert_eq!(
             directives[9..],
             [
-                tally(["bob"], 1, RequestKind::Devour, &[("bob", "erin")]),
-                tally(["carol"], 1, RequestKind::Investigate, &[("carol", "bob")]),
                 // The seer looked at bob and found the pack.
                 investigated("carol", "bob", Faction::Werewolves),
-                tally(["dave"], 1, RequestKind::Protect, &[("dave", "erin")]),
                 narrate(everyone, Narration::NoDeath { round: Round(1) }),
                 phase_began(1, Phase::Day, everyone),
                 ask("alice", 4, 1, RequestKind::Nominate),

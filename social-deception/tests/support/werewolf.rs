@@ -907,6 +907,34 @@ struct Phases<'p, 'a> {
 }
 
 impl<'p, 'a> Phases<'p, 'a> {
+    /// The players the session that decides a death named most often:
+    /// the pack's at night, the day's by day.
+    ///
+    /// Read from the points the moderator observed rather than from the
+    /// tally it narrated. A point is the primary record — an action a
+    /// player took, joined to the request it answers — and it is there
+    /// whether or not anybody was told a tally. A tally is a message to
+    /// the members of a session, and a session of one is sent none,
+    /// because a lone seer, doctor or wolf would be told only what it
+    /// has just said.
+    fn leaders_of(&self, round: Round, phase: Phase) -> BTreeSet<AgentId> {
+        let deciding = match phase {
+            Phase::Night => RequestKind::Devour,
+            Phase::Day => RequestKind::Nominate,
+        };
+        let votes: BTreeMap<AgentId, AgentId> = self
+            .play
+            .heard
+            .iter()
+            .filter_map(|heard| {
+                let (_, _, request) = self.play.asked(heard.point.request)?;
+                (request.round == round && request.kind == deciding)
+                    .then(|| (heard.from.clone(), heard.point.target.clone()))
+            })
+            .collect();
+        leaders(&votes)
+    }
+
     /// A phase began: it is the one after the last, its living are the
     /// living, and the last phase was complete.
     fn began(
@@ -978,8 +1006,8 @@ impl<'p, 'a> Phases<'p, 'a> {
                 };
                 assert_eq!(*cause, expected, "the cause is the phase's: {line}");
                 assert!(
-                    self.counts.leaders.contains(who),
-                    "an elimination is of a player the tally names most: {line}"
+                    self.leaders_of(round, phase).contains(who),
+                    "an elimination is of a player the deciding session named most: {line}"
                 );
                 if phase == Phase::Night {
                     assert_ne!(
@@ -998,8 +1026,9 @@ impl<'p, 'a> Phases<'p, 'a> {
                 // soon as they are asked, but it is a legal night and
                 // not a bug: a pack that cannot agree to act does not
                 // act.
-                let saved = protected.is_some_and(|who| self.counts.leaders.contains(who));
-                let nobody_chosen = self.counts.leaders.is_empty();
+                let chosen = self.leaders_of(round, Phase::Night);
+                let saved = protected.is_some_and(|who| chosen.contains(who));
+                let nobody_chosen = chosen.is_empty();
                 assert!(
                     saved || nobody_chosen,
                     "a night with no death is one the doctor saved or one the pack named \
@@ -1030,8 +1059,6 @@ struct PhaseCounts {
     tallies: usize,
     eliminated: usize,
     no_death: usize,
-    /// The players the phase's tally named most, once it has been narrated.
-    leaders: BTreeSet<AgentId>,
 }
 
 impl PhaseCounts {
@@ -1040,11 +1067,7 @@ impl PhaseCounts {
     fn count(&mut self, narration: &Narration, round: Round, phase: Phase, line: &Value) {
         match narration {
             Narration::Tally {
-                round: r,
-                phase: p,
-                kind,
-                votes,
-                ..
+                round: r, phase: p, ..
             } => {
                 assert_eq!(
                     (*r, *p),
@@ -1052,12 +1075,6 @@ impl PhaseCounts {
                     "a tally belongs to its phase: {line}"
                 );
                 self.tallies += 1;
-                // A night has three sessions and only the pack's decides
-                // who dies; the seer's and the doctor's name nobody the
-                // elimination has to match (ADR-0011).
-                if matches!(kind, RequestKind::Devour | RequestKind::Nominate) {
-                    self.leaders = leaders(votes);
-                }
             }
             Narration::Eliminated { round: r, .. } => {
                 assert_eq!(*r, round, "a death belongs to its round: {line}");
@@ -1089,14 +1106,18 @@ impl PhaseCounts {
         let Some((_, phase, line)) = phase else {
             return;
         };
+        // A tally goes only to a session of more than one member, since
+        // a session of one would be told what it alone said, so how many
+        // a phase has is a fact about the roster rather than about the
+        // rules: a night of three lone roles has none, a seven-player
+        // day has one. What each arm checks is the part that does not
+        // depend on who is left alive.
         match phase {
-            // A night is up to three sessions, each closing with a tally
-            // of its own; the seer's and the doctor's may not open at all
-            // when nobody holds the role (ADR-0011).
+            // At most three: the pack, the seer and the doctor.
             Phase::Night => {
                 assert!(
-                    (1..=3).contains(&self.tallies),
-                    "a night has a tally per session it opened: {line}"
+                    self.tallies <= 3,
+                    "a night has at most a tally per session: {line}"
                 );
                 assert_eq!(
                     self.eliminated + self.no_death,
@@ -1107,7 +1128,7 @@ impl PhaseCounts {
             // A day is one session, and it may end without a lynch now
             // that it closes on a majority rather than a plurality.
             Phase::Day => {
-                assert_eq!(self.tallies, 1, "a day has one tally: {line}");
+                assert!(self.tallies <= 1, "a day is one session: {line}");
                 assert_eq!(
                     self.eliminated + self.no_death,
                     1,
@@ -1608,15 +1629,20 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "an elimination is of a player the tally names most")]
-    fn an_elimination_the_tally_does_not_call_for_is_caught() {
+    #[should_panic(expected = "an elimination is of a player the deciding session named most")]
+    fn an_elimination_the_points_do_not_call_for_is_caught() {
         // No day of this fixture lynches anybody, so the elimination to
         // forge is a devouring. On night 4 the pack splits, dave naming
         // alice and erin naming grace, and alice is the one taken; bob,
         // whom neither named, is devoured in her place. The last night, so
         // that no later phase's record of the living trips first, and the
-        // outcome is corrected to match, so that the tally is what the
-        // check trips on rather than the survivors.
+        // outcome is corrected to match, so that whom the pack pointed at
+        // is what the check trips on rather than the survivors.
+        //
+        // What it is checked against is the pack's *points*, which the
+        // moderator observed, and not a tally it narrated: a tally is a
+        // message to a session's members and says nothing a point did
+        // not, so forging one would not make this death legitimate.
         let mut lines = fixture();
         let death = find(&lines, "moderator", "action", eliminated("alice"));
         lines[death]["event"]["payload"]["Narration"]["Eliminated"] =
