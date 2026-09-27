@@ -106,7 +106,7 @@ fn run(config: &Config) -> Transcript {
         trajectory: Some(file.clone()),
         ..config.clone()
     };
-    let outcome = werewolf::run(&config).unwrap();
+    let outcome = werewolf::run(&config, None).unwrap();
     let transcript = read(&file, &config);
     assert_eq!(
         transcript.outcome, outcome,
@@ -236,6 +236,8 @@ fn a_run_is_reproduced_from_its_artifacts() {
     let effective_path = config::effective_path(&original);
     let rerun = dir.join("rerun.jsonl");
     let seed = SEED.to_string();
+    // `--quiet`, because what this test reads is the summary: the
+    // narration above it is the subject of its own tests.
     let played = werewolf(&[
         "play",
         EXAMPLE,
@@ -243,6 +245,7 @@ fn a_run_is_reproduced_from_its_artifacts() {
         &seed,
         "--trajectory",
         original.to_str().unwrap(),
+        "--quiet",
     ]);
 
     let effective = config::load(&effective_path).unwrap();
@@ -272,6 +275,7 @@ fn a_run_is_reproduced_from_its_artifacts() {
         effective_path.to_str().unwrap(),
         "--trajectory",
         rerun.to_str().unwrap(),
+        "--quiet",
     ]);
     assert_eq!(read(&rerun, &effective), transcript);
 }
@@ -293,4 +297,94 @@ fn a_reader_that_stops_early_is_not_an_error() {
     let output = child.wait_with_output().unwrap();
     assert!(output.status.success(), "{output:?}");
     assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+}
+
+/// A five-player configuration file in `dir`, whose trajectory is beside
+/// it, for the tests that play a game through the binary.
+fn playable(dir: &TempDir) -> (std::path::PathBuf, std::path::PathBuf) {
+    let trajectory = dir.join("played.jsonl");
+    let config = dir.join("game.toml");
+    fs::write(
+        &config,
+        format!(
+            "seed = 26\nplayers = [\"alice\", \"bob\", \"carol\", \"dave\", \"erin\", \"frank\", \
+             \"grace\"]\ntrajectory = '{}'\n[roles]\nwerewolves = 2\nseers = 1\ndoctors = 1\n",
+            trajectory.display()
+        ),
+    )
+    .unwrap();
+    (config, trajectory)
+}
+
+/// The summary `play` prints after a game: the five or six lines from the
+/// seed to what was written.
+fn summary(printed: &str) -> String {
+    let at = printed.find("seed: ").expect("a summary");
+    printed[at..].to_owned()
+}
+
+#[test]
+fn play_narrates_the_game_above_its_summary() {
+    let dir = TempDir::new();
+    let (config, _) = playable(&dir);
+    let printed = werewolf(&["play", config.to_str().unwrap()]);
+
+    // The game, line by line, from the first phase to the outcome.
+    assert!(
+        printed
+            .lines()
+            .any(|line| line.contains("PhaseBegan(Night 1")),
+        "{printed}"
+    );
+    assert!(
+        printed.lines().any(|line| line.contains("Outcome(")),
+        "{printed}"
+    );
+    // Then a blank line, then the summary and nothing after it.
+    let ended = summary(&printed);
+    assert!(printed.ends_with(&ended), "{printed}");
+    assert!(
+        printed[..printed.len() - ended.len()].ends_with("\n\n"),
+        "{printed}"
+    );
+    assert!(ended.starts_with("seed: 26\nwinner: "), "{ended}");
+}
+
+#[test]
+fn quiet_prints_the_summary_alone() {
+    let dir = TempDir::new();
+    let (config, _) = playable(&dir);
+    let loud = werewolf(&["play", config.to_str().unwrap()]);
+    let quiet = werewolf(&["play", config.to_str().unwrap(), "--quiet"]);
+
+    // Exactly the summary: no narration, and no blank line where the
+    // narration would have been.
+    assert!(quiet.starts_with("seed: 26\n"), "{quiet}");
+    assert_eq!(quiet, summary(&loud));
+    assert!(!quiet.contains("PhaseBegan"), "{quiet}");
+}
+
+#[test]
+fn a_watcher_who_stops_reading_still_leaves_a_whole_trajectory() {
+    // `werewolf play … | head` closes the pipe partway through the
+    // narration. The text sink is optional, so it is dropped and the game
+    // plays on: the trajectory is complete and the run succeeds.
+    let dir = TempDir::new();
+    let (config, trajectory) = playable(&dir);
+    let mut child = Command::new(WEREWOLF)
+        .args(["play", config.to_str().unwrap()])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(child.stdout.take());
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+
+    // The whole game is on disk, and it is the game the fixed seed plays.
+    let effective = config::load(config::effective_path(&trajectory)).unwrap();
+    let transcript = read(&trajectory, &effective);
+    assert_eq!(transcript.outcome.winner, Faction::Werewolves);
+    assert_eq!(transcript.rounds.len(), 2);
 }
