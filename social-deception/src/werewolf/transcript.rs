@@ -115,8 +115,15 @@ pub struct PhaseRecord {
     /// more than one.
     pub investigations: BTreeMap<AgentId, (AgentId, Faction)>,
     /// Who was eliminated, the role their death revealed, and how. `None`
-    /// on a night when nobody died.
+    /// on a night when nobody died and on a day that ran out of time.
     pub eliminated: Option<(AgentId, Role, Cause)>,
+    /// Whether this day closed at its limit with no majority, so that a
+    /// day with nobody lynched is told from a day still being read
+    /// (ADR-0011). Always false for a night.
+    pub no_lynch: bool,
+    /// The player whose point completed the majority that ended the day:
+    /// the *hammer*. `None` for a night, and for a day that ran out.
+    pub hammer: Option<AgentId>,
 }
 
 impl PhaseRecord {
@@ -127,6 +134,8 @@ impl PhaseRecord {
             moves: BTreeMap::new(),
             investigations: BTreeMap::new(),
             eliminated: None,
+            no_lynch: false,
+            hammer: None,
         }
     }
 }
@@ -321,7 +330,71 @@ struct Record {
     message: Message,
 }
 
+/// What one phase settled, as ADR-0011 guarantees it to be reproducible.
+///
+/// A projection of a [`PhaseRecord`] onto its outcome alone: who died and
+/// what each seer found. The points that led there, and their order, are
+/// not part of it, because with timed sessions they are not reproducible.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Verdict {
+    /// Who was eliminated and how, or `None` for a night nobody died in
+    /// and a day nobody was lynched in.
+    pub eliminated: Option<(AgentId, Role, Cause)>,
+    /// What each seer learned this phase.
+    pub investigations: BTreeMap<AgentId, (AgentId, Faction)>,
+}
+
+/// Everything a run of one seed must reproduce (ADR-0011).
+///
+/// A game played with timed sessions is reproducible in its *outcomes* and
+/// not in its traffic: every death, every finding, the winner and the
+/// rewards are the same on every run of a seed, while the order of points,
+/// and which late points arrive before a session closes, are not. This is
+/// the part the determinism tests compare.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Verdicts {
+    /// Each player's role, as the moderator dealt it.
+    pub assignment: BTreeMap<AgentId, Role>,
+    /// Each phase in order, night before day.
+    pub phases: Vec<Verdict>,
+    /// How the game ended.
+    pub outcome: Outcome,
+    /// What each player's game was worth.
+    pub rewards: BTreeMap<AgentId, i32>,
+}
+
 impl Transcript {
+    /// The game projected onto what ADR-0011 guarantees to be
+    /// reproducible: the deal, each phase's elimination and findings, the
+    /// outcome and the rewards.
+    ///
+    /// Two runs of one seed agree on this and need not agree on anything
+    /// else, so it is what the determinism tests compare. Comparing whole
+    /// transcripts would compare the order points arrived in, which is a
+    /// fact about thread scheduling rather than about the game.
+    #[must_use]
+    pub fn verdicts(&self) -> Verdicts {
+        let verdict = |record: &PhaseRecord| Verdict {
+            eliminated: record.eliminated.clone(),
+            investigations: record.investigations.clone(),
+        };
+        Verdicts {
+            assignment: self.assignment.clone(),
+            phases: self
+                .rounds
+                .iter()
+                .flat_map(|round| {
+                    [Some(&round.night), round.day.as_ref()]
+                        .into_iter()
+                        .flatten()
+                        .map(verdict)
+                })
+                .collect(),
+            outcome: self.outcome.clone(),
+            rewards: self.rewards.clone(),
+        }
+    }
+
     /// Reconstructs the game from the moderator's records in a trajectory.
     ///
     /// `lines` is the whole file, one value per line, as [`lines`] returns
@@ -571,9 +644,15 @@ impl Reader {
             Narration::Eliminated {
                 who, role, cause, ..
             } => self.current(line)?.eliminated = Some((who, role, cause)),
-            // The tally repeats the responses already recorded, and a night
-            // without a death is one without an elimination.
-            Narration::Tally { .. } | Narration::NoDeath { .. } => {}
+            Narration::NoLynch { .. } => self.current(line)?.no_lynch = true,
+            Narration::Tally { hammer, .. } => {
+                if let Some(hammer) = hammer {
+                    self.current(line)?.hammer = Some(hammer);
+                }
+            }
+            // A tally otherwise repeats points already recorded, and a
+            // night without a death is one without an elimination.
+            Narration::NoDeath { .. } => {}
             Narration::Outcome(outcome) => self.outcome = Some(outcome),
         }
         Ok(())
@@ -727,10 +806,15 @@ fn phase(
             None => writeln!(f)?,
         }
     }
-    match &record.eliminated {
-        Some((who, role, Cause::Devoured)) => writeln!(f, "  {who} is devoured   ({role})"),
-        Some((who, role, Cause::Lynched)) => writeln!(f, "  {who} is lynched   ({role})"),
-        None => writeln!(f, "  no one died"),
+    match (&record.eliminated, record.no_lynch) {
+        (Some((who, role, Cause::Devoured)), _) => writeln!(f, "  {who} is devoured   ({role})"),
+        (Some((who, role, Cause::Lynched)), _) => match &record.hammer {
+            Some(hammer) => writeln!(f, "  {who} is lynched   ({role}; hammer: {hammer})"),
+            None => writeln!(f, "  {who} is lynched   ({role})"),
+        },
+        // A day that ran out of time is not a night that nobody died in.
+        (None, true) => writeln!(f, "  no one was lynched"),
+        (None, false) => writeln!(f, "  no one died"),
     }
 }
 
@@ -748,7 +832,10 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::testing::{id, ids, village};
+    use std::time::Duration;
+
+    use crate::clock::Timestamp;
+    use crate::testing::{fast, id, ids, village};
     use crate::werewolf::assignment::Assignment;
     use crate::werewolf::game::{Directive, Game};
     use crate::werewolf::role::Role::{Doctor, Seer, Villager, Werewolf};
@@ -812,6 +899,8 @@ mod tests {
         eliminated: Option<(&str, Role, Cause)>,
     ) -> PhaseRecord {
         PhaseRecord {
+            no_lynch: false,
+            hammer: None,
             living: ids(living),
             moves,
             investigations: investigation
@@ -825,9 +914,6 @@ mod tests {
     /// The game the fixture records, written out by hand from the
     /// moderator's records.
     fn expected() -> Transcript {
-        use Cause::{Devoured, Lynched};
-        use RequestKind::{Devour, Investigate, Protect};
-        let everyone = ["alice", "bob", "carol", "dave", "erin", "frank", "grace"];
         Transcript {
             assignment: [
                 ("alice", Villager),
@@ -842,71 +928,15 @@ mod tests {
             .map(|(who, role)| (id(who), role))
             .collect(),
             rounds: vec![
-                RoundRecord {
-                    round: Round(1),
-                    // The pack splits, the tie-break picks alice, and the
-                    // doctor has protected her: a saved night.
-                    night: phase(
-                        everyone,
-                        moves([
-                            ("carol", Protect, target("alice")),
-                            ("dave", Devour, target("alice")),
-                            ("erin", Devour, target("bob")),
-                            ("grace", Investigate, target("alice")),
-                        ]),
-                        Some(("grace", "alice", Faction::Village)),
-                        None,
-                    ),
-                    day: Some(phase(
-                        everyone,
-                        nominations([
-                            ("alice", "frank"),
-                            ("bob", "carol"),
-                            ("carol", "bob"),
-                            ("dave", "alice"),
-                            ("erin", "alice"),
-                            ("frank", "grace"),
-                            ("grace", "erin"),
-                        ]),
-                        None,
-                        Some(("alice", Villager, Lynched)),
-                    )),
-                },
-                RoundRecord {
-                    round: Round(2),
-                    // The pack agrees on carol, whom the doctor did not
-                    // protect, and the seer finds a werewolf too late.
-                    night: phase(
-                        ["bob", "carol", "dave", "erin", "frank", "grace"],
-                        moves([
-                            ("carol", Protect, target("erin")),
-                            ("dave", Devour, target("carol")),
-                            ("erin", Devour, target("carol")),
-                            ("grace", Investigate, target("dave")),
-                        ]),
-                        Some(("grace", "dave", Faction::Werewolves)),
-                        Some(("carol", Doctor, Devoured)),
-                    ),
-                    // Grace and frank tie, and the tie-break lynches grace:
-                    // two werewolves among four living is parity.
-                    day: Some(phase(
-                        ["bob", "dave", "erin", "frank", "grace"],
-                        nominations([
-                            ("bob", "grace"),
-                            ("dave", "bob"),
-                            ("erin", "frank"),
-                            ("frank", "grace"),
-                            ("grace", "frank"),
-                        ]),
-                        None,
-                        Some(("grace", Seer, Lynched)),
-                    )),
-                },
+                expected_round_one(),
+                expected_round_two(),
+                expected_round_three(),
+                expected_round_four(),
             ],
             outcome: Outcome {
                 winner: Faction::Werewolves,
-                rounds: Round(2),
-                living: ids(["bob", "dave", "erin", "frank"]),
+                rounds: Round(4),
+                living: ids(["bob", "dave", "erin", "grace"]),
             },
             // The werewolves dave and erin won; everybody else, living or
             // dead, lost with the village.
@@ -923,6 +953,139 @@ mod tests {
             .map(|(who, value)| (id(who), value))
             .collect(),
         }
+    }
+
+    /// Everyone, for the rounds before anybody has died.
+    const EVERYONE: [&str; 7] = ["alice", "bob", "carol", "dave", "erin", "frank", "grace"];
+
+    /// The pack splits, the tie-break picks alice, and the doctor has
+    /// protected her: a saved night. Then seven players scatter over five
+    /// targets, so nobody reaches the four a majority of the living needs
+    /// and the day runs out (ADR-0011).
+    fn expected_round_one() -> RoundRecord {
+        use RequestKind::{Devour, Investigate, Protect};
+        RoundRecord {
+            round: Round(1),
+            night: phase(
+                EVERYONE,
+                moves([
+                    ("carol", Protect, target("alice")),
+                    ("dave", Devour, target("alice")),
+                    ("erin", Devour, target("bob")),
+                    ("grace", Investigate, target("alice")),
+                ]),
+                Some(("grace", "alice", Faction::Village)),
+                None,
+            ),
+            day: Some(no_lynch(phase(
+                EVERYONE,
+                nominations([
+                    ("alice", "frank"),
+                    ("bob", "carol"),
+                    ("carol", "bob"),
+                    ("dave", "alice"),
+                    ("erin", "alice"),
+                    ("frank", "grace"),
+                    ("grace", "erin"),
+                ]),
+                None,
+                None,
+            ))),
+        }
+    }
+
+    /// The pack agrees on carol, whom the doctor did not protect, and the
+    /// seer finds a werewolf too late to say so.
+    fn expected_round_two() -> RoundRecord {
+        use Cause::Devoured;
+        use RequestKind::{Devour, Investigate, Protect};
+        RoundRecord {
+            round: Round(2),
+            night: phase(
+                EVERYONE,
+                moves([
+                    ("carol", Protect, target("erin")),
+                    ("dave", Devour, target("carol")),
+                    ("erin", Devour, target("bob")),
+                    ("grace", Investigate, target("dave")),
+                ]),
+                Some(("grace", "dave", Faction::Werewolves)),
+                Some(("carol", Doctor, Devoured)),
+            ),
+            day: Some(no_lynch(phase(
+                ["alice", "bob", "dave", "erin", "frank", "grace"],
+                nominations([
+                    ("alice", "grace"),
+                    ("bob", "grace"),
+                    ("dave", "alice"),
+                    ("erin", "bob"),
+                    ("frank", "grace"),
+                    ("grace", "erin"),
+                ]),
+                None,
+                None,
+            ))),
+        }
+    }
+
+    /// No doctor lives, so no protection session opens and nothing stands
+    /// between the pack and the player it agrees on.
+    fn expected_round_three() -> RoundRecord {
+        use Cause::Devoured;
+        use RequestKind::{Devour, Investigate};
+        RoundRecord {
+            round: Round(3),
+            night: phase(
+                ["alice", "bob", "dave", "erin", "frank", "grace"],
+                moves([
+                    ("dave", Devour, target("frank")),
+                    ("erin", Devour, target("frank")),
+                    ("grace", Investigate, target("frank")),
+                ]),
+                Some(("grace", "frank", Faction::Village)),
+                Some(("frank", Villager, Devoured)),
+            ),
+            day: Some(no_lynch(phase(
+                ["alice", "bob", "dave", "erin", "grace"],
+                nominations([
+                    ("alice", "erin"),
+                    ("bob", "dave"),
+                    ("dave", "alice"),
+                    ("erin", "alice"),
+                    ("grace", "dave"),
+                ]),
+                None,
+                None,
+            ))),
+        }
+    }
+
+    /// The pack splits again, the tie-break picks alice, and two
+    /// werewolves among four living is parity: the game ends at night, so
+    /// the round has no day.
+    fn expected_round_four() -> RoundRecord {
+        use Cause::Devoured;
+        use RequestKind::{Devour, Investigate};
+        RoundRecord {
+            round: Round(4),
+            night: phase(
+                ["alice", "bob", "dave", "erin", "grace"],
+                moves([
+                    ("dave", Devour, target("alice")),
+                    ("erin", Devour, target("grace")),
+                    ("grace", Investigate, target("bob")),
+                ]),
+                Some(("grace", "bob", Faction::Village)),
+                Some(("alice", Villager, Devoured)),
+            ),
+            day: None,
+        }
+    }
+
+    /// A day that reached its limit without a majority.
+    fn no_lynch(mut record: PhaseRecord) -> PhaseRecord {
+        record.no_lynch = true;
+        record
     }
 
     #[test]
@@ -1048,7 +1211,7 @@ mod tests {
         let rendered = transcript.to_string();
         assert!(!rendered.contains("Rewards"), "{rendered}");
         assert!(
-            rendered.ends_with("Survivors: bob, dave, erin, frank\n"),
+            rendered.ends_with("Survivors: bob, dave, erin, grace\n"),
             "{rendered}"
         );
         // And is otherwise the same game.
@@ -1076,7 +1239,8 @@ mod tests {
                 };
                 assert_eq!(*kind, expected, "{who} in round {:?}", round.round);
             }
-            for (who, (kind, _)) in &round.day.as_ref().unwrap().moves {
+            // The last round ends at night, so it has no day.
+            for (who, (kind, _)) in round.day.iter().flat_map(|day| &day.moves) {
                 assert_eq!(
                     *kind,
                     RequestKind::Nominate,
@@ -1515,11 +1679,14 @@ mod tests {
     /// Plays `script`, one phase's answers per entry, through a game over
     /// `assignment`, and returns the moderator's records.
     fn scripted(assignment: Assignment, script: &[Vec<(&str, AgentId)>]) -> Vec<Value> {
+        /// Far enough apart that one phase's clocks never reach the next.
+        const STEP: u64 = 10_000;
+
         let mut scribe = Scribe::new();
-        let mut game = Game::new(assignment, 1);
-        let mut latest = game.begin();
+        let mut game = Game::new(assignment, 1, fast());
+        let mut latest = game.begin(Timestamp::default());
         scribe.directives(latest.clone());
-        for answers in script {
+        for (index, answers) in script.iter().enumerate() {
             let asked: BTreeMap<AgentId, RequestId> = latest
                 .iter()
                 .filter_map(|directive| match directive {
@@ -1527,15 +1694,35 @@ mod tests {
                     Directive::Narrate { .. } => None,
                 })
                 .collect();
+            let now = Timestamp::from(Duration::from_millis((index as u64 + 1) * STEP));
+            // Taken before any point is recorded: a day ends on the point
+            // that makes a majority, so pointing alone may finish it.
+            let phase = game.phase_now();
+            let mut caused = Vec::new();
             for (who, chosen) in answers {
                 let point = Point {
                     request: asked[&id(who)],
                     target: chosen.clone(),
                 };
                 scribe.point(who, point.clone());
-                latest = game.point(&id(who), &point);
-                scribe.directives(latest.clone());
+                caused = game.point(&id(who), &point, now);
+                scribe.directives(caused.clone());
             }
+            // Close this phase and no more. Expiring at the earliest
+            // deadline open, and stopping as soon as the phase moves,
+            // keeps one pass from cascading through every later phase.
+            while game.phase_now() == phase && game.outcome().is_none() {
+                let Some(deadline) = game.next_deadline() else {
+                    break;
+                };
+                let expired = game.expire(deadline);
+                if expired.is_empty() {
+                    break;
+                }
+                scribe.directives(expired.clone());
+                caused = expired;
+            }
+            latest = caused;
         }
         scribe.lines
     }
@@ -1555,12 +1742,9 @@ mod tests {
             village(),
             &[
                 answers([("bob", "carol"), ("carol", "bob"), ("dave", "alice")]),
-                answers([
-                    ("alice", "erin"),
-                    ("bob", "erin"),
-                    ("dave", "erin"),
-                    ("erin", "alice"),
-                ]),
+                // Three of four living point at erin, so dave's is the
+                // hammer and the day closes before erin is asked.
+                answers([("alice", "erin"), ("bob", "erin"), ("dave", "erin")]),
                 answers([("bob", "alice"), ("dave", "bob")]),
             ],
         );

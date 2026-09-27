@@ -121,11 +121,17 @@ impl Moderator {
     /// If a player sends the moderator a narration or a request.
     fn fold(&mut self, observation: &Observation<WerewolfDomain>) -> Vec<Directive> {
         let sender = &observation.event.sender;
-        match &observation.event.payload {
-            Message::Point(point) => self.game.point(sender, point),
+        let now = observation.received;
+        let mut directives = match &observation.event.payload {
+            Message::Point(point) => self.game.point(sender, point, now),
             Message::Narration(_) => panic!("{sender} sent the moderator a narration"),
             Message::Request(_) => panic!("{sender} sent the moderator a request"),
-        }
+        };
+        // A deadline that passed while this observation waited joins its
+        // cycle (ADR-0008), so a session whose time is up closes here
+        // rather than waiting for a `timeout` that may never come.
+        directives.extend(self.game.expire(now));
+        directives
     }
 
     /// Everything the directives say, said; then, if the game has just
@@ -178,8 +184,8 @@ impl Environment<WerewolfDomain> for Moderator {
     /// cycle's events before its controls either way, so what a player
     /// actually sees is its `Start` — controls are popped first — and then
     /// the opening narrations.
-    fn start(&mut self, _now: Timestamp) -> Vec<Effect<WerewolfDomain>> {
-        let opening = self.game.begin();
+    fn start(&mut self, now: Timestamp) -> Vec<Effect<WerewolfDomain>> {
+        let opening = self.game.begin(now);
         let mut effects = vec![Effect::control(self.players(), Control::Start)];
         effects.extend(self.say(opening));
         effects
@@ -207,6 +213,26 @@ impl Environment<WerewolfDomain> for Moderator {
         let directives = self.fold(observation);
         self.say(directives)
     }
+
+    /// Closes every session whose time is up.
+    ///
+    /// The moderator is the only agent in the tree that keeps clocks. It
+    /// wakes on the earliest of them and asks the game what that instant
+    /// finished; a session that closed is a tally to its members, and the
+    /// last of a night's sessions resolves the night.
+    fn timeout(&mut self, now: Timestamp) -> Vec<Effect<WerewolfDomain>> {
+        if self.game.outcome().is_some() {
+            return Vec::new();
+        }
+        let directives = self.game.expire(now);
+        self.say(directives)
+    }
+
+    /// The earliest instant a session could close, or `None` once the game
+    /// is over (ADR-0010, ADR-0011).
+    fn deadline(&self) -> Option<Timestamp> {
+        self.game.next_deadline()
+    }
 }
 
 #[cfg(test)]
@@ -216,9 +242,11 @@ mod tests {
     use crossbeam_channel::{Receiver, TryRecvError, unbounded};
 
     use super::*;
+    use std::time::Duration;
+
     use crate::agent::Recipients;
     use crate::event::{AgentId, Event};
-    use crate::testing::{id, ids, observed, town, village};
+    use crate::testing::{fast, id, ids, observed, town, village};
     use crate::werewolf::assignment::Assignment;
     use crate::werewolf::message::{
         Narration, Phase, Point, Request, RequestId, RequestKind, Round,
@@ -233,7 +261,7 @@ mod tests {
 
     fn moderator(assignment: Assignment) -> (Moderator, Receiver<Outcome>) {
         let (sender, receiver) = unbounded();
-        let game = Game::new(assignment, SEED);
+        let game = Game::new(assignment, SEED, fast());
         (Moderator::new(game, sender), receiver)
     }
 
@@ -352,18 +380,35 @@ mod tests {
     /// them over one at a time (ADR-0008). The game runs until the
     /// moderator asks nothing more.
     fn play(moderator: &mut Moderator, policy: Policy) -> Vec<Effect<WerewolfDomain>> {
-        let opening = moderator.start(Timestamp::default());
-        let mut pending = respond(&actions(&opening), policy, &moderator.game);
-        let mut produced = opening;
-        while !pending.is_empty() {
-            let effects: Vec<Effect<WerewolfDomain>> = pending
+        /// Far enough apart that one phase's clocks never reach the next.
+        const STEP: u64 = 10_000;
+
+        let mut clock = 0;
+        let mut produced = moderator.start(at(clock));
+        let mut pending = respond(&actions(&produced), policy, &moderator.game);
+        while moderator.game.outcome().is_none() {
+            clock += STEP;
+            let mut effects: Vec<Effect<WerewolfDomain>> = pending
                 .iter()
                 .flat_map(|observation| moderator.handle(observation))
                 .collect();
+            // Every stub points once and never changes its mind, so
+            // running the clock out is what closes the phase (ADR-0011).
+            clock += STEP;
+            effects.extend(moderator.timeout(at(clock)));
             pending = respond(&actions(&effects), policy, &moderator.game);
             produced.extend(effects);
+            assert!(
+                clock < STEP * 200,
+                "a stub game should have ended long before now"
+            );
         }
         produced
+    }
+
+    /// An instant, in milliseconds from the start of the episode.
+    fn at(millis: u64) -> Timestamp {
+        Timestamp::from(Duration::from_millis(millis))
     }
 
     /// A game played out: its assignment, how the game says it ended, the
@@ -729,23 +774,30 @@ mod tests {
         // the fold before it starts.
         let (mut reference, _receiver) = moderator(village());
         let (mut doubled, _receiver) = moderator(village());
-        let opening = reference.start(Timestamp::default());
-        assert_eq!(doubled.start(Timestamp::default()), opening);
+        let mut clock = 0;
+        let opening = reference.start(at(clock));
+        assert_eq!(doubled.start(at(clock)), opening);
         let mut pending = respond(&actions(&opening), first_other, &reference.game);
-        while !pending.is_empty() {
+        while reference.game.outcome().is_none() {
+            clock += 10_000;
             let mut effects = Vec::new();
             for observation in &pending {
                 let produced = reference.handle(observation);
                 assert_eq!(doubled.handle(observation), produced);
-                // The repeat is only safe once the game has ended; before
-                // that the game would refuse a response it has already
-                // recorded, which is a different claim and its own test.
-                if doubled.game.outcome().is_some() {
-                    assert_eq!(doubled.handle(observation), []);
-                }
+                // A point repeated while its session is still open is
+                // simply the same vote again, and says nothing new; once
+                // the game has ended the outcome guard stops the fold
+                // before it starts. Either way the repeat is silent.
+                assert_eq!(doubled.handle(observation), []);
                 effects.extend(produced);
             }
+            // Both clocks run out together, so the two games stay in step.
+            clock += 10_000;
+            let expired = reference.timeout(at(clock));
+            assert_eq!(doubled.timeout(at(clock)), expired);
+            effects.extend(expired);
             pending = respond(&actions(&effects), first_other, &reference.game);
+            assert!(clock < 2_000_000, "a stub game should have ended by now");
         }
         assert!(reference.game.outcome().is_some() && doubled.game.outcome().is_some());
     }

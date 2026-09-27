@@ -152,7 +152,7 @@ fn moderate(
     records: Sender<LogRecord<WerewolfDomain>>,
 ) -> (Episode<WerewolfDomain>, Receiver<Outcome>) {
     let (outcome, outcomes) = unbounded();
-    let game = Game::new(assignment, config.seed);
+    let game = Game::new(assignment, config.seed, config.timing);
     let episode = Episode::new(
         records,
         config.moderator.clone(),
@@ -285,9 +285,10 @@ mod tests {
 
     use super::*;
     use crate::agent::{Action, Observation};
-    use crate::testing::{TempDir, id, ids, parse_lines};
-    use crate::werewolf::config::{DEFAULT_MODERATOR, RoleCounts, Timing};
+    use crate::testing::{TempDir, fast, id, ids, parse_lines};
+    use crate::werewolf::config::{DEFAULT_MODERATOR, RoleCounts};
     use crate::werewolf::message::Round;
+    use crate::werewolf::role::Faction;
     use crate::werewolf::transcript::{self, Transcript};
 
     const SEED: u64 = 20_260_918;
@@ -310,7 +311,7 @@ mod tests {
             },
             trajectory: None,
             moderator: id(DEFAULT_MODERATOR),
-            timing: Timing::default(),
+            timing: fast(),
         };
         config.validate().unwrap();
         config
@@ -452,11 +453,13 @@ mod tests {
     }
 
     #[test]
-    fn a_silent_player_stalls_the_run() {
+    fn a_silent_player_no_longer_stalls_the_run() {
         // The same roster `episode` would build, except that one werewolf
-        // never answers. The first night's request to it goes unanswered,
-        // nothing is left in flight, and the moderator has stopped nobody,
-        // which is a stall naming every player.
+        // never answers. Under ADR-0004 that was a stall: the phase
+        // resolved on its last answer and one that never came stopped the
+        // game. Under ADR-0011 a session closes on its clock, so the
+        // silent player is simply a member that never pointed, and the
+        // game finishes without it.
         let config = config(["alice", "bob", "carol"], 1, 0, 0);
         let assignment = Assignment::deal(&config);
         let silent = assignment.pack().iter().next().unwrap().clone();
@@ -470,11 +473,9 @@ mod tests {
             }
         }
 
-        let error = play(episode, &outcomes, writer, None).unwrap_err();
-        let RunError::Episode(EpisodeError::Stalled { running }) = &error else {
-            panic!("unexpected error: {error:?}");
-        };
-        assert_eq!(*running, config.players.iter().cloned().collect());
-        assert!(error.to_string().contains("stalled"), "{error}");
+        // A pack of one that never points devours nobody, so the village
+        // wins by lynching it.
+        let outcome = play(episode, &outcomes, writer, None).unwrap();
+        assert_eq!(outcome.winner, Faction::Village);
     }
 }

@@ -143,6 +143,29 @@ pub(crate) fn target(name: &str) -> AgentId {
     id(name)
 }
 
+/// Timing fast enough that a test does not wait on a real clock, for the
+/// unit tests that drive a game with explicit instants and never let a
+/// wall-clock deadline fire at all.
+pub(crate) fn fast() -> crate::werewolf::config::Timing {
+    use std::time::Duration;
+
+    use crate::werewolf::config::{DayTiming, NightTiming, Timing};
+
+    let night = NightTiming {
+        quiet: Duration::from_millis(10),
+        limit: Duration::from_millis(50),
+    };
+    Timing {
+        day_cap: None,
+        pack: night,
+        seer: night,
+        doctor: night,
+        day: DayTiming {
+            limit: Duration::from_millis(50),
+        },
+    }
+}
+
 /// A request of `kind`, for tests where its id and round do not matter.
 pub(crate) fn request(kind: RequestKind) -> Request {
     Request {

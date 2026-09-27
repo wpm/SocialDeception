@@ -136,6 +136,7 @@ impl fmt::Display for Narration {
                 phase,
                 kind,
                 votes,
+                hammer: _,
             } => {
                 let votes: Vec<String> = votes
                     .iter()
@@ -152,6 +153,7 @@ impl fmt::Display for Narration {
                 who, role, cause, ..
             } => write!(f, "Eliminated({who}, {role}, {cause})"),
             Self::NoDeath { round } => write!(f, "NoDeath(Night {})", round.0),
+            Self::NoLynch { round } => write!(f, "NoLynch(Day {})", round.0),
             Self::Outcome(outcome) => write!(
                 f,
                 "Outcome({} win after {} rounds; survivors: {})",
@@ -370,6 +372,7 @@ mod tests {
                 phase: Phase::Day,
                 kind: RequestKind::Nominate,
                 votes: BTreeMap::from([(id("alice"), id("frank")), (id("bob"), id("carol")),]),
+                hammer: None,
             })),
             "Tally(Day 1 Nominate: alice\u{2192}frank, bob\u{2192}carol)"
         );
@@ -402,6 +405,17 @@ mod tests {
         assert_eq!(
             shown(Message::Narration(Narration::NoDeath { round: Round(2) })),
             "NoDeath(Night 2)"
+        );
+    }
+
+    #[test]
+    fn a_day_that_ran_out_names_its_round() {
+        // A day that reached its limit without a majority is its own
+        // narration, told from a night nobody died in by the phase it
+        // names (ADR-0011).
+        assert_eq!(
+            shown(Message::Narration(Narration::NoLynch { round: Round(3) })),
+            "NoLynch(Day 3)"
         );
     }
 

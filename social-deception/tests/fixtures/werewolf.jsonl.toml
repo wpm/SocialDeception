@@ -10,3 +10,21 @@ moderator = "moderator"
 werewolves = 2
 seers = 1
 doctors = 1
+
+[timing]
+day_cap = 7
+
+[timing.pack]
+quiet = 0.01
+limit = 0.05
+
+[timing.seer]
+quiet = 0.01
+limit = 0.05
+
+[timing.doctor]
+quiet = 0.01
+limit = 0.05
+
+[timing.day]
+limit = 0.05

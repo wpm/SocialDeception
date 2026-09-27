@@ -342,6 +342,28 @@ impl<'a> Play<'a> {
             .collect()
     }
 
+    /// The members of a night session of `kind` at the record numbered
+    /// `seq`: the living players asked that kind, which is who its
+    /// closing tally is addressed to.
+    ///
+    /// Read from the requests actually issued rather than from the roles,
+    /// so that a player the rules left nothing to point at — a doctor with
+    /// nobody it may protect — is not counted as a member it never was.
+    fn night_members(&self, kind: RequestKind, seq: u64) -> BTreeSet<AgentId> {
+        let living = self.living_at(seq);
+        self.requests
+            .values()
+            .map(|index| &self.said[*index])
+            .filter_map(|said| match &said.message {
+                Message::Request(request) if request.kind == kind && said.seq < seq => {
+                    said.to.iter().next().cloned()
+                }
+                _ => None,
+            })
+            .filter(|who| living.contains(who))
+            .collect()
+    }
+
     /// The request with the given id, if one was asked: the record it was
     /// asked in, the player it was asked of, and the request.
     fn asked(&self, id: RequestId) -> Option<(&Said<'a>, &AgentId, &Request)> {
@@ -382,22 +404,42 @@ impl<'a> Play<'a> {
                 asked.seq < heard.seq,
                 "a point arrives after its request was sent: {line}"
             );
-            assert!(
-                answered.insert(heard.point.request),
-                "a request is answered once: {line}"
-            );
-            assert!(
-                !self.dead_at(&heard.from, heard.seq),
-                "no point arrives from a player after its elimination: {line}"
-            );
+            // A member may point as often as it likes while its session
+            // is open, so a request answered twice is a change of mind
+            // rather than a bug (ADR-0011).
+            answered.insert(heard.point.request);
         }
-        for (said, _, request) in self.requests() {
+        // Nor is every request answered. A session closes on its clock, so
+        // a member that never pointed is simply absent from its tally, and
+        // a player may point once more just before its stop reaches it. A
+        // random player points immediately, so in practice these are rare;
+        // the rules allow them, and the check is that they are the only
+        // way a request goes unanswered.
+        for (said, who, request) in self.requests() {
+            if answered.contains(&request.id) {
+                continue;
+            }
             assert!(
-                answered.contains(&request.id),
-                "every request is answered, but this one was not: {}",
+                self.closed_before_answering(request.id) || self.dead_at(who, said.seq),
+                "a request goes unanswered only when its session closed first: {}",
                 said.line
             );
         }
+    }
+
+    /// Whether the session `request` belonged to closed: its closing tally
+    /// is the moderator's record that it did.
+    fn closed_before_answering(&self, request: RequestId) -> bool {
+        let Some((_, _, request)) = self.asked(request) else {
+            return false;
+        };
+        self.said.iter().any(|said| {
+            matches!(
+                &said.message,
+                Message::Narration(Narration::Tally { round, kind, .. })
+                    if *round == request.round && *kind == request.kind
+            )
+        })
     }
 
     /// Every request asks a player what its role is asked in that phase,
@@ -457,20 +499,31 @@ impl<'a> Play<'a> {
                 Message::Narration(Narration::Investigated { .. }) => {
                     assert_eq!(said.to, seers, "a finding goes to the seer alone: {line}");
                 }
+                // A night session's tally marks its close, and goes to
+                // its own members: the pack sees the pack's, and the seer
+                // and the doctor each see only their own (ADR-0011).
                 Message::Narration(Narration::Tally {
                     phase: Phase::Night,
+                    kind,
                     votes,
                     ..
-                }) => assert_eq!(
-                    said.to,
-                    votes.keys().cloned().collect(),
-                    "a night tally goes to the werewolves who cast it, and nobody else: {line}"
-                ),
+                }) => {
+                    let members = self.night_members(*kind, said.seq);
+                    assert_eq!(
+                        said.to, members,
+                        "a night tally goes to its session's members: {line}"
+                    );
+                    assert!(
+                        votes.keys().all(|who| members.contains(who)),
+                        "a night tally names only its session's members: {line}"
+                    );
+                }
                 Message::Narration(
                     Narration::Tally { .. }
                     | Narration::PhaseBegan { .. }
                     | Narration::Eliminated { .. }
-                    | Narration::NoDeath { .. },
+                    | Narration::NoDeath { .. }
+                    | Narration::NoLynch { .. },
                 ) => assert_eq!(
                     said.to,
                     self.living_at(said.seq),
@@ -511,14 +564,23 @@ impl<'a> Play<'a> {
                         );
                     }
                 }
+                // A night session's tally names its own members, and only
+                // the pack's is the werewolves' (ADR-0011).
                 Message::Narration(Narration::Tally {
                     phase: Phase::Night,
+                    kind,
                     votes,
                     ..
                 }) => {
+                    let role = match kind {
+                        RequestKind::Devour => Role::Werewolf,
+                        RequestKind::Investigate => Role::Seer,
+                        RequestKind::Protect => Role::Doctor,
+                        RequestKind::Nominate => unreachable!("nobody nominates at night"),
+                    };
                     assert!(
-                        votes.keys().all(|who| self.assignment.pack().contains(who)),
-                        "a night tally is the werewolves' votes: {line}"
+                        votes.keys().all(|who| self.role(who) == role),
+                        "a {kind:?} tally is the {role}s' votes: {line}"
                     );
                 }
                 _ => {}
@@ -806,11 +868,12 @@ impl<'p, 'a> Phases<'p, 'a> {
             "a phase begins with the living as they are: {line}"
         );
         if phase == Phase::Night {
+            // Never grow, rather than strictly shrink. A round may now
+            // pass with nobody dead: the doctor saves the pack's victim
+            // and the day runs out without a majority (ADR-0011). What
+            // bounds a game is the day cap.
             if let Some(before) = &self.living_last_night {
-                assert!(
-                    living.is_subset(before) && living.len() < before.len(),
-                    "the living strictly shrink every round: {line}"
-                );
+                assert!(living.is_subset(before), "the living never grow: {line}");
             }
             self.living_last_night = Some(living.clone());
         }
@@ -902,6 +965,7 @@ impl PhaseCounts {
             Narration::Tally {
                 round: r,
                 phase: p,
+                kind,
                 votes,
                 ..
             } => {
@@ -911,7 +975,12 @@ impl PhaseCounts {
                     "a tally belongs to its phase: {line}"
                 );
                 self.tallies += 1;
-                self.leaders = leaders(votes);
+                // A night has three sessions and only the pack's decides
+                // who dies; the seer's and the doctor's name nobody the
+                // elimination has to match (ADR-0011).
+                if matches!(kind, RequestKind::Devour | RequestKind::Nominate) {
+                    self.leaders = leaders(votes);
+                }
             }
             Narration::Eliminated { round: r, .. } => {
                 assert_eq!(*r, round, "a death belongs to its round: {line}");
@@ -920,6 +989,11 @@ impl PhaseCounts {
             Narration::NoDeath { round: r } => {
                 assert_eq!(*r, round, "a quiet night belongs to its round: {line}");
                 assert_eq!(phase, Phase::Night, "only a night has no death: {line}");
+                self.no_death += 1;
+            }
+            Narration::NoLynch { round: r } => {
+                assert_eq!(*r, round, "a quiet day belongs to its round: {line}");
+                assert_eq!(phase, Phase::Day, "only a day has no lynch: {line}");
                 self.no_death += 1;
             }
             Narration::Investigated { .. } => {
@@ -938,16 +1012,30 @@ impl PhaseCounts {
         let Some((_, phase, line)) = phase else {
             return;
         };
-        assert_eq!(self.tallies, 1, "a phase has one tally: {line}");
         match phase {
-            Phase::Night => assert_eq!(
-                self.eliminated + self.no_death,
-                1,
-                "a night has one death or one NoDeath, never both or neither: {line}"
-            ),
+            // A night is up to three sessions, each closing with a tally
+            // of its own; the seer's and the doctor's may not open at all
+            // when nobody holds the role (ADR-0011).
+            Phase::Night => {
+                assert!(
+                    (1..=3).contains(&self.tallies),
+                    "a night has a tally per session it opened: {line}"
+                );
+                assert_eq!(
+                    self.eliminated + self.no_death,
+                    1,
+                    "a night has one death or one NoDeath, never both or neither: {line}"
+                );
+            }
+            // A day is one session, and it may end without a lynch now
+            // that it closes on a majority rather than a plurality.
             Phase::Day => {
-                assert_eq!(self.eliminated, 1, "a day eliminates exactly one: {line}");
-                assert_eq!(self.no_death, 0, "only a night has no death: {line}");
+                assert_eq!(self.tallies, 1, "a day has one tally: {line}");
+                assert_eq!(
+                    self.eliminated + self.no_death,
+                    1,
+                    "a day lynches exactly one or nobody, never both: {line}"
+                );
             }
         }
     }
@@ -959,11 +1047,14 @@ mod tests {
 
     use super::*;
 
-    /// The fixture: a seven-player game played to a werewolf win in two
+    /// The fixture: a seven-player game played to a werewolf win in four
     /// rounds, with its effective config beside it. Its first night is a
-    /// saved one, so the fixture's first `Eliminated` is a lynching, and it
-    /// ends by parity rather than by the pack being wiped out. Every
-    /// request in it is answered with a target: it holds no abstention.
+    /// saved one and no day of it ever reaches a majority, so every death
+    /// in it is a devouring — carol on night 2, frank on night 3, alice on
+    /// night 4 — and it ends by parity rather than by the pack being wiped
+    /// out. Its doctor, carol, is the first to die, so nights 3 and 4 open
+    /// no protection session at all. Every request in it is answered with a
+    /// target: it holds no abstention.
     const FIXTURE: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/werewolf.jsonl"
@@ -1031,9 +1122,11 @@ mod tests {
         }
     }
 
-    /// An elimination by the day's vote.
-    fn lynched(payload: &Value) -> bool {
-        payload["Narration"]["Eliminated"]["cause"] == "Lynched"
+    /// An elimination by the pack's night vote. Every death in the fixture
+    /// is one of these: no day of it ever reaches a majority, so there is
+    /// no lynching anywhere in the file to corrupt.
+    fn devoured(payload: &Value) -> bool {
+        payload["Narration"]["Eliminated"]["cause"] == "Devoured"
     }
 
     /// The elimination of the given player.
@@ -1194,8 +1287,10 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "a request is answered once")]
-    fn a_request_answered_twice_is_caught() {
+    fn a_request_answered_twice_is_a_change_of_mind() {
+        // A member may point as often as it likes while its session is
+        // open, so the same request answered twice is the rules working
+        // rather than a bug (ADR-0011).
         let nominate = asked("alice", 1, "Nominate");
         check(
             &doubled("moderator", "observation", response(nominate)),
@@ -1204,8 +1299,9 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "every request is answered")]
-    fn an_unanswered_request_is_caught() {
+    fn a_request_may_go_unanswered_once_its_session_has_closed() {
+        // A session closes on its clock, so a member that never pointed
+        // is simply absent from its tally (ADR-0011).
         let nominate = asked("alice", 1, "Nominate");
         check(
             &without("moderator", "observation", response(nominate)),
@@ -1216,18 +1312,21 @@ mod tests {
     #[test]
     #[should_panic(expected = "no request is asked of a player after its elimination")]
     fn a_request_to_the_dead_is_caught() {
-        // alice was lynched on day 1; bob's nomination on day 2 goes to her.
-        let nominate = asked("bob", 2, "Nominate");
+        // carol was devoured on night 2; bob's nomination on day 3 goes to
+        // her instead. The dead are asked nothing, and this is the whole of
+        // what that means: the request itself, before any point answers it.
+        let nominate = asked("bob", 3, "Nominate");
         check(
-            &said(request(nominate), |line| recipients(line, &["alice"])),
+            &said(request(nominate), |line| recipients(line, &["carol"])),
             &config(),
         );
     }
 
     #[test]
-    #[should_panic(expected = "no point arrives from a player after its elimination")]
-    fn a_response_from_the_dead_is_caught() {
-        // alice's nomination on day 1, dated after her lynching that day.
+    fn a_point_that_lost_a_race_with_its_own_death_is_not_a_bug() {
+        // alice's nomination on day 1, dated after her lynching that day:
+        // a point she sent before her stop reached her. ADR-0011 makes
+        // that a lost race rather than a bug, and the game ignores it.
         let lines = heard(response(asked("alice", 1, "Nominate")), |line| {
             line["seq"] = json!(81);
         });
@@ -1258,10 +1357,11 @@ mod tests {
     #[test]
     #[should_panic(expected = "a point targets a living player")]
     fn a_dead_target_is_caught() {
-        // alice was lynched on day 1; bob nominates her on day 2.
-        let nominate = asked("bob", 2, "Nominate");
+        // carol was devoured on night 2; bob nominates her on day 3, a
+        // round after she stopped being a player anyone may point at.
+        let nominate = asked("bob", 3, "Nominate");
         check(
-            &heard(response(nominate), |line| target(line, "alice")),
+            &heard(response(nominate), |line| target(line, "carol")),
             &config(),
         );
     }
@@ -1293,7 +1393,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "a night tally goes to the werewolves who cast it")]
+    #[should_panic(expected = "a night tally goes to its session's members")]
     fn a_night_tally_sent_to_a_villager_is_caught() {
         let lines = said(tally(1, "Night"), |line| {
             recipients(line, &["alice", "dave", "erin"]);
@@ -1304,8 +1404,11 @@ mod tests {
     #[test]
     #[should_panic(expected = "a narration to the living goes to exactly the living")]
     fn a_narration_to_the_dead_is_caught() {
+        // Night 3 is the first phase to begin with somebody dead: carol was
+        // devoured on night 2. Sending its opening to the whole roster is
+        // sending it to her too.
         let everyone = everyone();
-        let lines = said(began(2, "Night"), |line| {
+        let lines = said(began(3, "Night"), |line| {
             line["event"]["recipients"] = json!(everyone);
         });
         check(&lines, &config());
@@ -1361,7 +1464,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "a night tally is the werewolves' votes")]
+    #[should_panic(expected = "a night tally goes to its session's members")]
     fn a_night_tally_with_a_villager_in_it_is_caught() {
         let lines = said(tally(1, "Night"), |line| {
             line["event"]["payload"]["Narration"]["Tally"]["votes"]["carol"] = json!("alice");
@@ -1382,8 +1485,13 @@ mod tests {
     #[test]
     #[should_panic(expected = "a phase begins with the living as they are")]
     fn a_phase_that_miscounts_the_living_is_caught() {
+        // Night 3 opens with six, carol having been devoured on night 2. A
+        // phase claiming all seven is one whose own record of the living
+        // disagrees with the deaths the same moderator narrated. The
+        // recipients are widened to match, so that the miscount is what
+        // trips the check rather than the routing.
         let everyone = everyone();
-        let lines = said(began(2, "Night"), |line| {
+        let lines = said(began(3, "Night"), |line| {
             line["event"]["payload"]["Narration"]["PhaseBegan"]["living"] = json!(everyone);
             line["event"]["recipients"] = json!(everyone);
         });
@@ -1409,38 +1517,53 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "a day eliminates exactly one")]
-    fn a_day_without_a_lynching_is_caught() {
-        check(&without("moderator", "action", lynched), &config());
+    #[should_panic(expected = "a day lynches exactly one or nobody, never both")]
+    fn a_day_that_neither_lynches_nor_says_so_is_caught() {
+        // A day may end with nobody lynched, but it says so with a
+        // `NoLynch`. Every day of this fixture ends that way, so the
+        // forgery is the other half of the same rule: drop day 1's
+        // `NoLynch` and the day narrates neither a lynching nor its
+        // absence, which is a day that did not happen.
+        check(
+            &without("moderator", "action", narration("NoLynch")),
+            &config(),
+        );
     }
 
     #[test]
     #[should_panic(expected = "an elimination is of a player the tally names most")]
-    fn a_lynching_the_tally_does_not_call_for_is_caught() {
-        // On the last day the tally names grace twice and frank twice, and
-        // bob once; bob, a villager, is lynched in grace's place. The last
-        // day, so that no later request to grace trips the check on the
-        // dead first, and the outcome is corrected to match, so that the
-        // tally is what the check trips on rather than the survivors.
+    fn an_elimination_the_tally_does_not_call_for_is_caught() {
+        // No day of this fixture lynches anybody, so the elimination to
+        // forge is a devouring. On night 4 the pack splits, dave naming
+        // alice and erin naming grace, and alice is the one taken; bob,
+        // whom neither named, is devoured in her place. The last night, so
+        // that no later phase's record of the living trips first, and the
+        // outcome is corrected to match, so that the tally is what the
+        // check trips on rather than the survivors.
         let mut lines = fixture();
-        let death = find(&lines, "moderator", "action", eliminated("grace"));
+        let death = find(&lines, "moderator", "action", eliminated("alice"));
         lines[death]["event"]["payload"]["Narration"]["Eliminated"] =
-            json!({"who": "bob", "role": "Villager", "round": 2, "cause": "Lynched"});
+            json!({"who": "bob", "role": "Villager", "round": 4, "cause": "Devoured"});
         let outcome = find(&lines, "moderator", "action", narration("Outcome"));
         lines[outcome]["event"]["payload"]["Narration"]["Outcome"]["living"] =
-            json!(["dave", "erin", "frank", "grace"]);
+            json!(["alice", "dave", "erin", "grace"]);
         check(&lines, &config());
     }
 
     #[test]
     #[should_panic(expected = "a death at night is of a player the doctor did not protect")]
     fn a_death_of_a_protected_player_is_caught() {
-        // On night 2 the pack agrees on carol, carol protects erin, and
-        // carol is devoured. The forgery has the pack name grace and carol
-        // protect grace, so the night's victim is the protected player.
-        // Grace dies in carol's place, so from that death on the two are
-        // exchanged everywhere — carol is lynched on day 2 in grace's
-        // stead — and each still dies exactly once.
+        // Night 2 is the last night with a doctor in it — carol, the
+        // doctor, is the one devoured there. On it dave names carol, erin
+        // names bob, carol protects erin, and carol dies. The forgery has
+        // both werewolves name bob and carol protect bob, so the night's
+        // victim is the very player the doctor covered.
+        //
+        // Bob dies in carol's place, so from that death on the two are
+        // exchanged everywhere: carol goes on to play out bob's rounds 2
+        // through 4 and survives, and bob, never eliminated again, still
+        // dies exactly once. Rounds 3 and 4 ask nobody to protect, so a
+        // doctor living through them leaves no request unaccounted for.
         let mut lines = fixture();
         for who in ["dave", "erin"] {
             let index = find(
@@ -1449,7 +1572,7 @@ mod tests {
                 "observation",
                 response(asked(who, 2, "Devour")),
             );
-            target(&mut lines[index], "grace");
+            target(&mut lines[index], "bob");
         }
         let protect = find(
             &lines,
@@ -1457,16 +1580,14 @@ mod tests {
             "observation",
             response(asked("carol", 2, "Protect")),
         );
-        target(&mut lines[protect], "grace");
+        target(&mut lines[protect], "bob");
         let tally = find(&lines, "moderator", "action", tally(2, "Night"));
         lines[tally]["event"]["payload"]["Narration"]["Tally"]["votes"] =
-            json!({"dave": "grace", "erin": "grace"});
+            json!({"dave": "bob", "erin": "bob"});
         let death = find(&lines, "moderator", "action", eliminated("carol"));
-        swap(&mut lines[death..], "carol", "grace");
-        // A swap exchanges the names, not the roles each death reveals.
-        lines[death]["event"]["payload"]["Narration"]["Eliminated"]["role"] = json!("Seer");
-        let lynched = find(&lines[death..], "moderator", "action", eliminated("carol")) + death;
-        lines[lynched]["event"]["payload"]["Narration"]["Eliminated"]["role"] = json!("Doctor");
+        swap(&mut lines[death..], "carol", "bob");
+        // A swap exchanges the names, not the role the death reveals.
+        lines[death]["event"]["payload"]["Narration"]["Eliminated"]["role"] = json!("Villager");
         check(&lines, &config());
     }
 
@@ -1483,9 +1604,13 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "the cause is the phase's")]
-    fn a_devouring_by_day_is_caught() {
-        let lines = said(lynched, |line| {
-            line["event"]["payload"]["Narration"]["Eliminated"]["cause"] = json!("Devoured");
+    fn a_lynching_by_night_is_caught() {
+        // The night's deaths are the pack's and the day's are the village's,
+        // and the rule runs both ways. No day of this fixture lynches
+        // anybody, so the mismatch to forge is the other one: carol's
+        // devouring on night 2, blamed on a vote that no night takes.
+        let lines = said(devoured, |line| {
+            line["event"]["payload"]["Narration"]["Eliminated"]["cause"] = json!("Lynched");
         });
         check(&lines, &config());
     }
@@ -1493,7 +1618,9 @@ mod tests {
     #[test]
     #[should_panic(expected = "a death reveals the role")]
     fn a_death_revealing_the_wrong_role_is_caught() {
-        let lines = said(lynched, |line| {
+        // carol, the doctor, is devoured on night 2 — the fixture's first
+        // death — and her death is made to announce a seer instead.
+        let lines = said(devoured, |line| {
             line["event"]["payload"]["Narration"]["Eliminated"]["role"] = json!("Seer");
         });
         check(&lines, &config());

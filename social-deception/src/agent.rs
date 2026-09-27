@@ -503,6 +503,14 @@ pub struct CycleDispatch<D: Domain> {
     /// The events the cycle sent, stamped with this agent as sender, in the
     /// order the handler returned them.
     pub sent: Vec<Event<D>>,
+    /// Whether the agent is waiting on a deadline after this cycle.
+    ///
+    /// An agent that is has work of its own still to do: it will run
+    /// another cycle when the instant arrives, whatever anybody says to
+    /// it. The episode counts that as work outstanding, so a roster whose
+    /// only pending thing is a clock is waiting rather than stalled (see
+    /// [`episode`](crate::episode)).
+    pub waking: bool,
 }
 
 /// Everything an agent's thread needs besides its handler and timer.
@@ -541,6 +549,7 @@ where
             .field("agent", &self.agent)
             .field("deliveries", &self.deliveries)
             .field("sent", &self.sent)
+            .field("waking", &self.waking)
             .finish()
     }
 }
@@ -551,6 +560,7 @@ impl<D: Domain> Clone for CycleDispatch<D> {
             agent: self.agent.clone(),
             deliveries: self.deliveries,
             sent: self.sent.clone(),
+            waking: self.waking,
         }
     }
 }
@@ -560,7 +570,10 @@ where
     D::Payload: PartialEq,
 {
     fn eq(&self, other: &Self) -> bool {
-        self.agent == other.agent && self.deliveries == other.deliveries && self.sent == other.sent
+        self.agent == other.agent
+            && self.deliveries == other.deliveries
+            && self.sent == other.sent
+            && self.waking == other.waking
     }
 }
 
@@ -708,16 +721,6 @@ impl<D: Domain> Popped<D> {
     }
 }
 
-/// What the loop needs to know about the cycle it has just run.
-///
-/// Both answers are about the agent's own life rather than about the game:
-/// the cycle that started it is where a wired interval is measured from,
-/// and the cycle that stopped it is its last.
-struct Ran {
-    started: bool,
-    stopped: bool,
-}
-
 /// The state of an agent's thread.
 struct Loop<D: Domain, H, T> {
     wiring: Wiring<D>,
@@ -773,15 +776,10 @@ where
             if timed_out {
                 self.take_deadline();
             }
-            let ran = self.cycle(t_start, popped, timed_out)?;
-            if ran.stopped || self.closed {
+            let stopped = self.cycle(t_start, popped, timed_out)?;
+            if stopped || self.closed {
                 break;
             }
-            // After the start hook and after every cycle, the handler says
-            // when it next wants waking (ADR-0010). A handler with no
-            // opinion leaves it to the wired interval, which runs from the
-            // cycle that started the agent.
-            self.arm(t_start, ran.started || timed_out);
         }
         Ok(self.handler)
     }
@@ -948,8 +946,7 @@ where
 
     /// Runs one cycle: record what was popped, hand the observation to the
     /// handler, send and record what comes back, and close with the cycle
-    /// record. Returns whether the cycle popped a start and whether it
-    /// popped a stop.
+    /// record. Returns whether the cycle popped a stop.
     ///
     /// Whatever the handler returns is sent. Nothing arriving while it runs
     /// changes that: an agent does not know it is being stopped (ADR-0009),
@@ -960,7 +957,7 @@ where
         t_start: Timestamp,
         popped: Popped<D>,
         timed_out: bool,
-    ) -> Result<Ran, Error> {
+    ) -> Result<bool, Error> {
         let Popped {
             controls,
             event,
@@ -1021,10 +1018,18 @@ where
             sent.push(event);
         }
 
+        // The next deadline is settled before the dispatch goes out,
+        // because the dispatch reports it. A stop ends the agent, so it
+        // arms nothing: an agent on its way out is not waiting for
+        // anything.
+        if !stopped {
+            self.arm(t_start, started || timed_out);
+        }
         let dispatch = CycleDispatch {
             agent: self.wiring.id.clone(),
             deliveries,
             sent,
+            waking: self.pending.is_some(),
         };
         self.wiring
             .dispatches
@@ -1046,7 +1051,7 @@ where
             .records
             .send(cycle.into())
             .map_err(|_| Error::WriterClosed)?;
-        Ok(Ran { started, stopped })
+        Ok(stopped)
     }
 
     /// Stamps one action with this agent as sender and the instant of the

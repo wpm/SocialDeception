@@ -455,9 +455,16 @@ mod tests {
         let trajectory = trajectory.map_or_else(String::new, |trajectory| {
             format!("trajectory = '{}'\n", dir.join(trajectory).display())
         });
+        // Fast clocks, or the game would run on the defaults a
+        // language-model game wants: twenty seconds a night session and
+        // sixty for the day (ADR-0011).
         let text = format!(
             "seed = 3\nplayers = [\"alice\", \"bob\", \"carol\", \"dave\", \"erin\"]\n\
-             {trajectory}[roles]\nwerewolves = 1\nseers = 1\ndoctors = 1\n"
+             {trajectory}[roles]\nwerewolves = 1\nseers = 1\ndoctors = 1\n\
+             [timing.pack]\nquiet = 0.01\nlimit = 0.05\n\
+             [timing.seer]\nquiet = 0.01\nlimit = 0.05\n\
+             [timing.doctor]\nquiet = 0.01\nlimit = 0.05\n\
+             [timing.day]\nlimit = 0.05\n"
         );
         file(dir, name, &text)
     }
@@ -606,7 +613,7 @@ mod tests {
         assert_eq!(seed(&replayed), Some(26));
         assert_eq!(replayed.moderator, AgentId::new("moderator"));
         assert_eq!(replayed.overridden, None);
-        assert_eq!(replayed.transcript.rounds.len(), 2);
+        assert_eq!(replayed.transcript.rounds.len(), 4);
         let golden = fs::read_to_string(fixture().with_extension("txt")).unwrap();
         assert_eq!(
             replayed.to_string(),
@@ -622,7 +629,7 @@ mod tests {
         assert_eq!(seed(&disagreeing), Some(26));
         assert_eq!(disagreeing.moderator, AgentId::new("moderator"));
         assert_eq!(disagreeing.overridden.as_deref(), Some("narrator"));
-        assert_eq!(disagreeing.transcript.rounds.len(), 2);
+        assert_eq!(disagreeing.transcript.rounds.len(), 4);
         // The same flag, agreeing, is not overridden.
         let agreeing = replay(&fixture(), Some("moderator")).unwrap();
         assert_eq!(agreeing.overridden, None);
@@ -638,7 +645,7 @@ mod tests {
         assert_eq!(seed(&replayed), None);
         assert_eq!(replayed.moderator, AgentId::new("moderator"));
         assert_eq!(replayed.overridden, None);
-        assert_eq!(replayed.transcript.rounds.len(), 2);
+        assert_eq!(replayed.transcript.rounds.len(), 4);
         assert!(
             replayed
                 .to_string()

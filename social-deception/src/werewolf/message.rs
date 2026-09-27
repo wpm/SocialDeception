@@ -94,6 +94,11 @@ pub enum Narration {
         /// Each member's latest target, in canonical order. A member that
         /// never pointed is absent.
         votes: BTreeMap<AgentId, AgentId>,
+        /// The member whose point completed the majority that ended the
+        /// day: the *hammer*. `None` for a night session and for a day
+        /// that reached its limit without one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hammer: Option<AgentId>,
     },
     /// To the living, and to the eliminated player itself: someone is out
     /// of the game, and their role is revealed.
@@ -108,9 +113,15 @@ pub enum Narration {
         cause: Cause,
     },
     /// To the living: the night ended with nobody dead. A save is never
-    /// announced as one.
+    /// announced as one, and neither is a pack that pointed nowhere.
     NoDeath {
         /// The round whose night it was.
+        round: Round,
+    },
+    /// To the living: the day ran out of time without a majority, so
+    /// nobody was lynched (ADR-0011).
+    NoLynch {
+        /// The round whose day it was.
         round: Round,
     },
     /// To everyone, living and dead: the game is over.
@@ -155,7 +166,10 @@ pub struct Request {
 }
 
 /// What a [`Request`] asks a player to do.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+///
+/// Ordered so that a night's sessions can be kept in a map: the order is
+/// the declaration order below and carries no meaning of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum RequestKind {
     /// Name a player to lynch. Asked of every living player by day.
     Nominate,
@@ -237,12 +251,14 @@ mod tests {
                         (AgentId::new("alice"), AgentId::new("bob")),
                         (AgentId::new("bob"), AgentId::new("carol")),
                     ]),
+                    hammer: Some(AgentId::new("bob")),
                 },
                 json!({"Tally": {
                     "round": 2,
                     "phase": "Day",
                     "kind": "Nominate",
                     "votes": {"alice": "bob", "bob": "carol"},
+                    "hammer": "bob",
                 }}),
             ),
             (
@@ -363,6 +379,7 @@ mod tests {
                 .into_iter()
                 .map(|who| (AgentId::new(who), AgentId::new("dave")))
                 .collect(),
+            hammer: None,
         };
         // A `serde_json::Value` object sorts its own keys, so the order has
         // to be checked on the text.

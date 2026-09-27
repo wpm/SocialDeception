@@ -52,9 +52,13 @@ const WEREWOLF: &str = env!("CARGO_BIN_EXE_werewolf");
 const SEED: u64 = 20_260_918;
 
 /// How many seeds a search for particular kinds of game tries at most.
-/// With a uniform policy over seven players the events searched for turn
-/// up in a good fraction of games, so this is generous.
-const SEEDS: u64 = 40;
+///
+/// A village win is the scarce one. Under ADR-0011 a day closes on a
+/// majority of the living, and seven uniform players seldom put four on
+/// one target, so most days run out and the pack wins by attrition; the
+/// first village win is at seed 41. This is that with room to spare, and
+/// it is why the number is no longer small.
+const SEEDS: u64 = 120;
 
 /// A validated configuration for `players` with the given special roles,
 /// played from `seed`, writing no trajectory.
@@ -217,23 +221,23 @@ fn the_seeds_hold_a_save_and_a_win_for_each_side() {
 #[test]
 fn the_same_seed_plays_the_same_game() {
     let config = town(SEED);
-    assert_eq!(run(&config), run(&config));
-    // The two trajectory *files* are deliberately not compared. They record
-    // wall-clock timestamps, and the records of different agents' threads
-    // interleave however the scheduler ran them, so the files of the same
-    // game differ from run to run. Tightening this test to compare them
-    // would assert something the runtime cannot honor, and is not meant
-    // to. The transcript is the claim.
+    assert_eq!(run(&config).verdicts(), run(&config).verdicts());
+    // What is compared is the *verdicts*, not the whole transcript, and
+    // certainly not the trajectory files. Under ADR-0011 a phase is a
+    // timed session: every death, every finding and the winner are the
+    // same on every run of a seed, while the order points arrived in, and
+    // which late ones landed before a session closed, are facts about
+    // thread scheduling. The files differ for that reason and for their
+    // wall-clock stamps. Comparing more than the verdicts would assert
+    // something the runtime does not promise.
 }
 
 #[test]
 fn different_seeds_play_different_games() {
     // A `seed_for` that ignored its input would pass every other test here.
-    let transcripts: Vec<Transcript> = (1..=4).map(|seed| run(&town(seed))).collect();
+    let verdicts: Vec<_> = (1..=4).map(|seed| run(&town(seed)).verdicts()).collect();
     assert!(
-        transcripts
-            .iter()
-            .any(|transcript| *transcript != transcripts[0]),
+        verdicts.iter().any(|verdict| *verdict != verdicts[0]),
         "four seeds played the same game"
     );
 }
@@ -243,9 +247,13 @@ fn a_dozen_runs_play_the_same_game() {
     // A determinism bug that depends on thread scheduling will not show up
     // in two runs.
     let config = town(SEED);
-    let first = run(&config);
+    let first = run(&config).verdicts();
     for i in 1..12 {
-        assert_eq!(run(&config), first, "run {i} played a different game");
+        assert_eq!(
+            run(&config).verdicts(),
+            first,
+            "run {i} played a different game"
+        );
     }
 }
 
@@ -301,7 +309,7 @@ fn a_run_is_reproduced_from_its_artifacts() {
         rerun.to_str().unwrap(),
         "--quiet",
     ]);
-    assert_eq!(read(&rerun, &effective), transcript);
+    assert_eq!(read(&rerun, &effective).verdicts(), transcript.verdicts());
 }
 
 #[test]
@@ -328,11 +336,18 @@ fn a_reader_that_stops_early_is_not_an_error() {
 fn playable(dir: &TempDir) -> (std::path::PathBuf, std::path::PathBuf) {
     let trajectory = dir.join("played.jsonl");
     let config = dir.join("game.toml");
+    // Fast clocks, or the game would run on the defaults a
+    // language-model game wants: twenty seconds a night session and sixty
+    // for the day (ADR-0011).
     fs::write(
         &config,
         format!(
             "seed = 26\nplayers = [\"alice\", \"bob\", \"carol\", \"dave\", \"erin\", \"frank\", \
-             \"grace\"]\ntrajectory = '{}'\n[roles]\nwerewolves = 2\nseers = 1\ndoctors = 1\n",
+             \"grace\"]\ntrajectory = '{}'\n[roles]\nwerewolves = 2\nseers = 1\ndoctors = 1\n\
+             [timing.pack]\nquiet = 0.01\nlimit = 0.05\n\
+             [timing.seer]\nquiet = 0.01\nlimit = 0.05\n\
+             [timing.doctor]\nquiet = 0.01\nlimit = 0.05\n\
+             [timing.day]\nlimit = 0.05\n",
             trajectory.display()
         ),
     )
@@ -407,8 +422,12 @@ fn a_watcher_who_stops_reading_still_leaves_a_whole_trajectory() {
     assert_eq!(String::from_utf8_lossy(&output.stderr), "");
 
     // The whole game is on disk, and it is the game the fixed seed plays.
+    // Four rounds where the old rules took two: a day closes on a
+    // majority now, and seven random players seldom put four on one
+    // target, so most days run out and the pack wins by attrition
+    // (ADR-0011).
     let effective = config::load(config::effective_path(&trajectory)).unwrap();
     let transcript = read(&trajectory, &effective);
     assert_eq!(transcript.outcome.winner, Faction::Werewolves);
-    assert_eq!(transcript.rounds.len(), 2);
+    assert_eq!(transcript.rounds.len(), 4);
 }

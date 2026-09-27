@@ -219,6 +219,7 @@ impl Knowledge {
                 phase,
                 kind,
                 votes,
+                hammer: _,
             } => self.tallies.push(Heard {
                 round: *round,
                 phase: *phase,
@@ -244,7 +245,7 @@ impl Knowledge {
             }
             // Still an observation, and still recorded in the trajectory;
             // whether it means a save is for a policy to infer.
-            Narration::NoDeath { .. } => {}
+            Narration::NoDeath { .. } | Narration::NoLynch { .. } => {}
             Narration::Outcome(outcome) => self.outcome = Some(outcome.clone()),
         }
     }
@@ -304,6 +305,7 @@ mod tests {
             phase,
             kind,
             votes,
+            hammer: None,
         })
     }
 

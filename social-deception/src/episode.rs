@@ -51,10 +51,21 @@
 //! In-flight work is counted in **deliveries, not events**: one event
 //! addressed to six agents is six handles that have not happened yet.
 //!
-//! An episode's agents have no timeout yet. The reason they could not have
-//! one is gone — an agent that wakes on its own no longer keeps an episode
-//! from ending, because quiescence no longer ends it — but giving them one
-//! is another issue's.
+//! # An agent that wakes on its own is not a stall
+//!
+//! A count of zero is only "nobody will ever speak again" if nobody is
+//! waiting on a clock. An agent that set a deadline (ADR-0010) runs another
+//! cycle when its instant arrives whether or not anything is said to it, so
+//! each cycle reports whether it left one pending
+//! ([`CycleDispatch::waking`]) and the episode holds the stall while any
+//! agent is waiting.
+//!
+//! Werewolf needs this: the moderator's sessions close on their clocks
+//! (ADR-0011), so a night where every player has already pointed is
+//! quiescent by the count and yet has three sessions still to close. A
+//! stall now means what it always meant, that nobody will speak again, and
+//! in Werewolf it is a player that never answered a request *and* a
+//! moderator with no clock left to wake for.
 
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
@@ -523,8 +534,12 @@ fn drive<D: Domain>(
         rewarded,
     } = environment;
     let mut held: Vec<BTreeSet<AgentId>> = Vec::new();
+    // Whoever reported a deadline pending on its last cycle. Such an agent
+    // will run another cycle when its instant arrives, whatever anybody
+    // says to it, so the roster is waiting rather than stalled.
+    let mut waking: BTreeSet<AgentId> = BTreeSet::new();
     while !running.is_empty() {
-        if in_flight == 0 {
+        if in_flight == 0 && waking.is_empty() {
             if held.is_empty() {
                 return Err(Halt::Error(EpisodeError::Stalled {
                     running: running.clone(),
@@ -560,6 +575,13 @@ fn drive<D: Domain>(
         in_flight = in_flight
             .checked_sub(dispatch.deliveries)
             .expect("an agent reported more deliveries than were routed to it");
+        // What this agent said about its own next cycle replaces whatever
+        // it said before.
+        if dispatch.waking {
+            waking.insert(dispatch.agent.clone());
+        } else {
+            waking.remove(&dispatch.agent);
+        }
         let refused = |error| {
             Halt::Error(EpisodeError::Route {
                 agent: dispatch.agent.clone(),
