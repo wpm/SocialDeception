@@ -2338,6 +2338,11 @@ mod tests {
         // all the same.
         let (rig, busy, release) = gated();
         rig.start();
+        // The start cycle first, and on its own. A cycle takes the controls
+        // at the head of its queue and then one event, so an event sent
+        // before the start was popped would share that cycle and the cycle
+        // read below would be the wrong one.
+        rig.cycle();
         rig.send(step("b", 1));
         recv(&busy);
         rig.stop();
