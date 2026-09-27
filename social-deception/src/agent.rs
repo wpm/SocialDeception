@@ -1020,9 +1020,13 @@ where
 
         // The next deadline is settled before the dispatch goes out,
         // because the dispatch reports it. A stop ends the agent, so it
-        // arms nothing: an agent on its way out is not waiting for
-        // anything.
-        if !stopped {
+        // arms nothing and *drops* whatever was pending: an agent on its
+        // way out is not waiting for anything, and a deadline left armed
+        // would be reported as a wake-up the episode then waits on
+        // forever.
+        if stopped {
+            self.pending = None;
+        } else {
             self.arm(t_start, started || timed_out);
         }
         let dispatch = CycleDispatch {
@@ -1806,6 +1810,28 @@ mod tests {
             "a withdrawn deadline still woke the handler"
         );
         assert_eq!(handler.inner.seen, steps([1, 2]));
+    }
+
+    #[test]
+    fn the_cycle_that_stops_an_agent_reports_no_deadline() {
+        // An agent on its way out is not waiting for anything, whatever
+        // it had armed before. The episode treats a cycle that reports a
+        // pending deadline as work still to come and waits on it
+        // (see `episode`), so a stopping cycle that reported one would
+        // have the episode waiting on a thread that has ended.
+        let (handler, _deadline) = Punctual::new(Some(at(500)));
+        let rig = rig(handler, None);
+        rig.start();
+        let started = rig.dispatch();
+        assert!(started.waking, "the handler named a deadline");
+
+        rig.stop();
+        let stopping = rig.dispatch();
+        assert!(
+            !stopping.waking,
+            "the cycle that popped the stop still claimed a deadline"
+        );
+        rig.agent.join().unwrap();
     }
 
     #[test]

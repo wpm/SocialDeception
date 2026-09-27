@@ -854,7 +854,8 @@ impl<'a> Play<'a> {
             assert_eq!(
                 outcome(last),
                 Some(&self.outcome),
-                "the last thing the survivor {who} received is the outcome"
+                "the last thing the survivor {who} received is the outcome; it was {last:?}, \
+                 and it received {received:?}"
             );
             return;
         };
