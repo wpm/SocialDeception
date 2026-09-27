@@ -59,6 +59,31 @@ an agent do something that transfers no information, that is a control.**
 
 Four rules, in the framework and in every domain built on it.
 
+### The heuristic
+
+**An episode's event trajectory should read as a narrative.** It is the
+quickest way to apply the rules below, and it does not need the rules to
+be recited: read the events in order and see whether they tell the story
+of what happened.
+
+A line a narrator would not write is a line that should not be there.
+Werewolf's requests fail on sight —
+
+> Night 1 begins. *The moderator asks dave to devour. The moderator asks
+> erin to devour. The moderator asks grace to investigate. The moderator
+> asks carol to protect.* Carol protects alice. Dave points at alice,
+> erin at bob.
+
+— because a reader who has watched the roles being dealt already knows
+who acts at night. Strike the four and the story is the same story,
+shorter. So are the tallies a session of one is sent: "grace investigates
+frank; the moderator tells grace that grace investigated frank."
+
+The heuristic works because a narrative and a training signal want the
+same thing. A narrator writes what somebody learned or did, in the order
+it happened, and nothing else; that is exactly an observation, an action,
+and no bookkeeping.
+
 ### 1. Every event to an agent informs it
 
 An event an environment sends is something the recipient did not already
