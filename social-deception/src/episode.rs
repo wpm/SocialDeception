@@ -672,7 +672,7 @@ mod tests {
 
     use super::*;
     use crate::environment::Effect;
-    use crate::testing::parse_lines;
+    use crate::testing::{Shared, joined, parse_lines, recording};
     use crate::trajectory::Writer;
 
     /// What the agents of the counting games below say.
@@ -775,19 +775,19 @@ mod tests {
     }
 
     /// An episode of a [`Paymaster`] over two mute agents, and its writer.
-    fn paid(to: &str, value: i32) -> (Episode<Counting>, Writer<Vec<u8>>) {
-        let (records, writer) = Writer::spawn(Vec::new());
+    fn paid(to: &str, value: i32) -> (Episode<Counting>, Writer, Shared) {
+        let (records, writer, bytes) = recording();
         let mut episode = Episode::new(records, REFEREE, Paymaster::paying(to, value));
         episode.add("a", Mute).unwrap();
         episode.add("b", Mute).unwrap();
-        (episode, writer)
+        (episode, writer, bytes)
     }
 
     #[test]
     fn a_reward_is_logged_to_the_agent_it_names_and_routed_nowhere() {
-        let (episode, writer) = paid("a", 7);
+        let (episode, writer, bytes) = paid("a", 7);
         episode.run().unwrap();
-        let lines = parse_lines(&writer.join().unwrap());
+        let lines = parse_lines(&joined(writer, &bytes));
         let rewards: Vec<&Value> = lines
             .iter()
             .filter(|line| line["type"] == "reward")
@@ -828,7 +828,7 @@ mod tests {
     fn a_reward_for_an_agent_not_in_the_roster_fails_the_episode() {
         // The router rejects it the way it rejects a control addressed to
         // a stranger: the episode stops and says whose bug it is.
-        let (episode, _writer) = paid("nobody", 1);
+        let (episode, _writer, _bytes) = paid("nobody", 1);
         assert_eq!(
             episode.run().unwrap_err(),
             EpisodeError::Route {
@@ -842,7 +842,7 @@ mod tests {
     fn an_environment_that_rewards_itself_fails_the_episode() {
         // The environment runs the game rather than playing it, so there
         // is nothing its own behavior could be worth.
-        let (episode, _writer) = paid(REFEREE, 1);
+        let (episode, _writer, _bytes) = paid(REFEREE, 1);
         assert_eq!(
             episode.run().unwrap_err(),
             EpisodeError::Route {
@@ -1024,16 +1024,17 @@ mod tests {
 
     /// An episode refereed over the named agents, whose trajectory goes to
     /// the writer returned beside it.
-    fn refereed<const N: usize>(agents: [&str; N]) -> (Episode<Counting>, Writer<Vec<u8>>) {
-        let (records, writer) = Writer::spawn(Vec::new());
+    fn refereed<const N: usize>(agents: [&str; N]) -> (Episode<Counting>, Writer, Shared) {
+        let (records, writer, bytes) = recording();
         (
             Episode::new(records, REFEREE, Referee::over(agents)),
             writer,
+            bytes,
         )
     }
 
-    fn rally(limit: u64) -> (Episode<Counting>, Writer<Vec<u8>>) {
-        let (mut episode, writer) = refereed(["a", "b"]);
+    fn rally(limit: u64) -> (Episode<Counting>, Writer, Shared) {
+        let (mut episode, writer, bytes) = refereed(["a", "b"]);
         for (me, partner, serves) in [("a", "b", true), ("b", "a", false)] {
             episode
                 .add(
@@ -1046,12 +1047,12 @@ mod tests {
                 )
                 .unwrap();
         }
-        (episode, writer)
+        (episode, writer, bytes)
     }
 
     #[test]
     fn a_rally_runs_to_its_limit_and_the_writer_flushes() {
-        let (episode, writer) = rally(20);
+        let (episode, writer, bytes) = rally(20);
         assert_eq!(
             episode.ids().collect::<Vec<_>>(),
             [
@@ -1064,7 +1065,7 @@ mod tests {
         episode.run().unwrap();
 
         // Every sender is gone, so the writer finishes on its own.
-        let lines = parse_lines(&writer.join().unwrap());
+        let lines = parse_lines(&joined(writer, &bytes));
         // The file interleaves agents in whatever order their records reached
         // the writer; only each agent's own order is promised.
         let volleyed = |agent: &str| -> Vec<u64> {
@@ -1133,9 +1134,9 @@ mod tests {
         // The join a training pipeline makes: an observation in one agent's
         // trajectory and the action in its sender's are the same event, and
         // nothing but the sender and the creation time links them.
-        let (episode, writer) = rally(6);
+        let (episode, writer, bytes) = rally(6);
         episode.run().unwrap();
-        let lines = parse_lines(&writer.join().unwrap());
+        let lines = parse_lines(&joined(writer, &bytes));
 
         let actions: BTreeSet<(String, u64)> = lines
             .iter()
@@ -1167,7 +1168,7 @@ mod tests {
     #[test]
     fn in_flight_work_is_counted_in_deliveries_not_messages() {
         let spokes: Vec<String> = (1..=6).map(|spoke| format!("spoke-{spoke}")).collect();
-        let (records, writer) = Writer::spawn(Vec::new());
+        let (records, writer, bytes) = recording();
         let roster: BTreeSet<AgentId> = spokes
             .iter()
             .map(AgentId::new)
@@ -1190,7 +1191,7 @@ mod tests {
         // Had the broadcast counted as one delivery, the count could have
         // reached zero after the first spoke's reply, and the episode would
         // have called a run in progress a stall.
-        let lines = parse_lines(&writer.join().unwrap());
+        let lines = parse_lines(&joined(writer, &bytes));
         let replies_seen_by_hub = of(&lines, "hub")
             .filter(|line| line["type"] == "observation")
             .count();
@@ -1208,11 +1209,11 @@ mod tests {
 
     #[test]
     fn an_environment_with_no_agents_runs_and_writes_only_its_own_controls() {
-        let (records, writer) = Writer::spawn(Vec::new());
+        let (records, writer, bytes) = recording();
         Episode::new(records, REFEREE, Referee::over([]))
             .run()
             .unwrap();
-        let lines = parse_lines(&writer.join().unwrap());
+        let lines = parse_lines(&joined(writer, &bytes));
         let controls = controls_of(&lines, None);
         assert_eq!(controls, ["start", "stop"]);
         assert!(lines.iter().all(|line| line["agent"] == REFEREE));
@@ -1222,7 +1223,7 @@ mod tests {
     fn an_episode_whose_environment_never_stops_anyone_stalls() {
         // Nothing is in flight and no agent has been stopped: nobody will
         // ever speak again and nobody has declared the episode over.
-        let (records, writer) = Writer::spawn(Vec::new());
+        let (records, writer, bytes) = recording();
         let mut episode = Episode::new(records, REFEREE, Absent(["a", "b"]));
         episode.add("a", Mute).unwrap();
         episode.add("b", Mute).unwrap();
@@ -1234,7 +1235,7 @@ mod tests {
         );
         // The trajectory is complete up to the stall: everybody was started,
         // and everybody, the environment last, was stopped and joined.
-        let lines = parse_lines(&writer.join().unwrap());
+        let lines = parse_lines(&joined(writer, &bytes));
         for agent in ["a", "b", REFEREE] {
             let controls = controls_of(&lines, Some(agent));
             assert_eq!(controls, ["start", "stop"], "{agent}");
@@ -1243,7 +1244,7 @@ mod tests {
 
     #[test]
     fn a_duplicate_id_is_rejected() {
-        let (mut episode, _writer) = refereed(["a"]);
+        let (mut episode, _writer, _bytes) = refereed(["a"]);
         episode.add("a", Spoke).unwrap();
         assert_eq!(
             episode.add("a", Spoke).unwrap_err(),
@@ -1259,7 +1260,7 @@ mod tests {
 
     #[test]
     fn a_panicking_handler_fails_the_episode_without_hanging_it() {
-        let (mut episode, writer) = refereed(["a", "b"]);
+        let (mut episode, writer, bytes) = refereed(["a", "b"]);
         episode.add("a", Panics).unwrap();
         episode.add("b", Spoke).unwrap();
         let error = episode.run().unwrap_err();
@@ -1272,7 +1273,7 @@ mod tests {
         );
         assert!(error.to_string().contains("the handler is broken"));
         // The other agent, and the environment, were still stopped cleanly.
-        let lines = parse_lines(&writer.join().unwrap());
+        let lines = parse_lines(&joined(writer, &bytes));
         for agent in ["b", REFEREE] {
             assert!(
                 of(&lines, agent).any(|line| line["control"] == "stop"),
@@ -1283,7 +1284,7 @@ mod tests {
 
     #[test]
     fn a_handler_that_addresses_itself_fails_the_episode() {
-        let (mut episode, _writer) = refereed(["a", "b"]);
+        let (mut episode, _writer, _bytes) = refereed(["a", "b"]);
         episode.add("a", Addresses("a")).unwrap();
         episode.add("b", Spoke).unwrap();
         assert_eq!(
@@ -1297,7 +1298,7 @@ mod tests {
 
     #[test]
     fn a_handler_that_addresses_a_stranger_fails_the_episode() {
-        let (mut episode, _writer) = refereed(["a", "b"]);
+        let (mut episode, _writer, _bytes) = refereed(["a", "b"]);
         episode.add("a", Addresses("nobody")).unwrap();
         episode.add("b", Spoke).unwrap();
         assert_eq!(
@@ -1378,7 +1379,7 @@ mod tests {
             .source()
             .is_none()
         );
-        let (records, _writer) = Writer::<Vec<u8>>::spawn::<Counting>(Vec::new());
+        let (records, _writer) = Writer::spawn::<Counting>(Vec::new());
         assert!(
             format!("{:?}", Episode::new(records, REFEREE, Referee::over([])))
                 .starts_with("Episode")

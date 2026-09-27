@@ -1,8 +1,16 @@
-//! Trajectory records and the writer that puts them on disk.
+//! Trajectory records and the writer that hands them to its sinks.
 //!
 //! Each agent's own record sequence is its trajectory. The agent loop
 //! records it as it folds and sends the records over an in-process channel
 //! to a [`Writer`].
+//!
+//! The writer is the one place in a running episode that sees every record
+//! as it happens, so it is where anything that wants the whole stream
+//! attaches. It does not write anything itself: it hands each record to a
+//! list of [`Sink`]s, each of which is a format bound to a destination.
+//! [`JsonLines`] over a file is the trajectory on disk; a domain that knows
+//! how to render its own messages can add a sink that shows the game as it
+//! plays.
 //!
 //! # Five record types
 //!
@@ -66,18 +74,27 @@
 //! records from different agents interleave arbitrarily, and a recipient's
 //! cycle can precede the sender's action record that caused it.
 //!
+//! Every sink sees that one order. A record reaches each sink in the order
+//! the writer received it off the channel, so the per-agent guarantees above
+//! hold for every sink alike, and so does the arbitrary interleaving between
+//! agents: what a live view shows is what the file records, in the same
+//! order.
+//!
 //! A reward record is outside all of it. It belongs to the agent it names
 //! and was written by another, so it is in no cycle of that agent's, sits
 //! between two of its cycles wherever the writer happened to take it, and
 //! carries no sequence number to place it. Its `created` is what places it.
 //!
-//! If the writer fails mid-cycle, the agent's loop exits with an error and
-//! its records end without a closing cycle record.
+//! If a [`Policy::Required`] sink fails mid-cycle, the writer stops, the
+//! agent's loop exits with an error and its records end without a closing
+//! cycle record. A [`Policy::Optional`] sink's failure costs that sink
+//! alone: it is dropped, and the episode runs on.
 //!
 //! # On-disk format
 //!
-//! One JSON object per line, wrapped in [`LogRecord`], whose `type` field is
-//! `observation`, `action`, `control`, `reward` or `cycle`.
+//! [`JsonLines`] writes one JSON object per line, wrapped in [`LogRecord`],
+//! whose `type` field is `observation`, `action`, `control`, `reward` or
+//! `cycle`.
 //! Nothing here reads a log back; only `Serialize` is required of a payload
 //! or a reward.
 //!
@@ -289,7 +306,7 @@ pub struct CycleRecord {
     pub outputs: Vec<Seq>,
 }
 
-/// One line of a trajectory file.
+/// One record of a trajectory: what a [`Sink`] is handed.
 ///
 /// Internally tagged: the `type` field of each line names the record kind.
 /// `Debug`, `Clone` and equality are written out for the same reason
@@ -506,66 +523,177 @@ impl<D: Domain> From<CycleRecord> for LogRecord<D> {
     }
 }
 
-/// The trajectory writer: a thread that owns the output and turns the records
-/// it receives into lines of JSON.
+/// A consumer of trajectory records: a format bound to a destination.
+///
+/// The [`Writer`] hands every record it receives to each of its sinks, in
+/// the order it was given them, which is the order the channel delivered
+/// the records. [`JsonLines`] is the one the framework provides; a domain
+/// that knows how to render its own messages provides its own, which is why
+/// this is a trait and not an enumeration of the formats the framework
+/// happens to know.
+///
+/// A sink runs on the writer's thread and owns its destination, so it need
+/// not be `Sync`, but it must be `Send` to be moved onto that thread.
+pub trait Sink<D: Domain>: Send {
+    /// Takes one record, in the order the writer received it.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the destination returned. What happens next is the sink's
+    /// [`Policy`].
+    fn record(&mut self, record: &LogRecord<D>) -> io::Result<()>;
+
+    /// Called once, after the last record: flush, close.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the destination returned, treated exactly as an error from
+    /// [`record`](Sink::record).
+    fn finish(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// What a sink's failure costs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Policy {
+    /// An error fails the run: the writer stops, every later send fails at
+    /// the agent that attempted it, and [`Writer::join`] returns the error.
+    ///
+    /// This is what a trajectory file wants: a run whose record of itself is
+    /// incomplete is a run that did not happen.
+    Required,
+    /// An error drops this sink; the others carry on, and [`Writer::join`]
+    /// does not report it.
+    ///
+    /// This is what a terminal wants: a reader that closed the pipe has seen
+    /// all it wanted, and the game is no less played for it.
+    Optional,
+}
+
+/// The trajectory writer: a thread that owns the sinks and hands each one
+/// every record it receives.
 ///
 /// Records reach it over an in-process channel whose sender is handed out by
 /// [`Writer::spawn`]; every agent gets a clone. The thread runs until every
-/// sender has been dropped, then flushes and exits. [`Writer::join`] waits for
-/// that and reports how it went.
+/// sender has been dropped, then finishes each sink and exits.
+/// [`Writer::join`] waits for that and reports how it went.
 ///
-/// On a write failure the thread stops and drops its receiver, so every
-/// subsequent `send` fails at the agent that attempted it, and the failure is
-/// returned from [`Writer::join`].
+/// On a [`Policy::Required`] sink's failure the thread stops and drops its
+/// receiver, so every subsequent `send` fails at the agent that attempted
+/// it, and the failure is returned from [`Writer::join`]. A
+/// [`Policy::Optional`] sink's failure removes that sink and nothing else.
 #[derive(Debug)]
-pub struct Writer<W> {
-    thread: JoinHandle<io::Result<W>>,
+pub struct Writer {
+    thread: JoinHandle<io::Result<()>>,
 }
 
-impl<W: Write + Send + 'static> Writer<W> {
-    /// Starts a writer thread that writes records to `sink`, one JSON object
-    /// per line, and returns the sender that feeds it.
+impl Writer {
+    /// Starts a writer thread that hands each record to every sink, in the
+    /// order given, and returns the sender that feeds it.
     ///
-    /// The sink is buffered internally; there is no need to wrap it in a
-    /// [`BufWriter`] first.
-    pub fn spawn<D: Domain>(sink: W) -> (Sender<LogRecord<D>>, Self) {
+    /// A writer with no sinks at all is allowed: it drains the channel and
+    /// discards what it receives, which is what an episode that records
+    /// nothing wants.
+    #[must_use]
+    pub fn spawn<D: Domain>(
+        sinks: Vec<(Box<dyn Sink<D>>, Policy)>,
+    ) -> (Sender<LogRecord<D>>, Self) {
         let (sender, receiver) = unbounded::<LogRecord<D>>();
         let thread = thread::spawn(move || {
-            let mut out = BufWriter::new(sink);
+            let mut live = sinks;
             for record in receiver {
-                serde_json::to_writer(&mut out, &record)?;
-                out.write_all(b"\n")?;
+                deliver(&mut live, |sink| sink.record(&record))?;
             }
-            out.into_inner().map_err(io::IntoInnerError::into_error)
+            deliver(&mut live, |sink| sink.finish())
         });
         (sender, Self { thread })
     }
 
-    /// Waits for the writer to finish and gives back its sink.
+    /// Waits for the writer to finish.
     ///
     /// The writer finishes when every sender returned by [`Writer::spawn`]
-    /// has been dropped, or earlier if a write failed. Drop the senders before
-    /// calling this, or it never returns.
+    /// has been dropped, or earlier if a required sink failed. Drop the
+    /// senders before calling this, or it never returns.
     ///
     /// # Errors
     ///
-    /// The first write or flush error the thread met, or an error of kind
-    /// [`io::ErrorKind::Other`] if the thread panicked.
-    pub fn join(self) -> io::Result<W> {
+    /// The first required sink's error, or an error of kind
+    /// [`io::ErrorKind::Other`] if the thread panicked. An optional sink's
+    /// error is never reported here: it cost that sink and nothing else.
+    pub fn join(self) -> io::Result<()> {
         self.thread
             .join()
             .map_err(|_| io::Error::other("trajectory writer thread panicked"))?
     }
-}
 
-impl Writer<File> {
-    /// Creates (or truncates) the file at `path` and starts a writer on it.
+    /// Creates (or truncates) the file at `path` and starts a writer whose
+    /// one sink writes JSON Lines to it, as a run whose trajectory is that
+    /// file requires.
     ///
     /// # Errors
     ///
     /// Whatever [`File::create`] returns.
     pub fn create<D: Domain>(path: impl AsRef<Path>) -> io::Result<(Sender<LogRecord<D>>, Self)> {
-        Ok(Self::spawn(File::create(path)?))
+        let sink: Box<dyn Sink<D>> = Box::new(JsonLines::new(File::create(path)?));
+        Ok(Self::spawn(vec![(sink, Policy::Required)]))
+    }
+}
+
+/// Runs `act` on every live sink in turn, dropping the optional ones that
+/// fail and returning on the first required one that does.
+///
+/// A sink that has failed is gone: it is neither given later records nor
+/// finished, because a destination that refused one write has no reason to
+/// accept the next.
+fn deliver<D: Domain>(
+    sinks: &mut Vec<(Box<dyn Sink<D>>, Policy)>,
+    mut act: impl FnMut(&mut dyn Sink<D>) -> io::Result<()>,
+) -> io::Result<()> {
+    let mut failed = None;
+    sinks.retain_mut(|(sink, policy)| match act(sink.as_mut()) {
+        Ok(()) => true,
+        Err(error) => {
+            if *policy == Policy::Required {
+                failed = Some(error);
+            }
+            false
+        }
+    });
+    match failed {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+/// The JSON Lines sink: one JSON object per record, one record per line.
+///
+/// This is the trajectory format described at the top of this module, and
+/// the format of the file a run writes. The destination is buffered
+/// internally, so there is no need to wrap it in a [`BufWriter`] first;
+/// [`finish`](Sink::finish) flushes that buffer.
+#[derive(Debug)]
+pub struct JsonLines<W: Write> {
+    out: BufWriter<W>,
+}
+
+impl<W: Write> JsonLines<W> {
+    /// A sink that writes JSON Lines to `out`.
+    pub fn new(out: W) -> Self {
+        Self {
+            out: BufWriter::new(out),
+        }
+    }
+}
+
+impl<D: Domain, W: Write + Send> Sink<D> for JsonLines<W> {
+    fn record(&mut self, record: &LogRecord<D>) -> io::Result<()> {
+        serde_json::to_writer(&mut self.out, record)?;
+        self.out.write_all(b"\n")
+    }
+
+    fn finish(&mut self) -> io::Result<()> {
+        self.out.flush()
     }
 }
 
@@ -575,12 +703,13 @@ mod tests {
     use std::fs;
     use std::process;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use serde_json::{Value, json};
 
     use super::*;
-    use crate::testing::{TestDomain, TestPayload, parse_lines};
+    use crate::testing::{TestDomain, TestPayload, joined, parse_lines, recording};
 
     fn at(nanos: u64) -> Timestamp {
         Timestamp::from(Duration::from_nanos(nanos))
@@ -641,13 +770,12 @@ mod tests {
 
     #[test]
     fn records_round_trip_through_the_writer_as_jsonl() {
-        let (sender, writer) = Writer::spawn(Vec::new());
+        let (sender, writer, bytes) = recording();
         for record in sample() {
             sender.send(record).unwrap();
         }
         drop(sender);
-        let bytes = writer.join().unwrap();
-        assert_eq!(parse_lines(&bytes), expected_lines());
+        assert_eq!(parse_lines(&joined(writer, &bytes)), expected_lines());
     }
 
     #[test]
@@ -734,12 +862,12 @@ mod tests {
 
     #[test]
     fn every_line_is_one_object_and_the_stream_dispatches_on_type() {
-        let (sender, writer) = Writer::spawn(Vec::new());
+        let (sender, writer, bytes) = recording();
         for record in sample() {
             sender.send(record).unwrap();
         }
         drop(sender);
-        let bytes = writer.join().unwrap();
+        let bytes = joined(writer, &bytes);
         let text = std::str::from_utf8(&bytes).unwrap();
         assert_eq!(text.lines().count(), 4);
         let types: Vec<Value> = parse_lines(&bytes)
@@ -755,7 +883,7 @@ mod tests {
 
     #[test]
     fn writer_thread_survives_records_from_several_senders() {
-        let (sender, writer) = Writer::spawn(Vec::new());
+        let (sender, writer, bytes) = recording();
         let handles: Vec<_> = (0..4u64)
             .map(|i| {
                 let sender = sender.clone();
@@ -779,8 +907,7 @@ mod tests {
         for handle in handles {
             handle.join().unwrap();
         }
-        let bytes = writer.join().unwrap();
-        let lines = parse_lines(&bytes);
+        let lines = parse_lines(&joined(writer, &bytes));
         assert_eq!(lines.len(), 40);
         // Each agent's records come out in its own order, whatever the
         // interleaving between agents.
@@ -828,9 +955,61 @@ mod tests {
         }
     }
 
+    /// A sink that records every record it is given, and can be told to
+    /// refuse the rest from a given one onwards.
+    #[derive(Debug, Clone)]
+    struct Spy {
+        seen: Arc<Mutex<Vec<String>>>,
+        fails_from: Option<usize>,
+    }
+
+    impl Spy {
+        /// A sink that accepts everything.
+        fn new() -> Self {
+            Self {
+                seen: Arc::new(Mutex::new(Vec::new())),
+                fails_from: None,
+            }
+        }
+
+        /// A sink that accepts the first `n` records and refuses the rest.
+        fn failing_after(n: usize) -> Self {
+            Self {
+                fails_from: Some(n),
+                ..Self::new()
+            }
+        }
+
+        /// The records it took, each as the JSON it would have written.
+        fn seen(&self) -> Vec<String> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    impl Sink<TestDomain> for Spy {
+        fn record(&mut self, record: &LogRecord<TestDomain>) -> io::Result<()> {
+            let mut seen = self.seen.lock().unwrap();
+            if self.fails_from.is_some_and(|n| seen.len() >= n) {
+                return Err(io::Error::new(io::ErrorKind::BrokenPipe, "no reader"));
+            }
+            seen.push(serde_json::to_string(record).unwrap());
+            Ok(())
+        }
+    }
+
+    /// Sends `sample` to `sender` and joins `writer`.
+    fn play(sender: Sender<LogRecord<TestDomain>>, writer: Writer) -> io::Result<()> {
+        for record in sample() {
+            let _ = sender.send(record);
+        }
+        drop(sender);
+        writer.join()
+    }
+
     #[test]
-    fn a_write_failure_is_loud_at_both_ends() {
-        let (sender, writer) = Writer::spawn(BrokenSink);
+    fn a_required_sink_s_failure_is_loud_at_both_ends() {
+        let broken: Box<dyn Sink<TestDomain>> = Box::new(JsonLines::new(BrokenSink));
+        let (sender, writer) = Writer::spawn(vec![(broken, Policy::Required)]);
         // A record small enough to sit in the buffer.
         let record: LogRecord<TestDomain> = CycleRecord {
             agent: AgentId::new("a"),
@@ -875,5 +1054,67 @@ mod tests {
             sender.send(late).is_err(),
             "sends after a write failure must fail"
         );
+    }
+
+    #[test]
+    fn every_sink_sees_every_record_in_the_same_order() {
+        let first = Spy::new();
+        let second = Spy::new();
+        let sinks: Vec<(Box<dyn Sink<TestDomain>>, Policy)> = vec![
+            (Box::new(first.clone()), Policy::Required),
+            (Box::new(second.clone()), Policy::Optional),
+        ];
+        let (sender, writer) = Writer::spawn(sinks);
+        play(sender, writer).unwrap();
+
+        let expected: Vec<String> = expected_lines()
+            .iter()
+            .map(|line| serde_json::to_string(line).unwrap())
+            .collect();
+        assert_eq!(first.seen().len(), expected.len());
+        assert_eq!(first.seen(), second.seen());
+        // The same records, and the same ones the file would have held.
+        let taken: Vec<Value> = first
+            .seen()
+            .iter()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(taken, expected_lines());
+    }
+
+    #[test]
+    fn a_failing_required_sink_takes_the_run_with_it() {
+        let survivor = Spy::new();
+        let sinks: Vec<(Box<dyn Sink<TestDomain>>, Policy)> = vec![
+            (Box::new(Spy::failing_after(2)), Policy::Required),
+            (Box::new(survivor.clone()), Policy::Optional),
+        ];
+        let (sender, writer) = Writer::spawn(sinks);
+        let error = play(sender, writer).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        // The writer stopped where the required sink did, so the sink beside
+        // it saw no more than the record that failed.
+        assert_eq!(survivor.seen().len(), 3);
+    }
+
+    #[test]
+    fn a_failing_optional_sink_is_dropped_and_nothing_else_notices() {
+        let dropped = Spy::failing_after(2);
+        let survivor = Spy::new();
+        let sinks: Vec<(Box<dyn Sink<TestDomain>>, Policy)> = vec![
+            (Box::new(dropped.clone()), Policy::Optional),
+            (Box::new(survivor.clone()), Policy::Required),
+        ];
+        let (sender, writer) = Writer::spawn(sinks);
+        play(sender, writer).unwrap();
+        // It took two and was gone; the run and the other sink went on.
+        assert_eq!(dropped.seen().len(), 2);
+        assert_eq!(survivor.seen().len(), sample().len());
+    }
+
+    #[test]
+    fn a_writer_with_no_sinks_drains_and_joins_cleanly() {
+        let (sender, writer) = Writer::spawn::<TestDomain>(Vec::new());
+        play(sender, writer).unwrap();
     }
 }
