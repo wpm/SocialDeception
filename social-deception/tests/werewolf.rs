@@ -29,8 +29,11 @@ use std::fs;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
+use std::time::Duration;
+
 use social_deception::AgentId;
 use social_deception::werewolf::config::DEFAULT_MODERATOR;
+use social_deception::werewolf::config::{DayTiming, NightTiming, Timing};
 use social_deception::werewolf::{self, Config, Faction, RoleCounts, Transcript, config};
 use support::TempDir;
 
@@ -55,6 +58,26 @@ const SEEDS: u64 = 40;
 
 /// A validated configuration for `players` with the given special roles,
 /// played from `seed`, writing no trajectory.
+/// Timing fast enough that a test does not spend real time waiting on a
+/// session's clock. A game of random players points once and never changes
+/// its mind, so a night session closes a quiet period after its last
+/// member's only point, and a day runs to its limit unless a majority falls
+/// out of the deal.
+const FAST: Timing = Timing {
+    day_cap: None,
+    pack: FAST_NIGHT,
+    seer: FAST_NIGHT,
+    doctor: FAST_NIGHT,
+    day: DayTiming {
+        limit: Duration::from_millis(50),
+    },
+};
+
+const FAST_NIGHT: NightTiming = NightTiming {
+    quiet: Duration::from_millis(10),
+    limit: Duration::from_millis(50),
+};
+
 fn config(players: &[&str], werewolves: usize, seers: usize, doctors: usize, seed: u64) -> Config {
     let config = Config {
         seed,
@@ -66,6 +89,7 @@ fn config(players: &[&str], werewolves: usize, seers: usize, doctors: usize, see
         },
         trajectory: None,
         moderator: AgentId::new(DEFAULT_MODERATOR),
+        timing: FAST,
     };
     config.validate().unwrap();
     config

@@ -286,7 +286,7 @@ mod tests {
     use super::*;
     use crate::agent::{Action, Observation};
     use crate::testing::{TempDir, id, ids, parse_lines};
-    use crate::werewolf::config::{DEFAULT_MODERATOR, RoleCounts};
+    use crate::werewolf::config::{DEFAULT_MODERATOR, RoleCounts, Timing};
     use crate::werewolf::message::Round;
     use crate::werewolf::transcript::{self, Transcript};
 
@@ -310,6 +310,7 @@ mod tests {
             },
             trajectory: None,
             moderator: id(DEFAULT_MODERATOR),
+            timing: Timing::default(),
         };
         config.validate().unwrap();
         config

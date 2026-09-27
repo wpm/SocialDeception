@@ -30,6 +30,7 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -64,6 +65,9 @@ pub struct Config {
     /// roster as the players, so no player may have this id.
     #[serde(default = "default_moderator")]
     pub moderator: AgentId,
+    /// The clocks the game's pointing sessions run on.
+    #[serde(default)]
+    pub timing: Timing,
 }
 
 /// How many of each special role a game has.
@@ -90,6 +94,189 @@ impl RoleCounts {
 
 fn default_moderator() -> AgentId {
     AgentId::new(DEFAULT_MODERATOR)
+}
+
+/// The clocks a game's pointing sessions run on (ADR-0011).
+///
+/// A phase is made of sessions, and a session closes on a clock rather than
+/// when the last member has answered. Each night session has a quiet period
+/// and a hard limit of its own, so that a slow role cannot spend another
+/// role's time; the day has a hard limit only, since it closes on a
+/// majority rather than on quiet.
+///
+/// Every field has a default, so a configuration with no `[timing]` table
+/// is still a configuration. Durations are written as seconds and held as
+/// [`Duration`], and `day_cap` is resolved from the number of players when
+/// the file does not set it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Timing {
+    /// Days after which a game that has not been won ends as a stalemate.
+    /// `None` means the number of players; [`Timing::day_cap`] resolves it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub day_cap: Option<u32>,
+    /// The pack's session: the living werewolves choosing a victim.
+    pub pack: NightTiming,
+    /// The seer's session.
+    pub seer: NightTiming,
+    /// The doctor's session.
+    pub doctor: NightTiming,
+    /// The day's one session.
+    pub day: DayTiming,
+}
+
+/// One night session's clock.
+///
+/// The session closes when every member has pointed and no point has
+/// changed for `quiet`, or at `limit`, whichever comes first. Any change of
+/// mind restarts the quiet period; a repeat of the same target does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct NightTiming {
+    /// How long the members must leave their points alone before the
+    /// session closes.
+    #[serde(with = "seconds")]
+    pub quiet: Duration,
+    /// How long the session may run whatever its members do.
+    #[serde(with = "seconds")]
+    pub limit: Duration,
+}
+
+/// The day session's clock.
+///
+/// The day has no quiet period: it closes the moment a majority of the
+/// living point at the same player, or at `limit` with nobody lynched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct DayTiming {
+    /// How long the day may run without a majority.
+    #[serde(with = "seconds")]
+    pub limit: Duration,
+}
+
+impl Default for NightTiming {
+    fn default() -> Self {
+        Self {
+            quiet: Duration::from_secs(1),
+            limit: Duration::from_secs(20),
+        }
+    }
+}
+
+impl Default for DayTiming {
+    fn default() -> Self {
+        Self {
+            limit: Duration::from_secs(60),
+        }
+    }
+}
+
+impl Timing {
+    /// The day cap this timing means for a game of `players` players: what
+    /// the file set, or the number of players.
+    ///
+    /// A game of *n* players cannot run past *n* days under ADR-0011's
+    /// rules, so the default is the smallest cap that never cuts a game
+    /// short on its own.
+    #[must_use]
+    pub fn day_cap(&self, players: usize) -> u32 {
+        self.day_cap
+            .unwrap_or_else(|| u32::try_from(players).unwrap_or(u32::MAX))
+    }
+
+    /// This timing with its `day_cap` resolved against `players`, as the
+    /// effective configuration writes it.
+    #[must_use]
+    pub fn resolved(&self, players: usize) -> Self {
+        Self {
+            day_cap: Some(self.day_cap(players)),
+            ..*self
+        }
+    }
+
+    /// Each session's clock, with the name the error messages use. The day
+    /// has no quiet period, so its is `None`.
+    fn sessions(&self) -> [(&'static str, Duration, Option<Duration>); 4] {
+        [
+            ("pack", self.pack.limit, Some(self.pack.quiet)),
+            ("seer", self.seer.limit, Some(self.seer.quiet)),
+            ("doctor", self.doctor.limit, Some(self.doctor.quiet)),
+            ("day", self.day.limit, None),
+        ]
+    }
+
+    /// Checks that every clock describes a session that can be pointed in.
+    ///
+    /// Parsing has already rejected anything that is not a finite,
+    /// non-negative number of seconds; what is left to check is that a
+    /// duration is greater than zero, that a quiet period is not longer
+    /// than the limit it has to fit inside, and that the day cap leaves at
+    /// least one day to play.
+    ///
+    /// # Errors
+    ///
+    /// The first check that fails, session by session in the order
+    /// [`Timing::sessions`] lists them.
+    fn validate(&self) -> Result<(), ConfigError> {
+        for (session, limit, quiet) in self.sessions() {
+            if limit.is_zero() {
+                return Err(ConfigError::TimingNotPositive {
+                    field: format!("timing.{session}.limit"),
+                });
+            }
+            if let Some(quiet) = quiet {
+                if quiet.is_zero() {
+                    return Err(ConfigError::TimingNotPositive {
+                        field: format!("timing.{session}.quiet"),
+                    });
+                }
+                if quiet > limit {
+                    return Err(ConfigError::QuietExceedsLimit {
+                        session,
+                        quiet,
+                        limit,
+                    });
+                }
+            }
+        }
+        if self.day_cap == Some(0) {
+            return Err(ConfigError::DayCapTooSmall);
+        }
+        Ok(())
+    }
+}
+
+/// Durations in a configuration file are seconds as floating-point numbers,
+/// and [`Duration`] everywhere else.
+///
+/// `Duration::from_secs_f64` panics on a negative, infinite or absurdly
+/// large value, so the conversion rejects those here rather than letting a
+/// file crash a run. What survives is finite and non-negative; whether it
+/// is *usable* — greater than zero, and a quiet period no longer than its
+/// limit — is [`Config::validate`]'s business, so that the error names the
+/// field.
+mod seconds {
+    use std::time::Duration;
+
+    use serde::{Deserialize, Deserializer, Serializer, de::Error as _};
+
+    pub(super) fn serialize<S: Serializer>(
+        duration: &Duration,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.serialize_f64(duration.as_secs_f64())
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Duration, D::Error> {
+        let seconds = f64::deserialize(deserializer)?;
+        if !seconds.is_finite() {
+            return Err(D::Error::custom(format!("{seconds} is not a duration")));
+        }
+        Duration::try_from_secs_f64(seconds)
+            .map_err(|error| D::Error::custom(format!("{seconds} is not a duration: {error}")))
+    }
 }
 
 /// Why a configuration was rejected.
@@ -141,6 +328,24 @@ pub enum ConfigError {
     /// A player has the name of one of the seed streams that are not a
     /// player's, [`seed::RESERVED`], and would share its generator with it.
     ReservedPlayer(AgentId),
+    /// A timing duration is zero. A session with no time cannot be pointed
+    /// in.
+    TimingNotPositive {
+        /// The field, as it is written in the file, such as `timing.pack.quiet`.
+        field: String,
+    },
+    /// A night session's quiet period is longer than its hard limit, so the
+    /// session could never close on quiet.
+    QuietExceedsLimit {
+        /// The session, such as `pack`.
+        session: &'static str,
+        /// `quiet`.
+        quiet: Duration,
+        /// `limit`.
+        limit: Duration,
+    },
+    /// `timing.day_cap` is zero: a game must have at least one day to play.
+    DayCapTooSmall,
 }
 
 impl fmt::Display for ConfigError {
@@ -170,6 +375,21 @@ impl fmt::Display for ConfigError {
             Self::PlayerIsModerator(who) => {
                 write!(f, "player {:?} has the moderator's id", who.as_str())
             }
+            Self::TimingNotPositive { field } => {
+                write!(f, "{field} must be greater than zero")
+            }
+            Self::QuietExceedsLimit {
+                session,
+                quiet,
+                limit,
+            } => write!(
+                f,
+                "timing.{session}.quiet ({} s) must not be greater than timing.{session}.limit \
+                 ({} s)",
+                quiet.as_secs_f64(),
+                limit.as_secs_f64()
+            ),
+            Self::DayCapTooSmall => f.write_str("timing.day_cap must be at least 1"),
             Self::ReservedPlayer(who) => write!(
                 f,
                 "player {:?} has a name reserved for the game's own random streams; the \
@@ -301,11 +521,13 @@ impl Config {
                 return Err(ConfigError::ReservedPlayer(player.clone()));
             }
         }
+        self.timing.validate()?;
         Ok(())
     }
 
     /// The effective configuration of a run played from this one: the same
-    /// configuration as TOML, without its `trajectory` field.
+    /// configuration as TOML, without its `trajectory` field and with its
+    /// `[timing]` table resolved.
     ///
     /// It is a valid configuration file in the schema [`load`] reads, and
     /// reads back as this configuration with no trajectory. That is what
@@ -313,6 +535,12 @@ impl Config {
     /// <elsewhere>`: the trajectory is omitted so that replaying the file
     /// cannot truncate the very trajectory it describes, and a reproduction
     /// names its own output.
+    ///
+    /// `day_cap` is written as the number the run actually played to, rather
+    /// than left out to be defaulted again. It defaults from the number of
+    /// players, so a file whose player list was overridden would otherwise
+    /// resolve it differently on the way back in, and the effective
+    /// configuration has to describe the run that happened.
     ///
     /// # Panics
     ///
@@ -322,6 +550,7 @@ impl Config {
     pub fn effective(&self) -> String {
         let effective = Self {
             trajectory: None,
+            timing: self.timing.resolved(self.players.len()),
             ..self.clone()
         };
         toml::to_string(&effective).expect("a configuration is representable as TOML")
@@ -347,6 +576,24 @@ mod tests {
         werewolves = 2
         seers = 1
         doctors = 1
+
+        [timing]
+        day_cap = 5
+
+        [timing.pack]
+        quiet = 0.5
+        limit = 9.0
+
+        [timing.seer]
+        quiet = 0.25
+        limit = 8.0
+
+        [timing.doctor]
+        quiet = 0.125
+        limit = 7.0
+
+        [timing.day]
+        limit = 6.0
     "#;
 
     /// A configuration with only the required fields.
@@ -381,6 +628,24 @@ mod tests {
                 },
                 trajectory: Some(PathBuf::from("werewolf.jsonl")),
                 moderator: AgentId::new("narrator"),
+                timing: Timing {
+                    day_cap: Some(5),
+                    pack: NightTiming {
+                        quiet: Duration::from_millis(500),
+                        limit: Duration::from_secs(9),
+                    },
+                    seer: NightTiming {
+                        quiet: Duration::from_millis(250),
+                        limit: Duration::from_secs(8),
+                    },
+                    doctor: NightTiming {
+                        quiet: Duration::from_millis(125),
+                        limit: Duration::from_secs(7),
+                    },
+                    day: DayTiming {
+                        limit: Duration::from_secs(6),
+                    },
+                },
             }
         );
     }
@@ -399,6 +664,7 @@ mod tests {
                 },
                 trajectory: None,
                 moderator: AgentId::new(DEFAULT_MODERATOR),
+                timing: Timing::default(),
             }
         );
     }
@@ -609,7 +875,8 @@ mod tests {
             Config::parse(&text).unwrap(),
             Config {
                 trajectory: None,
-                ..config
+                timing: config.timing.resolved(config.players.len()),
+                ..config.clone()
             }
         );
     }
@@ -624,9 +891,16 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("seers = 0"), "{text}");
+        // Including the day cap, which defaults from the number of players
+        // and so has to be pinned to the number this run played to.
+        assert!(text.contains("day_cap = 3"), "{text}");
+        let minimal = Config::parse(MINIMAL).unwrap();
         assert_eq!(
             Config::parse(&text).unwrap(),
-            Config::parse(MINIMAL).unwrap()
+            Config {
+                timing: minimal.timing.resolved(minimal.players.len()),
+                ..minimal.clone()
+            }
         );
     }
 
@@ -636,11 +910,13 @@ mod tests {
         let trajectory = dir.join("werewolf.jsonl");
         let written = write_effective(&valid(), &trajectory).unwrap();
         assert_eq!(written, effective_path(&trajectory));
+        let config = valid();
         assert_eq!(
             load(&written).unwrap(),
             Config {
                 trajectory: None,
-                ..valid()
+                timing: config.timing.resolved(config.players.len()),
+                ..config.clone()
             }
         );
     }
@@ -657,6 +933,161 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "cannot write /no-such-directory/werewolf.jsonl.toml"
+        );
+    }
+
+    #[test]
+    fn a_config_without_timing_gets_the_default_clocks() {
+        let config = Config::parse(MINIMAL).unwrap();
+        assert_eq!(config.timing, Timing::default());
+        for session in [config.timing.pack, config.timing.seer, config.timing.doctor] {
+            assert_eq!(session.quiet, Duration::from_secs(1));
+            assert_eq!(session.limit, Duration::from_secs(20));
+        }
+        assert_eq!(config.timing.day.limit, Duration::from_secs(60));
+        // Unset, the day cap is the number of players: the smallest cap that
+        // never ends a game the rules would have ended anyway.
+        assert_eq!(config.timing.day_cap, None);
+        assert_eq!(config.timing.day_cap(config.players.len()), 3);
+        assert_eq!(config.timing.day_cap(12), 12);
+    }
+
+    #[test]
+    fn a_day_cap_that_is_set_is_kept() {
+        let config = valid();
+        assert_eq!(config.timing.day_cap, Some(5));
+        // Set, it is what it says whatever the game's size.
+        assert_eq!(config.timing.day_cap(config.players.len()), 5);
+        assert_eq!(config.timing.day_cap(99), 5);
+    }
+
+    #[test]
+    fn a_duration_of_zero_is_rejected_by_the_field_that_holds_it() {
+        // Every duration, named one at a time, so that each is checked and
+        // each error says which field it was.
+        /// A field of a [`Timing`], named as the file writes it, and the
+        /// way to set it.
+        type Case = (&'static str, fn(&mut Timing));
+
+        let cases: [Case; 7] = [
+            ("timing.pack.limit", |t| t.pack.limit = Duration::ZERO),
+            ("timing.pack.quiet", |t| t.pack.quiet = Duration::ZERO),
+            ("timing.seer.limit", |t| t.seer.limit = Duration::ZERO),
+            ("timing.seer.quiet", |t| t.seer.quiet = Duration::ZERO),
+            ("timing.doctor.limit", |t| t.doctor.limit = Duration::ZERO),
+            ("timing.doctor.quiet", |t| t.doctor.quiet = Duration::ZERO),
+            ("timing.day.limit", |t| t.day.limit = Duration::ZERO),
+        ];
+        for (field, break_it) in cases {
+            let mut config = valid();
+            break_it(&mut config.timing);
+            let error = config.validate().unwrap_err();
+            assert!(
+                matches!(&error, ConfigError::TimingNotPositive { field: f } if f == field),
+                "{field}: {error:?}"
+            );
+            assert_eq!(
+                error.to_string(),
+                format!("{field} must be greater than zero")
+            );
+        }
+    }
+
+    #[test]
+    fn a_quiet_period_may_not_outlast_its_limit() {
+        // A session whose quiet period is longer than its limit could never
+        // close on quiet, so the limit would be the only way it ever ended.
+        for session in ["pack", "seer", "doctor"] {
+            let mut config = valid();
+            let clock = match session {
+                "pack" => &mut config.timing.pack,
+                "seer" => &mut config.timing.seer,
+                _ => &mut config.timing.doctor,
+            };
+            clock.quiet = Duration::from_secs(2);
+            clock.limit = Duration::from_secs(1);
+            let error = config.validate().unwrap_err();
+            assert!(
+                matches!(&error, ConfigError::QuietExceedsLimit { session: s, .. } if *s == session),
+                "{session}: {error:?}"
+            );
+            let text = error.to_string();
+            assert!(
+                text.contains(&format!("timing.{session}.quiet (2 s)")),
+                "{text}"
+            );
+            assert!(
+                text.contains(&format!("timing.{session}.limit (1 s)")),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_quiet_period_equal_to_its_limit_is_allowed() {
+        // Not greater than, so equal is fine: the session closes on quiet at
+        // the same instant its limit would have closed it.
+        let mut config = valid();
+        config.timing.pack.quiet = config.timing.pack.limit;
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn a_day_cap_of_zero_leaves_no_game_to_play() {
+        let mut config = valid();
+        config.timing.day_cap = Some(0);
+        let error = config.validate().unwrap_err();
+        assert!(matches!(error, ConfigError::DayCapTooSmall), "{error:?}");
+        assert_eq!(error.to_string(), "timing.day_cap must be at least 1");
+        // One is the smallest cap there is.
+        config.timing.day_cap = Some(1);
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn a_duration_that_is_not_a_duration_does_not_parse() {
+        // Rejected at parse rather than in `validate`, because there is no
+        // `Duration` to hold a negative or an infinity in the first place.
+        for bad in ["-1.0", "nan", "inf"] {
+            let text = format!(
+                "{MINIMAL}
+[timing.pack]
+quiet = {bad}
+limit = 1.0
+"
+            );
+            let error = Config::parse(&text).unwrap_err();
+            assert!(matches!(error, ConfigError::Parse(_)), "{bad}: {error:?}");
+        }
+    }
+
+    #[test]
+    fn a_quiet_period_under_the_day_is_an_unknown_field() {
+        // The day has no quiet period, and `deny_unknown_fields` is what
+        // says so rather than silently taking a default.
+        let text = format!(
+            "{MINIMAL}
+[timing.day]
+quiet = 1.0
+limit = 2.0
+"
+        );
+        let error = Config::parse(&text).unwrap_err();
+        assert!(matches!(error, ConfigError::Parse(_)), "{error:?}");
+        assert!(error.to_string().contains("quiet"), "{error}");
+    }
+
+    #[test]
+    fn the_effective_timing_round_trips() {
+        // Written, parsed back, equal: what a run is reproduced from.
+        let config = valid();
+        let text = config.effective();
+        let read = Config::parse(&text).unwrap();
+        assert_eq!(read.timing, config.timing.resolved(config.players.len()));
+        // And again, to show the resolved form is a fixed point.
+        assert_eq!(
+            Config::parse(&read.effective()).unwrap().timing,
+            read.timing
         );
     }
 
