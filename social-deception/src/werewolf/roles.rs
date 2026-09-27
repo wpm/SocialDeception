@@ -13,16 +13,20 @@
 //! Every action space in the game is computed by one function,
 //! [`action_space`]: a target for each living player other than the agent
 //! itself, in sorted agent order, less the one the doctor protected last
-//! night, then [`Move::Abstain`] exactly where [`RequestKind::may_abstain`]
-//! permits it. The two universal rules fall out of that, since the target
-//! must be living and no action may target the agent taking it; neither is
+//! night. The two universal rules fall out of that, since the target must
+//! be living and no action may target the agent taking it; neither is
 //! strategy, and nothing can do them. The order is canonical and
 //! load-bearing: an index into the vector is a stable action label, the
 //! same on every run and in every episode with the same living set, which
-//! is why the action space is a `Vec<Move>` and not a set.
+//! is why the action space is a `Vec<AgentId>` and not a set.
+//!
+//! **It may be empty.** The doctor may protect neither itself nor last
+//! night's patient, which in a small enough game leaves nobody, and a
+//! member with nothing it may point at is not asked at all. That is what
+//! used to be an abstention (ADR-0011).
 //!
 //! The roles here compute their action spaces from what they know, and the
-//! [`Game`](super::Game) checks every response against the same function
+//! [`Game`](super::Game) checks every point against the same function
 //! from what it knows, so the two cannot disagree about what the rules
 //! permit: a player that is not one of these types, a language-model agent
 //! or a test stub, is held to exactly the space these types compute.
@@ -50,43 +54,35 @@
 use std::collections::BTreeSet;
 
 use super::knowledge::Knowledge;
-use super::message::{Move, Request, RequestKind};
+use super::message::{Request, RequestKind};
 use super::player::Player;
 use super::role::Role;
 use crate::event::AgentId;
 
 /// The action space the rules permit `me` for a request of `kind` while
 /// `living` are alive: a target for each living player other than `me`, in
-/// sorted agent order, less `last_protected` if the request is a `Protect`,
-/// then [`Move::Abstain`] if and only if the kind
-/// [may be abstained from](RequestKind::may_abstain).
+/// sorted agent order, less `last_protected` if the request is a `Protect`.
 ///
 /// This is the whole of the rules about what a player may do, and the one
 /// place they are written: the roles below compute their action spaces with
-/// it from their knowledge, and the game checks every response against it
+/// it from their knowledge, and the game checks every point against it
 /// from its own state. `last_protected` is whom the doctor protected the
-/// night before, or `None` for anyone else, for a doctor that abstained,
-/// and for a doctor on the first night.
+/// night before, or `None` for anyone else, for a doctor that pointed
+/// nowhere, and for a doctor on the first night.
+///
+/// The result may be empty, and a player whose action space is empty is not
+/// asked at all.
 #[must_use]
 pub fn action_space(
     me: &AgentId,
     living: &BTreeSet<AgentId>,
     kind: RequestKind,
     last_protected: Option<&AgentId>,
-) -> Vec<Move> {
+) -> Vec<AgentId> {
     let excluded = |who: &&AgentId| {
         *who != me && !(kind == RequestKind::Protect && Some(*who) == last_protected)
     };
-    let mut space: Vec<Move> = living
-        .iter()
-        .filter(excluded)
-        .cloned()
-        .map(Move::Target)
-        .collect();
-    if kind.may_abstain() {
-        space.push(Move::Abstain);
-    }
-    space
+    living.iter().filter(excluded).cloned().collect()
 }
 
 /// The action space [`action_space`] permits a player with `knowledge` for
@@ -98,7 +94,7 @@ pub fn action_space(
 /// If the request is of a kind the player's role is never asked, by
 /// [`Role::asked_in`]: a bug in the moderator, not a runtime condition.
 #[must_use]
-pub fn base_action_space(knowledge: &Knowledge, request: &Request) -> Vec<Move> {
+pub fn base_action_space(knowledge: &Knowledge, request: &Request) -> Vec<AgentId> {
     let kind = request.kind;
     assert_eq!(
         knowledge.role.asked_in(kind.phase()),
@@ -139,7 +135,7 @@ impl Player for Villager {
         &mut self.knowledge
     }
 
-    fn action_space(&self, request: &Request) -> Vec<Move> {
+    fn action_space(&self, request: &Request) -> Vec<AgentId> {
         base_action_space(&self.knowledge, request)
     }
 }
@@ -172,7 +168,7 @@ impl Player for Werewolf {
 
     /// Eating a packmate is in the action space; see the
     /// [module documentation](self).
-    fn action_space(&self, request: &Request) -> Vec<Move> {
+    fn action_space(&self, request: &Request) -> Vec<AgentId> {
         base_action_space(&self.knowledge, request)
     }
 }
@@ -204,7 +200,7 @@ impl Player for Seer {
 
     /// Re-investigating someone is in the action space: permitted but
     /// pointless, and "pointless" is the policy's judgment to make.
-    fn action_space(&self, request: &Request) -> Vec<Move> {
+    fn action_space(&self, request: &Request) -> Vec<AgentId> {
         base_action_space(&self.knowledge, request)
     }
 }
@@ -239,7 +235,7 @@ impl Player for Doctor {
     /// For `Protect`, everyone living but itself and whoever it protected
     /// last night, which its knowledge remembers. `Abstain` is always there,
     /// so the space is never empty.
-    fn action_space(&self, request: &Request) -> Vec<Move> {
+    fn action_space(&self, request: &Request) -> Vec<AgentId> {
         base_action_space(&self.knowledge, request)
     }
 }
@@ -271,11 +267,11 @@ mod tests {
         with(Doctor::new(id(ME)), knowing(Role::Doctor, others))
     }
 
-    /// Answers a `Protect` with `action`, the way a seat would.
-    fn protected(doctor: &mut Doctor, action: &Move) {
+    /// Points at `target` for a `Protect`, the way a seat would.
+    fn protected(doctor: &mut Doctor, target: &AgentId) {
         doctor
             .knowledge_mut()
-            .acted(&request(RequestKind::Protect), action);
+            .acted(&request(RequestKind::Protect), target);
     }
 
     #[test]
@@ -288,15 +284,11 @@ mod tests {
     }
 
     #[test]
-    fn the_action_space_is_every_living_other_in_order_then_abstain_where_permitted() {
+    fn the_action_space_is_every_living_other_in_order() {
         // Given out of order, so that the order is the rules' doing.
         let others = ["carol", "alice", "bob"];
         let targets = || ["alice", "bob", "carol"].map(target).to_vec();
-        let with_abstain = || {
-            let mut space = targets();
-            space.push(Move::Abstain);
-            space
-        };
+        let with_abstain = targets;
 
         assert_eq!(
             villager(others).action_space(&request(RequestKind::Nominate)),
@@ -372,7 +364,7 @@ mod tests {
         let seer = seer(["alice", "bob"], ["alice"]);
         assert_eq!(
             seer.action_space(&request(RequestKind::Investigate)),
-            [target("alice"), target("bob"), Move::Abstain]
+            [target("alice"), target("bob")]
         );
     }
 
@@ -382,37 +374,27 @@ mod tests {
         let protect = request(RequestKind::Protect);
         assert_eq!(
             doctor.action_space(&protect),
-            [target("alice"), target("bob"), Move::Abstain]
+            [target("alice"), target("bob")]
         );
 
         protected(&mut doctor, &target("alice"));
-        assert_eq!(
-            doctor.action_space(&protect),
-            [target("bob"), Move::Abstain]
-        );
+        assert_eq!(doctor.action_space(&protect), [target("bob")]);
 
         // The night after, alice is available again.
         protected(&mut doctor, &target("bob"));
-        assert_eq!(
-            doctor.action_space(&protect),
-            [target("alice"), Move::Abstain]
-        );
-
-        // After an abstain there was no protection to repeat.
-        protected(&mut doctor, &Move::Abstain);
-        assert_eq!(
-            doctor.action_space(&protect),
-            [target("alice"), target("bob"), Move::Abstain]
-        );
+        assert_eq!(doctor.action_space(&protect), [target("alice")]);
     }
 
     #[test]
-    fn a_doctor_with_no_permitted_target_may_still_abstain() {
+    fn a_doctor_may_be_left_with_nobody_it_can_protect() {
+        // The action space is empty rather than holding an abstention, and
+        // a player with an empty one is not asked at all (ADR-0011).
         let mut doctor = doctor(["alice"]);
         protected(&mut doctor, &target("alice"));
-        assert_eq!(
-            doctor.action_space(&request(RequestKind::Protect)),
-            [Move::Abstain]
+        assert!(
+            doctor
+                .action_space(&request(RequestKind::Protect))
+                .is_empty()
         );
     }
 

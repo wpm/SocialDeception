@@ -34,7 +34,7 @@ use std::fmt;
 use std::io::{self, Write};
 
 use super::WerewolfDomain;
-use super::message::{Cause, Message, Move, Narration, Phase, Request, Response};
+use super::message::{Cause, Message, Narration, Phase, Point, Request};
 use crate::event::AgentId;
 use crate::trajectory::{ActionRecord, LogRecord, Sink};
 
@@ -102,7 +102,7 @@ impl fmt::Display for Message {
         match self {
             Self::Narration(narration) => narration.fmt(f),
             Self::Request(request) => request.fmt(f),
-            Self::Response(response) => response.fmt(f),
+            Self::Point(point) => point.fmt(f),
         }
     }
 }
@@ -134,13 +134,19 @@ impl fmt::Display for Narration {
             Self::Tally {
                 round,
                 phase,
+                kind,
                 votes,
             } => {
                 let votes: Vec<String> = votes
                     .iter()
                     .map(|(who, chosen)| format!("{who}\u{2192}{chosen}"))
                     .collect();
-                write!(f, "Tally({phase} {}: {})", round.0, votes.join(", "))
+                write!(
+                    f,
+                    "Tally({phase} {} {kind:?}: {})",
+                    round.0,
+                    votes.join(", ")
+                )
             }
             Self::Eliminated {
                 who, role, cause, ..
@@ -164,20 +170,10 @@ impl fmt::Display for Request {
     }
 }
 
-impl fmt::Display for Response {
-    /// The id it answers and the move it carries.
+impl fmt::Display for Point {
+    /// The request it points for and whom it points at.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Response(#{}: {})", self.request.0, self.chosen)
-    }
-}
-
-impl fmt::Display for Move {
-    /// The player targeted, or `abstain`.
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Target(who) => who.fmt(f),
-            Self::Abstain => f.write_str("abstain"),
-        }
+        write!(f, "Point(#{}: {})", self.request.0, self.target)
     }
 }
 
@@ -372,13 +368,10 @@ mod tests {
             shown(Message::Narration(Narration::Tally {
                 round: Round(1),
                 phase: Phase::Day,
-                votes: BTreeMap::from([
-                    (id("alice"), Move::Target(id("frank"))),
-                    (id("bob"), Move::Target(id("carol"))),
-                    (id("dave"), Move::Abstain),
-                ]),
+                kind: RequestKind::Nominate,
+                votes: BTreeMap::from([(id("alice"), id("frank")), (id("bob"), id("carol")),]),
             })),
-            "Tally(Day 1: alice\u{2192}frank, bob\u{2192}carol, dave\u{2192}abstain)"
+            "Tally(Day 1 Nominate: alice\u{2192}frank, bob\u{2192}carol)"
         );
     }
 
@@ -437,20 +430,13 @@ mod tests {
     }
 
     #[test]
-    fn a_response_names_the_request_and_the_move() {
+    fn a_point_names_the_request_and_the_target() {
         assert_eq!(
-            shown(Message::Response(Response {
+            shown(Message::Point(Point {
                 request: RequestId(3),
-                chosen: Move::Target(id("frank")),
+                target: id("frank"),
             })),
-            "Response(#3: frank)"
-        );
-        assert_eq!(
-            shown(Message::Response(Response {
-                request: RequestId(3),
-                chosen: Move::Abstain,
-            })),
-            "Response(#3: abstain)"
+            "Point(#3: frank)"
         );
     }
 
@@ -497,20 +483,20 @@ mod tests {
             "bob",
             ["moderator"],
             0,
-            Message::Response(Response {
+            Message::Point(Point {
                 request: RequestId(1),
-                chosen: Move::Abstain,
+                target: id("alice"),
             }),
         );
         assert_eq!(
             line(&record, 9).unwrap(),
-            "0:00.000 bob        \u{2192} moderator  Response(#1: abstain)"
+            "0:00.000 bob        \u{2192} moderator  Point(#1: alice)"
         );
         // An id wider than the column simply overflows it rather than being
         // cut: a name is worth more than an aligned column.
         assert_eq!(
             line(&record, 2).unwrap(),
-            "0:00.000 bob  \u{2192} moderator  Response(#1: abstain)"
+            "0:00.000 bob  \u{2192} moderator  Point(#1: alice)"
         );
     }
 

@@ -4,7 +4,7 @@
 //! to say, to whom, in what order. It touches no channel and spawns no
 //! thread, so the whole of the rules is testable by calling functions with a
 //! scripted sequence of responses. The moderator that wraps it is plumbing,
-//! folding the events it receives into [`Game::record`] and turning the
+//! folding the events it receives into [`Game::point`] and turning the
 //! directives into messages.
 //!
 //! # How a game runs
@@ -71,21 +71,11 @@ use rand_chacha::ChaCha8Rng;
 use crate::event::AgentId;
 use crate::werewolf::assignment::Assignment;
 use crate::werewolf::message::{
-    Cause, Move, Narration, Outcome, Phase, Request, RequestId, RequestKind, Response, Round,
+    Cause, Narration, Outcome, Phase, Point, Request, RequestId, RequestKind, Round,
 };
 use crate::werewolf::role::{Faction, Role};
 use crate::werewolf::roles;
 use crate::werewolf::seed::{TIES, pick, seed_for};
-
-/// Termination rests on the day always eliminating someone, so a
-/// `Nominate` must never be allowed to abstain: a living set that could
-/// abstain unanimously would leave a game to run forever. The check sits
-/// next to the rules it protects, and it is a compile-time one because
-/// [`RequestKind::may_abstain`] is `const`.
-const NOMINATE_DECIDES: () = assert!(
-    !RequestKind::Nominate.may_abstain(),
-    "a Nominate that may abstain would let a game run forever"
-);
 
 /// What the game wants said, in the order it wants it said.
 ///
@@ -125,7 +115,7 @@ pub struct Game {
     outstanding: BTreeMap<RequestId, (AgentId, RequestKind)>,
     /// This phase's answers so far, by the agent that gave them: what it
     /// was asked, and what it did.
-    answers: BTreeMap<AgentId, (RequestKind, Move)>,
+    answers: BTreeMap<AgentId, (RequestKind, AgentId)>,
     /// Whom each doctor protected last night, for doctors that protected
     /// someone: the state the doctor's own rule constrains its next
     /// `Protect` with.
@@ -206,29 +196,26 @@ impl Game {
     /// that is the responder itself or not living, or a doctor's protection
     /// of the player it protected the night before. Each is a bug in a
     /// player.
-    pub fn record(&mut self, from: &AgentId, response: &Response) -> Vec<Directive> {
-        let RequestId(id) = response.request;
+    pub fn point(&mut self, from: &AgentId, point: &Point) -> Vec<Directive> {
+        let RequestId(id) = point.request;
         assert!(
             self.outcome.is_none(),
-            "{from} answered request {id} after the game ended"
+            "{from} pointed for request {id} after the game ended"
         );
-        let Some((to, kind)) = self.outstanding.remove(&response.request) else {
-            panic!("{from} answered request {id}, which is not outstanding");
+        let Some((to, kind)) = self.outstanding.remove(&point.request) else {
+            panic!("{from} pointed for request {id}, which is not outstanding");
         };
         assert_eq!(
             to, *from,
-            "{from} answered request {id}, which was asked of {to}"
+            "{from} pointed for request {id}, which was asked of {to}"
         );
-        let space = roles::action_space(from, &self.living, kind, self.last_protected.get(from));
+        let space = self.action_space_for(from, kind);
         assert!(
-            space.contains(&response.chosen),
-            "{from} {} request {id}, which is outside its action space for {kind:?}",
-            match &response.chosen {
-                Move::Abstain => "abstained from".to_owned(),
-                Move::Target(target) => format!("targeted {target} in"),
-            }
+            space.contains(&point.target),
+            "{from} pointed at {} in request {id}, which is outside its action space for {kind:?}",
+            point.target
         );
-        self.answers.insert(to, (kind, response.chosen.clone()));
+        self.answers.insert(to, (kind, point.target.clone()));
         if !self.outstanding.is_empty() {
             return Vec::new();
         }
@@ -249,6 +236,17 @@ impl Game {
     #[must_use]
     pub fn living(&self) -> &BTreeSet<AgentId> {
         &self.living
+    }
+
+    /// The targets the rules permit `who` for a request of `kind`, from the
+    /// game's own state.
+    ///
+    /// The same [`roles::action_space`] a player computes from its
+    /// knowledge, so the two cannot disagree; this is the game's side of
+    /// it, and what [`point`](Self::point) checks against.
+    #[must_use]
+    pub fn action_space_for(&self, who: &AgentId, kind: RequestKind) -> Vec<AgentId> {
+        roles::action_space(who, &self.living, kind, self.last_protected.get(who))
     }
 
     /// Everyone dealt into the game, living and dead, in agent order.
@@ -324,32 +322,30 @@ impl Game {
 
     /// Resolves a night from its answers: the pack's tally to the pack,
     /// each seer's finding to that seer, then the death or the lack of one.
-    fn resolve_night(&mut self, answers: BTreeMap<AgentId, (RequestKind, Move)>) -> Vec<Directive> {
+    fn resolve_night(
+        &mut self,
+        answers: BTreeMap<AgentId, (RequestKind, AgentId)>,
+    ) -> Vec<Directive> {
         let mut votes = BTreeMap::new();
         let mut protected = BTreeSet::new();
         let mut findings = Vec::new();
-        for (who, (kind, action)) in answers {
+        for (who, (kind, target)) in answers {
             match kind {
                 RequestKind::Devour => {
-                    votes.insert(who, action);
+                    votes.insert(who, target);
                 }
                 RequestKind::Protect => {
-                    protected.extend(action.target().cloned());
-                    match action.target() {
-                        Some(target) => self.last_protected.insert(who, target.clone()),
-                        None => self.last_protected.remove(&who),
-                    };
+                    protected.insert(target.clone());
+                    self.last_protected.insert(who, target);
                 }
                 RequestKind::Investigate => {
-                    if let Some(target) = action.target() {
-                        findings.push(Directive::Narrate {
-                            to: [who].into(),
-                            narration: Narration::Investigated {
-                                target: target.clone(),
-                                faction: self.role(target).faction(),
-                            },
-                        });
-                    }
+                    findings.push(Directive::Narrate {
+                        to: [who].into(),
+                        narration: Narration::Investigated {
+                            faction: self.role(&target).faction(),
+                            target,
+                        },
+                    });
                 }
                 RequestKind::Nominate => unreachable!("nobody nominates at night"),
             }
@@ -361,6 +357,7 @@ impl Game {
             narration: Narration::Tally {
                 round: self.round,
                 phase: Phase::Night,
+                kind: RequestKind::Devour,
                 votes,
             },
         }];
@@ -377,11 +374,11 @@ impl Game {
 
     /// Resolves a day from its nominations: the full tally to the living,
     /// then the lynching.
-    fn resolve_day(&mut self, answers: BTreeMap<AgentId, (RequestKind, Move)>) -> Vec<Directive> {
-        // The lynching below is what makes a game end, and it is certain
-        // only because a `Nominate` cannot abstain.
-        let () = NOMINATE_DECIDES;
-        let votes: BTreeMap<AgentId, Move> = answers
+    fn resolve_day(
+        &mut self,
+        answers: BTreeMap<AgentId, (RequestKind, AgentId)>,
+    ) -> Vec<Directive> {
+        let votes: BTreeMap<AgentId, AgentId> = answers
             .into_iter()
             .map(|(who, chosen)| (who, chosen.1))
             .collect();
@@ -390,6 +387,7 @@ impl Game {
         let mut directives = vec![self.narrate_living(Narration::Tally {
             round: self.round,
             phase: Phase::Day,
+            kind: RequestKind::Nominate,
             votes,
         })];
         directives.push(self.eliminate(&lynched, Cause::Lynched));
@@ -492,11 +490,11 @@ impl Game {
 /// A tie is broken by [`pick`]ing among the tied players, in agent order,
 /// from `ties`, which is touched only when there is a tie.
 fn plurality<'a>(
-    actions: impl IntoIterator<Item = &'a Move>,
+    targets: impl IntoIterator<Item = &'a AgentId>,
     ties: &mut ChaCha8Rng,
 ) -> Option<AgentId> {
     let mut counts: BTreeMap<&AgentId, usize> = BTreeMap::new();
-    for who in actions.into_iter().filter_map(Move::target) {
+    for who in targets {
         *counts.entry(who).or_default() += 1;
     }
     let most = *counts.values().max()?;
@@ -520,19 +518,12 @@ mod tests {
 
     /// One phase of a script: every request's answer, keyed by the agent
     /// asked, in the order the answers are to be recorded.
-    type Answers = Vec<(&'static str, Move)>;
+    type Answers = Vec<(&'static str, AgentId)>;
 
     fn answers(pairs: &[(&'static str, &str)]) -> Answers {
         pairs
             .iter()
-            .map(|(who, whom)| {
-                let chosen = if *whom == "-" {
-                    Move::Abstain
-                } else {
-                    target(whom)
-                };
-                (*who, chosen)
-            })
+            .map(|(who, whom)| (*who, target(whom)))
             .collect()
     }
 
@@ -577,15 +568,15 @@ mod tests {
         let mut caused = Vec::new();
         for (index, (who, chosen)) in answers.iter().enumerate() {
             let who = id(who);
-            let response = Response {
+            let point = Point {
                 request: asks[&who].id,
-                chosen: chosen.clone(),
+                target: chosen.clone(),
             };
-            caused = game.record(&who, &response);
+            caused = game.point(&who, &point);
             if index + 1 < answers.len() {
                 assert!(
                     caused.is_empty(),
-                    "{who}'s response caused {caused:?} with requests still outstanding"
+                    "{who}'s point caused {caused:?} with requests still outstanding"
                 );
             }
         }
@@ -654,6 +645,13 @@ mod tests {
             Narration::Tally {
                 round: Round(round),
                 phase,
+                // Every night tally in these tests is the pack's, since
+                // the seer's and the doctor's sessions have one member
+                // each and no tally of their own until #68.
+                kind: match phase {
+                    Phase::Night => RequestKind::Devour,
+                    Phase::Day => RequestKind::Nominate,
+                },
                 votes: answers(votes)
                     .into_iter()
                     .map(|(who, action)| (id(who), action))
@@ -703,13 +701,13 @@ mod tests {
         )
     }
 
-    /// Records one response to the request with the given id.
-    fn respond(game: &mut Game, from: &str, request: u64, chosen: Move) -> Vec<Directive> {
-        let response = Response {
+    /// Records one point for the request with the given id.
+    fn respond(game: &mut Game, from: &str, request: u64, target: AgentId) -> Vec<Directive> {
+        let point = Point {
             request: RequestId(request),
-            chosen,
+            target,
         };
-        game.record(&id(from), &response)
+        game.point(&id(from), &point)
     }
 
     /// In the village, alice is devoured and then bob, the only werewolf,
@@ -738,7 +736,7 @@ mod tests {
                 ("dave", "erin"),
                 ("erin", "alice"),
             ]),
-            answers(&[("bob", "alice"), ("dave", "-")]),
+            answers(&[("bob", "alice"), ("dave", "bob")]),
         ]
     }
 
@@ -753,12 +751,11 @@ mod tests {
         ])]
     }
 
-    /// In the village, the doctor protects the victim and the seer abstains:
-    /// nobody dies.
+    /// In the village, the doctor protects the victim: nobody dies.
     fn saved() -> Vec<Answers> {
         vec![answers(&[
             ("bob", "erin"),
-            ("carol", "-"),
+            ("carol", "bob"),
             ("dave", "erin"),
         ])]
     }
@@ -932,11 +929,11 @@ mod tests {
                     request.kind,
                     game.last_protected.get(&who),
                 );
-                let response = Response {
+                let point = Point {
                     request: request.id,
-                    chosen: pick(&mut moves, &space).clone(),
+                    target: pick(&mut moves, &space).clone(),
                 };
-                caused = game.record(&who, &response);
+                caused = game.point(&who, &point);
             }
             latest = caused;
         }
@@ -1134,14 +1131,13 @@ mod tests {
     }
 
     #[test]
-    fn a_plurality_ignores_abstentions() {
+    fn a_plurality_of_nothing_is_nobody() {
+        // A member that never pointed is absent from the tally rather than
+        // present with an abstention, so an empty tally is the only way a
+        // plurality comes back empty (ADR-0011).
         let mut ties = ChaCha8Rng::seed_from_u64(1);
-        assert_eq!(plurality(&[Move::Abstain, Move::Abstain], &mut ties), None);
         assert_eq!(plurality(&[], &mut ties), None);
-        assert_eq!(
-            plurality(&[Move::Abstain, target("bob"), Move::Abstain], &mut ties),
-            Some(id("bob"))
-        );
+        assert_eq!(plurality(&[target("bob")], &mut ties), Some(id("bob")));
     }
 
     #[test]
@@ -1153,6 +1149,8 @@ mod tests {
             directives[9..],
             [
                 tally(["bob"], 1, Phase::Night, &[("bob", "erin")]),
+                // The seer looked at bob and found the pack.
+                investigated("carol", "bob", Faction::Werewolves),
                 narrate(everyone, Narration::NoDeath { round: Round(1) }),
                 phase_began(1, Phase::Day, everyone),
                 ask("alice", 4, 1, RequestKind::Nominate),
@@ -1198,7 +1196,9 @@ mod tests {
                 ("bob", "alice"),
                 ("carol", whom),
                 ("dave", "bob"),
-                ("erin", "-"),
+                // The second seer is asked too, and points somewhere it is
+                // allowed; only carol's finding is what this test reads.
+                ("erin", "alice"),
             ]);
             let directives = play(&mut game, &[night]);
             let finding = investigated("carol", whom, faction);
@@ -1388,7 +1388,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "bob answered request 99, which is not outstanding")]
+    #[should_panic(expected = "bob pointed for request 99, which is not outstanding")]
     fn an_unknown_request_id_panics() {
         let mut game = game(village());
         game.begin();
@@ -1396,7 +1396,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "carol answered request 1, which was asked of bob")]
+    #[should_panic(expected = "carol pointed for request 1, which was asked of bob")]
     fn a_request_id_asked_of_another_agent_panics() {
         let mut game = game(village());
         game.begin();
@@ -1405,17 +1405,7 @@ mod tests {
 
     #[test]
     #[should_panic(
-        expected = "bob abstained from request 1, which is outside its action space for Devour"
-    )]
-    fn an_abstention_where_none_is_permitted_panics() {
-        let mut game = game(village());
-        game.begin();
-        respond(&mut game, "bob", 1, Move::Abstain);
-    }
-
-    #[test]
-    #[should_panic(
-        expected = "dave targeted dave in request 3, which is outside its action space for Protect"
+        expected = "dave pointed at dave in request 3, which is outside its action space for Protect"
     )]
     fn a_doctor_protecting_itself_panics() {
         let mut game = game(village());
@@ -1440,7 +1430,7 @@ mod tests {
 
     #[test]
     #[should_panic(
-        expected = "dave targeted erin in request 9, which is outside its action space for Protect"
+        expected = "dave pointed at erin in request 9, which is outside its action space for Protect"
     )]
     fn a_doctor_protecting_the_same_player_two_nights_running_panics() {
         let mut game = game(village());
@@ -1466,12 +1456,11 @@ mod tests {
 
     #[test]
     fn the_doctor_may_return_to_a_player_after_a_night_off() {
-        // In the hamlet, dave protects erin on the first night, then on
-        // the second either abstains or protects carol, and on the third
-        // may protect erin again: the constraint is last night's protection
-        // alone. The requests of the third night are 23 to 26, and dave's
-        // is 25.
-        for second_night in ["-", "carol"] {
+        // In the hamlet, dave protects erin on the first night, then
+        // carol on the second, and on the third may protect erin again:
+        // the constraint is last night's protection alone. The requests of
+        // the third night are 23 to 26, and dave's is 25.
+        for second_night in ["carol", "frank"] {
             let mut game = game(hamlet());
             play(
                 &mut game,
@@ -1529,7 +1518,7 @@ mod tests {
 
     #[test]
     #[should_panic(
-        expected = "bob targeted alice in request 4, which is outside its action space for Nominate"
+        expected = "bob pointed at alice in request 4, which is outside its action space for Nominate"
     )]
     fn targeting_a_dead_player_panics() {
         let mut game = game(village());
@@ -1545,7 +1534,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "carol answered request 5 after the game ended")]
+    #[should_panic(expected = "carol pointed for request 5 after the game ended")]
     fn a_response_after_the_outcome_panics() {
         let mut game = game(village());
         play(&mut game, &village_wins());

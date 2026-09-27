@@ -1,5 +1,5 @@
 //! The decision boundary: a [`Policy`] is handed what an agent sees and
-//! returns one [`Move`].
+//! returns the target to point at, or none.
 //!
 //! A policy is a conditional distribution over the action space given the
 //! state, in the vocabulary the [module](super) documentation states and
@@ -79,7 +79,7 @@ use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 
 use super::knowledge::Knowledge;
-use super::message::{Move, Request, RequestKind};
+use super::message::{Request, RequestKind};
 use super::role::Role;
 use super::seed::{pick, seed_for};
 use crate::event::AgentId;
@@ -94,10 +94,10 @@ pub struct View<'a> {
     pub knowledge: &'a Knowledge,
     /// The request being answered.
     pub request: &'a Request,
-    /// Every action the rules permit, in canonical order: targets in sorted
-    /// agent order, [`Move::Abstain`] last where it is permitted. Never
-    /// empty.
-    pub action_space: &'a [Move],
+    /// Every target the rules permit, in canonical order: sorted agent
+    /// order. May be empty, and a policy handed an empty one has nowhere to
+    /// point.
+    pub action_space: &'a [AgentId],
 }
 
 /// How an agent picks an action from the action space.
@@ -105,7 +105,12 @@ pub struct View<'a> {
 /// Implemented by the uniform random baseline, [`RandomPolicy`], and later
 /// by a language-model policy, which sees exactly the same [`View`].
 pub trait Policy {
-    /// Picks an action. The result must be in `view.action_space`.
+    /// Picks a target, or `None` to point nowhere for now. A `Some` must be
+    /// in `view.action_space`.
+    ///
+    /// `None` is how a member abstains (ADR-0011): nothing is sent, and a
+    /// member that never points is absent from its session's tally. It is
+    /// also the only thing a policy can do with an empty action space.
     ///
     /// Infallible, and free to block; the [module documentation](self) says
     /// why, and what a policy that blocks owes its own deadline. Nothing
@@ -114,7 +119,7 @@ pub trait Policy {
     ///
     /// [`View`] is `Copy` and is passed by value, so a policy that hands it
     /// on does not have to thread a reference through.
-    fn choose(&mut self, view: View<'_>) -> Move;
+    fn choose(&mut self, view: View<'_>) -> Option<AgentId>;
 }
 
 /// The uniform random baseline: a policy that samples uniformly from its own
@@ -148,28 +153,34 @@ impl Policy for RandomPolicy {
     /// own and the question the [module documentation](self) raises does
     /// not arise. That is also what keeps a deterministic episode
     /// deterministic: nothing about the draw depends on timing at all.
-    fn choose(&mut self, view: View<'_>) -> Move {
-        (*pick(&mut self.rng, &candidates(&view))).clone()
+    fn choose(&mut self, view: View<'_>) -> Option<AgentId> {
+        let candidates = candidates(&view);
+        // Nowhere to point: the doctor with nobody left it may protect.
+        // Drawing from an empty list is the one thing sampling cannot do,
+        // and pointing nowhere is what the rules call for.
+        if candidates.is_empty() {
+            return None;
+        }
+        Some((*pick(&mut self.rng, &candidates)).clone())
     }
 }
 
-/// The baseline's candidates, in the action space's order: the first
-/// non-empty of the targets [`excluded`] leaves, `Abstain` where the rules
-/// permit it, and the whole action space, because a policy handed nothing
-/// has no correct behavior.
-fn candidates<'a>(view: &View<'a>) -> Vec<&'a Move> {
+/// The baseline's candidates, in the action space's order: the targets
+/// [`excluded`] leaves, or the whole action space when the heuristic has
+/// excluded everything, because a policy handed nothing has no correct
+/// behavior.
+///
+/// Empty only when the action space is, which is the doctor with nobody it
+/// may protect. The heuristic never empties a non-empty space: when it
+/// would, the space itself is the fallback, and the draw is the same one
+/// the old `Abstain`-less path made.
+fn candidates<'a>(view: &View<'a>) -> Vec<&'a AgentId> {
     let space = view.action_space;
-    let targets: Vec<&Move> = space
-        .iter()
-        .filter(|action| matches!(action, Move::Target(who) if !excluded(view, who)))
-        .collect();
-    if !targets.is_empty() {
-        return targets;
+    let targets: Vec<&AgentId> = space.iter().filter(|who| !excluded(view, who)).collect();
+    if targets.is_empty() {
+        return space.iter().collect();
     }
-    match space.iter().find(|action| **action == Move::Abstain) {
-        Some(abstain) => vec![abstain],
-        None => space.iter().collect(),
-    }
+    targets
 }
 
 /// Whether the heuristic drops `who` as a target for this request: a
@@ -204,8 +215,8 @@ mod tests {
         policy: &mut RandomPolicy,
         knowledge: &Knowledge,
         kind: RequestKind,
-        space: &[Move],
-    ) -> Move {
+        space: &[AgentId],
+    ) -> Option<AgentId> {
         policy.choose(View {
             knowledge,
             request: &request(kind),
@@ -215,7 +226,7 @@ mod tests {
 
     /// The first action a fresh policy under each of [`SEEDS`] takes for
     /// `kind`, in the action space the rules would hand it.
-    fn first_choices(knowledge: &Knowledge, kind: RequestKind) -> Vec<(u64, Move)> {
+    fn first_choices(knowledge: &Knowledge, kind: RequestKind) -> Vec<(u64, Option<AgentId>)> {
         let space = base_action_space(knowledge, &request(kind));
         SEEDS
             .map(|seed| {
@@ -227,7 +238,7 @@ mod tests {
 
     /// The first `n` nominations a policy makes as a villager among
     /// [`OTHERS`], where no heuristic is in play.
-    fn nominations(mut policy: RandomPolicy, n: usize) -> Vec<Move> {
+    fn nominations(mut policy: RandomPolicy, n: usize) -> Vec<Option<AgentId>> {
         let knowledge = knowing(Role::Villager, OTHERS);
         let space = base_action_space(&knowledge, &request(RequestKind::Nominate));
         (0..n)
@@ -275,6 +286,7 @@ mod tests {
         for (knowledge, kind) in cases {
             let space = base_action_space(knowledge, &request(kind));
             for (seed, action) in first_choices(knowledge, kind) {
+                let action = action.expect("a non-empty action space is pointed into");
                 assert!(
                     space.contains(&action),
                     "seed {seed}, {kind:?}: {action:?} outside {space:?}"
@@ -295,7 +307,7 @@ mod tests {
         for _ in 0..20 {
             for _ in 0..3 {
                 let action = choose(&mut policy, &doctor, RequestKind::Protect, &forced);
-                assert_eq!(action, target("alice"));
+                assert_eq!(action, Some(target("alice")));
             }
             interleaved.push(choose(&mut policy, &villager, RequestKind::Nominate, &open));
         }
@@ -307,7 +319,7 @@ mod tests {
         // A guard against an off-by-one that could never return the last
         // element, not a statistical test.
         let draws = 1000;
-        let mut counts: BTreeMap<Move, usize> = BTreeMap::new();
+        let mut counts: BTreeMap<Option<AgentId>, usize> = BTreeMap::new();
         for action in nominations(RandomPolicy::from_seed(MASTER), draws) {
             *counts.entry(action).or_default() += 1;
         }
@@ -326,7 +338,7 @@ mod tests {
         for kind in [RequestKind::Devour, RequestKind::Nominate] {
             for (seed, action) in first_choices(&knowledge, kind) {
                 assert!(
-                    action == target("alice") || action == target("carol"),
+                    action == Some(target("alice")) || action == Some(target("carol")),
                     "seed {seed}, {kind:?}: {action:?}"
                 );
             }
@@ -338,26 +350,25 @@ mod tests {
         let knowledge = seer_knowing(["alice", "bob", "carol", "dave"], ["alice", "carol"]);
         for (seed, action) in first_choices(&knowledge, RequestKind::Investigate) {
             assert!(
-                action == target("bob") || action == target("dave"),
+                action == Some(target("bob")) || action == Some(target("dave")),
                 "seed {seed}: {action:?}"
             );
         }
     }
 
     #[test]
-    fn abstain_is_never_chosen_while_a_target_is_available() {
+    fn a_policy_points_somewhere_whenever_it_can() {
+        // Pointing nowhere is for a member with nowhere to point. While the
+        // action space holds anybody at all, the baseline names somebody.
         let doctor = knowing(Role::Doctor, ["alice", "bob"]);
         let seer = seer_knowing(["alice", "bob"], []);
         for (knowledge, kind) in [
             (&doctor, RequestKind::Protect),
             (&seer, RequestKind::Investigate),
         ] {
-            assert_eq!(
-                base_action_space(knowledge, &request(kind)).last(),
-                Some(&Move::Abstain)
-            );
+            assert!(!base_action_space(knowledge, &request(kind)).is_empty());
             for (seed, action) in first_choices(knowledge, kind) {
-                assert_ne!(action, Move::Abstain, "seed {seed}, {kind:?}");
+                assert!(action.is_some(), "seed {seed}, {kind:?}");
             }
         }
     }
@@ -368,33 +379,39 @@ mod tests {
         for kind in [RequestKind::Devour, RequestKind::Nominate] {
             let space = base_action_space(&knowledge, &request(kind));
             for (seed, action) in first_choices(&knowledge, kind) {
+                let action = action.expect("a non-empty action space is pointed into");
                 assert!(space.contains(&action), "seed {seed}, {kind:?}: {action:?}");
             }
         }
     }
 
     #[test]
-    fn a_seer_that_has_investigated_everyone_living_abstains() {
+    fn a_seer_that_has_investigated_everyone_living_looks_again() {
+        // The heuristic would leave it nothing, and a policy handed a
+        // non-empty space still points: the space itself is the fallback,
+        // so it re-investigates rather than wasting its night.
         let knowledge = seer_knowing(["alice", "bob"], ["alice", "bob"]);
+        let space = base_action_space(&knowledge, &request(RequestKind::Investigate));
         for (seed, action) in first_choices(&knowledge, RequestKind::Investigate) {
-            assert_eq!(action, Move::Abstain, "seed {seed}");
+            let action = action.expect("a non-empty action space is pointed into");
+            assert!(space.contains(&action), "seed {seed}: {action:?}");
         }
     }
 
     #[test]
-    fn a_doctor_whose_action_space_is_abstain_abstains() {
-        // The rules have removed the doctor's only target, so the space is
-        // not derivable from its knowledge.
+    fn an_empty_action_space_points_nowhere() {
+        // The doctor with nobody left it may protect. Drawing from an empty
+        // list is the one thing sampling cannot do, and pointing nowhere is
+        // what the rules call for (ADR-0011).
         let knowledge = knowing(Role::Doctor, ["alice"]);
-        let space = [Move::Abstain];
         for seed in SEEDS {
             let action = choose(
                 &mut RandomPolicy::from_seed(seed),
                 &knowledge,
                 RequestKind::Protect,
-                &space,
+                &[],
             );
-            assert_eq!(action, Move::Abstain, "seed {seed}");
+            assert_eq!(action, None, "seed {seed}");
         }
     }
 
@@ -408,7 +425,7 @@ mod tests {
             [
                 "carol", "bob", "alice", "alice", "erin", "erin", "dave", "alice"
             ]
-            .map(target)
+            .map(|who| Some(target(who)))
         );
     }
 }

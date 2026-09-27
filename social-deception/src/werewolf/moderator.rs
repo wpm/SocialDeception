@@ -13,7 +13,7 @@
 //! is for: the moderator is the agent that opens play, and it does so before
 //! anybody has spoken to it. It is also where the players are started, since
 //! an episode's environment is the only thing that may send a [`Control`]
-//! (ADR-0007). Thereafter a [`Response`](super::Response) from a player is
+//! (ADR-0007). Thereafter a [`Point`](super::Point) from a player is
 //! recorded. The moderator never sees the control that started it, nor the
 //! one that stops it; those are the loop's, which is why there is no arm for
 //! either here.
@@ -122,7 +122,7 @@ impl Moderator {
     fn fold(&mut self, observation: &Observation<WerewolfDomain>) -> Vec<Directive> {
         let sender = &observation.event.sender;
         match &observation.event.payload {
-            Message::Response(response) => self.game.record(sender, response),
+            Message::Point(point) => self.game.point(sender, point),
             Message::Narration(_) => panic!("{sender} sent the moderator a narration"),
             Message::Request(_) => panic!("{sender} sent the moderator a request"),
         }
@@ -193,7 +193,7 @@ impl Environment<WerewolfDomain> for Moderator {
     /// # Panics
     ///
     /// If a player sends the moderator a narration or a request, or if a
-    /// response is one the game cannot accept; see [`Game::record`].
+    /// point is one the game cannot accept; see [`Game::point`].
     fn handle(&mut self, observation: &Observation<WerewolfDomain>) -> Vec<Effect<WerewolfDomain>> {
         // Whether the game is over is the game's to say, and it is asked
         // before every observation, so the one that ends it is the last
@@ -221,7 +221,7 @@ mod tests {
     use crate::testing::{id, ids, observed, town, village};
     use crate::werewolf::assignment::Assignment;
     use crate::werewolf::message::{
-        Move, Narration, Phase, Request, RequestId, RequestKind, Response, Round,
+        Narration, Phase, Point, Request, RequestId, RequestKind, Round,
     };
     use crate::werewolf::role::Faction;
     use crate::werewolf::role::Role::{self, Doctor, Seer, Villager, Werewolf};
@@ -249,34 +249,34 @@ mod tests {
         ))
     }
 
-    fn response(who: &AgentId, request: RequestId, chosen: Move) -> Observation<WerewolfDomain> {
-        from_player(
-            who.as_str(),
-            Message::Response(Response { request, chosen }),
-        )
+    fn response(who: &AgentId, request: RequestId, target: AgentId) -> Observation<WerewolfDomain> {
+        from_player(who.as_str(), Message::Point(Point { request, target }))
     }
 
-    /// A stub player: what it does with a request, given who it is and who
-    /// is living.
-    type Policy = fn(&AgentId, &Request, &BTreeSet<AgentId>) -> Move;
+    /// A stub player: whom it points at, out of the targets the rules
+    /// permit it.
+    ///
+    /// The space is the game's own, so a stub cannot point outside it; the
+    /// doctor's "not last night's patient" in particular is the rules'
+    /// business rather than every stub's.
+    type Policy = fn(&Request, &[AgentId]) -> AgentId;
 
-    /// Targets the first living player other than itself.
-    fn first_other(me: &AgentId, _: &Request, living: &BTreeSet<AgentId>) -> Move {
-        Move::Target(living.iter().find(|who| *who != me).unwrap().clone())
+    /// Points at the first target the rules permit.
+    fn first_other(_: &Request, space: &[AgentId]) -> AgentId {
+        space.first().unwrap().clone()
     }
 
-    /// Targets the last living player other than itself.
-    fn last_other(me: &AgentId, _: &Request, living: &BTreeSet<AgentId>) -> Move {
-        Move::Target(living.iter().rev().find(|who| *who != me).unwrap().clone())
+    /// Points at the last target the rules permit.
+    fn last_other(_: &Request, space: &[AgentId]) -> AgentId {
+        space.last().unwrap().clone()
     }
 
-    /// Abstains wherever the request permits it, and otherwise targets the
-    /// last living player other than itself.
-    fn abstainer(me: &AgentId, request: &Request, living: &BTreeSet<AgentId>) -> Move {
-        if request.kind.may_abstain() {
-            Move::Abstain
-        } else {
-            last_other(me, request, living)
+    /// Points at the last permitted target by night and the first by day,
+    /// so that the pack and the village disagree about whom to blame.
+    fn two_minded(request: &Request, space: &[AgentId]) -> AgentId {
+        match request.kind.phase() {
+            Phase::Night => last_other(request, space),
+            Phase::Day => first_other(request, space),
         }
     }
 
@@ -329,16 +329,17 @@ mod tests {
     fn respond(
         actions: &[Action<WerewolfDomain>],
         policy: Policy,
-        living: &BTreeSet<AgentId>,
+        game: &Game,
     ) -> Vec<Observation<WerewolfDomain>> {
         actions
             .iter()
             .filter_map(|action| match &action.payload {
                 Message::Request(request) => {
                     let who = asked(action);
-                    Some(response(who, request.id, policy(who, request, living)))
+                    let space = game.action_space_for(who, request.kind);
+                    Some(response(who, request.id, policy(request, &space)))
                 }
-                Message::Narration(_) | Message::Response(_) => None,
+                Message::Narration(_) | Message::Point(_) => None,
             })
             .collect()
     }
@@ -352,14 +353,14 @@ mod tests {
     /// moderator asks nothing more.
     fn play(moderator: &mut Moderator, policy: Policy) -> Vec<Effect<WerewolfDomain>> {
         let opening = moderator.start(Timestamp::default());
-        let mut pending = respond(&actions(&opening), policy, moderator.game.living());
+        let mut pending = respond(&actions(&opening), policy, &moderator.game);
         let mut produced = opening;
         while !pending.is_empty() {
             let effects: Vec<Effect<WerewolfDomain>> = pending
                 .iter()
                 .flat_map(|observation| moderator.handle(observation))
                 .collect();
-            pending = respond(&actions(&effects), policy, moderator.game.living());
+            pending = respond(&actions(&effects), policy, &moderator.game);
             produced.extend(effects);
         }
         produced
@@ -383,7 +384,7 @@ mod tests {
 
     /// Every combination of assignment and stub policy, played out.
     fn played_games() -> Vec<Played> {
-        let policies: [Policy; 3] = [first_other, last_other, abstainer];
+        let policies: [Policy; 3] = [first_other, last_other, two_minded];
         let mut games = Vec::new();
         for assignment in [village(), town()] {
             for policy in policies {
@@ -715,7 +716,7 @@ mod tests {
                 _ => None,
             })
             .unwrap();
-        let late = response(&who, request, Move::Target(id("bob")));
+        let late = response(&who, request, id("bob"));
         assert_eq!(moderator.handle(&late), []);
     }
 
@@ -730,7 +731,7 @@ mod tests {
         let (mut doubled, _receiver) = moderator(village());
         let opening = reference.start(Timestamp::default());
         assert_eq!(doubled.start(Timestamp::default()), opening);
-        let mut pending = respond(&actions(&opening), first_other, reference.game.living());
+        let mut pending = respond(&actions(&opening), first_other, &reference.game);
         while !pending.is_empty() {
             let mut effects = Vec::new();
             for observation in &pending {
@@ -744,7 +745,7 @@ mod tests {
                 }
                 effects.extend(produced);
             }
-            pending = respond(&actions(&effects), first_other, reference.game.living());
+            pending = respond(&actions(&effects), first_other, &reference.game);
         }
         assert!(reference.game.outcome().is_some() && doubled.game.outcome().is_some());
     }

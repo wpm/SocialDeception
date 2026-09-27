@@ -51,8 +51,8 @@ use serde::Deserialize;
 use serde_json::Value;
 use social_deception::AgentId;
 use social_deception::werewolf::{
-    Assignment, Cause, Config, Faction, Message, Move, Narration, Outcome, Phase, Request,
-    RequestId, RequestKind, Response, Role, Round,
+    Assignment, Cause, Config, Faction, Message, Narration, Outcome, Phase, Point, Request,
+    RequestId, RequestKind, Role, Round,
 };
 
 /// Something the moderator said.
@@ -63,11 +63,11 @@ struct Said<'a> {
     line: &'a Value,
 }
 
-/// A response the moderator heard.
+/// A point the moderator heard.
 struct Heard<'a> {
     seq: u64,
     from: AgentId,
-    response: Response,
+    point: Point,
     line: &'a Value,
 }
 
@@ -78,7 +78,7 @@ struct Play<'a> {
     config: &'a Config,
     /// Everything the moderator said, in sequence order.
     said: Vec<Said<'a>>,
-    /// Every response the moderator heard, in sequence order.
+    /// Every point the moderator heard, in sequence order.
     heard: Vec<Heard<'a>>,
     /// Where in `said` each request was asked.
     requests: BTreeMap<RequestId, usize>,
@@ -101,7 +101,7 @@ struct Play<'a> {
 /// On the first invariant that does not hold, naming the record.
 pub fn check(lines: &[Value], config: &Config) {
     let play = Play::read(lines, config);
-    play.check_requests_and_responses();
+    play.check_requests_and_points();
     play.check_action_spaces();
     play.check_phases();
     play.check_recipients();
@@ -190,10 +190,11 @@ fn outcome(message: &Message) -> Option<&Outcome> {
 }
 
 /// The players a tally names most often: the ones the elimination is
-/// drawn from. Abstentions name nobody.
-fn leaders(votes: &BTreeMap<AgentId, Move>) -> BTreeSet<AgentId> {
+/// drawn from. A member that never pointed is absent from the tally and
+/// names nobody.
+fn leaders(votes: &BTreeMap<AgentId, AgentId>) -> BTreeSet<AgentId> {
     let mut counts: BTreeMap<&AgentId, usize> = BTreeMap::new();
-    for who in votes.values().filter_map(Move::target) {
+    for who in votes.values() {
         *counts.entry(who).or_default() += 1;
     }
     let most = counts.values().copied().max().unwrap_or(0);
@@ -209,7 +210,7 @@ impl<'a> Play<'a> {
     /// checks need out of them.
     ///
     /// Panics on anything that is not even the shape of a game: a moderator
-    /// saying anything to a non-player or hearing anything but a response
+    /// saying anything to a non-player or hearing anything but a point
     /// from one, a request issued twice, a player assigned twice or
     /// eliminated twice, or a game without an outcome.
     fn read(lines: &'a [Value], config: &'a Config) -> Self {
@@ -218,7 +219,7 @@ impl<'a> Play<'a> {
             .map(|line| {
                 let message = message(line);
                 assert!(
-                    !matches!(message, Message::Response(_)),
+                    !matches!(message, Message::Point(_)),
                     "the moderator only narrates and asks: {line}"
                 );
                 let to = recipients(line);
@@ -236,8 +237,8 @@ impl<'a> Play<'a> {
             .collect();
         let heard: Vec<Heard> = records_of(lines, &config.moderator, "observation")
             .map(|line| {
-                let Message::Response(response) = message(line) else {
-                    panic!("the moderator hears only responses: {line}");
+                let Message::Point(point) = message(line) else {
+                    panic!("the moderator hears only points: {line}");
                 };
                 let from = AgentId::deserialize(&line["event"]["sender"]).unwrap();
                 assert!(
@@ -247,7 +248,7 @@ impl<'a> Play<'a> {
                 Heard {
                     seq: super::seq(line),
                     from,
-                    response,
+                    point,
                     line,
                 }
             })
@@ -357,9 +358,9 @@ impl<'a> Play<'a> {
     }
 
     /// No request goes to a dead player, and every request has exactly one
-    /// response, from the player it was asked of, echoing its id, arriving
+    /// point, from the player it was asked of, echoing its id, arriving
     /// after it, and before that player's elimination.
-    fn check_requests_and_responses(&self) {
+    fn check_requests_and_points(&self) {
         for (said, who, _) in self.requests() {
             assert!(
                 !self.dead_at(who, said.seq),
@@ -370,24 +371,24 @@ impl<'a> Play<'a> {
         let mut answered = BTreeSet::new();
         for heard in &self.heard {
             let line = heard.line;
-            let Some((asked, who, _)) = self.asked(heard.response.request) else {
-                panic!("a response answers a request that was asked: {line}");
+            let Some((asked, who, _)) = self.asked(heard.point.request) else {
+                panic!("a point answers a request that was asked: {line}");
             };
             assert_eq!(
                 *who, heard.from,
-                "a response comes from the player the request was asked of: {line}"
+                "a point comes from the player the request was asked of: {line}"
             );
             assert!(
                 asked.seq < heard.seq,
-                "a response arrives after its request was sent: {line}"
+                "a point arrives after its request was sent: {line}"
             );
             assert!(
-                answered.insert(heard.response.request),
+                answered.insert(heard.point.request),
                 "a request is answered once: {line}"
             );
             assert!(
                 !self.dead_at(&heard.from, heard.seq),
-                "no response arrives from a player after its elimination: {line}"
+                "no point arrives from a player after its elimination: {line}"
             );
         }
         for (said, _, request) in self.requests() {
@@ -400,10 +401,9 @@ impl<'a> Play<'a> {
     }
 
     /// Every request asks a player what its role is asked in that phase,
-    /// and every response's action is in the action space its request
-    /// allowed: a living player other than the responder, an abstention
-    /// only where the request's kind permits one, and for the doctor never
-    /// the player it protected the night before.
+    /// and every point's target is in the action space its request
+    /// allowed: a living player other than the one pointing, and for the
+    /// doctor never the player it protected the night before.
     fn check_action_spaces(&self) {
         for (said, who, request) in self.requests() {
             assert_eq!(
@@ -413,32 +413,23 @@ impl<'a> Play<'a> {
                 said.line
             );
         }
-        let mut last_protected: BTreeMap<&AgentId, &Move> = BTreeMap::new();
+        let mut last_protected: BTreeMap<&AgentId, &AgentId> = BTreeMap::new();
         for heard in &self.heard {
             let line = heard.line;
-            let (asked, _, request) = self.asked(heard.response.request).unwrap();
-            let chosen = &heard.response.chosen;
-            match chosen {
-                Move::Abstain => assert!(
-                    request.kind.may_abstain(),
-                    "an abstention is outside the action space of {:?}: {line}",
-                    request.kind
-                ),
-                Move::Target(target) => {
-                    assert_ne!(
-                        target, &heard.from,
-                        "no move targets the player taking it: {line}"
-                    );
-                    assert!(
-                        self.assignment.role(target).is_some() && !self.dead_at(target, asked.seq),
-                        "a move targets a living player: {line}"
-                    );
-                }
-            }
+            let (asked, _, request) = self.asked(heard.point.request).unwrap();
+            let chosen = &heard.point.target;
+            assert_ne!(
+                chosen, &heard.from,
+                "no point targets the player making it: {line}"
+            );
+            assert!(
+                self.assignment.role(chosen).is_some() && !self.dead_at(chosen, asked.seq),
+                "a point targets a living player: {line}"
+            );
             if request.kind == RequestKind::Protect {
                 if let Some(last) = last_protected.insert(&heard.from, chosen) {
-                    assert!(
-                        last.target().is_none() || last != chosen,
+                    assert_ne!(
+                        last, chosen,
                         "the doctor never protects the same player two nights running: {line}"
                     );
                 }
@@ -493,7 +484,7 @@ impl<'a> Play<'a> {
                     );
                     outcomes += 1;
                 }
-                Message::Response(_) => unreachable!("the moderator sends no responses"),
+                Message::Point(_) => unreachable!("the moderator sends no points"),
             }
         }
         assert_eq!(outcomes, 1, "the outcome is announced once");
@@ -548,9 +539,9 @@ impl<'a> Play<'a> {
             .heard
             .iter()
             .filter_map(|heard| {
-                let (_, _, request) = self.asked(heard.response.request)?;
-                match (request.kind, heard.response.chosen.target()) {
-                    (RequestKind::Protect, Some(target)) => Some((request.round, target)),
+                let (_, _, request) = self.asked(heard.point.request)?;
+                match request.kind {
+                    RequestKind::Protect => Some((request.round, &heard.point.target)),
                     _ => None,
                 }
             })
@@ -571,7 +562,7 @@ impl<'a> Play<'a> {
                 }) => phases.began(said, *round, *phase, living),
                 Message::Narration(narration) => phases.narrated(said, narration),
                 Message::Request(request) => phases.asked(said, request),
-                Message::Response(_) => unreachable!("the moderator sends no responses"),
+                Message::Point(_) => unreachable!("the moderator sends no points"),
             }
         }
         phases.counts.close(phases.current);
@@ -665,19 +656,53 @@ impl<'a> Play<'a> {
     }
 
     /// What the players' own records show: each took no action but a
-    /// response, to the moderator alone; each observed its role exactly
+    /// point, always including the moderator among its recipients and
+    /// never anyone the rules keep it from; each observed its role exactly
     /// once, the one the moderator dealt it; a survivor's last observation
     /// is the outcome; and a dead player observed nothing at all after the
     /// announcement of its own death. And the roles dealt are the ones
     /// configured.
+    ///
+    /// Who may see a point is the kind's to say (ADR-0011): a `Devour` goes
+    /// to the pack, a `Nominate` to every other living player, and the
+    /// seer's and the doctor's to the moderator alone.
     fn check_players(&self, lines: &[Value]) {
-        let moderator = BTreeSet::from([self.config.moderator.clone()]);
+        let moderator = &self.config.moderator;
         for who in &self.config.players {
             for line in records_of(lines, who, "action") {
+                let Message::Point(point) = message(line) else {
+                    panic!("a player sends only points: {line}");
+                };
+                let to = recipients(line);
                 assert!(
-                    matches!(message(line), Message::Response(_)) && recipients(line) == moderator,
-                    "a player sends only responses, to the moderator alone: {line}"
+                    to.contains(moderator),
+                    "every point reaches the moderator: {line}"
                 );
+                let (_, _, request) = self
+                    .asked(point.request)
+                    .unwrap_or_else(|| panic!("a point answers a request that was asked: {line}"));
+                let others: BTreeSet<&AgentId> =
+                    to.iter().filter(|seer| *seer != moderator).collect();
+                match request.kind {
+                    // The pack sees its own pointing and nobody else does.
+                    RequestKind::Devour => assert!(
+                        others
+                            .iter()
+                            .all(|other| self.role(other) == Role::Werewolf),
+                        "a devour point is seen by the pack alone: {line}"
+                    ),
+                    // The day's vote is public among the living.
+                    RequestKind::Nominate => assert!(
+                        others.iter().all(|other| *other != who),
+                        "a nomination is not addressed to its own author: {line}"
+                    ),
+                    // Nobody's business but the moderator's.
+                    RequestKind::Investigate | RequestKind::Protect => assert!(
+                        others.is_empty(),
+                        "a {:?} point is seen by the moderator alone: {line}",
+                        request.kind
+                    ),
+                }
             }
             let received: Vec<Message> =
                 records_of(lines, who, "observation").map(message).collect();
@@ -878,6 +903,7 @@ impl PhaseCounts {
                 round: r,
                 phase: p,
                 votes,
+                ..
             } => {
                 assert_eq!(
                     (*r, *p),
@@ -1020,9 +1046,9 @@ mod tests {
         move |payload| payload["Request"]["id"] == id
     }
 
-    /// The response to the request with the given id.
+    /// The point made for the request with the given id.
     fn response(id: u64) -> impl Fn(&Value) -> bool {
-        move |payload| payload["Response"]["request"] == id
+        move |payload| payload["Point"]["request"] == id
     }
 
     /// The id of the request of `kind` asked of `who` in `round`.
@@ -1124,7 +1150,7 @@ mod tests {
     }
 
     fn target(line: &mut Value, whom: &str) {
-        line["event"]["payload"]["Response"]["chosen"] = json!({"Target": whom});
+        line["event"]["payload"]["Point"]["target"] = json!(whom);
     }
 
     #[test]
@@ -1149,7 +1175,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "a response comes from the player the request was asked of")]
+    #[should_panic(expected = "a point comes from the player the request was asked of")]
     fn a_response_from_the_wrong_player_is_caught() {
         let nominate = asked("alice", 1, "Nominate");
         check(
@@ -1159,10 +1185,10 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "a response answers a request that was asked")]
+    #[should_panic(expected = "a point answers a request that was asked")]
     fn a_response_to_nothing_is_caught() {
         let lines = heard(response(asked("alice", 1, "Nominate")), |line| {
-            line["event"]["payload"]["Response"]["request"] = json!(99);
+            line["event"]["payload"]["Point"]["request"] = json!(99);
         });
         check(&lines, &config());
     }
@@ -1199,7 +1225,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "no response arrives from a player after its elimination")]
+    #[should_panic(expected = "no point arrives from a player after its elimination")]
     fn a_response_from_the_dead_is_caught() {
         // alice's nomination on day 1, dated after her lynching that day.
         let lines = heard(response(asked("alice", 1, "Nominate")), |line| {
@@ -1220,7 +1246,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "no move targets the player taking it")]
+    #[should_panic(expected = "no point targets the player making it")]
     fn a_self_target_is_caught() {
         let nominate = asked("alice", 1, "Nominate");
         check(
@@ -1230,7 +1256,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "a move targets a living player")]
+    #[should_panic(expected = "a point targets a living player")]
     fn a_dead_target_is_caught() {
         // alice was lynched on day 1; bob nominates her on day 2.
         let nominate = asked("bob", 2, "Nominate");
@@ -1238,15 +1264,6 @@ mod tests {
             &heard(response(nominate), |line| target(line, "alice")),
             &config(),
         );
-    }
-
-    #[test]
-    #[should_panic(expected = "an abstention is outside the action space of Nominate")]
-    fn an_abstention_from_nominating_is_caught() {
-        let lines = heard(response(asked("alice", 1, "Nominate")), |line| {
-            line["event"]["payload"]["Response"]["chosen"] = json!("Abstain");
-        });
-        check(&lines, &config());
     }
 
     #[test]
@@ -1347,8 +1364,7 @@ mod tests {
     #[should_panic(expected = "a night tally is the werewolves' votes")]
     fn a_night_tally_with_a_villager_in_it_is_caught() {
         let lines = said(tally(1, "Night"), |line| {
-            line["event"]["payload"]["Narration"]["Tally"]["votes"]["carol"] =
-                json!({"Target": "alice"});
+            line["event"]["payload"]["Narration"]["Tally"]["votes"]["carol"] = json!("alice");
             recipients(line, &["carol", "dave", "erin"]);
         });
         check(&lines, &config());
@@ -1444,7 +1460,7 @@ mod tests {
         target(&mut lines[protect], "grace");
         let tally = find(&lines, "moderator", "action", tally(2, "Night"));
         lines[tally]["event"]["payload"]["Narration"]["Tally"]["votes"] =
-            json!({"dave": {"Target": "grace"}, "erin": {"Target": "grace"}});
+            json!({"dave": "grace", "erin": "grace"});
         let death = find(&lines, "moderator", "action", eliminated("carol"));
         swap(&mut lines[death..], "carol", "grace");
         // A swap exchanges the names, not the roles each death reveals.
@@ -1653,14 +1669,44 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "a player sends only responses, to the moderator alone")]
-    fn a_player_addressing_another_player_is_caught() {
+    #[should_panic(expected = "a Investigate point is seen by the moderator alone")]
+    fn a_seers_point_shown_to_another_player_is_caught() {
+        // A nomination reaching another player is the rule now, so what a
+        // leak looks like is the seer's own business traveling.
+        let lines = edited(
+            "grace",
+            "action",
+            response(asked("grace", 1, "Investigate")),
+            |line| {
+                recipients(line, &["bob", "moderator"]);
+            },
+        );
+        check(&lines, &config());
+    }
+
+    #[test]
+    #[should_panic(expected = "a devour point is seen by the pack alone")]
+    fn a_devour_point_shown_to_a_villager_is_caught() {
+        let lines = edited(
+            "dave",
+            "action",
+            response(asked("dave", 1, "Devour")),
+            |line| {
+                recipients(line, &["alice", "erin", "moderator"]);
+            },
+        );
+        check(&lines, &config());
+    }
+
+    #[test]
+    #[should_panic(expected = "every point reaches the moderator")]
+    fn a_point_that_never_reaches_the_moderator_is_caught() {
         let lines = edited(
             "alice",
             "action",
             response(asked("alice", 1, "Nominate")),
             |line| {
-                recipients(line, &["bob", "moderator"]);
+                recipients(line, &["bob"]);
             },
         );
         check(&lines, &config());

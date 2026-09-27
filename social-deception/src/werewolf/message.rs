@@ -24,11 +24,12 @@ pub enum Phase {
     Day,
 }
 
-/// The identity of one [`Request`], echoed by the [`Response`] to it.
+/// The identity of one [`Request`], echoed by every [`Point`] answering it.
 ///
-/// The id makes "is this response an answer to something asked?" an exact
-/// check rather than an inferred one, and lets late and duplicate responses
-/// be recognized once a policy can be slow. Serializes as a bare integer.
+/// The id makes "is this point an answer to something asked?" an exact
+/// check rather than an inferred one, and it is what tells a point meant for
+/// a session that has closed from one meant for the session now open.
+/// Serializes as a bare integer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct RequestId(pub u64);
@@ -44,8 +45,10 @@ pub enum Message {
     Narration(Narration),
     /// Moderator to one player: act now.
     Request(Request),
-    /// Player to moderator: the move chosen.
-    Response(Response),
+    /// Player to the moderator and to whoever else may see it: a target
+    /// pointed at. A player may send more than one for the same request;
+    /// its latest is its vote (ADR-0011).
+    Point(Point),
 }
 
 /// A true statement from the moderator to the players it is addressed to.
@@ -75,15 +78,22 @@ pub enum Narration {
         /// The side that player is on.
         faction: Faction,
     },
-    /// How a phase's requests were answered: the day's tally to the living,
-    /// the night's to the living werewolves alone.
+    /// How a session's members pointed when it closed, addressed to the
+    /// session's observers: the day's to the living, a night session's to
+    /// its own members and the moderator.
+    ///
+    /// A tally marks the close of the session it belongs to, which is how
+    /// its members and the transcript know a point arriving later is late.
     Tally {
         /// The round the tally belongs to.
         round: Round,
         /// Which half of the round.
         phase: Phase,
-        /// Each responding player's move, in canonical order.
-        votes: BTreeMap<AgentId, Move>,
+        /// Which session closed, since a night has three.
+        kind: RequestKind,
+        /// Each member's latest target, in canonical order. A member that
+        /// never pointed is absent.
+        votes: BTreeMap<AgentId, AgentId>,
     },
     /// To the living, and to the eliminated player itself: someone is out
     /// of the game, and their role is revealed.
@@ -128,7 +138,12 @@ pub struct Outcome {
     pub living: BTreeSet<AgentId>,
 }
 
-/// A decision point: the moderator asking one player to act.
+/// The moderator telling one player it is a member of an open session.
+///
+/// Under ADR-0011 a request is not a question expecting one answer. It says
+/// "you may point at any time until this session closes", and a member may
+/// point as often as it likes until then; the session's clock, not the
+/// answer, is what ends it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Request {
     /// The id the response must echo.
@@ -164,56 +179,20 @@ impl RequestKind {
             Self::Devour | Self::Investigate | Self::Protect => Phase::Night,
         }
     }
-
-    /// Whether [`Move::Abstain`] is in the action space for this kind:
-    /// true for `Protect` and `Investigate` only.
-    ///
-    /// `Nominate` and `Devour` always have at least one valid target when
-    /// they are asked, because the game would already be over otherwise.
-    /// Protection can genuinely run out of targets, since the doctor may
-    /// protect neither itself nor the player it protected last night, so
-    /// abstaining has to exist.
-    #[must_use]
-    pub const fn may_abstain(self) -> bool {
-        match self {
-            Self::Investigate | Self::Protect => true,
-            Self::Nominate | Self::Devour => false,
-        }
-    }
 }
 
-/// A player's reply to a request.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Response {
-    /// The id of the request being answered.
-    pub request: RequestId,
-    /// The move chosen.
-    pub chosen: Move,
-}
-
-/// The move a player's action carries: one of these, drawn from the action
-/// space, is what a policy returns and what a [`Response`] reports.
+/// A player pointing at a target.
 ///
-/// The derived ordering puts every `Target` before `Abstain`, targets in
-/// agent-id order, which is the order the action space lists them in.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub enum Move {
-    /// Act on this player. Serializes as `{"Target": "<agent id>"}`.
-    Target(AgentId),
-    /// Decline to act. In the action space only where
-    /// [`RequestKind::may_abstain`] says so.
-    Abstain,
-}
-
-impl Move {
-    /// The player this move targets, if it is not an abstention.
-    #[must_use]
-    pub const fn target(&self) -> Option<&AgentId> {
-        match self {
-            Self::Target(who) => Some(who),
-            Self::Abstain => None,
-        }
-    }
+/// A member of an open session may point whenever it likes and as often as
+/// it likes; its most recent point is its vote (ADR-0011). Pointing nowhere
+/// is how a member abstains, and it is the absence of a point rather than a
+/// message, which is why there is no move that means "nobody".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Point {
+    /// The id of the request this points for.
+    pub request: RequestId,
+    /// The player pointed at.
+    pub target: AgentId,
 }
 
 #[cfg(test)]
@@ -253,15 +232,17 @@ mod tests {
                 Narration::Tally {
                     round: Round(2),
                     phase: Phase::Day,
+                    kind: RequestKind::Nominate,
                     votes: BTreeMap::from([
-                        (AgentId::new("alice"), Move::Target(AgentId::new("bob"))),
-                        (AgentId::new("bob"), Move::Abstain),
+                        (AgentId::new("alice"), AgentId::new("bob")),
+                        (AgentId::new("bob"), AgentId::new("carol")),
                     ]),
                 },
                 json!({"Tally": {
                     "round": 2,
                     "phase": "Day",
-                    "votes": {"alice": {"Target": "bob"}, "bob": "Abstain"},
+                    "kind": "Nominate",
+                    "votes": {"alice": "bob", "bob": "carol"},
                 }}),
             ),
             (
@@ -306,11 +287,11 @@ mod tests {
             json!({"Request": {"id": 7, "round": 1, "kind": "Devour"}}),
         ));
         messages.push((
-            Message::Response(Response {
+            Message::Point(Point {
                 request: RequestId(7),
-                chosen: Move::Target(AgentId::new("alice")),
+                target: AgentId::new("alice"),
             }),
-            json!({"Response": {"request": 7, "chosen": {"Target": "alice"}}}),
+            json!({"Point": {"request": 7, "target": "alice"}}),
         ));
         messages
     }
@@ -331,14 +312,6 @@ mod tests {
         ] {
             assert_eq!(kind.phase(), Phase::Night, "{kind:?}");
         }
-    }
-
-    #[test]
-    fn only_protect_and_investigate_may_abstain() {
-        assert!(RequestKind::Protect.may_abstain());
-        assert!(RequestKind::Investigate.may_abstain());
-        assert!(!RequestKind::Nominate.may_abstain());
-        assert!(!RequestKind::Devour.may_abstain());
     }
 
     #[test]
@@ -367,38 +340,16 @@ mod tests {
     }
 
     #[test]
-    fn a_target_carries_a_bare_agent_id() {
+    fn a_point_carries_a_bare_agent_id() {
+        // A target is an agent and nothing else: there is no longer a move
+        // wrapping it, and nothing that means "nobody". Pointing nowhere is
+        // the absence of a point (ADR-0011).
         assert_eq!(
-            json(&Move::Target(AgentId::new("alice"))),
-            json!({"Target": "alice"})
-        );
-        assert_eq!(json(&Move::Abstain), json!("Abstain"));
-    }
-
-    #[test]
-    fn only_a_target_names_a_player() {
-        assert_eq!(
-            Move::Target(AgentId::new("alice")).target(),
-            Some(&AgentId::new("alice"))
-        );
-        assert_eq!(Move::Abstain.target(), None);
-    }
-
-    #[test]
-    fn targets_sort_by_agent_and_precede_abstain() {
-        let mut moves = vec![
-            Move::Abstain,
-            Move::Target(AgentId::new("bob")),
-            Move::Target(AgentId::new("alice")),
-        ];
-        moves.sort();
-        assert_eq!(
-            moves,
-            [
-                Move::Target(AgentId::new("alice")),
-                Move::Target(AgentId::new("bob")),
-                Move::Abstain,
-            ]
+            json(&Point {
+                request: RequestId(3),
+                target: AgentId::new("alice"),
+            }),
+            json!({"request": 3, "target": "alice"})
         );
     }
 
@@ -407,16 +358,17 @@ mod tests {
         let tally = Narration::Tally {
             round: Round(1),
             phase: Phase::Night,
+            kind: RequestKind::Devour,
             votes: ["carol", "alice", "bob"]
                 .into_iter()
-                .map(|who| (AgentId::new(who), Move::Target(AgentId::new("dave"))))
+                .map(|who| (AgentId::new(who), AgentId::new("dave")))
                 .collect(),
         };
         // A `serde_json::Value` object sorts its own keys, so the order has
         // to be checked on the text.
         assert_eq!(
             serde_json::to_string(&tally).unwrap(),
-            r#"{"Tally":{"round":1,"phase":"Night","votes":{"alice":{"Target":"dave"},"bob":{"Target":"dave"},"carol":{"Target":"dave"}}}}"#
+            r#"{"Tally":{"round":1,"phase":"Night","kind":"Devour","votes":{"alice":"dave","bob":"dave","carol":"dave"}}}"#
         );
     }
 

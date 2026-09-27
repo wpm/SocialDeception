@@ -48,9 +48,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::WerewolfDomain;
-use super::message::{
-    Cause, Message, Move, Narration, Outcome, Phase, Request, RequestKind, Round,
-};
+use super::message::{Cause, Message, Narration, Outcome, Phase, Request, RequestKind, Round};
 use super::role::{Faction, Role};
 use crate::agent::Observation;
 use crate::event::AgentId;
@@ -83,8 +81,16 @@ pub struct Knowledge {
     pub investigations: BTreeMap<AgentId, Faction>,
     /// Whom the doctor protected last night, if anyone: the one player the
     /// rules keep it from protecting again tonight. `None` unless it is the
-    /// doctor and its last protection was not an abstention.
+    /// doctor and it pointed somewhere last night.
     pub last_protected: Option<AgentId>,
+    /// The latest target of each player whose point this agent has seen in
+    /// the current phase, cleared when a new phase begins.
+    ///
+    /// This is how a pack watches itself converge and how the village sees
+    /// its vote form (ADR-0011). It holds only what this agent was actually
+    /// addressed: a villager never sees a `Devour`, and nobody but the
+    /// moderator sees an `Investigate` or a `Protect`.
+    pub points: BTreeMap<AgentId, AgentId>,
     /// Every tally this agent was told, oldest first.
     pub tallies: Vec<Heard>,
     /// Set once the game is over.
@@ -109,8 +115,10 @@ pub struct Heard {
     pub round: Round,
     /// Which half of the round.
     pub phase: Phase,
-    /// Each responding player's move.
-    pub votes: BTreeMap<AgentId, Move>,
+    /// Which session closed.
+    pub kind: RequestKind,
+    /// Each member's latest target.
+    pub votes: BTreeMap<AgentId, AgentId>,
 }
 
 impl Knowledge {
@@ -126,6 +134,7 @@ impl Knowledge {
             pack: BTreeSet::new(),
             investigations: BTreeMap::new(),
             last_protected: None,
+            points: BTreeMap::new(),
             tallies: Vec::new(),
             outcome: None,
         }
@@ -136,23 +145,23 @@ impl Knowledge {
     ///
     /// Total, like [`observe`](Self::observe), and almost always a no-op,
     /// because the moderator narrates the consequences of nearly every
-    /// move back to the agent. The one exception is a `Protect`, which is
+    /// point back to the agent. The one exception is a `Protect`, which is
     /// announced to nobody: its target is remembered as
-    /// [`last_protected`](Self::last_protected), and an abstention clears
-    /// it, since there was no protection to repeat.
-    pub fn acted(&mut self, request: &Request, chosen: &Move) {
+    /// [`last_protected`](Self::last_protected).
+    pub fn acted(&mut self, request: &Request, chosen: &AgentId) {
         if request.kind == RequestKind::Protect {
-            self.last_protected = chosen.target().cloned();
+            self.last_protected = Some(chosen.clone());
         }
     }
 
     /// Folds one observation into the state.
     ///
     /// Total: every observation has a defined effect, and most have none.
-    /// Only a narration changes the state. A request tells the agent nothing
-    /// the phase's announcement did not, and answering it is the role's job;
-    /// a response is what a player sends and never receives. Neither is an
-    /// error, so the state stays a total function of whatever arrives.
+    /// A narration changes the state, and so does a point, which under
+    /// ADR-0011 another player may see. A request tells the agent nothing
+    /// the phase's announcement did not, and answering it is the role's
+    /// job. Nothing here is an error, so the state stays a total function
+    /// of whatever arrives.
     ///
     /// Controls do not appear here at all: they are out-of-domain, the
     /// agent loop acts on them, and no handler ever sees one.
@@ -165,8 +174,17 @@ impl Knowledge {
     /// fails at the start of the episode rather than producing a plausible
     /// game.
     pub fn observe(&mut self, observation: &Observation<WerewolfDomain>) {
-        if let Message::Narration(narration) = &observation.event.payload {
-            self.narrated(narration);
+        match &observation.event.payload {
+            Message::Narration(narration) => self.narrated(narration),
+            // The sender's latest point, which replaces whatever it pointed
+            // at before. The request id is not checked: a point this agent
+            // was addressed at all is one the moderator let it see, and the
+            // phase's own `PhaseBegan` is what clears the slate.
+            Message::Point(point) => {
+                self.points
+                    .insert(observation.event.sender.clone(), point.target.clone());
+            }
+            Message::Request(_) => {}
         }
     }
 
@@ -189,6 +207,9 @@ impl Knowledge {
             } => {
                 self.moment = Some((*round, *phase));
                 self.living.clone_from(living);
+                // Last phase's points are last phase's; a vote does not
+                // carry over into the argument that follows it.
+                self.points.clear();
             }
             Narration::Investigated { target, faction } => {
                 self.investigations.insert(target.clone(), *faction);
@@ -196,10 +217,12 @@ impl Knowledge {
             Narration::Tally {
                 round,
                 phase,
+                kind,
                 votes,
             } => self.tallies.push(Heard {
                 round: *round,
                 phase: *phase,
+                kind: *kind,
                 votes: votes.clone(),
             }),
             Narration::Eliminated {
@@ -250,9 +273,9 @@ mod tests {
     use super::*;
     use crate::event::Event;
     use crate::testing::{ME, from, id, ids, narrated, observed, phase_began, request, target};
-    use crate::werewolf::message::{RequestId, Response};
+    use crate::werewolf::message::{Point, RequestId};
 
-    fn votes<const N: usize>(votes: [(&str, Move); N]) -> BTreeMap<AgentId, Move> {
+    fn votes<const N: usize>(votes: [(&str, AgentId); N]) -> BTreeMap<AgentId, AgentId> {
         votes
             .into_iter()
             .map(|(who, action)| (id(who), action))
@@ -270,10 +293,16 @@ mod tests {
         })
     }
 
-    fn tally(round: u32, phase: Phase, votes: BTreeMap<AgentId, Move>) -> Event<WerewolfDomain> {
+    fn tally(
+        round: u32,
+        phase: Phase,
+        kind: RequestKind,
+        votes: BTreeMap<AgentId, AgentId>,
+    ) -> Event<WerewolfDomain> {
         narrated(Narration::Tally {
             round: Round(round),
             phase,
+            kind,
             votes,
         })
     }
@@ -308,7 +337,7 @@ mod tests {
     }
 
     /// The one day vote in [`a_seers_game`].
-    fn day_votes() -> BTreeMap<AgentId, Move> {
+    fn day_votes() -> BTreeMap<AgentId, AgentId> {
         votes([
             ("bob", target("carol")),
             ("carol", target("bob")),
@@ -329,7 +358,7 @@ mod tests {
             investigated("wolfgang", Faction::Werewolves),
             eliminated("alice", Role::Villager, 1, Cause::Devoured),
             phase_began(1, Phase::Day, ids(["bob", "carol", ME, "wolfgang"])),
-            tally(1, Phase::Day, day_votes()),
+            tally(1, Phase::Day, RequestKind::Nominate, day_votes()),
             eliminated("carol", Role::Doctor, 1, Cause::Lynched),
             phase_began(2, Phase::Night, ids(["bob", ME, "wolfgang"])),
             investigated("bob", Faction::Village),
@@ -363,9 +392,12 @@ mod tests {
                     (id("bob"), Faction::Village),
                 ]),
                 last_protected: None,
+                // Cleared by the phase that followed the day it saw.
+                points: BTreeMap::new(),
                 tallies: vec![Heard {
                     round: Round(1),
                     phase: Phase::Day,
+                    kind: RequestKind::Nominate,
                     votes: day_votes(),
                 }],
                 outcome: Some(Outcome {
@@ -476,13 +508,6 @@ mod tests {
                     kind: RequestKind::Investigate,
                 }),
             ),
-            from(
-                "bob",
-                Message::Response(Response {
-                    request: RequestId(3),
-                    chosen: target("alice"),
-                }),
-            ),
             narrated(Narration::NoDeath { round: Round(2) }),
         ];
         for event in &no_ops {
@@ -493,7 +518,7 @@ mod tests {
     }
 
     #[test]
-    fn a_protection_is_remembered_until_the_next_one_and_forgotten_on_an_abstain() {
+    fn a_protection_is_remembered_until_the_next_one() {
         let mut knowledge = Knowledge::new(id(ME), Role::Doctor);
         let protect = request(RequestKind::Protect);
         assert_eq!(knowledge.last_protected, None);
@@ -503,9 +528,46 @@ mod tests {
 
         knowledge.acted(&protect, &target("bob"));
         assert_eq!(knowledge.last_protected, Some(id("bob")));
+    }
 
-        knowledge.acted(&protect, &Move::Abstain);
-        assert_eq!(knowledge.last_protected, None);
+    #[test]
+    fn points_are_folded_in_and_cleared_at_the_next_phase() {
+        // A point another player may see is one this agent conditions on
+        // (ADR-0011): the pack watching itself converge, the village
+        // watching its vote form.
+        let mut knowledge = Knowledge::new(id(ME), Role::Villager);
+        let pointing = |who: &str, target: &str| {
+            from(
+                who,
+                Message::Point(Point {
+                    request: RequestId(1),
+                    target: id(target),
+                }),
+            )
+        };
+
+        knowledge.observe(&observed(pointing("alice", "bob")));
+        knowledge.observe(&observed(pointing("carol", "bob")));
+        assert_eq!(
+            knowledge.points,
+            votes([("alice", target("bob")), ("carol", target("bob"))])
+        );
+
+        // The latest point of a player replaces whatever it pointed at
+        // before: a member's most recent point is its vote.
+        knowledge.observe(&observed(pointing("alice", "carol")));
+        assert_eq!(
+            knowledge.points,
+            votes([("alice", target("carol")), ("carol", target("bob"))])
+        );
+
+        // A new phase is a new argument.
+        knowledge.observe(&observed(phase_began(
+            2,
+            Phase::Night,
+            ids(["alice", "carol", ME]),
+        )));
+        assert!(knowledge.points.is_empty());
     }
 
     #[test]
@@ -605,11 +667,22 @@ mod tests {
 
     #[test]
     fn tallies_keep_the_order_they_were_heard_in() {
-        let first = tally(1, Phase::Day, votes([("alice", target("bob"))]));
-        let second = tally(2, Phase::Day, votes([("bob", target("alice"))]));
+        let first = tally(
+            1,
+            Phase::Day,
+            RequestKind::Nominate,
+            votes([("alice", target("bob"))]),
+        );
+        let second = tally(
+            2,
+            Phase::Day,
+            RequestKind::Nominate,
+            votes([("bob", target("alice"))]),
+        );
         let heard = |round, who: &str, whom: &str| Heard {
             round: Round(round),
             phase: Phase::Day,
+            kind: RequestKind::Nominate,
             votes: votes([(who, target(whom))]),
         };
 

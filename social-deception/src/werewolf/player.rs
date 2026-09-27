@@ -3,30 +3,40 @@
 //!
 //! A player's turn is a fold, the same as any agent's: every observation is
 //! folded into its [`Knowledge`], and every [`Request`] among them is
-//! answered with one [`Response`] to the moderator. A seat has no opening
-//! move: it says nothing until it is asked, so it needs no
-//! [`start`](Handler::start). The two halves of
-//! answering are kept apart, and ADR-0005 says why: a [`Player`] is a role,
-//! and computes the action space the rules permit it and nothing else; a
-//! [`Policy`] is the strategy, and picks one move from that space. The
-//! roles are in [`roles`](super::roles), the baseline policy in
+//! answered with a [`Point`]. A seat has no opening move: it says nothing
+//! until it is asked, so it needs no [`start`](Handler::start). The two
+//! halves of answering are kept apart, and ADR-0005 says why: a [`Player`]
+//! is a role, and computes the action space the rules permit it and nothing
+//! else; a [`Policy`] is the strategy, and picks one target from that space
+//! or none. The roles are in [`roles`](super::roles), the baseline policy in
 //! [`policy`](super::policy).
 //!
 //! [`Seat`] joins the two. It is the [`Handler`] the episode runs, the same
-//! for every role, and it is where an action outside the action space is
+//! for every role, and it is where a target outside the action space is
 //! caught: a policy that returns one has a bug, and the game cannot
 //! continue from it.
 //!
-//! # Players only ever address the moderator
+//! # Who a point is addressed to
 //!
-//! Every action a seat takes is addressed to the moderator alone. A player
-//! is a peer of every other player, so a broadcast would reach them all,
-//! and that must never happen: a response is a sealed ballot, and the others
-//! learn of it only from the tally the moderator narrates.
+//! A point is not a sealed ballot. Under ADR-0011 pointing is how a pack
+//! agrees on a victim without speaking, and how a village's argument turns
+//! into a vote, so a point goes to everyone the rules let see it:
+//!
+//! | Kind | Recipients |
+//! |---|---|
+//! | `Devour` | the moderator and every other living member of the pack |
+//! | `Investigate`, `Protect` | the moderator |
+//! | `Nominate` | the moderator and every other living player |
+//!
+//! A seat addresses each point itself, from its own [`Knowledge`]: the pack
+//! it was told at the deal, and the living it learns from each
+//! `PhaseBegan`. It never broadcasts, because a broadcast reaches every
+//! agent in the roster and the night's secrets are exactly what must not
+//! travel that far.
 
 use super::WerewolfDomain;
 use super::knowledge::Knowledge;
-use super::message::{Message, Move, Request, Response};
+use super::message::{Message, Point, Request, RequestKind};
 use super::policy::{Policy, View};
 use crate::agent::{self, Handler, Observation};
 use crate::event::AgentId;
@@ -44,16 +54,19 @@ pub trait Player {
     /// The state, to fold the next observation into.
     fn knowledge_mut(&mut self) -> &mut Knowledge;
 
-    /// The action space for this request, in canonical order: targets in
-    /// sorted agent order, [`Move::Abstain`] last where permitted, so
-    /// that an index into it is a stable action label. Never empty for a
-    /// request the rules legitimately issue.
+    /// The action space for this request: the targets the rules permit, in
+    /// sorted agent order, so that an index into it is a stable action
+    /// label.
+    ///
+    /// It may be empty — a doctor can be left with nobody it may protect —
+    /// and a player whose action space is empty is not asked at all, so a
+    /// request that arrives always has somewhere to point.
     ///
     /// # Panics
     ///
     /// If the request is of a kind this role is never asked, which is a bug
     /// in the moderator rather than a runtime condition.
-    fn action_space(&self, request: &Request) -> Vec<Move>;
+    fn action_space(&self, request: &Request) -> Vec<AgentId>;
 }
 
 /// A player as an agent in the episode: a role, the policy that decides for
@@ -81,26 +94,53 @@ impl<R: Player, P: Policy> Seat<R, P> {
         }
     }
 
-    /// The response to one request: the policy's choice from the role's
-    /// action space, checked against it and folded into the role's state.
+    /// The point to make for one request, if the policy names a target:
+    /// its choice from the role's action space, checked against it and
+    /// folded into the role's state.
     ///
-    fn answer(&mut self, request: &Request) -> Response {
+    /// `None` is a policy declining to point for now, which is how a member
+    /// abstains. Nothing is sent, and nothing is folded: a point never made
+    /// is not a vote.
+    fn answer(&mut self, request: &Request) -> Option<Point> {
         let action_space = self.player.action_space(request);
         let chosen = self.policy.choose(View {
             knowledge: self.player.knowledge(),
             request,
             action_space: &action_space,
-        });
+        })?;
         assert!(
             action_space.contains(&chosen),
             "{}'s policy chose {chosen:?}, which is outside the action space {action_space:?}",
             self.player.knowledge().me
         );
         self.player.knowledge_mut().acted(request, &chosen);
-        Response {
+        Some(Point {
             request: request.id,
-            chosen,
-        }
+            target: chosen,
+        })
+    }
+
+    /// Who sees a point of this kind, besides the moderator: the pack for a
+    /// `Devour`, every other living player for a `Nominate`, and nobody for
+    /// the seer's and the doctor's own business.
+    ///
+    /// Always from the seat's own knowledge, and always without itself: a
+    /// player does not observe its own actions, and the router forbids an
+    /// agent addressing one to itself.
+    fn audience(&self, kind: RequestKind) -> Vec<AgentId> {
+        let knowledge = self.player.knowledge();
+        let me = &knowledge.me;
+        let seen_by = match kind {
+            RequestKind::Devour => &knowledge.pack,
+            RequestKind::Nominate => &knowledge.living,
+            RequestKind::Investigate | RequestKind::Protect => return vec![self.moderator.clone()],
+        };
+        seen_by
+            .iter()
+            .filter(|who| *who != me && knowledge.living.contains(*who))
+            .cloned()
+            .chain([self.moderator.clone()])
+            .collect()
     }
 }
 
@@ -112,7 +152,7 @@ impl<R: Player, P: Policy> Handler<WerewolfDomain> for Seat<R, P> {
     ///
     /// # Panics
     ///
-    /// If the policy chooses an action outside the action space, or if the
+    /// If the policy chooses a target outside the action space, or if the
     /// request is of a kind this role is never asked; see
     /// [`Player::action_space`].
     fn handle(
@@ -121,10 +161,11 @@ impl<R: Player, P: Policy> Handler<WerewolfDomain> for Seat<R, P> {
     ) -> Vec<agent::Action<WerewolfDomain>> {
         self.player.knowledge_mut().observe(observation);
         match &observation.event.payload {
-            Message::Request(request) => {
-                let response = Message::Response(self.answer(request));
-                vec![agent::Action::to([self.moderator.clone()], response)]
-            }
+            Message::Request(request) => self
+                .answer(request)
+                .map(|point| agent::Action::to(self.audience(request.kind), Message::Point(point)))
+                .into_iter()
+                .collect(),
             _ => Vec::new(),
         }
     }
@@ -148,30 +189,39 @@ mod tests {
 
     const MODERATOR: &str = "moderator";
 
-    /// Picks the first action in the action space.
+    /// Points at the first target in the action space.
     struct First;
 
     impl Policy for First {
-        fn choose(&mut self, view: View<'_>) -> Move {
-            view.action_space[0].clone()
+        fn choose(&mut self, view: View<'_>) -> Option<AgentId> {
+            view.action_space.first().cloned()
         }
     }
 
-    /// Picks the last action in the action space.
+    /// Points at the last target in the action space.
     struct Last;
 
     impl Policy for Last {
-        fn choose(&mut self, view: View<'_>) -> Move {
-            view.action_space.last().unwrap().clone()
+        fn choose(&mut self, view: View<'_>) -> Option<AgentId> {
+            view.action_space.last().cloned()
         }
     }
 
-    /// Picks a player who is not in the game at all.
+    /// Points at a player who is not in the game at all.
     struct Outside;
 
     impl Policy for Outside {
-        fn choose(&mut self, _: View<'_>) -> Move {
-            target("nobody")
+        fn choose(&mut self, _: View<'_>) -> Option<AgentId> {
+            Some(target("nobody"))
+        }
+    }
+
+    /// Points nowhere, which is how a member abstains.
+    struct Nowhere;
+
+    impl Policy for Nowhere {
+        fn choose(&mut self, _: View<'_>) -> Option<AgentId> {
+            None
         }
     }
 
@@ -195,16 +245,28 @@ mod tests {
         )
     }
 
-    /// The action `Seat` takes in reply to a request: a response to the
-    /// moderator.
-    fn response(id: u64, chosen: Move) -> Action<WerewolfDomain> {
+    /// The action `Seat` takes in reply to a request: a point, addressed to
+    /// `seen_by` and always to the moderator.
+    fn pointing<const N: usize>(
+        id: u64,
+        target: AgentId,
+        seen_by: [&str; N],
+    ) -> Action<WerewolfDomain> {
+        let mut to: Vec<AgentId> = seen_by.iter().map(|who| AgentId::new(*who)).collect();
+        to.push(AgentId::new(MODERATOR));
         Action::to(
-            [MODERATOR],
-            Message::Response(Response {
+            to,
+            Message::Point(Point {
                 request: RequestId(id),
-                chosen,
+                target,
             }),
         )
+    }
+
+    /// A point of a kind only the moderator sees: the seer's and the
+    /// doctor's own business.
+    fn privately(id: u64, target: AgentId) -> Action<WerewolfDomain> {
+        pointing(id, target, [])
     }
 
     /// What a seat does with a run of events, each in a cycle of its own,
@@ -229,6 +291,23 @@ mod tests {
     }
 
     #[test]
+    fn a_policy_that_points_nowhere_sends_nothing() {
+        // Pointing nowhere is how a member abstains (ADR-0011). Nothing is
+        // sent, and nothing is folded: a point never made is not a vote,
+        // so the doctor has no protection to be kept from repeating.
+        let mut seat = doctor(Nowhere);
+        let silent = handling(
+            &mut seat,
+            [
+                phase_began(1, Phase::Night, ids(["alice", "bob", ME])),
+                request(1, 1, RequestKind::Protect),
+            ],
+        );
+        assert!(silent.is_empty(), "{silent:?}");
+        assert_eq!(seat.player.knowledge().last_protected, None);
+    }
+
+    #[test]
     fn each_request_is_answered_from_the_state_every_earlier_observation_left() {
         let mut seat = villager(Last);
         let cycle = [
@@ -243,7 +322,10 @@ mod tests {
         ];
         assert_eq!(
             handling(&mut seat, cycle),
-            [response(1, target("bob")), response(2, target("alice"))]
+            [
+                pointing(1, target("bob"), ["alice", "bob"]),
+                pointing(2, target("alice"), ["alice"]),
+            ]
         );
     }
 
@@ -262,7 +344,7 @@ mod tests {
         // The elimination folded in the silent cycle shapes the next answer.
         assert_eq!(
             handling(&mut seat, [request(1, 1, RequestKind::Nominate)]),
-            [response(1, target("alice"))]
+            [pointing(1, target("alice"), ["alice"])]
         );
     }
 
@@ -297,9 +379,14 @@ mod tests {
         );
         assert_eq!(actions.len(), 2);
         for action in &actions {
-            assert_eq!(action.recipients, Recipients::To(ids([MODERATOR])));
-            assert!(matches!(action.payload, Message::Response(_)), "{action:?}");
+            assert!(matches!(action.payload, Message::Point(_)), "{action:?}");
         }
+        // The protect is the moderator's alone; the nomination is public.
+        assert_eq!(actions[0].recipients, Recipients::To(ids([MODERATOR])));
+        assert_eq!(
+            actions[1].recipients,
+            Recipients::To(ids([MODERATOR, "alice", "bob", "carol"]))
+        );
     }
 
     #[test]
@@ -315,18 +402,18 @@ mod tests {
         };
         assert_eq!(
             handling(&mut seat, night(1)),
-            [response(1, target("alice"))]
+            [privately(1, target("alice"))]
         );
-        assert_eq!(handling(&mut seat, night(2)), [response(2, target("bob"))]);
+        assert_eq!(handling(&mut seat, night(2)), [privately(2, target("bob"))]);
         assert_eq!(
             handling(&mut seat, night(3)),
-            [response(3, target("alice"))]
+            [privately(3, target("alice"))]
         );
     }
 
     #[test]
     #[should_panic(
-        expected = "me's policy chose Target(AgentId(\"nobody\")), which is outside the action space"
+        expected = "me's policy chose AgentId(\"nobody\"), which is outside the action space"
     )]
     fn an_action_outside_the_action_space_panics() {
         let mut seat = villager(Outside);

@@ -16,8 +16,8 @@ use crate::clock::Timestamp;
 use crate::event::{AgentId, Domain, Event};
 use crate::trajectory::{JsonLines, LogRecord, Policy, Sink, Writer};
 use crate::werewolf::{
-    Assignment, Faction, Knowledge, Message, Move, Narration, Phase, Request, RequestId,
-    RequestKind, Role, Round, WerewolfDomain,
+    Assignment, Faction, Knowledge, Message, Narration, Phase, Request, RequestId, RequestKind,
+    Role, Round, WerewolfDomain,
 };
 
 pub(crate) use temp::TempDir;
@@ -136,10 +136,11 @@ pub(crate) fn ids<const N: usize>(names: [&str; N]) -> BTreeSet<AgentId> {
     names.map(AgentId::new).into()
 }
 
-/// A move targeting the named agent, for tests that name agents by
-/// string literal.
-pub(crate) fn target(name: &str) -> Move {
-    Move::Target(id(name))
+/// The agent a point targets, for tests that name agents by string
+/// literal. The same thing as [`id`], named for the place it is used: it
+/// reads as "the target" where a point's target is what is meant.
+pub(crate) fn target(name: &str) -> AgentId {
+    id(name)
 }
 
 /// A request of `kind`, for tests where its id and round do not matter.

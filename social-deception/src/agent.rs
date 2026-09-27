@@ -1312,6 +1312,32 @@ mod tests {
         }
     }
 
+    /// A [`Punctual`] that withdraws its deadline the first time it fires,
+    /// so that a past deadline runs exactly one cycle instead of spinning.
+    struct Once {
+        inner: Punctual,
+        deadline: Arc<Mutex<Option<Timestamp>>>,
+    }
+
+    impl Handler<TestDomain> for Once {
+        fn start(&mut self, now: Timestamp) -> Vec<Action<TestDomain>> {
+            self.inner.start(now)
+        }
+
+        fn handle(&mut self, observation: &Observation<TestDomain>) -> Vec<Action<TestDomain>> {
+            self.inner.handle(observation)
+        }
+
+        fn timeout(&mut self, now: Timestamp) -> Vec<Action<TestDomain>> {
+            *self.deadline.lock().unwrap() = None;
+            self.inner.timeout(now)
+        }
+
+        fn deadline(&self) -> Option<Timestamp> {
+            self.inner.deadline()
+        }
+    }
+
     /// Broadcasts a step when it starts.
     struct Town;
 
@@ -1807,22 +1833,27 @@ mod tests {
         // The clock starts at zero and only goes up, so a deadline of zero
         // is always in the past. The real clock is the timer source here:
         // nothing fires this but the instant itself having gone by.
+        //
+        // The handler withdraws the deadline from inside its own `timeout`,
+        // so exactly one past-deadline cycle runs however the threads are
+        // scheduled. Clearing it from the test instead would race the
+        // agent, which spins until it sees the retraction.
         let (handler, deadline) = Punctual::new(Some(Timestamp::default()));
+        let once = Once {
+            inner: handler,
+            deadline: deadline.clone(),
+        };
         let wires = wires(None);
         let clock = wires.wiring.clock;
         let (queue, dispatches, records) = (wires.queue, wires.dispatches, wires.records);
-        let agent = Agent::spawn(wires.wiring, handler, clock);
+        let agent = Agent::spawn(wires.wiring, once, clock);
         queue
             .send(Delivery::control(Control::Start, clock.now()))
             .unwrap();
-        // The start cycle, then a cycle the past deadline woke, with nothing
-        // having been said to the agent in between.
-        recv(&dispatches);
-        // Stop spinning before the stop is sent, or the agent would run
-        // cycles until it reached it.
-        *deadline.lock().unwrap() = None;
-        let woken = recv(&dispatches);
-        assert_eq!(woken.deliveries, 0);
+        // The start cycle, then the cycle the past deadline woke, with
+        // nothing having been said to the agent in between.
+        assert_eq!(recv(&dispatches).deliveries, 1, "the start");
+        assert_eq!(recv(&dispatches).deliveries, 0, "the deadline");
 
         queue
             .send(Delivery::control(Control::Stop, clock.now()))
@@ -1830,9 +1861,9 @@ mod tests {
         drop(queue);
         let handler = agent.join().unwrap();
         drop(records);
-        assert!(
-            handler.inner.timeouts >= 1,
-            "a deadline in the past did not fire at once"
+        assert_eq!(
+            handler.inner.inner.timeouts, 1,
+            "a deadline in the past fires once, and once only after it is withdrawn"
         );
     }
 
