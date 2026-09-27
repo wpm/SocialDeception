@@ -45,7 +45,15 @@ seven-player game:
 
     cargo run --bin werewolf -- play examples/werewolf.toml
 
-That writes `werewolf.jsonl`, the trajectory, and `werewolf.jsonl.toml`,
+That narrates the game as it happens, a line per thing that is said —
+the time, who said it, who heard it, and what it was — and then prints
+how it ended. `--quiet` leaves the narration out and prints the summary
+alone. The narration is a live view rather than the record of the game:
+it shows each event once, from the side of whoever sent it, in the order
+the players' threads produced them. `replay`, below, is the reproducible
+reading.
+
+It also writes `werewolf.jsonl`, the trajectory, and `werewolf.jsonl.toml`,
 the effective configuration, at the repository root, where both are
 ignored by git. To read the game back:
 

@@ -128,11 +128,14 @@
 //! stand-in and a trajectory writer:
 //!
 //! ```
+//! use std::sync::{Arc, Mutex};
+//!
 //! use crossbeam_channel::unbounded;
 //! use social_deception::{
 //!     Action, Agent, AgentId, Clock, Control, CycleDispatch, Delivery, Domain, Event, Handler,
-//!     Observation, Wiring, Writer,
+//!     JsonLines, Observation, Sink, Wiring, Writer,
 //! };
+//! use social_deception::trajectory::Policy;
 //!
 //! struct Chat;
 //!
@@ -155,7 +158,11 @@
 //! let clock = Clock::start();
 //! let (to_agent, queue) = unbounded();
 //! let (dispatches, from_agent) = unbounded();
-//! let (records, writer) = Writer::spawn::<Chat>(Vec::new());
+//! // The trajectory goes to a `JsonLines` sink over a buffer this example
+//! // can read back; a run writes one over a file instead.
+//! let trajectory = Arc::new(Mutex::new(Vec::new()));
+//! let sink: Box<dyn Sink<Chat>> = Box::new(JsonLines::new(Recorded(trajectory.clone())));
+//! let (records, writer) = Writer::spawn(vec![(sink, Policy::Required)]);
 //! let peers = [AgentId::new("caller")].into();
 //! let wiring =
 //!     Wiring { id: "echo".into(), clock, queue, dispatches, records, timeout: None, peers };
@@ -175,8 +182,20 @@
 //! assert_eq!(sent.len(), 1);
 //! assert_eq!(sent[0].sender, AgentId::new("echo"));
 //! assert_eq!(sent[0].payload, "hello");
-//! let trajectory = writer.join().unwrap();
-//! assert!(!trajectory.is_empty());
+//! writer.join().unwrap();
+//! assert!(!trajectory.lock().unwrap().is_empty());
+//!
+//! /// A destination whose bytes stay readable after the sink has taken it.
+//! struct Recorded(Arc<Mutex<Vec<u8>>>);
+//!
+//! impl std::io::Write for Recorded {
+//!     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+//!         self.0.lock().unwrap().extend_from_slice(buf);
+//!         Ok(buf.len())
+//!     }
+//!
+//!     fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+//! }
 //! ```
 
 use std::collections::BTreeSet;
@@ -1036,9 +1055,8 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::testing::{TestDomain, TestPayload, parse_lines};
+    use crate::testing::{TestDomain, TestPayload, joined, parse_lines, recording};
     use crate::timer::{ManualTimer, ManualTimerControl};
-    use crate::trajectory::Writer;
 
     /// How long a test waits on a channel before giving up. A test only ever
     /// waits this long when it has already failed.
@@ -1548,7 +1566,7 @@ mod tests {
     #[test]
     fn a_cycle_is_recorded_as_its_inputs_then_its_outputs_then_the_cycle() {
         let mut wires = wires(None);
-        let (records, writer) = Writer::spawn(Vec::new());
+        let (records, writer, bytes) = recording();
         wires.wiring.records = records;
         wires
             .queue
@@ -1559,7 +1577,7 @@ mod tests {
         let agent = Agent::spawn(wires.wiring, Recorder::default(), clock);
         drop(wires.queue);
         agent.join().unwrap();
-        let lines = parse_lines(&writer.join().unwrap());
+        let lines = parse_lines(&joined(writer, &bytes));
 
         assert_eq!(lines.len(), 4);
         let t_start = lines[3]["t_start"].as_u64().unwrap();

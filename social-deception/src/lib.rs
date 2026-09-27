@@ -37,7 +37,7 @@
 //!   and [`Control`] that travel on the wire, and the [`Delivery`] that
 //!   carries either of them to an agent;
 //! - [`trajectory`]: the records an agent's loop produces and the [`Writer`]
-//!   that puts them on disk;
+//!   that hands each one to every [`Sink`] it was given;
 //! - [`timer`]: the [`TimerSource`] an agent's deadlines come from;
 //! - [`agent`]: the [`Agent`] thread that pops its queue, folds the
 //!   [`Observation`] it took through a [`Handler`], and records what it saw
@@ -83,7 +83,12 @@ pub use episode::{Episode, EpisodeError, Failure};
 pub use event::{AgentId, Control, Delivery, Domain, Event, Payload};
 pub use router::{Queues, RouteError, Router};
 pub use timer::{ManualTimer, ManualTimerControl, TimerSource};
+// [`trajectory::Policy`] is deliberately not re-exported here. The crate
+// root is a shared vocabulary, and `werewolf::Policy` — the trait a player
+// decides with — already has the name in it. A sink's policy is read in the
+// company of the sink it belongs to, where `trajectory::Policy::Required`
+// says what it means and collides with nothing.
 pub use trajectory::{
-    ActionRecord, ControlRecord, CycleRecord, LogRecord, ObservationRecord, RewardRecord, Seq,
-    Woken, Writer,
+    ActionRecord, ControlRecord, CycleRecord, JsonLines, LogRecord, ObservationRecord,
+    RewardRecord, Seq, Sink, Woken, Writer,
 };
