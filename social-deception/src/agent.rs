@@ -133,8 +133,9 @@
 //! use crossbeam_channel::unbounded;
 //! use social_deception::{
 //!     Action, Agent, AgentId, Clock, Control, CycleDispatch, Delivery, Domain, Event, Handler,
-//!     JsonLines, Observation, Policy, Sink, Wiring, Writer,
+//!     JsonLines, Observation, Sink, Wiring, Writer,
 //! };
+//! use social_deception::trajectory::Policy;
 //!
 //! struct Chat;
 //!
