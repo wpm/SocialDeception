@@ -39,7 +39,7 @@
 use std::error;
 use std::fmt;
 use std::fs::File;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
@@ -48,6 +48,7 @@ use super::WerewolfDomain;
 use super::assignment::Assignment;
 use super::config::Config;
 use super::game::Game;
+use super::live::Text;
 use super::message::Outcome;
 use super::moderator::Moderator;
 use super::player::Seat;
@@ -199,10 +200,22 @@ fn add(
 
 /// Runs one episode to completion and returns how it ended.
 ///
-/// The trajectory is written to `config.trajectory` if it is set, by a
-/// required [`JsonLines`] sink. Otherwise the writer has no sinks at all
-/// and discards what it receives: an episode with no trajectory exercises
-/// everything one with a trajectory does.
+/// Two sinks, either of which may be absent:
+///
+/// - the trajectory, a **required** [`JsonLines`] over `config.trajectory`
+///   when it is set. Required because a run whose record of itself is
+///   incomplete is a run that did not happen;
+/// - the live text, an **optional** [`Text`] over `live` when one is given.
+///   Optional because a watcher who closes the pipe has seen all they
+///   wanted, and the game is no less played for it.
+///
+/// With neither, the writer has no sinks at all and discards what it
+/// receives: an episode with no trajectory and nobody watching exercises
+/// everything a fully observed one does.
+///
+/// The summary a caller prints afterwards is not a sink. It is the
+/// [`Outcome`] returned here, which is the game's end rather than one more
+/// thing that happened in it.
 ///
 /// The configuration is taken as given. Any overrides the command line
 /// applies are applied to it before it gets here.
@@ -219,7 +232,7 @@ fn add(
 ///
 /// If the configuration would not pass [`Config::validate`]; see
 /// [`episode`].
-pub fn run(config: &Config) -> Result<Outcome, RunError> {
+pub fn run(config: &Config, live: Option<Box<dyn Write + Send>>) -> Result<Outcome, RunError> {
     let trajectory = config.trajectory.as_deref();
     let mut sinks: Vec<(Box<dyn Sink<WerewolfDomain>>, Policy)> = Vec::new();
     if let Some(path) = trajectory {
@@ -228,6 +241,12 @@ pub fn run(config: &Config) -> Result<Outcome, RunError> {
             source,
         })?;
         sinks.push((Box::new(JsonLines::new(file)), Policy::Required));
+    }
+    if let Some(live) = live {
+        // The moderator is in the roster the column is sized to: it sends
+        // most of what a watcher sees.
+        let roster = config.players.iter().chain([&config.moderator]);
+        sinks.push((Box::new(Text::new(live, roster)), Policy::Optional));
     }
     let (records, writer) = Writer::spawn(sinks);
     let (episode, outcomes) = episode(config, records);
@@ -351,14 +370,14 @@ mod tests {
     #[test]
     fn a_seven_player_game_runs_to_an_outcome_with_a_winner() {
         let config = town();
-        let outcome = run(&config).unwrap();
+        let outcome = run(&config, None).unwrap();
         check(&config, &outcome);
     }
 
     #[test]
     fn the_same_config_gives_the_same_outcome() {
         let config = town();
-        assert_eq!(run(&config).unwrap(), run(&config).unwrap());
+        assert_eq!(run(&config, None).unwrap(), run(&config, None).unwrap());
     }
 
     #[test]
@@ -369,7 +388,7 @@ mod tests {
             config(["alice", "bob", "carol"], 1, 0, 0),
             config(["alice", "bob", "carol", "dave", "erin"], 1, 0, 0),
         ] {
-            let outcome = run(&config).unwrap();
+            let outcome = run(&config, None).unwrap();
             check(&config, &outcome);
         }
     }
@@ -380,7 +399,7 @@ mod tests {
         let trajectory = dir.join("werewolf.jsonl");
         let mut config = town();
         config.trajectory = Some(trajectory.clone());
-        let outcome = run(&config).unwrap();
+        let outcome = run(&config, None).unwrap();
 
         let lines = parse_lines(&fs::read(&trajectory).unwrap());
         assert!(!lines.is_empty());
@@ -398,9 +417,9 @@ mod tests {
         let second = dir.join("second.jsonl");
         let mut config = town();
         config.trajectory = Some(first.clone());
-        run(&config).unwrap();
+        run(&config, None).unwrap();
         config.trajectory = Some(second.clone());
-        run(&config).unwrap();
+        run(&config, None).unwrap();
         assert_eq!(transcript(&first, &config), transcript(&second, &config));
     }
 
@@ -409,7 +428,7 @@ mod tests {
         let mut config = town();
         let path = Path::new("/no-such-directory/werewolf.jsonl");
         config.trajectory = Some(path.to_path_buf());
-        let error = run(&config).unwrap_err();
+        let error = run(&config, None).unwrap_err();
         assert!(
             matches!(&error, RunError::Io { trajectory: Some(t), .. } if t == path),
             "{error:?}"

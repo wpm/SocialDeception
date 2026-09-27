@@ -118,6 +118,7 @@ pub mod assignment;
 pub mod config;
 pub mod game;
 pub mod knowledge;
+pub mod live;
 pub mod message;
 pub mod moderator;
 pub mod player;
@@ -149,6 +150,7 @@ pub use assignment::Assignment;
 pub use config::{Config, ConfigError, RoleCounts};
 pub use game::{Directive, Game};
 pub use knowledge::{Death, Heard, Knowledge};
+pub use live::Text;
 pub use message::{
     Cause, Message, Move, Narration, Outcome, Phase, Request, RequestId, RequestKind, Response,
     Round,

@@ -1,10 +1,16 @@
 //! `werewolf`: play and replay episodes of Werewolf.
 //!
 //! `play` loads a configuration file, applies any overrides from the command
-//! line, plays one episode and prints how it ended: the effective seed, the
-//! winner, the number of rounds and the survivors. The effective seed is
-//! printed on every run because `--seed` means the file is no longer the
-//! sole determinant of the run.
+//! line, plays one episode narrating it to stdout as it happens, and then
+//! prints how it ended: the effective seed, the winner, the number of rounds
+//! and the survivors. The effective seed is printed on every run because
+//! `--seed` means the file is no longer the sole determinant of the run.
+//!
+//! The narration is a line per thing that happens, rendered by
+//! [`social_deception::werewolf::live`], and `--quiet`
+//! leaves it out. It is written by an optional sink, so a reader that closes
+//! the pipe costs the narration alone; the summary below it is printed from
+//! the outcome the run returns, not by a sink.
 //!
 //! For the same reason, when a trajectory is written the *effective
 //! configuration* is written beside it, at the trajectory's path with
@@ -59,6 +65,9 @@ enum Command {
         /// Override where the trajectory is written.
         #[arg(long)]
         trajectory: Option<PathBuf>,
+        /// Do not narrate the game as it plays; print only the summary.
+        #[arg(long)]
+        quiet: bool,
     },
     /// Render a trajectory written by an earlier run.
     Replay {
@@ -87,9 +96,18 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             config,
             seed,
             trajectory,
+            quiet,
         } => {
-            let played = play(&config, seed, trajectory)?;
-            print(&played.to_string())?;
+            let played = play(&config, seed, trajectory, quiet)?;
+            // A blank line between the game and the verdict on it. With
+            // `--quiet` there is no game above, so there is nothing to
+            // separate and the output is exactly what it always was.
+            let summary = played.to_string();
+            print(&if quiet {
+                summary
+            } else {
+                format!("\n{summary}")
+            })?;
             Ok(())
         }
         Command::Replay {
@@ -144,22 +162,32 @@ struct Played {
 }
 
 /// Plays one episode from the configuration at `path`, with the overrides
-/// applied.
+/// applied, narrating it to stdout unless `quiet`.
 ///
 /// When the configuration names a trajectory, the effective configuration
 /// is written beside it before the game begins, so that even a run that
 /// ends badly leaves the pair that reproduces it. Without a trajectory there
 /// is nothing to pair it with, and nothing is written.
+///
+/// The narration goes to stdout as an optional sink, so a reader that closes
+/// the pipe costs the narration and nothing else: the game finishes and the
+/// trajectory is complete.
 fn play(
     path: &Path,
     seed: Option<u64>,
     trajectory: Option<PathBuf>,
+    quiet: bool,
 ) -> Result<Played, Box<dyn Error>> {
     let config = load(path, seed, trajectory)?;
     if let Some(trajectory) = &config.trajectory {
         config::write_effective(&config, trajectory)?;
     }
-    let outcome = werewolf::run(&config)?;
+    let live: Option<Box<dyn Write + Send>> = if quiet {
+        None
+    } else {
+        Some(Box::new(io::stdout()))
+    };
+    let outcome = werewolf::run(&config, live)?;
     Ok(Played { config, outcome })
 }
 
@@ -310,7 +338,7 @@ mod tests {
         let cli = Cli::try_parse_from(["werewolf", "play", "x.toml"]).unwrap();
         assert!(matches!(
             cli.command,
-            Command::Play { config, seed: None, trajectory: None }
+            Command::Play { config, seed: None, trajectory: None, quiet: false }
                 if config == Path::new("x.toml")
         ));
     }
@@ -325,13 +353,20 @@ mod tests {
             "7",
             "--trajectory",
             "out.jsonl",
+            "--quiet",
         ])
         .unwrap();
         assert!(matches!(
             cli.command,
-            Command::Play { config, seed: Some(7), trajectory: Some(trajectory) }
+            Command::Play { config, seed: Some(7), trajectory: Some(trajectory), quiet: true }
                 if config == Path::new("x.toml") && trajectory == Path::new("out.jsonl")
         ));
+    }
+
+    #[test]
+    fn play_quietly() {
+        let cli = Cli::try_parse_from(["werewolf", "play", "x.toml", "--quiet"]).unwrap();
+        assert!(matches!(cli.command, Command::Play { quiet: true, .. }));
     }
 
     #[test]
@@ -431,7 +466,7 @@ mod tests {
     fn play_plays_a_game_and_prints_how_it_ended() {
         let dir = TempDir::new();
         let trajectory = dir.join("out.jsonl");
-        let played = play(&example(), Some(7), Some(trajectory.clone())).unwrap();
+        let played = play(&example(), Some(7), Some(trajectory.clone()), true).unwrap();
         assert_eq!(played.config.seed, 7);
         let text = played.to_string();
         assert!(text.starts_with("seed: 7\nwinner: "), "{text}");
@@ -451,7 +486,7 @@ mod tests {
     fn play_writes_the_effective_config_beside_the_trajectory() {
         let dir = TempDir::new();
         let trajectory = dir.join("out.jsonl");
-        let played = play(&example(), Some(7), Some(trajectory.clone())).unwrap();
+        let played = play(&example(), Some(7), Some(trajectory.clone()), true).unwrap();
         assert!(fs::metadata(&trajectory).unwrap().len() > 0);
         let effective = config::load(config::effective_path(&trajectory)).unwrap();
         assert_eq!(
@@ -468,7 +503,7 @@ mod tests {
     fn play_without_a_trajectory_writes_nothing() {
         let dir = TempDir::new();
         let config = config(&dir, "game.toml", None);
-        let played = play(&config, None, None).unwrap();
+        let played = play(&config, None, None, true).unwrap();
         assert!(played.to_string().ends_with("trajectory: none\n"));
         let mut entries = fs::read_dir(&*dir).unwrap();
         assert_eq!(
@@ -483,11 +518,17 @@ mod tests {
     fn the_effective_config_reproduces_the_run() {
         let dir = TempDir::new();
         let first = dir.join("first.jsonl");
-        let original = play(&example(), Some(7), Some(first.clone())).unwrap();
+        let original = play(&example(), Some(7), Some(first.clone()), true).unwrap();
         // The whole reproduction recipe: the effective config, and a
         // trajectory of the reproduction's own.
         let second = dir.join("second.jsonl");
-        let reproduced = play(&config::effective_path(&first), None, Some(second.clone())).unwrap();
+        let reproduced = play(
+            &config::effective_path(&first),
+            None,
+            Some(second.clone()),
+            true,
+        )
+        .unwrap();
         assert_eq!(reproduced.outcome, original.outcome);
         assert_eq!(reproduced.config.seed, 7);
         assert_eq!(
@@ -504,7 +545,7 @@ mod tests {
         let dir = TempDir::new();
         let config = config(&dir, "game.toml", Some("game.jsonl"));
         let before = fs::read_to_string(&config).unwrap();
-        play(&config, Some(4), None).unwrap();
+        play(&config, Some(4), None, true).unwrap();
         assert_eq!(fs::read_to_string(&config).unwrap(), before);
         let effective = dir.join("game.jsonl.toml");
         assert_eq!(config::load(&effective).unwrap().seed, 4);
@@ -514,7 +555,7 @@ mod tests {
     fn an_effective_config_that_cannot_be_written_is_an_error_naming_it() {
         let dir = TempDir::new();
         let trajectory = dir.join("no-such-directory/out.jsonl");
-        let error = play(&example(), None, Some(trajectory)).unwrap_err();
+        let error = play(&example(), None, Some(trajectory), true).unwrap_err();
         assert!(
             error
                 .to_string()
@@ -530,7 +571,7 @@ mod tests {
         let dir = TempDir::new();
         let trajectory = dir.join("out");
         fs::create_dir(&trajectory).unwrap();
-        let error = play(&example(), None, Some(trajectory.clone())).unwrap_err();
+        let error = play(&example(), None, Some(trajectory.clone()), true).unwrap_err();
         assert!(config::effective_path(&trajectory).exists());
         assert!(
             error
