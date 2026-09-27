@@ -118,6 +118,11 @@ impl<D: Domain> Clone for Queues<D> {
 #[derive(Debug)]
 pub struct Router<D: Domain> {
     queues: BTreeMap<AgentId, Queues<D>>,
+    /// Whoever has been stopped. Their queues are gone, and an event
+    /// addressed to one of them is skipped rather than failing the
+    /// episode: a queue closed because the environment stopped its agent
+    /// is not a queue that broke (ADR-0012).
+    stopped: BTreeSet<AgentId>,
     environment: AgentId,
     clock: Clock,
 }
@@ -130,9 +135,33 @@ impl<D: Domain> Router<D> {
     pub fn new(queues: BTreeMap<AgentId, Queues<D>>, environment: AgentId, clock: Clock) -> Self {
         Self {
             queues,
+            stopped: BTreeSet::new(),
             environment,
             clock,
         }
+    }
+
+    /// Records that `who` has been stopped and drops its queue, so that
+    /// nothing further is put on it.
+    ///
+    /// An event addressed to a stopped agent is delivered to its other
+    /// recipients and skipped for this one. That is what makes stopping
+    /// one agent in the middle of an episode safe: a sender working from
+    /// its own knowledge may address somebody the environment has already
+    /// stopped, and that is a lost race rather than a broken queue
+    /// (ADR-0012).
+    pub fn stopped(&mut self, who: &AgentId) {
+        // The queue is dropped so that nothing further is put on it, and
+        // the id stays in the roster: a stopped agent is still somebody
+        // the environment may reward and still a name a sender may
+        // address without that being an error.
+        self.stopped.insert(who.clone());
+    }
+
+    /// Whether `who` has been stopped.
+    #[must_use]
+    pub fn has_stopped(&self, who: &AgentId) -> bool {
+        self.stopped.contains(who)
     }
 
     /// The ids in the roster, in order.
@@ -173,6 +202,13 @@ impl<D: Domain> Router<D> {
         // queues it found, so each recipient is looked up once.
         let mut resolved = Vec::with_capacity(recipients.len());
         for id in recipients {
+            // A recipient that has been stopped is skipped, not resolved:
+            // it is still in the roster and still a name the sender may
+            // address, but there is nobody there to hear it any more.
+            if self.stopped.contains(id) {
+                continue;
+            }
+
             resolved.push((id, self.queues_of(id)?));
         }
         let mut deliveries = 0;

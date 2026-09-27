@@ -134,6 +134,16 @@ pub enum Directive {
         /// What it is asked.
         request: Request,
     },
+    /// Stop this agent: it is out of the game (ADR-0012).
+    ///
+    /// A dead player is stopped in the cycle its death is announced, and
+    /// it is not among those told: there is nobody left to tell. Its
+    /// reward is logged rather than said, so it needs to hear nothing to
+    /// be paid.
+    Stop {
+        /// The agent out of the game.
+        who: AgentId,
+    },
 }
 
 /// One open pointing session: who may point, what they were asked, and the
@@ -614,7 +624,7 @@ impl Game {
         let mut directives = Vec::new();
         match plurality(votes.values(), &mut self.ties) {
             Some(victim) if !protected.contains(&victim) => {
-                directives.push(self.eliminate(&victim, Cause::Devoured));
+                directives.extend(self.eliminate(&victim, Cause::Devoured));
                 directives.extend(self.advance(now));
             }
             _ => {
@@ -643,7 +653,7 @@ impl Game {
             hammer,
         })];
         if let Some(who) = lynched {
-            directives.push(self.eliminate(&who, Cause::Lynched));
+            directives.extend(self.eliminate(&who, Cause::Lynched));
             directives.extend(self.advance(now));
         } else {
             directives.push(self.narrate_living(Narration::NoLynch { round: self.round }));
@@ -654,18 +664,24 @@ impl Game {
 
     /// Removes a player from the living and announces it, with the role
     /// revealed, to the living and to the player itself.
-    fn eliminate(&mut self, who: &AgentId, cause: Cause) -> Directive {
-        let to = self.living.clone();
+    fn eliminate(&mut self, who: &AgentId, cause: Cause) -> Vec<Directive> {
         assert!(self.living.remove(who), "{who} is not living");
-        Directive::Narrate {
-            to,
-            narration: Narration::Eliminated {
-                who: who.clone(),
-                role: self.role(who),
-                round: self.round,
-                cause,
+        // To the living, which no longer includes the victim. A dead
+        // player observes nothing, its own death least of all: it is
+        // stopped in this same cycle, and an agent that has stopped is
+        // not somebody to address (ADR-0012).
+        vec![
+            Directive::Narrate {
+                to: self.living.clone(),
+                narration: Narration::Eliminated {
+                    who: who.clone(),
+                    role: self.role(who),
+                    round: self.round,
+                    cause,
+                },
             },
-        }
+            Directive::Stop { who: who.clone() },
+        ]
     }
 
     /// After an elimination: the outcome if a side has won, and otherwise
@@ -832,7 +848,7 @@ mod tests {
             .iter()
             .filter_map(|directive| match directive {
                 Directive::Ask { to, request } => Some((to.clone(), request.clone())),
-                Directive::Narrate { .. } => None,
+                Directive::Narrate { .. } | Directive::Stop { .. } => None,
             })
             .collect()
     }
@@ -985,6 +1001,14 @@ mod tests {
         )
     }
 
+    /// The stop that follows an elimination: a dead player is out of the
+    /// game and its agent with it (ADR-0012).
+    fn stopped(who: &str) -> Directive {
+        Directive::Stop { who: id(who) }
+    }
+
+    /// A death announced to `to` — less the victim, who is never told
+    /// (ADR-0012), so a caller may pass the living as they were before it.
     fn eliminated<const N: usize>(
         to: [&str; N],
         who: &str,
@@ -992,15 +1016,19 @@ mod tests {
         round: u32,
         cause: Cause,
     ) -> Directive {
-        narrate(
-            to,
-            Narration::Eliminated {
+        Directive::Narrate {
+            to: to
+                .into_iter()
+                .filter(|other| *other != who)
+                .map(id)
+                .collect(),
+            narration: Narration::Eliminated {
                 who: id(who),
                 role,
                 round: Round(round),
                 cause,
             },
-        )
+        }
     }
 
     /// The outcome as it is announced: to the living, who are exactly the
@@ -1130,6 +1158,7 @@ mod tests {
                 investigated("carol", "bob", Faction::Werewolves),
                 tally(["dave"], 1, RequestKind::Protect, &[("dave", "erin")]),
                 eliminated(everyone, "alice", Villager, 1, Cause::Devoured),
+                stopped("alice"),
                 phase_began(1, Phase::Day, survivors),
                 ask("bob", 4, 1, RequestKind::Nominate),
                 ask("carol", 5, 1, RequestKind::Nominate),
@@ -1147,6 +1176,7 @@ mod tests {
                     ],
                 ),
                 eliminated(survivors, "bob", Werewolf, 1, Cause::Lynched),
+                stopped("bob"),
                 outcome(Faction::Village, 1, ["carol", "dave", "erin"]),
             ]
         );
@@ -1182,6 +1212,7 @@ mod tests {
                     1,
                     Cause::Devoured,
                 ),
+                stopped("carol"),
                 phase_began(1, Phase::Day, ["alice", "bob", "dave", "erin"]),
                 ask("alice", 4, 1, RequestKind::Nominate),
                 ask("bob", 5, 1, RequestKind::Nominate),
@@ -1202,6 +1233,7 @@ mod tests {
                     1,
                     Cause::Lynched,
                 ),
+                stopped("erin"),
                 // No seer lives, so the second night asks nothing of one.
                 phase_began(2, Phase::Night, ["alice", "bob", "dave"]),
                 ask("bob", 8, 2, RequestKind::Devour),
@@ -1215,6 +1247,7 @@ mod tests {
                     2,
                     Cause::Devoured
                 ),
+                stopped("alice"),
                 outcome(Faction::Werewolves, 2, ["bob", "dave"]),
             ]
         );
@@ -1569,7 +1602,7 @@ mod tests {
                     | Narration::Outcome(_) => Some(narration.clone()),
                     _ => None,
                 },
-                Directive::Ask { .. } => None,
+                Directive::Ask { .. } | Directive::Stop { .. } => None,
             })
             .collect()
     }
@@ -1602,6 +1635,7 @@ mod tests {
                     &[("alice", "dave"), ("bob", "erin"), ("carol", "frank")],
                 ),
                 eliminated(everyone, "dave", Villager, 1, Cause::Devoured),
+                stopped("dave"),
                 outcome(
                     Faction::Werewolves,
                     1,
@@ -1807,22 +1841,28 @@ mod tests {
             for directive in &directives {
                 match directive {
                     Directive::Narrate { to, narration } => {
-                        let own_death = match narration {
-                            Narration::Eliminated { who, .. } => Some(who),
-                            _ => None,
-                        };
+                        // No exception for the victim's own death. A dead
+                        // player observes nothing at all, its own death
+                        // least of all: it is stopped in the cycle the
+                        // death is announced and is not among those told
+                        // (ADR-0012).
                         for who in to {
                             assert!(
-                                !dead.contains(who) || own_death == Some(who),
+                                !dead.contains(who),
                                 "{who} is dead but is told {narration:?}"
                             );
                         }
-                        if let Some(who) = own_death {
-                            dead.insert(who.clone());
+                        if let Narration::Eliminated { who, .. } = narration {
+                            assert!(!to.contains(who), "{who} is told of its own death");
                         }
                     }
                     Directive::Ask { to, request } => {
                         assert!(!dead.contains(to), "{to} is dead but is asked {request:?}");
+                    }
+                    // The death and the stop are one cycle's work, so a
+                    // player counts as dead from the stop onward.
+                    Directive::Stop { who } => {
+                        dead.insert(who.clone());
                     }
                 }
             }

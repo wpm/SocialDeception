@@ -27,15 +27,19 @@
 //! - **the episode's shape**: every trajectory, the moderator's included,
 //!   begins with a `Start` control and ends with a `Stop`, because the
 //!   moderator is the episode's environment and starting and stopping the
-//!   players is its doing. Nothing at all reaches a dead player after the
-//!   announcement of its own death: no message of this game is broadcast,
-//!   and the outcome, which ADR-0004 once excepted, is narrated to the
-//!   living like everything else;
+//!   players is its doing. Nothing at all reaches a dead player from the
+//!   moment of its death: not its own death, which it is never told, not
+//!   a peer's point, nothing. The victim is left out of the `Eliminated`
+//!   narration and its agent is stopped in the same cycle (ADR-0012), so
+//!   its trajectory simply ends where the game ended for it. No message
+//!   of this game is broadcast, and the outcome, which ADR-0004 once
+//!   excepted, is narrated to the living like everything else;
 //! - **the rewards**: every player has exactly one, +1 exactly when the
 //!   role it was dealt belongs to the winning faction and −1 otherwise,
-//!   living or dead, and logged before the `Stop` that ends its
-//!   trajectory. The moderator has none: it plays no game, so there is
-//!   nothing its behavior could be worth;
+//!   living or dead. Death does not affect it: a reward is logged rather
+//!   than sent (ADR-0007), so a player stopped mid-game is still paid at
+//!   the end, after its own `Stop`. The moderator has none: it plays no
+//!   game, so there is nothing its behavior could be worth;
 //! - **game shape**: the phases alternate from the first night, each
 //!   eliminates at most one player and each day exactly one, the player
 //!   eliminated is one the phase's tally names most often, a night with no
@@ -518,10 +522,20 @@ impl<'a> Play<'a> {
                         "a night tally names only its session's members: {line}"
                     );
                 }
+                // A death is announced to the living *after* it: the
+                // victim is not told, because it is stopped in the same
+                // cycle and there is nobody left to tell (ADR-0012).
+                Message::Narration(Narration::Eliminated { who, .. }) => {
+                    let mut living = self.living_at(said.seq);
+                    assert!(living.remove(who), "{who} was already dead: {line}");
+                    assert_eq!(
+                        said.to, living,
+                        "a death is announced to the living, less the victim: {line}"
+                    );
+                }
                 Message::Narration(
                     Narration::Tally { .. }
                     | Narration::PhaseBegan { .. }
-                    | Narration::Eliminated { .. }
                     | Narration::NoDeath { .. }
                     | Narration::NoLynch { .. },
                 ) => assert_eq!(
@@ -669,9 +683,14 @@ impl<'a> Play<'a> {
     }
 
     /// Every player has exactly one reward, worth +1 if the role it was
-    /// dealt belongs to the winning faction and −1 if it does not, logged
-    /// at or before the `Stop` that ends its trajectory. The moderator has
-    /// none.
+    /// dealt belongs to the winning faction and −1 if it does not. The
+    /// moderator has none.
+    ///
+    /// Living or dead makes no difference. A reward is logged rather than
+    /// sent (ADR-0007), so a player stopped in the middle of the game for
+    /// dying (ADR-0012) is paid at the end like everybody else, after its
+    /// own `Stop`. When a reward may be logged is the shared checker's
+    /// business, and the bound it keeps is the episode's last stop.
     ///
     /// The roles come from the `Assigned` narrations the moderator sent,
     /// which is the same place every other check here gets them, so the
@@ -722,9 +741,16 @@ impl<'a> Play<'a> {
     /// point, always including the moderator among its recipients and
     /// never anyone the rules keep it from; each observed its role exactly
     /// once, the one the moderator dealt it; a survivor's last observation
-    /// is the outcome; and a dead player observed nothing at all after the
-    /// announcement of its own death. And the roles dealt are the ones
-    /// configured.
+    /// is the outcome; and a dead player observed nothing at all from its
+    /// own death onward. And the roles dealt are the ones configured.
+    ///
+    /// Whether a player died is read from the moderator's records and not
+    /// from the player's own, because the victim is never told: the
+    /// `Eliminated` narration goes to the living after the death, which no
+    /// longer includes the victim, and the victim's agent is stopped in the
+    /// same cycle (ADR-0012). A dead player's trajectory therefore simply
+    /// ends where the game ended for it, with no announcement to mark the
+    /// spot.
     ///
     /// Who may see a point is the kind's to say (ADR-0011): a `Devour` goes
     /// to the pack, a `Nominate` to every other living player, and the
@@ -781,33 +807,7 @@ impl<'a> Play<'a> {
                 [&self.role(who)],
                 "{who} is assigned its role exactly once"
             );
-            let last = received
-                .last()
-                .unwrap_or_else(|| panic!("{who} received nothing"));
-            let death = received.iter().position(|message| {
-                matches!(message, Message::Narration(Narration::Eliminated { who: dead, .. }) if dead == who)
-            });
-            if let Some(death) = death {
-                assert_eq!(
-                    received.len(),
-                    death + 1,
-                    "a dead player observes nothing after its own death: {who}"
-                );
-                assert!(
-                    !self.outcome.living.contains(who),
-                    "a player told it was eliminated is not among the survivors: {who}"
-                );
-            } else {
-                assert!(
-                    self.outcome.living.contains(who),
-                    "a player never eliminated survives: {who}"
-                );
-                assert_eq!(
-                    outcome(last),
-                    Some(&self.outcome),
-                    "the last thing the survivor {who} received is the outcome"
-                );
-            }
+            self.check_where_it_ended(lines, who, &received);
         }
         let counts = &self.config.roles;
         let villagers = self.config.players.len() - counts.special();
@@ -823,6 +823,72 @@ impl<'a> Play<'a> {
                 "the roles dealt are the ones configured: {role}"
             );
         }
+    }
+
+    /// Where the game ended for one player, read from its own records:
+    /// a survivor's last observation is the outcome, and a dead player
+    /// observed nothing from the moment of its death.
+    ///
+    /// Whether it died is the moderator's record to say, not this
+    /// player's. Since ADR-0012 the victim is never told: the
+    /// `Eliminated` narration goes to the living after the death, which
+    /// no longer includes the victim, and its agent is stopped in the
+    /// same cycle. A dead player's trajectory simply stops, with no
+    /// announcement in it to mark the place.
+    fn check_where_it_ended(&self, lines: &[Value], who: &AgentId, received: &[Message]) {
+        // No player ever observes its own death, whatever else it saw.
+        assert!(
+            !received.iter().any(|message| {
+                matches!(message, Message::Narration(Narration::Eliminated { who: dead, .. }) if dead == who)
+            }),
+            "{who} was told of its own death"
+        );
+        let Some(&death) = self.eliminated.get(who) else {
+            assert!(
+                self.outcome.living.contains(who),
+                "a player never eliminated survives: {who}"
+            );
+            let last = received
+                .last()
+                .unwrap_or_else(|| panic!("{who} received nothing"));
+            assert_eq!(
+                outcome(last),
+                Some(&self.outcome),
+                "the last thing the survivor {who} received is the outcome"
+            );
+            return;
+        };
+        // A dead player observes nothing from its death onward: not its
+        // own death, not a peer's point, nothing at all (ADR-0012). It is
+        // stopped in the cycle the death is announced, and the router
+        // drops whatever is addressed to it after that.
+        //
+        // "After the death" is measured on the wall clock rather than on
+        // sequence numbers, because the two sides of an event are
+        // numbered in different agents' trajectories. The eliminating
+        // narration's `created` stamp is the moment the game ended for
+        // this player, and everything it observed was created before it.
+        let died = self
+            .said
+            .iter()
+            .find(|said| said.seq == death)
+            .expect("the eliminating narration is one the moderator said")
+            .line["created"]
+            .as_u64()
+            .expect("a record says when it was created");
+        for line in records_of(lines, who, "observation") {
+            let created = line["created"]
+                .as_u64()
+                .expect("an observed event says when it was created");
+            assert!(
+                created < died,
+                "{who} died at {died} but observed something created at {created}: {line}"
+            );
+        }
+        assert!(
+            !self.outcome.living.contains(who),
+            "a player the moderator eliminated is not among the survivors: {who}"
+        );
     }
 }
 
@@ -924,10 +990,20 @@ impl<'p, 'a> Phases<'p, 'a> {
                 }
             }
             Narration::NoDeath { .. } => {
+                // Two ways a night passes with nobody dead (ADR-0011).
+                // The doctor protected whoever the pack settled on; or
+                // the pack named nobody at all, because no wolf's point
+                // reached its session before the clock closed it. The
+                // second is rare with random players, which point as
+                // soon as they are asked, but it is a legal night and
+                // not a bug: a pack that cannot agree to act does not
+                // act.
+                let saved = protected.is_some_and(|who| self.counts.leaders.contains(who));
+                let nobody_chosen = self.counts.leaders.is_empty();
                 assert!(
-                    protected.is_some_and(|who| self.counts.leaders.contains(who)),
-                    "a night with no death is one on which the doctor protected a player the \
-                     pack chose: {line}"
+                    saved || nobody_chosen,
+                    "a night with no death is one the doctor saved or one the pack named \
+                     nobody in: {line}"
                 );
             }
             _ => {}
@@ -1593,10 +1669,13 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "a night with no death is one on which the doctor protected")]
+    #[should_panic(expected = "a night with no death is one the doctor saved")]
     fn a_quiet_night_without_a_save_is_caught() {
         // On night 1 the pack splits between alice and bob, and carol
-        // protects alice.
+        // protects alice. Moving her protection to grace leaves a night
+        // that reports no death although the pack named somebody and
+        // nobody shielded them — neither of the two ways a night is
+        // quiet (ADR-0011).
         let lines = heard(response(asked("carol", 1, "Protect")), |line| {
             target(line, "grace");
         });
@@ -1674,18 +1753,25 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "a dead player observes nothing after its own death")]
+    #[should_panic(expected = "but observed something created at")]
     fn a_dead_player_that_hears_more_is_caught() {
-        // bob's copy of the day 2 tally, delivered to the dead alice too,
-        // after the narration of alice's own elimination.
+        // A dead player observes nothing from its death onward — not its
+        // own death, not a peer's point, nothing (ADR-0012). The leak is
+        // bob's copy of a narration that came after carol had died,
+        // handed to the dead carol as well.
+        //
+        // The victim is the one the moderator eliminated, and no longer
+        // one that was told so: carol is never sent its own death, so the
+        // check reads the death off the moderator's records and this test
+        // has to put the leak after that moment rather than after an
+        // announcement carol never received.
         let mut lines = fixture();
-        let leaked = lines[find(&lines, "bob", "observation", tally(2, "Day"))].clone();
-        let mut leaked = leaked;
-        leaked["agent"] = json!("alice");
+        let mut leaked = lines[find(&lines, "bob", "observation", tally(2, "Day"))].clone();
+        leaked["agent"] = json!("carol");
         let stop = lines
             .iter()
-            .position(|line| line["agent"] == "alice" && line["control"] == "stop")
-            .expect("alice is stopped");
+            .position(|line| line["agent"] == "carol" && line["control"] == "stop")
+            .expect("carol is stopped");
         lines.insert(stop, leaked);
         check(&lines, &config());
     }
@@ -1739,19 +1825,66 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "logged before the stop that ends its agent's trajectory")]
-    fn a_reward_logged_after_its_agents_stop_is_caught() {
-        // An agent's trajectory ends at its stop, so a reward stamped
-        // after one is scoring an episode that was already over for it.
-        // The claim is the shared checker's, since it holds of any
-        // environment's rewards and not only Werewolf's.
+    #[should_panic(expected = "logged before the episode's last stop")]
+    fn a_reward_logged_after_the_episode_is_caught() {
+        // A reward stamped after the run has finished for everybody is
+        // scoring an episode that no longer existed.
+        //
+        // The bound is the episode's last stop and not the stop of the
+        // agent being paid. Since ADR-0012 an agent may be stopped while
+        // the others play on — a dead Werewolf player is — and it is
+        // still paid at the end, after its own trajectory has closed.
+        // That is sound because a reward is logged rather than sent
+        // (ADR-0007): nobody has to be there to receive it. So the test
+        // pushes the stamp past the *last* stop in the file, which is
+        // what no reward may follow.
         let mut lines = fixture();
         let index = reward_of(&lines, "grace");
-        let stop = lines
+        let end = lines
             .iter()
-            .find(|line| line["agent"] == "grace" && line["control"] == "stop")
-            .expect("grace is stopped");
-        lines[index]["created"] = json!(stop["created"].as_u64().unwrap() + 1);
+            .filter(|line| line["type"] == "control" && line["control"] == "stop")
+            .map(|line| line["created"].as_u64().expect("a stop says when"))
+            .max()
+            .expect("somebody is stopped");
+        lines[index]["created"] = json!(end + 1);
+        super::super::check(&lines);
+    }
+
+    #[test]
+    fn a_reward_after_its_own_agents_stop_is_not_a_bug() {
+        // The companion to the above, and the rule ADR-0012 replaced.
+        //
+        // A reward for an agent stopped mid-episode is logged at the end,
+        // after that agent's own stop, and that is correct rather than
+        // tolerated: the dead are paid like everybody else. The fixture
+        // already contains the case — carol and frank both die — so this
+        // asserts the shape is really there and that the checker accepts
+        // it, which stops the bound above from being quietly tightened
+        // back to the agent's own stop.
+        let lines = fixture();
+        let stops: BTreeMap<&str, u64> = lines
+            .iter()
+            .filter(|line| line["type"] == "control" && line["control"] == "stop")
+            .map(|line| {
+                (
+                    line["agent"].as_str().expect("a stop names its agent"),
+                    line["created"].as_u64().expect("a stop says when"),
+                )
+            })
+            .collect();
+        let late = lines
+            .iter()
+            .filter(|line| line["type"] == "reward")
+            .filter(|line| {
+                let who = line["agent"].as_str().expect("a reward names its agent");
+                let created = line["created"].as_u64().expect("a reward says when");
+                stops.get(who).is_some_and(|&stop| created > stop)
+            })
+            .count();
+        assert!(
+            late > 0,
+            "the fixture should hold a player stopped before it was paid"
+        );
         super::super::check(&lines);
     }
 

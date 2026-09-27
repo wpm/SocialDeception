@@ -1664,6 +1664,9 @@ mod tests {
                 let (to, payload) = match directive {
                     Directive::Narrate { to, narration } => (to, Message::Narration(narration)),
                     Directive::Ask { to, request } => ([to].into(), Message::Request(request)),
+                    // A stop is a control, and `Transcript::read` skips
+                    // control records: they say nothing about the game.
+                    Directive::Stop { .. } => continue,
                 };
                 self.record("action", MODERATOR, &to, &payload);
             }
@@ -1694,7 +1697,7 @@ mod tests {
                 .iter()
                 .filter_map(|directive| match directive {
                     Directive::Ask { to, request } => Some((to.clone(), request.id)),
-                    Directive::Narrate { .. } => None,
+                    Directive::Narrate { .. } | Directive::Stop { .. } => None,
                 })
                 .collect();
             let now = Timestamp::from(Duration::from_millis((index as u64 + 1) * STEP));

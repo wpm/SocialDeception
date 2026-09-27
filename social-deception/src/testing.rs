@@ -151,9 +151,16 @@ pub(crate) fn fast() -> crate::werewolf::config::Timing {
 
     use crate::werewolf::config::{DayTiming, NightTiming, Timing};
 
+    // A night's limit has to outlast the slowest player's one point, or a
+    // point misses its session and the game differs from run to run
+    // (ADR-0011); a day's is what costs real time, since a random day
+    // rarely reaches a majority and so usually runs it out. These unit
+    // tests drive a game with explicit instants and never let a
+    // wall-clock deadline fire, so neither number decides anything here —
+    // they match the integration suite's so that the two agree.
     let night = NightTiming {
         quiet: Duration::from_millis(10),
-        limit: Duration::from_millis(50),
+        limit: Duration::from_millis(400),
     };
     Timing {
         day_cap: None,
@@ -161,7 +168,7 @@ pub(crate) fn fast() -> crate::werewolf::config::Timing {
         seer: night,
         doctor: night,
         day: DayTiming {
-            limit: Duration::from_millis(50),
+            limit: Duration::from_millis(80),
         },
     }
 }

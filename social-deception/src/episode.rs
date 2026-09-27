@@ -330,7 +330,7 @@ impl<D: Domain> Episode<D> {
             agents,
         } = spawn(handlers, &ids, &dispatch, &obituary, &records, clock);
         drop((dispatch, obituary, records));
-        let router = Router::new(queues, environment_id.clone(), clock);
+        let mut router = Router::new(queues, environment_id.clone(), clock);
 
         let environment_only = BTreeSet::from([environment_id.clone()]);
         let mut running = router.agents();
@@ -344,7 +344,7 @@ impl<D: Domain> Episode<D> {
             .map_err(|error| Halt::Error(EpisodeError::Control(error)))
             .and_then(|in_flight| {
                 drive(
-                    &router,
+                    &mut router,
                     &seat,
                     &dispatches,
                     &obituaries,
@@ -521,7 +521,7 @@ use Halt::Departure;
 /// Nothing in flight, no stop waiting to be issued, and some agent still
 /// running is a stall; see the [module documentation](self).
 fn drive<D: Domain>(
-    router: &Router<D>,
+    router: &mut Router<D>,
     environment: &Seat,
     dispatches: &Receiver<CycleDispatch<D>>,
     obituaries: &Receiver<AgentId>,
@@ -607,14 +607,42 @@ fn drive<D: Domain>(
                             .command(&dispatch.agent, &to, control)
                             .map_err(refused)?;
                     }
-                    // Validated now, so that a stop addressed to a stranger
-                    // fails the episode where it was asked for rather than
-                    // once everything has gone quiet.
+                    // A `Stop` asked for while others are still running
+                    // goes out at once, and only the end-of-episode stop
+                    // is held for quiescence (ADR-0012). Holding this one
+                    // would defeat its purpose: the point of stopping a
+                    // dead player mid-game is that it does *not* hear what
+                    // comes next, and during a phase there is always
+                    // something in flight, so a held stop might never go.
                     Control::Stop => {
-                        router
-                            .validate(&dispatch.agent, &to)
-                            .map_err(refused)
-                            .map(|()| held.push(to))?;
+                        router.validate(&dispatch.agent, &to).map_err(refused)?;
+                        let to: BTreeSet<AgentId> = to.intersection(running).cloned().collect();
+                        if to.is_empty() {
+                            continue;
+                        }
+                        // The stop that ends the episode is held for
+                        // quiescence, so that every agent hears what was
+                        // said to it before it stops (ADR-0009). A stop
+                        // for *some* of the running agents goes out at
+                        // once: the point of stopping a dead player
+                        // mid-game is that it does not hear what comes
+                        // next, and during a phase there is always
+                        // something in flight, so holding it might never
+                        // let it go (ADR-0012).
+                        if to == *running {
+                            held.push(to);
+                            continue;
+                        }
+                        in_flight += router
+                            .command(&dispatch.agent, &to, Control::Stop)
+                            .map_err(refused)?;
+                        // Nothing further is routed to them, and the
+                        // episode no longer waits on them.
+                        for who in &to {
+                            router.stopped(who);
+                        }
+                        running.retain(|id| !to.contains(id));
+                        waking.retain(|id| !to.contains(id));
                     }
                 }
             }

@@ -59,9 +59,12 @@ pub fn parse(bytes: &[u8]) -> Vec<Value> {
 /// cycle of that agent's, has no sequence number to be contiguous with, and
 /// arrives in the file wherever the writer took it. What is left to check
 /// is its shape, which is what the reward clause above says, and the one
-/// ordering that does hold: it precedes the `Stop` that ends the trajectory
-/// it belongs to, since a reward assigned after an agent has been told to
-/// stop would be scoring an episode that was already over.
+/// ordering that does hold: it is logged before the episode's last `Stop`,
+/// since a reward assigned after the run had finished for everybody would
+/// be scoring an episode that no longer existed. It need not precede the
+/// stop of its *own* agent: an agent stopped mid-episode, as a dead
+/// Werewolf player is (ADR-0012), is paid at the end like everybody else,
+/// which a logged reward allows and a sent one would not.
 ///
 /// The last is the one that makes a trajectory a single object rather than a
 /// pile of per-agent logs: an observation and the action that produced it
@@ -129,26 +132,36 @@ fn check_reward(line: &Value) {
     assert!(line["event"].is_null(), "a reward carries no event: {line}");
 }
 
-/// Every reward precedes the `Stop` of the agent it belongs to.
+/// Every reward is logged before the episode ends, which is the last `Stop`
+/// in the run.
 ///
-/// An agent's trajectory ends at its `Stop`, so a reward after one would be
-/// scoring an episode that was already over for that agent. The check is on
-/// the `created` stamps and not on file order, because a reward is written
-/// by the environment's thread and its line lands wherever the writer took
-/// it.
+/// A reward may *not* precede the stop of the agent it belongs to. An
+/// environment may stop one agent while the others run on — Werewolf stops
+/// a player in the cycle its death is announced (ADR-0012) — and rewards
+/// are handed out when the episode ends, so an agent that left early is
+/// paid after its own trajectory has closed. That is sound because a reward
+/// is logged rather than sent (ADR-0007): the agent does not have to be
+/// there to receive it, and its value is the episode's to decide once the
+/// episode is over.
+///
+/// What still holds is the outer bound. A reward logged after the last stop
+/// would be scoring a run that had finished for everybody, with no episode
+/// left to have produced it. The check is on the `created` stamps and not
+/// on file order, because a reward is written by the environment's thread
+/// and its line lands wherever the writer took it.
 fn check_rewards_precede_their_stop(lines: &[Value]) {
-    let stopped: HashMap<&str, u64> = lines
+    let Some(end) = lines
         .iter()
         .filter(|line| line["type"] == "control" && line["control"] == "stop")
-        .map(|line| (agent(line), time(line, "created")))
-        .collect();
+        .map(|line| time(line, "created"))
+        .max()
+    else {
+        return;
+    };
     for line in lines.iter().filter(|line| line["type"] == "reward") {
-        let Some(stop) = stopped.get(agent(line)) else {
-            continue;
-        };
         assert!(
-            time(line, "created") <= *stop,
-            "a reward is logged before the stop that ends its agent's trajectory: {line}"
+            time(line, "created") <= end,
+            "a reward is logged before the episode's last stop: {line}"
         );
     }
 }
@@ -418,9 +431,67 @@ fn check_nothing_follows_a_stop(lines: &[Value]) {
 }
 
 /// Every observation is somebody's action, and every action is observed by
-/// each of its recipients. The join is on the sender and the creation time,
-/// which is all a reader has: nothing carries an identifier for an event.
+/// each of its recipients that was still running. The join is on the sender
+/// and the creation time, which is all a reader has: nothing carries an
+/// identifier for an event.
+///
+/// The join is no longer total on the recipient side, and ADR-0012 is why.
+/// An environment may stop one agent while the rest run on, and an event
+/// addressed to an agent that has stopped is dropped for that recipient and
+/// delivered to the others. So an action may name a recipient with no
+/// matching observation anywhere: a trace in the sender's trajectory and
+/// none in the recipient's. That is correct for reinforcement learning —
+/// the recipient did not observe it, and its trajectory should not pretend
+/// otherwise — and anything joining the two sides of an event, replay
+/// included, has to allow for it.
+///
+/// What cannot be allowed is using that as a blanket excuse, because then
+/// the check would pass for a delivery that was simply lost. A missing
+/// observation is accepted only for a recipient this run actually stopped,
+/// and only for an event created after the last event that recipient did
+/// observe. Up to that instant the agent was demonstrably taking delivery,
+/// so a gap there is a real failure and still fails here.
 fn check_the_join(lines: &[Value]) {
+    // The earliest instant from which each stopped agent may legitimately
+    // miss an event.
+    //
+    // An agent stopped while the run continued was stopped by some
+    // cycle's batch of effects, and the whole of that batch shares one
+    // fate: the episode applies a batch's controls before routing its
+    // events, so an event created earlier in the batch than the stop is
+    // dropped for the agent that batch stopped. The bound is therefore
+    // the start of that cycle, not the stop's own stamp — the router
+    // stamps a control when it queues it, which is after the cycle
+    // returned, so the stamp sits outside the batch it belongs to.
+    //
+    // The bound cannot be read off the stop's own stamp. A control is
+    // stamped when the router queues it, which is after the cycle that
+    // asked for it has returned, so the stamp falls between cycles and
+    // may fall after cycles later than the batch it came from. What the
+    // trajectory does show without guesswork is the last event the agent
+    // actually observed: the batch that stopped it produced nothing it
+    // took in, so every event it missed was created after that instant.
+    //
+    // Being stopped is what licenses the gap, and the instant is what
+    // bounds it. Together they are narrow: an agent that was never
+    // stopped may miss nothing, and a stopped agent may miss only what
+    // came after the last thing it did observe. A delivery lost while
+    // the agent was still taking others in falls inside the bound and
+    // still fails.
+    let stopped: HashMap<&str, u64> = lines
+        .iter()
+        .filter(|line| line["type"] == "control" && line["control"] == "stop")
+        .map(|line| (agent(line), time(line, "created")))
+        .collect();
+    // The creation stamp of the last event each agent observed.
+    let mut last_observed: HashMap<&str, u64> = HashMap::new();
+    for line in lines.iter().filter(|line| line["type"] == "observation") {
+        let at = time(line, "created");
+        last_observed
+            .entry(agent(line))
+            .and_modify(|latest| *latest = (*latest).max(at))
+            .or_insert(at);
+    }
     let mut actions: BTreeMap<(&str, u64), &Value> = BTreeMap::new();
     for line in lines.iter().filter(|line| line["type"] == "action") {
         let key = (agent(line), time(line, "created"));
@@ -450,11 +521,30 @@ fn check_the_join(lines: &[Value]) {
     }
     for (key, action) in &actions {
         let (_, recipients, _) = event(action);
+        let (_, created) = *key;
         for who in recipients {
             let who = who.as_str().expect("a recipient is an agent id");
+            if observed.contains(&(*key, who)) {
+                continue;
+            }
+            // Unobserved: allowed only from the sender's cycle that
+            // stopped this recipient onward, which is the one way an
+            // event legitimately reaches nobody (ADR-0012).
+            //
+            // The bound is the sender's cycle and not the stop's own
+            // stamp because a stop and the events around it are one
+            // cycle's work. The environment returns a batch of effects
+            // together, and the episode applies that batch's controls
+            // before routing its events, so an event created earlier in
+            // the batch than the stop is still dropped for the agent the
+            // batch stopped. Werewolf does exactly this when a night's
+            // last tally and the death that follows it fall in one cycle.
+            let dropped =
+                stopped.contains_key(who) && created > last_observed.get(who).copied().unwrap_or(0);
             assert!(
-                observed.contains(&(*key, who)),
-                "every recipient of an action observes it, but {who} did not: {action}"
+                dropped,
+                "every recipient of an action observes it unless it had stopped, but {who} \
+                 did not: {action}"
             );
         }
     }
@@ -643,11 +733,36 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "before the stop that ends its agent's trajectory")]
-    fn a_reward_logged_after_its_agents_stop_is_caught() {
+    #[should_panic(expected = "before the episode's last stop")]
+    fn a_reward_logged_after_the_episode_is_caught() {
+        // The only stop in `good()` is `a`'s, at 75, so that is where the
+        // episode ends and 76 is past it.
         let mut lines = rewarded();
         let last = lines.len() - 1;
         lines[last]["created"] = json!(76);
+        check(&lines);
+    }
+
+    #[test]
+    fn a_reward_after_its_own_agents_stop_is_not_a_bug() {
+        // An environment may stop one agent while the rest run on, and
+        // pay it when the episode ends (ADR-0012). A reward logged after
+        // its own agent's stop but before the run finished is therefore
+        // correct, not a fault: the reward is logged rather than sent
+        // (ADR-0007), so the agent need not be there to take it.
+        //
+        // `b` is never stopped in `good()`, so `a` may be paid after its
+        // own stop at 75 while the episode is still going.
+        let mut lines = good();
+        lines.push(
+            json!({"type": "control", "agent": "b", "seq": 2, "created": 90,
+                          "received": 95, "control": "stop"}),
+        );
+        lines.push(
+            json!({"type": "cycle", "agent": "b", "t_start": 95, "t_stop": 96,
+                          "woken": "queue", "inputs": [2], "outputs": []}),
+        );
+        lines.push(json!({"type": "reward", "agent": "a", "created": 85, "value": 1}));
         check(&lines);
     }
 

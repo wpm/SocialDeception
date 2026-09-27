@@ -63,23 +63,44 @@ const SEEDS: u64 = 120;
 /// A validated configuration for `players` with the given special roles,
 /// played from `seed`, writing no trajectory.
 /// Timing fast enough that a test does not spend real time waiting on a
-/// session's clock. A game of random players points once and never changes
-/// its mind, so a night session closes a quiet period after its last
-/// member's only point, and a day runs to its limit unless a majority falls
-/// out of the deal.
+/// session's clock, and slow enough that a random player's one point
+/// always lands inside it.
+///
+/// A game of random players points once and never changes its mind, so a
+/// night session closes a quiet period after its last member's only
+/// point, and a day runs to its limit unless a majority falls out of the
+/// deal. The outcome is reproducible only while every one of those points
+/// arrives before its session closes (ADR-0011), which is a claim about
+/// thread latency: the limits have to exceed however long the slowest
+/// player takes to be scheduled and answer.
+///
+/// The two clocks are set for different reasons. A **hard limit** has to
+/// outlast the slowest player's one point, or a point misses its session
+/// and the game genuinely differs from run to run; at 50 ms these tests
+/// passed alone and failed a few times in ten with several suites at
+/// once, because seven agent threads on a loaded machine can outrun a
+/// margin that small. A **quiet period** costs real time on every night,
+/// since a night closes one quiet period after its members settle, so it
+/// stays short.
+///
+/// The day's limit is the expensive one — a random day rarely reaches a
+/// majority, so most days run it out — but it is also the one a slow
+/// point matters least for, because a day closes on a majority of the
+/// living and a point that misses cannot have made one. It is kept below
+/// the night's for that reason.
 const FAST: Timing = Timing {
     day_cap: None,
     pack: FAST_NIGHT,
     seer: FAST_NIGHT,
     doctor: FAST_NIGHT,
     day: DayTiming {
-        limit: Duration::from_millis(50),
+        limit: Duration::from_millis(80),
     },
 };
 
 const FAST_NIGHT: NightTiming = NightTiming {
     quiet: Duration::from_millis(10),
-    limit: Duration::from_millis(50),
+    limit: Duration::from_millis(400),
 };
 
 fn config(players: &[&str], werewolves: usize, seers: usize, doctors: usize, seed: u64) -> Config {
@@ -149,7 +170,8 @@ fn werewolf(args: &[&str]) -> String {
     let output = Command::new(WEREWOLF).args(args).output().unwrap();
     assert!(
         output.status.success(),
-        "werewolf {args:?} failed: {}",
+        "werewolf {args:?} failed with {:?}: {}",
+        output.status,
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8(output.stdout).unwrap()
@@ -353,10 +375,10 @@ fn playable(dir: &TempDir) -> (std::path::PathBuf, std::path::PathBuf) {
         format!(
             "seed = 26\nplayers = [\"alice\", \"bob\", \"carol\", \"dave\", \"erin\", \"frank\", \
              \"grace\"]\ntrajectory = '{}'\n[roles]\nwerewolves = 2\nseers = 1\ndoctors = 1\n\
-             [timing.pack]\nquiet = 0.01\nlimit = 0.05\n\
-             [timing.seer]\nquiet = 0.01\nlimit = 0.05\n\
-             [timing.doctor]\nquiet = 0.01\nlimit = 0.05\n\
-             [timing.day]\nlimit = 0.05\n",
+             [timing.pack]\nquiet = 0.01\nlimit = 0.4\n\
+             [timing.seer]\nquiet = 0.01\nlimit = 0.4\n\
+             [timing.doctor]\nquiet = 0.01\nlimit = 0.4\n\
+             [timing.day]\nlimit = 0.08\n",
             trajectory.display()
         ),
     )

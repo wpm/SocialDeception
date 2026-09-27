@@ -464,10 +464,10 @@ mod tests {
         let text = format!(
             "seed = 3\nplayers = [\"alice\", \"bob\", \"carol\", \"dave\", \"erin\"]\n\
              {trajectory}[roles]\nwerewolves = 1\nseers = 1\ndoctors = 1\n\
-             [timing.pack]\nquiet = 0.01\nlimit = 0.05\n\
-             [timing.seer]\nquiet = 0.01\nlimit = 0.05\n\
-             [timing.doctor]\nquiet = 0.01\nlimit = 0.05\n\
-             [timing.day]\nlimit = 0.05\n"
+             [timing.pack]\nquiet = 0.01\nlimit = 0.4\n\
+             [timing.seer]\nquiet = 0.01\nlimit = 0.4\n\
+             [timing.doctor]\nquiet = 0.01\nlimit = 0.4\n\
+             [timing.day]\nlimit = 0.08\n"
         );
         file(dir, name, &text)
     }

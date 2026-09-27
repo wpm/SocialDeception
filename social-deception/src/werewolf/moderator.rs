@@ -139,8 +139,7 @@ impl Moderator {
     /// every player stopped. The order is the shutdown sequence; see the
     /// [module documentation](self).
     fn say(&mut self, directives: Vec<Directive>) -> Vec<Effect<WerewolfDomain>> {
-        let mut effects: Vec<Effect<WerewolfDomain>> =
-            directives.into_iter().map(send).map(Effect::Act).collect();
+        let mut effects: Vec<Effect<WerewolfDomain>> = directives.into_iter().map(send).collect();
         if let Some(outcome) = self.game.outcome() {
             // The caller may have dropped the receiver. That is not the
             // game's problem: the in-world announcement is the record.
@@ -158,20 +157,28 @@ impl Moderator {
                     .into_iter()
                     .map(|(who, value)| Effect::Reward { agent: who, value }),
             );
-            effects.push(Effect::control(self.players(), Control::Stop));
+            // Only the living: a dead player was stopped in the cycle
+            // its death was announced (ADR-0012), and stopping it again
+            // would claim in its trajectory that it was told to stop
+            // after it had already stopped.
+            effects.push(Effect::control(self.game.living().clone(), Control::Stop));
         }
         effects
     }
 }
 
-/// The action that carries one directive.
-fn send(directive: Directive) -> Action<WerewolfDomain> {
+/// The effect that carries one directive.
+///
+/// Most are something said; a [`Directive::Stop`] is the game putting a
+/// player out of it, which is a control rather than a message (ADR-0012).
+fn send(directive: Directive) -> Effect<WerewolfDomain> {
     match directive {
-        Directive::Narrate { to, narration } => Action {
+        Directive::Narrate { to, narration } => Effect::Act(Action {
             recipients: Recipients::To(to),
             payload: Message::Narration(narration),
-        },
-        Directive::Ask { to, request } => Action::to([to], Message::Request(request)),
+        }),
+        Directive::Ask { to, request } => Effect::Act(Action::to([to], Message::Request(request))),
+        Directive::Stop { who } => Effect::control([who], Control::Stop),
     }
 }
 
@@ -573,7 +580,11 @@ mod tests {
     fn the_rewards_come_after_the_outcome_and_before_the_stop() {
         // The shutdown's order, read off the effects as the loop sees
         // them: the narration is said, then every reward is logged, then
-        // everybody is stopped. Nothing follows the stop.
+        // whoever is left is stopped. Nothing follows that stop.
+        //
+        // It is the *last* stop that ends the episode. Earlier ones are
+        // dead players, each stopped in the cycle its death was announced
+        // (ADR-0012).
         for Played { effects, .. } in played_games() {
             let kinds: Vec<&str> = effects
                 .iter()
@@ -591,7 +602,7 @@ mod tests {
                 })
                 .collect();
             let outcome = kinds.iter().position(|kind| *kind == "outcome").unwrap();
-            let stop = kinds.iter().position(|kind| *kind == "stop").unwrap();
+            let stop = kinds.iter().rposition(|kind| *kind == "stop").unwrap();
             let rewards: Vec<usize> = kinds
                 .iter()
                 .enumerate()
@@ -633,14 +644,27 @@ mod tests {
                 sent.last().map(|action| &action.payload),
                 Some(&Message::Narration(Narration::Outcome(outcome.clone())))
             );
-            // The players are started once and stopped once, the stop last
-            // and to everyone, living and dead.
+            // The players are started once, together. Each is then
+            // stopped exactly once: a dead player in the cycle its death
+            // was announced, and whoever is left at the end (ADR-0012).
+            let (started, stops) = commanded.split_first().expect("a start");
+            assert_eq!(*started, (everyone.clone(), Control::Start));
+            let mut stopped: Vec<AgentId> = Vec::new();
+            for (to, control) in stops {
+                assert_eq!(*control, Control::Stop);
+                stopped.extend(to.iter().cloned());
+            }
             assert_eq!(
-                commanded,
-                [
-                    (everyone.clone(), Control::Start),
-                    (everyone, Control::Stop)
-                ]
+                stopped.iter().cloned().collect::<BTreeSet<_>>(),
+                everyone,
+                "everybody is stopped"
+            );
+            assert_eq!(stopped.len(), everyone.len(), "and nobody twice");
+            // The last stop takes exactly the survivors.
+            assert_eq!(
+                stops.last().map(|(to, _)| to),
+                Some(&outcome.living),
+                "the episode ends by stopping whoever is still living"
             );
         }
     }
