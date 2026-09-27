@@ -71,7 +71,7 @@ fn rendered(action: &ActionRecord<WerewolfDomain>, senders: usize) -> String {
         "{:>TIME_WIDTH$} {:<senders$}  \u{2192} {}  {}",
         Elapsed(action.created.nanos()),
         action.agent.as_str(),
-        Ids(action.event.recipients.iter()),
+        listed(&action.event.recipients),
         action.event.payload,
     )
 }
@@ -114,7 +114,7 @@ impl fmt::Display for Narration {
             Self::Assigned { role, pack } => {
                 write!(f, "Assigned({role}")?;
                 if !pack.is_empty() {
-                    write!(f, "; pack: {}", Ids(pack.iter()))?;
+                    write!(f, "; pack: {}", listed(pack))?;
                 }
                 f.write_str(")")
             }
@@ -136,14 +136,11 @@ impl fmt::Display for Narration {
                 phase,
                 votes,
             } => {
-                write!(f, "Tally({phase} {}: ", round.0)?;
-                for (i, (who, chosen)) in votes.iter().enumerate() {
-                    if i > 0 {
-                        f.write_str(", ")?;
-                    }
-                    write!(f, "{who}\u{2192}{chosen}")?;
-                }
-                f.write_str(")")
+                let votes: Vec<String> = votes
+                    .iter()
+                    .map(|(who, chosen)| format!("{who}\u{2192}{chosen}"))
+                    .collect();
+                write!(f, "Tally({phase} {}: {})", round.0, votes.join(", "))
             }
             Self::Eliminated {
                 who, role, cause, ..
@@ -154,7 +151,7 @@ impl fmt::Display for Narration {
                 "Outcome({} win after {} rounds; survivors: {})",
                 outcome.winner,
                 outcome.rounds.0,
-                Ids(outcome.living.iter()),
+                listed(&outcome.living),
             ),
         }
     }
@@ -206,18 +203,14 @@ impl fmt::Display for Phase {
 }
 
 /// A comma-separated list of agent ids, in the order given.
-struct Ids<I>(I);
-
-impl<'a, I: Iterator<Item = &'a AgentId> + Clone> fmt::Display for Ids<I> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for (i, who) in self.0.clone().enumerate() {
-            if i > 0 {
-                f.write_str(", ")?;
-            }
-            who.fmt(f)?;
-        }
-        Ok(())
-    }
+///
+/// Not named `ids`: the test helper `testing::ids` builds a set of them,
+/// and two functions of that name in one file would be a puzzle.
+fn listed<'a>(who: impl IntoIterator<Item = &'a AgentId>) -> String {
+    who.into_iter()
+        .map(AgentId::as_str)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// The live text sink: every action as a line, flushed as it is written.
