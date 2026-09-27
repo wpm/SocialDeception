@@ -61,28 +61,24 @@ Four rules, in the framework and in every domain built on it.
 
 ### The heuristic
 
-**An episode's event trajectory should read as a narrative.** It is the
-quickest way to apply the rules below, and it does not need the rules to
-be recited: read the events in order and see whether they tell the story
-of what happened.
+**An episode's event trajectory should read as a narrative.** Read the
+events in order: each one should be a sentence in the story of what
+happened, and together they should be the whole of it.
 
-A line a narrator would not write is a line that should not be there.
-Werewolf's requests fail on sight —
+Werewolf's night reads as one when every line earns its place:
 
-> Night 1 begins. *The moderator asks dave to devour. The moderator asks
-> erin to devour. The moderator asks grace to investigate. The moderator
-> asks carol to protect.* Carol protects alice. Dave points at alice,
-> erin at bob.
+> Night 1 begins, with seven living. Carol protects alice. Dave points
+> at alice and erin at bob. Grace investigates alice. The pack is split,
+> dave to alice and erin to bob. Grace learns that alice is Village.
+> Nobody dies.
 
-— because a reader who has watched the roles being dealt already knows
-who acts at night. Strike the four and the story is the same story,
-shorter. So are the tallies a session of one is sent: "grace investigates
-frank; the moderator tells grace that grace investigated frank."
+Each sentence is somebody learning something or doing something, and the
+reader who has watched the roles being dealt needs nothing else to follow
+it.
 
-The heuristic works because a narrative and a training signal want the
-same thing. A narrator writes what somebody learned or did, in the order
-it happened, and nothing else; that is exactly an observation, an action,
-and no bookkeeping.
+This is the quickest way to apply the rules below, because a narrative
+and a training signal want the same thing: what an agent learned, what it
+did, in the order it happened.
 
 ### 1. Every event to an agent informs it
 
