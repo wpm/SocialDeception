@@ -745,8 +745,10 @@ impl fmt::Display for Transcript {
         writeln!(f)?;
         let Round(rounds) = self.outcome.rounds;
         match self.outcome.winner {
-            Faction::Village => write!(f, "Village wins")?,
-            Faction::Werewolves => write!(f, "Werewolves win")?,
+            Some(Faction::Village) => write!(f, "Village wins")?,
+            Some(Faction::Werewolves) => write!(f, "Werewolves win")?,
+            // A game that reached the day cap without a winner.
+            None => write!(f, "Stalemate")?,
         }
         let plural = if rounds == 1 { "" } else { "s" };
         write!(f, " after {rounds} round{plural}.  Survivors: ")?;
@@ -934,7 +936,7 @@ mod tests {
                 expected_round_four(),
             ],
             outcome: Outcome {
-                winner: Faction::Werewolves,
+                winner: Some(Faction::Werewolves),
                 rounds: Round(4),
                 living: ids(["bob", "dave", "erin", "grace"]),
             },
@@ -1115,11 +1117,12 @@ mod tests {
             "every player is paid, and nobody else"
         );
         for (who, value) in &transcript.rewards {
-            let expected = if transcript.assignment[who].faction() == transcript.outcome.winner {
-                1
-            } else {
-                -1
-            };
+            let expected =
+                if transcript.outcome.winner == Some(transcript.assignment[who].faction()) {
+                    1
+                } else {
+                    -1
+                };
             assert_eq!(*value, expected, "{who}");
         }
         assert!(
@@ -1763,7 +1766,7 @@ mod tests {
             last.night.eliminated,
             Some((id("alice"), Villager, Cause::Devoured))
         );
-        assert_eq!(transcript.outcome.winner, Faction::Werewolves);
+        assert_eq!(transcript.outcome.winner, Some(Faction::Werewolves));
         let rendered = transcript.to_string();
         assert!(rendered.contains("Night 2  (3 living)\n"), "{rendered}");
         assert!(!rendered.contains("Day 2"), "{rendered}");

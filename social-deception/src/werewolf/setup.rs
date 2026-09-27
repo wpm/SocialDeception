@@ -288,7 +288,6 @@ mod tests {
     use crate::testing::{TempDir, fast, id, ids, parse_lines};
     use crate::werewolf::config::{DEFAULT_MODERATOR, RoleCounts};
     use crate::werewolf::message::Round;
-    use crate::werewolf::role::Faction;
     use crate::werewolf::transcript::{self, Transcript};
 
     const SEED: u64 = 20_260_918;
@@ -473,9 +472,12 @@ mod tests {
             }
         }
 
-        // A pack of one that never points devours nobody, so the village
-        // wins by lynching it.
+        // A pack of one that never points devours nobody, and three
+        // random players never put two on one target either, so nobody
+        // dies at all and the game runs to its day cap: a stalemate,
+        // which pays -1 to everyone (ADR-0011).
         let outcome = play(episode, &outcomes, writer, None).unwrap();
-        assert_eq!(outcome.winner, Faction::Village);
+        assert_eq!(outcome.winner, None);
+        assert_eq!(outcome.living.len(), 3, "nobody died");
     }
 }

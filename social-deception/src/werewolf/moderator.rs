@@ -547,7 +547,7 @@ mod tests {
             let expected: Vec<(AgentId, i32)> = assignment
                 .players()
                 .map(|(who, role)| {
-                    let value = if role.faction() == outcome.winner {
+                    let value = if outcome.winner == Some(role.faction()) {
                         1
                     } else {
                         -1
@@ -665,12 +665,12 @@ mod tests {
 
     #[test]
     fn the_stub_players_between_them_reach_every_terminal_state() {
-        let winners: Vec<Faction> = played_games()
+        let winners: Vec<Option<Faction>> = played_games()
             .iter()
             .map(|played| played.outcome.winner)
             .collect();
-        assert!(winners.contains(&Faction::Village), "{winners:?}");
-        assert!(winners.contains(&Faction::Werewolves), "{winners:?}");
+        assert!(winners.contains(&Some(Faction::Village)), "{winners:?}");
+        assert!(winners.contains(&Some(Faction::Werewolves)), "{winners:?}");
     }
 
     #[test]

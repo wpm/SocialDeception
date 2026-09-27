@@ -658,7 +658,8 @@ impl<'a> Play<'a> {
             Faction::Werewolves
         };
         assert_eq!(
-            outcome.winner, winner,
+            outcome.winner,
+            Some(winner),
             "the winner is what the parity rule says of the survivors: {outcome:?}"
         );
         assert!(
@@ -692,7 +693,7 @@ impl<'a> Play<'a> {
                 .unwrap_or_else(|| panic!("{who} has a reward"));
             assert_eq!(paid.len(), 1, "{who} has exactly one reward: {paid:?}");
             let line = paid[0];
-            let expected = if self.role(who).faction() == self.outcome.winner {
+            let expected = if self.outcome.winner == Some(self.role(who).faction()) {
                 1
             } else {
                 -1

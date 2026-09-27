@@ -70,10 +70,17 @@
 //!
 //! # Termination
 //!
-//! A day may now end without a lynch, so the living set no longer shrinks
-//! every round and nothing here bounds a game on its own. What bounds it is
-//! the day cap in the configuration's `[timing]` table, after which a game
-//! nobody has won ends as a stalemate.
+//! A day may end without a lynch, so the living set no longer shrinks every
+//! round and the rules of play do not bound a game on their own. What
+//! bounds it is the **day cap** in the configuration's `[timing]` table,
+//! which defaults to the number of players: a game nobody has won by the
+//! end of the cap's day ends as a **stalemate**, an [`Outcome`] with no
+//! winner. A game of n players therefore ends within its cap however its
+//! players act.
+//!
+//! A stalemate pays −1 to every player, living and dead, exactly as losing
+//! does ([`rewards`](Game::rewards)). Stalling can then never beat losing,
+//! and a side that is ahead has every reason to finish (ADR-0011).
 //!
 //! # Player bugs are panics
 //!
@@ -471,7 +478,14 @@ impl Game {
             self.assignment
                 .players()
                 .map(|(who, role)| {
-                    let value = if role.faction() == winner { 1 } else { -1 };
+                    // A stalemate pays -1 to everyone, the same as losing,
+                    // so that stalling can never beat losing and a side
+                    // that is ahead has every reason to finish (ADR-0011).
+                    let value = if winner == Some(role.faction()) {
+                        1
+                    } else {
+                        -1
+                    };
                     (who.clone(), value)
                 })
                 .collect(),
@@ -633,7 +647,7 @@ impl Game {
             directives.extend(self.advance(now));
         } else {
             directives.push(self.narrate_living(Narration::NoLynch { round: self.round }));
-            directives.extend(self.next_phase(now));
+            directives.extend(self.advance(now));
         }
         directives
     }
@@ -657,10 +671,23 @@ impl Game {
     /// After an elimination: the outcome if a side has won, and otherwise
     /// the next phase.
     fn advance(&mut self, now: Timestamp) -> Vec<Directive> {
-        match self.winner() {
-            Some(winner) => vec![self.end(winner)],
-            None => self.next_phase(now),
+        if let Some(winner) = self.winner() {
+            return vec![self.end(Some(winner))];
         }
+        // A game nobody has won by the end of the cap's day is a
+        // stalemate: it has run out of days, and going on would let a
+        // village that keeps running out the clock play forever
+        // (ADR-0011).
+        if self.phase == Phase::Day && self.round.0 >= self.day_cap() {
+            return vec![self.end(None)];
+        }
+        self.next_phase(now)
+    }
+
+    /// The day after which a game nobody has won is a stalemate: what the
+    /// configuration set, or the number of players.
+    fn day_cap(&self) -> u32 {
+        self.timing.day_cap(self.assignment.players().count())
     }
 
     /// Begins the phase after this one: the day of the same round, or the
@@ -702,7 +729,7 @@ impl Game {
     /// player's terminal reward signal; a reward is now logged rather than
     /// said (ADR-0007), so the exception is withdrawn and no message of
     /// this game goes to a player after the announcement of its own death.
-    fn end(&mut self, winner: Faction) -> Directive {
+    fn end(&mut self, winner: Option<Faction>) -> Directive {
         let outcome = Outcome {
             winner,
             rounds: self.round,
@@ -982,7 +1009,7 @@ mod tests {
         narrate(
             living,
             Narration::Outcome(Outcome {
-                winner,
+                winner: Some(winner),
                 rounds: Round(rounds),
                 living: ids(living),
             }),
@@ -1126,7 +1153,7 @@ mod tests {
         assert_eq!(
             game.outcome(),
             Some(&Outcome {
-                winner: Faction::Village,
+                winner: Some(Faction::Village),
                 rounds: Round(1),
                 living: ids(["carol", "dave", "erin"]),
             })
@@ -1192,7 +1219,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            game.outcome().map(|outcome| outcome.winner),
+            game.outcome().and_then(|outcome| outcome.winner),
             Some(Faction::Werewolves)
         );
     }
@@ -1211,7 +1238,16 @@ mod tests {
     /// The same, giving back the game itself, whatever else is wanted of
     /// it once it has ended.
     fn played(assignment: Assignment, seed: u64) -> (Game, Outcome, Vec<usize>) {
-        let mut game = Game::new(assignment, seed, fast());
+        played_with(assignment, seed, fast())
+    }
+
+    /// The same, under timing the caller chooses.
+    fn played_with(
+        assignment: Assignment,
+        seed: u64,
+        timing: Timing,
+    ) -> (Game, Outcome, Vec<usize>) {
+        let mut game = Game::new(assignment, seed, timing);
         let mut moves = ChaCha8Rng::seed_from_u64(seed);
         let mut clock = 0;
         let mut latest = game.begin(at(clock));
@@ -1265,7 +1301,7 @@ mod tests {
                 );
                 for (who, value) in &rewards {
                     let role = assignment.role(who).unwrap();
-                    let expected = if role.faction() == outcome.winner {
+                    let expected = if outcome.winner == Some(role.faction()) {
                         1
                     } else {
                         -1
@@ -1293,6 +1329,136 @@ mod tests {
         assert_eq!(game.rewards(), None, "a game not yet begun pays nobody");
         game.begin(at(0));
         assert_eq!(game.rewards(), None, "nor does one under way");
+    }
+
+    /// A game whose day cap is `cap`, for the stalemate tests.
+    fn capped(assignment: Assignment, cap: u32) -> Game {
+        let timing = Timing {
+            day_cap: Some(cap),
+            ..fast()
+        };
+        Game::new(assignment, SEED, timing)
+    }
+
+    #[test]
+    fn a_random_game_stalemates_only_when_the_cap_is_tight() {
+        // Where the cap actually bites. At its default of one day per
+        // player a seven-player random game always resolves first, so the
+        // rule costs a uniform baseline nothing; tighten the cap and
+        // stalemates appear, which is the guard working. Both halves
+        // matter: a cap that never fired would be untested, and one that
+        // fired at the default would be shaping the baseline's win rates.
+        let rate = |cap: u32| {
+            let timing = Timing {
+                day_cap: Some(cap),
+                ..fast()
+            };
+            (0..40)
+                .filter(|seed| {
+                    let (_, outcome, _) = played_with(town(), *seed, timing);
+                    outcome.winner.is_none()
+                })
+                .count()
+        };
+        assert_eq!(rate(7), 0, "the default cap never fires for seven players");
+        assert!(rate(3) > 0, "a tight cap does fire");
+    }
+
+    #[test]
+    fn a_game_that_reaches_its_day_cap_is_a_stalemate() {
+        // Nobody dies: the pack splits every night and the doctor is not
+        // needed, and every day scatters so no majority forms. On the
+        // cap's day the game ends with no winner (ADR-0011).
+        let mut game = capped(town(), 2);
+        let scattered = || {
+            answers(&[
+                ("alice", "bob"),
+                ("bob", "carol"),
+                ("carol", "dave"),
+                ("dave", "erin"),
+                ("erin", "frank"),
+                ("frank", "grace"),
+                ("grace", "alice"),
+            ])
+        };
+        // bob and frank are the pack, and they agree, so there is no
+        // tie-break and the doctor knows exactly whom to cover. A
+        // different victim each night, since the doctor may not protect
+        // the same player twice running.
+        let night = |victim: &'static str| {
+            answers(&[
+                ("bob", victim),
+                ("carol", "erin"),
+                ("dave", victim),
+                ("frank", victim),
+            ])
+        };
+        let directives = play(
+            &mut game,
+            &[night("alice"), scattered(), night("grace"), scattered()],
+        );
+
+        let outcome = game.outcome().expect("the cap ended the game");
+        assert_eq!(outcome.winner, None, "a stalemate has no winner");
+        assert_eq!(outcome.rounds, Round(2), "it ended on the cap's day");
+        assert_eq!(outcome.living.len(), 7, "nobody died");
+        assert!(
+            directives.contains(&narrate(
+                ["alice", "bob", "carol", "dave", "erin", "frank", "grace"],
+                Narration::Outcome(outcome.clone()),
+            )),
+            "the outcome is narrated to the living like a won game's"
+        );
+    }
+
+    #[test]
+    fn a_stalemate_pays_every_player_the_same_as_losing() {
+        // -1 to everyone, living and dead, so that stalling can never
+        // beat losing and a side that is ahead has a reason to finish.
+        let mut game = capped(town(), 1);
+        play(
+            &mut game,
+            &[
+                answers(&[
+                    ("bob", "alice"),
+                    ("carol", "erin"),
+                    ("dave", "alice"),
+                    ("frank", "grace"),
+                ]),
+                answers(&[
+                    ("alice", "bob"),
+                    ("bob", "carol"),
+                    ("carol", "dave"),
+                    ("dave", "erin"),
+                    ("erin", "frank"),
+                    ("frank", "grace"),
+                    ("grace", "alice"),
+                ]),
+            ],
+        );
+        assert_eq!(game.outcome().unwrap().winner, None);
+        for (who, value) in game.rewards().expect("the game ended") {
+            assert_eq!(value, -1, "{who} was not paid as a loser");
+        }
+    }
+
+    #[test]
+    fn a_game_won_on_the_caps_day_is_a_win_and_not_a_stalemate() {
+        // The cap ends a game nobody has won. A game won *on* that day
+        // was won, and the win is checked first.
+        let mut game = capped(village(), 1);
+        play(&mut game, &village_wins());
+        let outcome = game.outcome().expect("the game ended");
+        assert_eq!(outcome.winner, Some(Faction::Village));
+        assert_eq!(outcome.rounds, Round(1));
+        for (who, value) in game.rewards().unwrap() {
+            let expected = if game.role(&who).faction() == Faction::Village {
+                1
+            } else {
+                -1
+            };
+            assert_eq!(value, expected, "{who}");
+        }
     }
 
     #[test]
@@ -1384,7 +1550,7 @@ mod tests {
             let mut game = game(village());
             let directives = play(&mut game, reordered);
             assert_eq!(deaths(&directives), reference, "{reordered:?}");
-            assert_eq!(game.outcome().unwrap().winner, Faction::Village);
+            assert_eq!(game.outcome().unwrap().winner, Some(Faction::Village));
         }
     }
 

@@ -154,13 +154,18 @@ impl fmt::Display for Narration {
             } => write!(f, "Eliminated({who}, {role}, {cause})"),
             Self::NoDeath { round } => write!(f, "NoDeath(Night {})", round.0),
             Self::NoLynch { round } => write!(f, "NoLynch(Day {})", round.0),
-            Self::Outcome(outcome) => write!(
-                f,
-                "Outcome({} win after {} rounds; survivors: {})",
-                outcome.winner,
-                outcome.rounds.0,
-                listed(&outcome.living),
-            ),
+            Self::Outcome(outcome) => {
+                let ended = match outcome.winner {
+                    Some(winner) => format!("{winner} win"),
+                    None => "stalemate".to_owned(),
+                };
+                write!(
+                    f,
+                    "Outcome({ended} after {} rounds; survivors: {})",
+                    outcome.rounds.0,
+                    listed(&outcome.living),
+                )
+            }
         }
     }
 }
@@ -423,7 +428,7 @@ mod tests {
     fn an_outcome_names_the_winner_the_rounds_and_the_survivors() {
         assert_eq!(
             shown(Message::Narration(Narration::Outcome(Outcome {
-                winner: Faction::Werewolves,
+                winner: Some(Faction::Werewolves),
                 rounds: Round(2),
                 living: ids(["bob", "dave"]),
             }))),

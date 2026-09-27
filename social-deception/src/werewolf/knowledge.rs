@@ -366,7 +366,7 @@ mod tests {
             investigated("bob", Faction::Village),
             eliminated("bob", Role::Villager, 2, Cause::Devoured),
             narrated(Narration::Outcome(Outcome {
-                winner: Faction::Werewolves,
+                winner: Some(Faction::Werewolves),
                 rounds: Round(2),
                 living: ids([ME, "wolfgang"]),
             })),
@@ -403,7 +403,7 @@ mod tests {
                     votes: day_votes(),
                 }],
                 outcome: Some(Outcome {
-                    winner: Faction::Werewolves,
+                    winner: Some(Faction::Werewolves),
                     rounds: Round(2),
                     living: ids([ME, "wolfgang"]),
                 }),

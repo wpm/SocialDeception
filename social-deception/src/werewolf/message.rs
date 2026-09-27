@@ -140,9 +140,13 @@ pub enum Cause {
 /// How a game ended. The one narration addressed to every player.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Outcome {
-    /// The winning side. Every game has one: a day always eliminates
-    /// someone, so no game can run out of rounds undecided.
-    pub winner: Faction,
+    /// The winning side, or `None` for a **stalemate**: a game that
+    /// reached the day cap with nobody having won (ADR-0011).
+    ///
+    /// A day may end without a lynch, so a doctor who keeps saving and a
+    /// village that keeps running out the clock could otherwise go on
+    /// forever. A game has a winner unless it reaches the cap.
+    pub winner: Option<Faction>,
     /// The round the game ended in.
     pub rounds: Round,
     /// Everyone still in the game at the end.
@@ -276,7 +280,7 @@ mod tests {
             ),
             (
                 Narration::Outcome(Outcome {
-                    winner: Faction::Werewolves,
+                    winner: Some(Faction::Werewolves),
                     rounds: Round(3),
                     living: ["wanda"].map(AgentId::new).into(),
                 }),

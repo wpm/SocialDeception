@@ -175,7 +175,7 @@ fn three_players_with_one_werewolf_is_the_smallest_game() {
     // The werewolf devours one of the other two on the first night, and
     // with no doctor to save them that is parity, whatever the seed.
     let transcript = run(&config(&["alice", "bob", "carol"], 1, 0, 0, SEED));
-    assert_eq!(transcript.outcome.winner, Faction::Werewolves);
+    assert_eq!(transcript.outcome.winner, Some(Faction::Werewolves));
     assert_eq!(transcript.rounds.len(), 1);
 }
 
@@ -194,7 +194,10 @@ fn a_game_without_a_seer_or_a_doctor_or_either() {
 fn the_seeds_hold_a_save_and_a_win_for_each_side() {
     // None of these can be arranged by choosing the roles, so search the
     // seeds for them rather than contrive them, and stop once all three
-    // have turned up. Every game searched goes through the full invariant
+    // have turned up. A stalemate is not among them: at the default cap
+    // of one day per player a seven-player random game always resolves
+    // first, which 400 seeds confirm. Where the cap does bite is a unit
+    // test of its own, `a_random_game_stalemates_only_when_the_cap_is_tight`. Every game searched goes through the full invariant
     // suite on the way, which is where "the doctor is working" is actually
     // asserted: a quiet night is one on which it protected the pack's
     // choice. Here it need only happen.
@@ -207,7 +210,10 @@ fn the_seeds_hold_a_save_and_a_win_for_each_side() {
             .iter()
             .any(|round| round.night.eliminated.is_none());
         winners.push(transcript.outcome.winner);
-        if saved && winners.contains(&Faction::Village) && winners.contains(&Faction::Werewolves) {
+        if saved
+            && winners.contains(&Some(Faction::Village))
+            && winners.contains(&Some(Faction::Werewolves))
+        {
             return;
         }
     }
@@ -290,7 +296,10 @@ fn a_run_is_reproduced_from_its_artifacts() {
     let transcript = read(&original, &effective);
     let winner = transcript.outcome.winner;
     assert!(
-        played.starts_with(&format!("seed: {SEED}\nwinner: {winner}\n")),
+        played.starts_with(&format!(
+            "seed: {SEED}\nwinner: {}\n",
+            winner.expect("a random game has a winner")
+        )),
         "{played}"
     );
     assert!(played.contains(&format!("effective config: {}\n", effective_path.display())));
@@ -428,6 +437,6 @@ fn a_watcher_who_stops_reading_still_leaves_a_whole_trajectory() {
     // (ADR-0011).
     let effective = config::load(config::effective_path(&trajectory)).unwrap();
     let transcript = read(&trajectory, &effective);
-    assert_eq!(transcript.outcome.winner, Faction::Werewolves);
+    assert_eq!(transcript.outcome.winner, Some(Faction::Werewolves));
     assert_eq!(transcript.rounds.len(), 4);
 }

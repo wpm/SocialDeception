@@ -195,7 +195,10 @@ impl fmt::Display for Played {
     /// The effective seed, how the game ended, and what was written.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "seed: {}", self.config.seed)?;
-        writeln!(f, "winner: {}", self.outcome.winner)?;
+        match self.outcome.winner {
+            Some(winner) => writeln!(f, "winner: {winner}")?,
+            None => writeln!(f, "winner: none (stalemate)")?,
+        }
         writeln!(f, "rounds: {}", self.outcome.rounds.0)?;
         let survivors: Vec<&str> = self.outcome.living.iter().map(AgentId::as_str).collect();
         writeln!(f, "survivors: {}", survivors.join(", "))?;
