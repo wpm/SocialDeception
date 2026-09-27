@@ -39,7 +39,7 @@
 use std::error;
 use std::fmt;
 use std::fs::File;
-use std::io::{self, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
@@ -57,7 +57,7 @@ use super::roles::{Doctor, Seer, Villager, Werewolf};
 use crate::agent::Handler;
 use crate::episode::{Episode, EpisodeError};
 use crate::event::AgentId;
-use crate::trajectory::{LogRecord, Writer};
+use crate::trajectory::{JsonLines, LogRecord, Policy, Sink, Writer};
 
 /// Why a run did not end with an outcome.
 #[derive(Debug)]
@@ -199,9 +199,10 @@ fn add(
 
 /// Runs one episode to completion and returns how it ended.
 ///
-/// The trajectory is written to `config.trajectory` if it is set. Otherwise
-/// it goes nowhere, by the same path: an episode with no trajectory
-/// exercises everything one with a trajectory does.
+/// The trajectory is written to `config.trajectory` if it is set, by a
+/// required [`JsonLines`] sink. Otherwise the writer has no sinks at all
+/// and discards what it receives: an episode with no trajectory exercises
+/// everything one with a trajectory does.
 ///
 /// The configuration is taken as given. Any overrides the command line
 /// applies are applied to it before it gets here.
@@ -220,14 +221,15 @@ fn add(
 /// [`episode`].
 pub fn run(config: &Config) -> Result<Outcome, RunError> {
     let trajectory = config.trajectory.as_deref();
-    let sink: Box<dyn Write + Send> = match trajectory {
-        Some(path) => Box::new(File::create(path).map_err(|source| RunError::Io {
+    let mut sinks: Vec<(Box<dyn Sink<WerewolfDomain>>, Policy)> = Vec::new();
+    if let Some(path) = trajectory {
+        let file = File::create(path).map_err(|source| RunError::Io {
             trajectory: Some(path.to_path_buf()),
             source,
-        })?),
-        None => Box::new(io::sink()),
-    };
-    let (records, writer) = Writer::spawn(sink);
+        })?;
+        sinks.push((Box::new(JsonLines::new(file)), Policy::Required));
+    }
+    let (records, writer) = Writer::spawn(sinks);
     let (episode, outcomes) = episode(config, records);
     play(episode, &outcomes, writer, trajectory)
 }
@@ -235,10 +237,10 @@ pub fn run(config: &Config) -> Result<Outcome, RunError> {
 /// Runs an assembled episode, joins its writer, which is writing the
 /// trajectory to `trajectory` if anywhere, and takes the outcome off the
 /// moderator's channel.
-fn play<W: Write + Send + 'static>(
+fn play(
     episode: Episode<WerewolfDomain>,
     outcomes: &Receiver<Outcome>,
-    writer: Writer<W>,
+    writer: Writer,
     trajectory: Option<&Path>,
 ) -> Result<Outcome, RunError> {
     let ran = episode.run();
@@ -328,7 +330,7 @@ mod tests {
 
     #[test]
     fn the_roster_is_every_player_and_the_moderator() {
-        let (records, _writer) = Writer::spawn(io::sink());
+        let (records, _writer) = Writer::spawn(Vec::new());
         let (episode, _outcomes) = episode(&town(), records);
         let roster: BTreeSet<AgentId> = episode.ids().cloned().collect();
         assert_eq!(
@@ -438,7 +440,7 @@ mod tests {
         let config = config(["alice", "bob", "carol"], 1, 0, 0);
         let assignment = Assignment::deal(&config);
         let silent = assignment.pack().iter().next().unwrap().clone();
-        let (records, writer) = Writer::spawn(io::sink());
+        let (records, writer) = Writer::spawn(Vec::new());
         let (mut episode, outcomes) = moderate(&config, assignment.clone(), records);
         for (who, role) in assignment.players() {
             if *who == silent {

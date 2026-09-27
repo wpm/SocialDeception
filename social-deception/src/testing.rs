@@ -4,13 +4,17 @@
 mod temp;
 
 use std::collections::BTreeSet;
+use std::io::{self, Write};
+use std::sync::{Arc, Mutex};
 
+use crossbeam_channel::Sender;
 use serde::Serialize;
 use serde_json::Value;
 
 use crate::agent::Observation;
 use crate::clock::Timestamp;
 use crate::event::{AgentId, Domain, Event};
+use crate::trajectory::{JsonLines, LogRecord, Policy, Sink, Writer};
 use crate::werewolf::{
     Assignment, Faction, Knowledge, Message, Move, Narration, Phase, Request, RequestId,
     RequestKind, Role, Round, WerewolfDomain,
@@ -37,6 +41,66 @@ pub(crate) struct TestDomain;
 impl Domain for TestDomain {
     type Payload = TestPayload;
     type Reward = i32;
+}
+
+/// A destination a test can read back after the writer has taken ownership
+/// of it.
+///
+/// A sink owns its destination and the writer owns its sinks, so the bytes
+/// a sink wrote are not handed back at the end. A test that wants them
+/// keeps this, which is a [`Write`] whose bytes are shared, and reads
+/// [`Shared::bytes`] once the writer has been joined.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Shared(Arc<Mutex<Vec<u8>>>);
+
+impl Shared {
+    /// An empty buffer.
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Everything written to it so far.
+    ///
+    /// # Panics
+    ///
+    /// If a writer thread panicked while holding the lock.
+    pub(crate) fn bytes(&self) -> Vec<u8> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+impl Write for Shared {
+    /// # Panics
+    ///
+    /// If a writer thread panicked while holding the lock.
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A writer whose one required [`JsonLines`] sink writes to a buffer the
+/// test keeps, which is what a test that reads its trajectory back wants.
+pub(crate) fn recording<D: Domain>() -> (Sender<LogRecord<D>>, Writer, Shared) {
+    let bytes = Shared::new();
+    let sink: Box<dyn Sink<D>> = Box::new(JsonLines::new(bytes.clone()));
+    let (sender, writer) = Writer::spawn(vec![(sink, Policy::Required)]);
+    (sender, writer, bytes)
+}
+
+/// Joins `writer` and gives back everything its [`JsonLines`] sink wrote
+/// to `bytes`.
+///
+/// # Panics
+///
+/// If the writer failed or its thread panicked.
+pub(crate) fn joined(writer: Writer, bytes: &Shared) -> Vec<u8> {
+    writer.join().unwrap();
+    bytes.bytes()
 }
 
 /// Parses a trajectory file into one JSON value per line.

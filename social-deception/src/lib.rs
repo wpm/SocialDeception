@@ -37,7 +37,7 @@
 //!   and [`Control`] that travel on the wire, and the [`Delivery`] that
 //!   carries either of them to an agent;
 //! - [`trajectory`]: the records an agent's loop produces and the [`Writer`]
-//!   that puts them on disk;
+//!   that hands each one to every [`Sink`] it was given;
 //! - [`timer`]: the [`TimerSource`] an agent's deadlines come from;
 //! - [`agent`]: the [`Agent`] thread that pops its queue, folds the
 //!   [`Observation`] it took through a [`Handler`], and records what it saw
@@ -84,6 +84,6 @@ pub use event::{AgentId, Control, Delivery, Domain, Event, Payload};
 pub use router::{Queues, RouteError, Router};
 pub use timer::{ManualTimer, ManualTimerControl, TimerSource};
 pub use trajectory::{
-    ActionRecord, ControlRecord, CycleRecord, LogRecord, ObservationRecord, RewardRecord, Seq,
-    Woken, Writer,
+    ActionRecord, ControlRecord, CycleRecord, JsonLines, LogRecord, ObservationRecord, Policy,
+    RewardRecord, Seq, Sink, Woken, Writer,
 };
