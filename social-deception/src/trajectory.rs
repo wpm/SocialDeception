@@ -709,7 +709,7 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
-    use crate::testing::{TestDomain, TestPayload, joined, parse_lines, recording};
+    use crate::testing::{Shared, TestDomain, TestPayload, joined, parse_lines, recording};
 
     fn at(nanos: u64) -> Timestamp {
         Timestamp::from(Duration::from_nanos(nanos))
@@ -1054,6 +1054,54 @@ mod tests {
             sender.send(late).is_err(),
             "sends after a write failure must fail"
         );
+    }
+
+    /// A destination whose `flush` refuses, and which counts the flushes it
+    /// was asked for. Writes succeed, so nothing fails before `finish`.
+    #[derive(Debug, Clone, Default)]
+    struct UnflushableSink(Arc<Mutex<usize>>);
+
+    impl Write for UnflushableSink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            *self.0.lock().unwrap() += 1;
+            Err(io::Error::new(io::ErrorKind::StorageFull, "no room"))
+        }
+    }
+
+    #[test]
+    fn json_lines_holds_a_record_in_its_buffer_until_it_is_finished() {
+        // Called directly, without a writer: `JsonLines` buffers, so a
+        // record small enough to fit is nowhere yet, and `finish` is what
+        // puts it on the destination. This is why `finish` is not the
+        // trait's default no-op.
+        let bytes = Shared::new();
+        let mut sink = JsonLines::new(bytes.clone());
+        let record = &sample()[0];
+        Sink::<TestDomain>::record(&mut sink, record).unwrap();
+        assert!(
+            bytes.bytes().is_empty(),
+            "a buffered record must not be on the destination yet"
+        );
+
+        Sink::<TestDomain>::finish(&mut sink).unwrap();
+        assert_eq!(parse_lines(&bytes.bytes()), expected_lines()[..1]);
+    }
+
+    #[test]
+    fn a_flush_that_fails_is_reported_by_finish() {
+        // `BufWriter`'s own `Drop` flushes and discards the error, so a
+        // trajectory could be truncated in silence. `finish` is the call
+        // that gets to report it, and it must.
+        let destination = UnflushableSink::default();
+        let mut sink = JsonLines::new(destination.clone());
+        Sink::<TestDomain>::record(&mut sink, &sample()[0]).unwrap();
+        let error = Sink::<TestDomain>::finish(&mut sink).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::StorageFull);
+        assert_eq!(*destination.0.lock().unwrap(), 1, "finish flushed once");
     }
 
     #[test]
