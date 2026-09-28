@@ -765,14 +765,14 @@ impl fmt::Display for Transcript {
         });
         columns(f, roster)?;
         for round in &self.rounds {
-            let Round(number) = round.round;
+            let number = round.round.number();
             phase(f, &format!("Night {number}"), &round.night, width)?;
             if let Some(day) = &round.day {
                 phase(f, &format!("Day {number}"), day, width)?;
             }
         }
         writeln!(f)?;
-        let Round(rounds) = self.outcome.rounds;
+        let rounds = self.outcome.rounds.number();
         match self.outcome.winner {
             Some(Faction::Village) => write!(f, "Village wins")?,
             Some(Faction::Werewolves) => write!(f, "Werewolves win")?,
@@ -966,7 +966,7 @@ mod tests {
             ],
             outcome: Outcome {
                 winner: Some(Faction::Werewolves),
-                rounds: Round(4),
+                rounds: Round::new(4),
                 living: ids(["bob", "dave", "erin", "grace"]),
             },
             // The werewolves dave and erin won; everybody else, living or
@@ -996,7 +996,7 @@ mod tests {
     fn expected_round_one() -> RoundRecord {
         use RequestKind::{Devour, Investigate, Protect};
         RoundRecord {
-            round: Round(1),
+            round: Round::new(1),
             night: phase(
                 EVERYONE,
                 moves([
@@ -1031,7 +1031,7 @@ mod tests {
         use Cause::Devoured;
         use RequestKind::{Devour, Investigate, Protect};
         RoundRecord {
-            round: Round(2),
+            round: Round::new(2),
             night: phase(
                 EVERYONE,
                 moves([
@@ -1065,7 +1065,7 @@ mod tests {
         use Cause::Devoured;
         use RequestKind::{Devour, Investigate};
         RoundRecord {
-            round: Round(3),
+            round: Round::new(3),
             night: phase(
                 ["alice", "bob", "dave", "erin", "frank", "grace"],
                 moves([
@@ -1098,7 +1098,7 @@ mod tests {
         use Cause::Devoured;
         use RequestKind::{Devour, Investigate};
         RoundRecord {
-            round: Round(4),
+            round: Round::new(4),
             night: phase(
                 ["alice", "bob", "dave", "erin", "grace"],
                 moves([

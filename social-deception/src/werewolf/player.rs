@@ -267,7 +267,7 @@ mod tests {
         narrated(Narration::Eliminated {
             who: id(who),
             role: Role::Villager,
-            round: Round(round),
+            round: Round::new(round),
             cause: Cause::Devoured,
         })
     }
@@ -290,7 +290,7 @@ mod tests {
         Action::to(
             [AgentId::new(MODERATOR)],
             Message::Point(Point {
-                round: Round(round),
+                round: Round::new(round),
                 kind,
                 target,
                 seen_by: seen_by.iter().map(|who| AgentId::new(*who)).collect(),

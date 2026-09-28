@@ -199,7 +199,7 @@ impl fmt::Display for Played {
             Some(winner) => writeln!(f, "winner: {winner}")?,
             None => writeln!(f, "winner: none (stalemate)")?,
         }
-        writeln!(f, "rounds: {}", self.outcome.rounds.0)?;
+        writeln!(f, "rounds: {}", self.outcome.rounds.number())?;
         let survivors: Vec<&str> = self.outcome.living.iter().map(AgentId::as_str).collect();
         writeln!(f, "survivors: {}", survivors.join(", "))?;
         match &self.config.trajectory {

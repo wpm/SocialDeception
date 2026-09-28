@@ -555,7 +555,7 @@ mod tests {
                 narrate(
                     everyone,
                     Narration::PhaseBegan {
-                        round: Round(1),
+                        round: Round::new(1),
                         phase: Phase::Night,
                         living: ids(everyone),
                     }
@@ -819,7 +819,12 @@ mod tests {
         let (mut moderator, _receiver) = moderator(village());
         play(&mut moderator, first_other, &village());
         assert!(moderator.game.outcome().is_some());
-        let late = response(&id("carol"), Round(1), RequestKind::Nominate, id("bob"));
+        let late = response(
+            &id("carol"),
+            Round::new(1),
+            RequestKind::Nominate,
+            id("bob"),
+        );
         assert_eq!(moderator.handle(&late), []);
     }
 
@@ -867,7 +872,9 @@ mod tests {
         moderator.start(Timestamp::default());
         moderator.handle(&from_player(
             "erin",
-            Message::Narration(Narration::NoDeath { round: Round(1) }),
+            Message::Narration(Narration::NoDeath {
+                round: Round::new(1),
+            }),
         ));
     }
 

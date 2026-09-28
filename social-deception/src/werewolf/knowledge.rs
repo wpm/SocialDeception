@@ -322,14 +322,14 @@ mod tests {
         narrated(Narration::Eliminated {
             who: id(who),
             role,
-            round: Round(round),
+            round: Round::new(round),
             cause,
         })
     }
 
     fn death(round: u32, cause: Cause, role: Role) -> Death {
         Death {
-            round: Round(round),
+            round: Round::new(round),
             cause,
             role,
         }
@@ -363,7 +363,7 @@ mod tests {
         from(
             who,
             Message::Point(Point {
-                round: Round(round),
+                round: Round::new(round),
                 kind: RequestKind::Nominate,
                 target: id(whom),
                 seen_by: BTreeSet::new(),
@@ -392,7 +392,7 @@ mod tests {
             eliminated("bob", Role::Villager, 2, Cause::Devoured),
             narrated(Narration::Outcome(Outcome {
                 winner: Some(Faction::Werewolves),
-                rounds: Round(2),
+                rounds: Round::new(2),
                 living: ids([ME, "wolfgang"]),
             })),
         ]
@@ -406,7 +406,7 @@ mod tests {
             Knowledge {
                 me: id(ME),
                 role: Role::Seer,
-                moment: Some((Round(2), Phase::Night)),
+                moment: Some((Round::new(2), Phase::Night)),
                 living: ids([ME, "wolfgang"]),
                 dead: BTreeMap::from([
                     (id("alice"), death(1, Cause::Devoured, Role::Villager)),
@@ -424,19 +424,19 @@ mod tests {
                 points: BTreeMap::new(),
                 history: vec![
                     Phased {
-                        round: Round(1),
+                        round: Round::new(1),
                         phase: Phase::Night,
                         points: BTreeMap::new(),
                     },
                     Phased {
-                        round: Round(1),
+                        round: Round::new(1),
                         phase: Phase::Day,
                         points: day_points(),
                     },
                 ],
                 outcome: Some(Outcome {
                     winner: Some(Faction::Werewolves),
-                    rounds: Round(2),
+                    rounds: Round::new(2),
                     living: ids([ME, "wolfgang"]),
                 }),
             }
@@ -454,7 +454,7 @@ mod tests {
             Phase::Night,
             ids(["alice", "bob", "carol", ME]),
         )));
-        assert_eq!(knowledge.moment, Some((Round(1), Phase::Night)));
+        assert_eq!(knowledge.moment, Some((Round::new(1), Phase::Night)));
         assert_eq!(knowledge.living, ids(["alice", "bob", "carol", ME]));
 
         knowledge.observe(&observed(eliminated(
@@ -479,7 +479,7 @@ mod tests {
         // preceded it.
         knowledge.observe(&observed(phase_began(2, Phase::Night, ids(["bob", ME]))));
         assert_eq!(knowledge.living, ids(["bob", ME]));
-        assert_eq!(knowledge.moment, Some((Round(2), Phase::Night)));
+        assert_eq!(knowledge.moment, Some((Round::new(2), Phase::Night)));
     }
 
     #[test]
@@ -533,7 +533,9 @@ mod tests {
         // A control is not among these: the loop acts on controls and a
         // handler, and so this fold, never sees one.
         let knowledge = folded(Role::Seer, &a_seers_game()[..8]);
-        let no_ops = [narrated(Narration::NoDeath { round: Round(2) })];
+        let no_ops = [narrated(Narration::NoDeath {
+            round: Round::new(2),
+        })];
         for event in &no_ops {
             let mut after = knowledge.clone();
             after.observe(&observed(event.clone()));
@@ -563,7 +565,7 @@ mod tests {
             from(
                 who,
                 Message::Point(Point {
-                    round: Round(1),
+                    round: Round::new(1),
                     kind: RequestKind::Nominate,
                     target: id(target),
                     seen_by: BTreeSet::new(),
@@ -683,7 +685,9 @@ mod tests {
                 ids(["alice", "bob", ME]),
             )));
             knowledge.acted(RequestKind::Protect, &target("alice"));
-            knowledge.observe(&observed(narrated(Narration::NoDeath { round: Round(1) })));
+            knowledge.observe(&observed(narrated(Narration::NoDeath {
+                round: Round::new(1),
+            })));
         };
         let mut first = Knowledge::new(id(ME), Role::Doctor);
         let mut second = Knowledge::new(id(ME), Role::Doctor);
@@ -736,7 +740,7 @@ mod tests {
         knowledge.observe(&observed(nominated("bob", "alice", 2)));
         knowledge.observe(&observed(narrated(Narration::Outcome(Outcome {
             winner: Some(Faction::Village),
-            rounds: Round(2),
+            rounds: Round::new(2),
             living: ids(["alice", ME]),
         }))));
 
@@ -744,12 +748,12 @@ mod tests {
             knowledge.history,
             [
                 Phased {
-                    round: Round(1),
+                    round: Round::new(1),
                     phase: Phase::Day,
                     points: votes([("alice", target("bob")), (ME, target("alice"))]),
                 },
                 Phased {
-                    round: Round(2),
+                    round: Round::new(2),
                     phase: Phase::Night,
                     points: BTreeMap::new(),
                 },

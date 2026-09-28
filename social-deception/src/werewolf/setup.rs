@@ -287,7 +287,6 @@ mod tests {
     use crate::agent::{Action, Observation};
     use crate::testing::{TempDir, fast, id, ids, parse_lines};
     use crate::werewolf::config::{DEFAULT_MODERATOR, RoleCounts};
-    use crate::werewolf::message::Round;
     use crate::werewolf::transcript::{self, Transcript};
 
     const SEED: u64 = 20_260_918;
@@ -336,9 +335,10 @@ mod tests {
     /// decided within as many rounds as there are players.
     fn check(config: &Config, outcome: &Outcome) {
         let players: BTreeSet<&AgentId> = config.players.iter().collect();
-        assert!(outcome.rounds >= Round(1), "{outcome:?}");
+        // No lower bound to check: a `Round` cannot be zero, so that a
+        // finished game lasted at least one round is the type's guarantee.
         assert!(
-            outcome.rounds.0 as usize <= config.players.len(),
+            outcome.rounds.number() as usize <= config.players.len(),
             "{outcome:?}"
         );
         assert!(!outcome.living.is_empty(), "{outcome:?}");
