@@ -531,6 +531,7 @@ mod tests {
                     round: Round(1),
                     kind: RequestKind::Nominate,
                     target: id(target),
+                    seen_by: BTreeSet::new(),
                 }),
             )
         };

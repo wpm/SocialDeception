@@ -181,6 +181,12 @@ impl RequestKind {
 /// it likes; its most recent point is its vote (ADR-0011). Pointing nowhere
 /// is how a member abstains, and it is the absence of a point rather than a
 /// message, which is why there is no move that means "nobody".
+///
+/// A point is addressed to the moderator and to nobody else. The other
+/// players who should see it are named in `seen_by`, and the moderator
+/// forwards it to them if the session it names is still open. A player
+/// never sends another player anything directly, so there is no path by
+/// which a point can outlive its session in somebody else's queue.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Point {
     /// The round the session belongs to.
@@ -189,6 +195,16 @@ pub struct Point {
     pub kind: RequestKind,
     /// The player pointed at.
     pub target: AgentId,
+    /// The other players who should see this point, for the moderator to
+    /// forward it to.
+    ///
+    /// Empty for a point that is nobody else's business: the seer's
+    /// investigation and the doctor's protection are between that player
+    /// and the moderator. A `Devour` names the rest of the pack and a
+    /// `Nominate` the rest of the living, and in neither case does it name
+    /// the sender or the moderator.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub seen_by: BTreeSet<AgentId>,
 }
 
 #[cfg(test)]
@@ -281,6 +297,7 @@ mod tests {
                 round: Round(1),
                 kind: RequestKind::Devour,
                 target: AgentId::new("alice"),
+                seen_by: BTreeSet::new(),
             }),
             json!({"Point": {"round": 1, "kind": "Devour", "target": "alice"}}),
         ));
@@ -338,6 +355,7 @@ mod tests {
                 round: Round(3),
                 kind: RequestKind::Nominate,
                 target: AgentId::new("alice"),
+                seen_by: BTreeSet::new(),
             }),
             json!({"round": 3, "kind": "Nominate", "target": "alice"})
         );

@@ -319,10 +319,11 @@ impl Received for Instruction {
 
 /// What an agent sends: to whom, and what.
 ///
-/// No sender and no creation time. An action has no creation time until it
-/// is sent, and the handler cannot know that instant, so the loop stamps
-/// both as it hands the action to the router; the stamped value is the
-/// [`Event`] on the wire and what the `action` record logs.
+/// No sender and no creation time, unless the action is a relay. An action
+/// has no creation time until it is sent, and the handler cannot know that
+/// instant, so the loop stamps both as it hands the action to the router;
+/// the stamped value is the [`Event`] on the wire and what the `action`
+/// record logs.
 /// `Debug`, `Clone` and equality are written out for the same reason
 /// [`Event`]'s are.
 pub struct Action<D: Domain> {
@@ -330,6 +331,29 @@ pub struct Action<D: Domain> {
     pub recipients: Recipients,
     /// What to say.
     pub payload: D::Payload,
+    /// Who really said it, and when, when this action is one agent
+    /// passing on another's.
+    ///
+    /// `None` for the ordinary case: the action is the sender's own and
+    /// the loop stamps it with the sender's own name and clock. `Some` is
+    /// a **relay**, and the stamp keeps what is here instead, so the
+    /// recipient sees the event the original actor would have sent it
+    /// directly. See [`Action::relay`].
+    pub origin: Option<Origin>,
+}
+
+/// Who first sent a relayed action, and when.
+///
+/// An agent that passes on another's action does not put its own name on
+/// it. The pair here is what [`Event::sender`] and [`Event::created`]
+/// become, so a relayed event is indistinguishable from a direct one and
+/// the relay shows up only as the extra latency it costs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Origin {
+    /// The agent whose action this is.
+    pub sender: AgentId,
+    /// The instant that agent created it.
+    pub created: Timestamp,
 }
 
 impl<D: Domain> Action<D> {
@@ -342,6 +366,7 @@ impl<D: Domain> Action<D> {
         Self {
             recipients: Recipients::To(recipients.into_iter().map(Into::into).collect()),
             payload,
+            origin: None,
         }
     }
 
@@ -350,6 +375,40 @@ impl<D: Domain> Action<D> {
         Self {
             recipients: Recipients::Broadcast,
             payload,
+            origin: None,
+        }
+    }
+
+    /// One agent passing on another's action, addressed to `recipients`.
+    ///
+    /// The event the recipients observe names `sender` and is stamped
+    /// `created`, not the relaying agent and not the instant of the relay.
+    /// What a recipient sees is therefore exactly what it would have seen
+    /// had the original actor addressed it directly; the only trace of the
+    /// relay is that the event arrives later than it was created.
+    ///
+    /// The relaying agent's own numbering is untouched: the strictly
+    /// increasing stamp [`Handler`] actions get is per sender, and this
+    /// action is not the relaying agent's to number. Two actions are told
+    /// apart by their sender and creation time (ADR-0002), and both of
+    /// those belong to the original actor here.
+    pub fn relay<I, A>(
+        sender: impl Into<AgentId>,
+        created: Timestamp,
+        recipients: I,
+        payload: D::Payload,
+    ) -> Self
+    where
+        I: IntoIterator<Item = A>,
+        A: Into<AgentId>,
+    {
+        Self {
+            recipients: Recipients::To(recipients.into_iter().map(Into::into).collect()),
+            payload,
+            origin: Some(Origin {
+                sender: sender.into(),
+                created,
+            }),
         }
     }
 }
@@ -362,6 +421,7 @@ where
         f.debug_struct("Action")
             .field("recipients", &self.recipients)
             .field("payload", &self.payload)
+            .field("origin", &self.origin)
             .finish()
     }
 }
@@ -371,6 +431,7 @@ impl<D: Domain> Clone for Action<D> {
         Self {
             recipients: self.recipients.clone(),
             payload: self.payload.clone(),
+            origin: self.origin.clone(),
         }
     }
 }
@@ -380,7 +441,9 @@ where
     D::Payload: PartialEq,
 {
     fn eq(&self, other: &Self) -> bool {
-        self.recipients == other.recipients && self.payload == other.payload
+        self.recipients == other.recipients
+            && self.payload == other.payload
+            && self.origin == other.origin
     }
 }
 
@@ -1073,11 +1136,33 @@ where
     /// few hundred nanoseconds of each other, which the clock's resolution
     /// does not always separate, and two cycles can run that close together
     /// too, so the guarantee is the agent's and not one cycle's.
+    ///
+    /// # A relay is stamped with whose action it is
+    ///
+    /// An action carrying an [`Origin`] is one agent passing on another's,
+    /// and it keeps the original sender and creation time
+    /// ([`Action::relay`]). This agent's own numbering is left alone: the
+    /// increasing-stamp guarantee is per sender, and a relayed action is
+    /// not this agent's to number. Advancing `last_created` for one would
+    /// push this agent's next real action past an instant it never used.
     fn stamp(&mut self, action: Action<D>) -> Event<D> {
         let Action {
             recipients,
             payload,
+            origin,
         } = action;
+        let recipients = match recipients {
+            Recipients::Broadcast => self.wiring.peers.clone(),
+            Recipients::To(recipients) => recipients,
+        };
+        if let Some(Origin { sender, created }) = origin {
+            return Event {
+                sender,
+                recipients,
+                created,
+                payload,
+            };
+        }
         let now = self.wiring.clock.now();
         let created = match self.last_created {
             Some(previous) if now <= previous => previous + Duration::from_nanos(1),
@@ -1086,10 +1171,7 @@ where
         self.last_created = Some(created);
         Event {
             sender: self.wiring.id.clone(),
-            recipients: match recipients {
-                Recipients::Broadcast => self.wiring.peers.clone(),
-                Recipients::To(recipients) => recipients,
-            },
+            recipients,
             created,
             payload,
         }
@@ -1357,6 +1439,41 @@ mod tests {
 
         fn handle(&mut self, _: &Observation<TestDomain>) -> Vec<Action<TestDomain>> {
             Vec::new()
+        }
+    }
+
+    /// Passes on whatever it observes, to `to`, as the agent that sent it.
+    ///
+    /// The stand-in for an environment that relays one agent's action to
+    /// another: what it emits is not its own action but somebody else's,
+    /// carried on.
+    struct Relays(&'static str);
+
+    impl Handler<TestDomain> for Relays {
+        fn handle(&mut self, observation: &Observation<TestDomain>) -> Vec<Action<TestDomain>> {
+            vec![Action::relay(
+                observation.event.sender.clone(),
+                observation.event.created,
+                [self.0],
+                observation.event.payload.clone(),
+            )]
+        }
+    }
+
+    /// Relays what it observes to `to`, then says something of its own.
+    struct RelaysThenSpeaks(&'static str);
+
+    impl Handler<TestDomain> for RelaysThenSpeaks {
+        fn handle(&mut self, observation: &Observation<TestDomain>) -> Vec<Action<TestDomain>> {
+            vec![
+                Action::relay(
+                    observation.event.sender.clone(),
+                    observation.event.created,
+                    [self.0],
+                    observation.event.payload.clone(),
+                ),
+                Action::to([self.0], TestPayload::Step(42)),
+            ]
         }
     }
 
@@ -2119,6 +2236,56 @@ mod tests {
             [LogRecord::Observation(_), LogRecord::Action(_)]
         ));
         assert_eq!((cycle.inputs, cycle.outputs), (vec![Seq(1)], vec![Seq(2)]));
+        rig.stop();
+        rig.agent.join().unwrap();
+    }
+
+    #[test]
+    fn a_relayed_action_keeps_the_original_sender_and_creation_time() {
+        // What `c` observes must be indistinguishable from what `b` would
+        // have sent it directly: the relay costs latency and shows up
+        // nowhere else.
+        let rig = rig(Relays("c"), None);
+        rig.start();
+        rig.cycle();
+        rig.dispatch();
+        rig.send(step_at("b", 1, at(7)));
+        let dispatch = rig.dispatch();
+        assert_eq!(dispatch.sent.len(), 1);
+        let sent = &dispatch.sent[0];
+        assert_eq!(sent.sender, AgentId::new("b"), "whose action it is");
+        assert_eq!(sent.created, at(7), "and when that agent made it");
+        assert_eq!(sent.recipients, ["c"].map(AgentId::new).into());
+        rig.stop();
+        rig.agent.join().unwrap();
+    }
+
+    #[test]
+    fn relaying_does_not_advance_the_relaying_agents_own_stamps() {
+        // The increasing-stamp guarantee is per sender. A relayed action
+        // is not this agent's to number, so its own next action is stamped
+        // from its clock and not pushed past an instant it never used.
+        let rig = rig(RelaysThenSpeaks("c"), None);
+        rig.start();
+        rig.cycle();
+        rig.dispatch();
+        // Far enough ahead that the agent's own clock cannot have reached
+        // it: if relaying advanced `last_created`, the agent's own action
+        // would be dragged past this instant.
+        let far = at(60_000_000_000);
+        rig.send(step_at("b", 1, far));
+        let dispatch = rig.dispatch();
+        let [relayed, own] = dispatch.sent.as_slice() else {
+            panic!("the cycle relays and then speaks: {:?}", dispatch.sent);
+        };
+        assert_eq!(relayed.sender, AgentId::new("b"));
+        assert_eq!(relayed.created, far);
+        assert_eq!(own.sender, AgentId::new("a"), "its own action is its own");
+        assert!(
+            own.created < far,
+            "and is stamped from its own clock, not dragged past the relay: {:?}",
+            own.created
+        );
         rig.stop();
         rig.agent.join().unwrap();
     }

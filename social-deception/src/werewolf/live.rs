@@ -438,6 +438,7 @@ mod tests {
                 round: Round(1),
                 kind: RequestKind::Nominate,
                 target: id("frank"),
+                seen_by: BTreeSet::new(),
             })),
             "Point(Nominate: frank)"
         );
@@ -490,6 +491,7 @@ mod tests {
                 round: Round(1),
                 kind: RequestKind::Devour,
                 target: id("alice"),
+                seen_by: BTreeSet::new(),
             }),
         );
         assert_eq!(

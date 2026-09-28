@@ -596,6 +596,12 @@ impl Reader {
                 self.narrated(line, recipients, narration)
             }
             (Direction::Received, Message::Point(point)) => self.answered(line, sender, point),
+            // A point the moderator sent is one it is passing on to the
+            // players who should see it (ADR-0014). It is stamped with the
+            // player that made it, so it is the same point this reader
+            // already folded when the moderator received it, and folding
+            // it twice would count one vote as two.
+            (Direction::Sent, Message::Point(_)) => Ok(()),
             _ => Err(TranscriptError::Misdirected { line }),
         }
     }
@@ -1622,28 +1628,45 @@ mod tests {
 
     #[test]
     fn a_message_the_moderator_never_records_is_an_error() {
-        // A response the moderator took as an action of its own.
-        let mut lines = fixture();
-        let index = moderator_record(&lines, is_point);
-        lines[index]["type"] = json!("action");
-        lines[index].as_object_mut().unwrap().remove("received");
-        let error = read(&lines).unwrap_err();
-        assert!(
-            matches!(error, TranscriptError::Misdirected { line } if line == index + 1),
-            "{error:?}"
-        );
-        assert!(error.to_string().contains("never records"), "{error}");
-
-        // A narration the moderator observed rather than sent.
+        // A narration the moderator observed rather than sent. It only
+        // ever sends one, so a narration among its observations is a
+        // trajectory that does not describe this game.
         let mut lines = fixture();
         let index = moderator_record(&lines, |payload| !payload["Narration"].is_null());
         lines[index]["type"] = json!("observation");
         lines[index]["received"] = lines[index]["created"].clone();
         let error = read(&lines).unwrap_err();
         assert!(
-            matches!(error, TranscriptError::Misdirected { .. }),
+            matches!(error, TranscriptError::Misdirected { line } if line == index + 1),
             "{error:?}"
         );
+        assert!(error.to_string().contains("never records"), "{error}");
+    }
+
+    #[test]
+    fn a_point_the_moderator_sent_is_one_it_forwarded() {
+        // The moderator both receives a point and sends it on to the
+        // players who should see it (ADR-0014), so a point among its
+        // actions is no error: the fixture contains both, and it reads.
+        let lines = fixture();
+        let forwarded = lines.iter().filter(|line| {
+            line["type"] == "action" && !line["event"]["payload"]["Point"].is_null()
+        });
+        let forwarded: Vec<&Value> = forwarded.collect();
+        assert!(
+            !forwarded.is_empty(),
+            "the fixture exercises forwarding, or this proves nothing"
+        );
+        // Each is stamped with the player that made it, never with the
+        // moderator: that is what makes the relay invisible.
+        for line in forwarded {
+            assert_ne!(
+                line["event"]["sender"],
+                json!(MODERATOR),
+                "a forwarded point is sent as the player that made it: {line}"
+            );
+        }
+        read(&lines).expect("a trajectory with forwarded points reads");
     }
 
     /// Writes the moderator's records of a game played through [`Game`]
@@ -1690,6 +1713,15 @@ mod tests {
             for directive in directives {
                 let (to, payload) = match directive {
                     Directive::Narrate { to, narration } => (to, Message::Narration(narration)),
+                    // A forwarded point is recorded as the player that
+                    // made it, not as the moderator, so the scribe writes
+                    // it under that name rather than its own.
+                    Directive::Forward {
+                        from, to, point, ..
+                    } => {
+                        self.record("action", from.as_str(), &to, &Message::Point(point));
+                        continue;
+                    }
                     // A stop is a control, and `Transcript::read` skips
                     // control records: they say nothing about the game.
                     Directive::Stop { .. } => continue,
@@ -1733,13 +1765,35 @@ mod tests {
                     .role(&id(who))
                     .and_then(|role| role.asked_in(phase_kind))
                     .expect("the phase asks something of this role");
+                // The audience the player would name, so the fixture
+                // exercises the moderator's forwarding the way a real game
+                // does: a nomination is public, a devour is the pack's, and
+                // the seer's and doctor's business is nobody else's.
+                let seen_by = match kind {
+                    RequestKind::Nominate => game
+                        .living()
+                        .iter()
+                        .filter(|other| *other != &id(who))
+                        .cloned()
+                        .collect(),
+                    RequestKind::Devour => roles
+                        .players()
+                        .filter(|(other, role)| {
+                            role.faction() == Faction::Werewolves && *other != &id(who)
+                        })
+                        .map(|(other, _)| other.clone())
+                        .filter(|other| game.living().contains(other))
+                        .collect(),
+                    RequestKind::Investigate | RequestKind::Protect => BTreeSet::new(),
+                };
                 let point = Point {
                     round,
                     kind,
                     target: chosen.clone(),
+                    seen_by,
                 };
                 scribe.point(who, point.clone());
-                scribe.directives(game.point(&id(who), &point, now));
+                scribe.directives(game.point(&id(who), &point, now, now));
             }
             // Close this phase and no more. Expiring at the earliest
             // deadline open, and stopping as soon as the phase moves,
