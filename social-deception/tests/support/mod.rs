@@ -256,21 +256,19 @@ fn check_record(line: &Value, kind: &str) {
             // An action has no `received`: its sender knows only when it
             // sent it, and when each recipient got it is in that
             // recipient's own observation record. The check above says so.
-            let (sender, recipients, payload) = event(line);
+            let (sender, recipients, _) = event(line);
             check_recipients(line, sender, &recipients);
             if sender == agent(line) {
                 return;
             }
-            // The one exception: an agent passing on somebody else's
-            // action. The event keeps the original sender, so that a
-            // recipient cannot tell the difference and the relay costs
-            // latency and nothing else (ADR-0014). In Werewolf only the
-            // moderator relays, and only a point.
-            assert!(
-                !payload["Point"].is_null(),
-                "an action names the agent that took it as its sender, \
-                 unless it is one being passed on: {line}"
-            );
+            // Otherwise this agent is passing on somebody else's action.
+            // The event keeps the original sender, so a recipient cannot
+            // tell the difference and the relay costs latency and nothing
+            // else (ADR-0014). Which agents may relay, and what, is the
+            // domain's rule and is checked there; what holds everywhere is
+            // that passing an action on does not address it to the agent
+            // doing the passing, which would be that agent observing what
+            // it had just sent.
             assert!(
                 !recipients.contains(&&Value::from(agent(line))),
                 "an agent does not forward an action to itself: {line}"
@@ -521,9 +519,11 @@ fn check_the_join(lines: &[Value]) {
     // is not a second action under this key: it is skipped here and joined
     // through the original below (ADR-0014).
     let mut actions: BTreeMap<(&str, u64), &Value> = BTreeMap::new();
+    let mut relayed: Vec<&Value> = Vec::new();
     for line in lines.iter().filter(|line| line["type"] == "action") {
         let (sender, _, _) = event(line);
         if sender != agent(line) {
+            relayed.push(line);
             continue;
         }
         let key = (sender, time(line, "created"));
@@ -531,6 +531,25 @@ fn check_the_join(lines: &[Value]) {
             actions.insert(key, line).is_none(),
             "an agent takes at most one action per instant, or no observation could \
              name which: {line}"
+        );
+    }
+    // A relay passes on an action somebody really took, so the original is
+    // in that agent's own trajectory, at the same instant and carrying the
+    // same payload. Without this an action misfiled under another agent
+    // would read as a forward of an action nobody made.
+    for line in &relayed {
+        let (sender, _, payload) = event(line);
+        let key = (sender, time(line, "created"));
+        let original = actions.get(&key).unwrap_or_else(|| {
+            panic!(
+                "a forwarded action passes on one its sender really took, \
+                 but none names the agent that took it as its sender: {line}"
+            )
+        });
+        let (_, _, made) = event(original);
+        assert_eq!(
+            payload, made,
+            "a forwarded action carries what was made: {line} against {original}"
         );
     }
     let mut observed: HashSet<((&str, u64), &str)> = HashSet::new();
@@ -545,12 +564,21 @@ fn check_the_join(lines: &[Value]) {
             payload, sent,
             "an observation and its action are the same event: {line} against {action}"
         );
-        // The recipients agree when the observer was addressed directly.
-        // They need not when the event was passed on: the original names
-        // whoever the actor addressed — in Werewolf the moderator alone —
-        // and the forwarded copy names the players it was relayed to. The
-        // observer is among the latter, which is checked for every
-        // observation regardless.
+        // The join above is what ties an observation to the agent that
+        // really acted: it is keyed on the sender and the instant, against
+        // the actions each agent took, so an observation naming a sender
+        // that took no such action panics there. That holds for a relayed
+        // event too, because it keeps the original sender and instant.
+        //
+        // What does not carry over is the recipient list, and it should
+        // not. Two sends carried one event: the actor addressed the
+        // moderator, and the moderator addressed the players it forwarded
+        // to. Requiring the lists to match would be requiring the relay
+        // not to happen. Who observed the event is checked on the
+        // observation's own recipients, for every observation and with no
+        // exception for a relay — that it was addressed to its observer
+        // (`check_record`) and that every recipient observed it
+        // (`check_deliveries`).
         if sent_to.contains(&&Value::from(agent(line))) {
             assert_eq!(
                 recipients, sent_to,
@@ -628,6 +656,56 @@ mod tests {
                    "event": {"sender": "a", "recipients": ["b"], "payload": {"Step": 7}}}),
             json!({"type": "cycle", "agent": "b", "t_start": 45, "t_stop": 46, "woken": "queue",
                    "inputs": [1], "outputs": []}),
+        ]
+    }
+
+    /// A trajectory in which `r` relays `b`'s action to `c`.
+    ///
+    /// `b` addresses `r` alone; `r` passes the event on, keeping `b` as the
+    /// sender and `b`'s creation instant, so `c` observes what `b` would
+    /// have sent it directly (ADR-0014). The relay shows up only as the gap
+    /// between `created` and `c`'s `received`.
+    fn relayed() -> Vec<Value> {
+        vec![
+            json!({"type": "control", "agent": "b", "seq": 0, "created": 5, "received": 10,
+                   "control": "start"}),
+            json!({"type": "action", "agent": "b", "seq": 1, "created": 20,
+                   "event": {"sender": "b", "recipients": ["r"], "payload": {"Step": 6}}}),
+            json!({"type": "cycle", "agent": "b", "t_start": 10, "t_stop": 25, "woken": "queue",
+                   "inputs": [0], "outputs": [1]}),
+            json!({"type": "cycle", "agent": "b", "t_start": 26, "t_stop": 27,
+                   "woken": "timeout", "inputs": [], "outputs": []}),
+            json!({"type": "control", "agent": "b", "seq": 2, "created": 90, "received": 95,
+                   "control": "stop"}),
+            json!({"type": "cycle", "agent": "b", "t_start": 95, "t_stop": 96, "woken": "queue",
+                   "inputs": [2], "outputs": []}),
+            json!({"type": "control", "agent": "r", "seq": 0, "created": 5, "received": 10,
+                   "control": "start"}),
+            json!({"type": "cycle", "agent": "r", "t_start": 10, "t_stop": 11, "woken": "queue",
+                   "inputs": [0], "outputs": []}),
+            json!({"type": "observation", "agent": "r", "seq": 1, "created": 20, "received": 30,
+                   "event": {"sender": "b", "recipients": ["r"], "payload": {"Step": 6}}}),
+            // The forward: `r`'s own record, carrying `b`'s name and stamp.
+            json!({"type": "action", "agent": "r", "seq": 2, "created": 20,
+                   "event": {"sender": "b", "recipients": ["c"], "payload": {"Step": 6}}}),
+            json!({"type": "cycle", "agent": "r", "t_start": 30, "t_stop": 50, "woken": "queue",
+                   "inputs": [1], "outputs": [2]}),
+            json!({"type": "control", "agent": "r", "seq": 3, "created": 90, "received": 95,
+                   "control": "stop"}),
+            json!({"type": "cycle", "agent": "r", "t_start": 95, "t_stop": 96, "woken": "queue",
+                   "inputs": [3], "outputs": []}),
+            json!({"type": "control", "agent": "c", "seq": 0, "created": 5, "received": 10,
+                   "control": "start"}),
+            json!({"type": "cycle", "agent": "c", "t_start": 10, "t_stop": 11, "woken": "queue",
+                   "inputs": [0], "outputs": []}),
+            json!({"type": "observation", "agent": "c", "seq": 1, "created": 20, "received": 60,
+                   "event": {"sender": "b", "recipients": ["c"], "payload": {"Step": 6}}}),
+            json!({"type": "cycle", "agent": "c", "t_start": 60, "t_stop": 61, "woken": "queue",
+                   "inputs": [1], "outputs": []}),
+            json!({"type": "control", "agent": "c", "seq": 2, "created": 90, "received": 95,
+                   "control": "stop"}),
+            json!({"type": "cycle", "agent": "c", "t_start": 95, "t_stop": 96, "woken": "queue",
+                   "inputs": [2], "outputs": []}),
         ]
     }
 
@@ -922,9 +1000,29 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "names the agent that took it as its sender")]
+    #[should_panic(expected = "which has no record")]
     fn an_action_recorded_by_somebody_other_than_its_sender_is_caught() {
+        // Moving `a`'s action into `c`'s trajectory. Since an agent may
+        // pass on somebody else's action, a record whose sender is not its
+        // agent is no longer wrong on its face; what still catches this is
+        // that `a`'s cycle claimed an output it no longer has.
         check(&edited(2, |line| line["agent"] = json!("c")));
+    }
+
+    #[test]
+    #[should_panic(expected = "but none names the agent that took it as its sender")]
+    fn a_forward_of_an_action_nobody_took_is_caught() {
+        // A relay must pass on something real. Here `r` forwards an event
+        // stamped with an agent and instant at which nobody acted, which is
+        // what a misattributed action would otherwise look like.
+        let mut lines = relayed();
+        let forward = lines
+            .iter()
+            .position(|line| line["type"] == "action" && line["agent"] == "r")
+            .expect("the fixture has the forward");
+        lines[forward]["created"] = json!(21);
+        lines[forward]["event"]["created"] = json!(21);
+        check(&lines);
     }
 
     #[test]
@@ -953,6 +1051,49 @@ mod tests {
         check(&edited(1, |line| {
             line["event"]["payload"] = json!({"Step": 99});
         }));
+    }
+
+    #[test]
+    fn a_relayed_action_reads_as_the_action_of_whoever_made_it() {
+        // `c` observes `b`'s step although `r` was what sent it. Nothing
+        // records that the relay happened: `c`'s observation names `b` and
+        // carries `b`'s instant, and the only trace is that it was received
+        // at 60 rather than at 20.
+        check(&relayed());
+    }
+
+    #[test]
+    #[should_panic(expected = "but none names the agent that took it as its sender")]
+    fn an_observation_naming_a_sender_that_never_acted_is_caught() {
+        // Nothing may claim to carry an action its supposed author never
+        // took. Relabeling both the forward and `c`'s observation of it as
+        // `a`'s is caught where the relay is held to a real original: `a`
+        // never acted at instant 20.
+        let mut lines = relayed();
+        for line in &mut lines {
+            let relabel = (line["type"] == "action" && line["agent"] == "r")
+                || (line["type"] == "observation" && line["agent"] == "c");
+            if relabel {
+                line["event"]["sender"] = json!("a");
+            }
+        }
+        check(&lines);
+    }
+
+    #[test]
+    #[should_panic(expected = "no event has its sender among its recipients")]
+    fn a_relay_back_to_its_own_author_is_caught() {
+        // Forwarding somebody's action to that same somebody: it would be
+        // an agent observing what it did, which no relay may manufacture.
+        // The forward keeps `b` as the sender, so naming `b` a recipient
+        // makes the event its own author's.
+        let mut lines = relayed();
+        let forward = lines
+            .iter()
+            .position(|line| line["type"] == "action" && line["agent"] == "r")
+            .expect("the fixture has the forward");
+        lines[forward]["event"]["recipients"] = json!(["b"]);
+        check(&lines);
     }
 
     #[test]
