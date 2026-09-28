@@ -6,9 +6,9 @@
 //! they play for, the [`Round`] and [`Phase`] that locate a moment in a
 //! game, and [`Message`], the one payload type that travels over the
 //! runtime's [`Event`](crate::Event) between the moderator and the players.
-//! The only facts it states are properties of a request kind itself, such as
-//! which phase it belongs to; every rule that depends on who is alive lives
-//! with the moderator and the roles, not here.
+//! The only facts it states are properties of a session kind itself, such
+//! as which phase it belongs to; every rule that depends on who is alive
+//! lives with the moderator and the roles, not here.
 //!
 //! The setup is a [`Config`] read from a TOML file ([`config`]), the
 //! [`Assignment`] of roles dealt from its seed ([`assignment`]), and
@@ -36,37 +36,41 @@
 //! are equal exactly when the same game was played. The `werewolf` binary's
 //! `replay` renders one.
 //!
-//! # Three kinds of message
+//! # Two kinds of message
 //!
 //! | Message | Direction | Is |
 //! |---|---|---|
 //! | [`Narration`] | moderator → a chosen set of players | a true statement the recipients now observe |
-//! | [`Request`] | moderator → one player | membership of a session: point at any time until it closes |
 //! | [`Point`] | player → the moderator and whoever else may see it | a target, which the player may revise |
+//!
+//! There is no third kind, and in particular nothing that asks a player to
+//! act. A player observes that a phase has begun and consults its own role
+//! (ADR-0014); being told what its own role already says would inform it of
+//! nothing.
 //!
 //! In the reinforcement-learning vocabulary of the design, `Event<Message>`
 //! is the observation type and the move a player's action carries is an
 //! [`AgentId`](crate::AgentId): the target inside the point, not the point
-//! itself. The set
-//! of targets the rules permit for one request is the *action space*, a
-//! `Vec<AgentId>` computed by the rules; a target outside it is a policy
-//! bug. A request and the points answering it are correlated by
-//! [`RequestId`], which is what tells a point meant for the session now
-//! open from one meant for a session that has closed.
+//! itself. The set of targets the rules permit in a session is the *action
+//! space*, a `Vec<AgentId>` computed by the rules; a target outside it is a
+//! policy bug. A point names the session it was made in, by round and
+//! [`RequestKind`], which both sides derive from what they each know — so
+//! there is nothing to correlate, and a point naming a round that has
+//! passed is one whose session closed while it was in flight.
 //!
-//! A request is not a question expecting one answer (ADR-0011). A member
-//! may point as often as it likes while its session is open, and its most
-//! recent point is its vote; pointing nowhere is how it abstains, which is
-//! why there is no move meaning "nobody".
+//! A member may point as often as it likes while its session is open, and
+//! its most recent point is its vote; pointing nowhere is how it abstains,
+//! which is why there is no move meaning "nobody" (ADR-0011).
 //!
 //! # Nothing is broadcast
 //!
 //! No message here names its recipients, because that is the sender's
 //! decision: a narration goes to one player, to the living, or to the pack,
 //! and that choice of recipients is the whole hidden-information mechanism
-//! (see ADR-0004). A player observes many narrations but acts only on a
-//! request, which is what gives an agent in a turnless runtime its decision
-//! points.
+//! (see ADR-0004). A player acts on observing that a phase has begun,
+//! which is what gives an agent in a turnless runtime its decision points:
+//! nobody asks it to, and it works out from its own role whether the
+//! phase asks anything of it (ADR-0014).
 //!
 //! A point is addressed the same way, by the player making it: a `Devour`
 //! to the living pack, a `Nominate` to every other living player, and the
@@ -89,20 +93,20 @@
 //! every observation it has received, and what a policy conditions on. It
 //! records only what the moderator said, so nothing in it can be false.
 //!
-//! A [`Policy`] is handed a [`View`] of that state, the request in front of
-//! it and the action space, and returns a target or none. [`RandomPolicy`]
-//! is the uniform random baseline; a language-model policy is the same
-//! trait ([`policy`]).
+//! A [`Policy`] is handed a [`View`] of that state, the kind of session in
+//! front of it and the action space, and returns a target or none.
+//! [`RandomPolicy`] is the uniform random baseline; a language-model
+//! policy is the same trait ([`policy`]).
 //!
 //! The action space is the rules' to compute, and the rules are a role's:
 //! [`Villager`], [`Werewolf`], [`Seer`] and [`Doctor`] ([`roles`]) each
-//! carry their own [`Knowledge`] and say which targets a request permits
+//! carry their own [`Knowledge`] and say which targets a session permits
 //! them, and nothing else. It may be empty — the doctor may be left with
-//! nobody it can protect — and a player with an empty one is not asked.
+//! nobody it can protect — and a player with an empty one points nowhere.
 //! A [`Seat`] ([`player`]) pairs a role with the policy that decides for
 //! it and is the agent the episode runs: it folds every event into the
-//! role's state, answers each request with the policy's choice from the
-//! role's action space, and addresses each point as the rules allow.
+//! role's state, acts when it observes a phase begin, and addresses each
+//! point as the rules allow.
 //!
 //! # What no message carries
 //!
@@ -164,9 +168,7 @@ pub use config::{Config, ConfigError, RoleCounts};
 pub use game::{Directive, Game};
 pub use knowledge::{Death, Heard, Knowledge};
 pub use live::Text;
-pub use message::{
-    Cause, Message, Narration, Outcome, Phase, Point, Request, RequestId, RequestKind, Round,
-};
+pub use message::{Cause, Message, Narration, Outcome, Phase, Point, RequestKind, Round};
 pub use moderator::Moderator;
 pub use player::{Player, Seat};
 pub use policy::{Policy, RandomPolicy, View};

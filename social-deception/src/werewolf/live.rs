@@ -26,15 +26,15 @@
 //!
 //! Lines appear in the order the writer received the records, which
 //! interleaves agents arbitrarily (see [`trajectory`](crate::trajectory)).
-//! A player's response can appear before the request that prompted it is
-//! rendered. That is expected of a live view of concurrent agents, and is
-//! the same interleaving the trajectory file records.
+//! A player's point can appear before the phase announcement that prompted
+//! it is rendered. That is expected of a live view of concurrent agents,
+//! and is the same interleaving the trajectory file records.
 
 use std::fmt;
 use std::io::{self, Write};
 
 use super::WerewolfDomain;
-use super::message::{Cause, Message, Narration, Phase, Point, Request};
+use super::message::{Cause, Message, Narration, Phase, Point};
 use crate::event::AgentId;
 use crate::trajectory::{ActionRecord, LogRecord, Sink};
 
@@ -101,7 +101,6 @@ impl fmt::Display for Message {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Narration(narration) => narration.fmt(f),
-            Self::Request(request) => request.fmt(f),
             Self::Point(point) => point.fmt(f),
         }
     }
@@ -170,17 +169,10 @@ impl fmt::Display for Narration {
     }
 }
 
-impl fmt::Display for Request {
-    /// The request's id and what it asks.
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Request(#{}: {:?})", self.id.0, self.kind)
-    }
-}
-
 impl fmt::Display for Point {
-    /// The request it points for and whom it points at.
+    /// The session it points in and whom it points at.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Point(#{}: {})", self.request.0, self.target)
+        write!(f, "Point({:?}: {})", self.kind, self.target)
     }
 }
 
@@ -276,7 +268,7 @@ mod tests {
     use crate::trajectory::{
         ControlRecord, CycleRecord, ObservationRecord, RewardRecord, Seq, Woken,
     };
-    use crate::werewolf::message::{Outcome, RequestId, RequestKind, Round};
+    use crate::werewolf::message::{Outcome, RequestKind, Round};
     use crate::werewolf::role::{Faction, Role};
 
     fn at(nanos: u64) -> Timestamp {
@@ -437,25 +429,17 @@ mod tests {
     }
 
     #[test]
-    fn a_request_names_its_id_and_what_it_asks() {
-        assert_eq!(
-            shown(Message::Request(Request {
-                id: RequestId(3),
-                round: Round(1),
-                kind: RequestKind::Nominate,
-            })),
-            "Request(#3: Nominate)"
-        );
-    }
-
-    #[test]
-    fn a_point_names_the_request_and_the_target() {
+    fn a_point_names_its_session_and_the_target() {
+        // Nothing renders a request any more: there is none to render.
+        // A point says for itself what it is for (ADR-0014), so the line
+        // reads without a request to look the id up in.
         assert_eq!(
             shown(Message::Point(Point {
-                request: RequestId(3),
+                round: Round(1),
+                kind: RequestKind::Nominate,
                 target: id("frank"),
             })),
-            "Point(#3: frank)"
+            "Point(Nominate: frank)"
         );
     }
 
@@ -503,19 +487,20 @@ mod tests {
             ["moderator"],
             0,
             Message::Point(Point {
-                request: RequestId(1),
+                round: Round(1),
+                kind: RequestKind::Devour,
                 target: id("alice"),
             }),
         );
         assert_eq!(
             line(&record, 9).unwrap(),
-            "0:00.000 bob        \u{2192} moderator  Point(#1: alice)"
+            "0:00.000 bob        \u{2192} moderator  Point(Devour: alice)"
         );
         // An id wider than the column simply overflows it rather than being
         // cut: a name is worth more than an aligned column.
         assert_eq!(
             line(&record, 2).unwrap(),
-            "0:00.000 bob  \u{2192} moderator  Point(#1: alice)"
+            "0:00.000 bob  \u{2192} moderator  Point(Devour: alice)"
         );
     }
 

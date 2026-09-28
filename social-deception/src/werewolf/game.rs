@@ -12,12 +12,20 @@
 //! # A phase is made of sessions
 //!
 //! [`Game::begin`] tells each player its role, and a werewolf its pack,
-//! then opens the first night. A phase opens one session per kind of
-//! request it calls for, and every member of a session is asked at once. A
-//! member may point whenever it likes while its session is open and may
-//! change its mind; its most recent point is its vote, and pointing nowhere
-//! is how it abstains (ADR-0011). A player the rules leave nothing to point
-//! at is not asked at all, and no request ever goes to a dead player.
+//! then opens the first night. A phase opens one session per kind it calls
+//! for, and announces that it has begun.
+//!
+//! **Nobody is asked to act.** A player observes the phase and works out
+//! from its own role whether the rules ask anything of it (ADR-0014), so
+//! the announcement is the whole of what the moderator says. What the
+//! moderator keeps is each session's membership, because that is what
+//! decides when a session closes, and it checks a point against the rules
+//! when the point arrives. A player the rules leave nothing to point at is
+//! not a member of anything.
+//!
+//! A member may point whenever it likes while its session is open and may
+//! change its mind; its most recent point is its vote, and pointing
+//! nowhere is how it abstains (ADR-0011).
 //!
 //! **A night is three sessions at once**, each with a clock of its own so
 //! that a slow role cannot spend another's time: the pack devours, the seer
@@ -92,12 +100,13 @@
 //!
 //! # Player bugs are panics
 //!
-//! A point for a request the game never asked, or asked of somebody else,
-//! or naming a target outside the request's action space, is a bug in a
+//! A point in a session the rules never make its sender a member of, or
+//! one naming a target outside that session's action space, is a bug in a
 //! player rather than a condition the game can continue from: the game
 //! cannot vouch for a state built on it. Each panics with a message naming
-//! the agent and the request. A point that merely arrived too late is not
-//! among them. The action space a response is checked
+//! the agent and the session. A point that merely arrived too late — for a
+//! session that has closed, or a round that has passed — is not among
+//! them. The action space a point is checked
 //! against is [`roles::action_space`], the same function the role types
 //! compute theirs with, so the game holds every player to exactly the rules
 //! the roles apply to themselves, including the doctor's: for that the game
@@ -113,9 +122,7 @@ use crate::clock::Timestamp;
 use crate::event::AgentId;
 use crate::werewolf::assignment::Assignment;
 use crate::werewolf::config::Timing;
-use crate::werewolf::message::{
-    Cause, Narration, Outcome, Phase, Point, Request, RequestId, RequestKind, Round,
-};
+use crate::werewolf::message::{Cause, Narration, Outcome, Phase, Point, RequestKind, Round};
 use crate::werewolf::role::{Faction, Role};
 use crate::werewolf::roles;
 use crate::werewolf::seed::{TIES, pick, seed_for};
@@ -134,13 +141,6 @@ pub enum Directive {
         to: BTreeSet<AgentId>,
         /// What they are told.
         narration: Narration,
-    },
-    /// A request for one agent to act.
-    Ask {
-        /// The agent asked.
-        to: AgentId,
-        /// What it is asked.
-        request: Request,
     },
     /// Stop this agent: it is out of the game (ADR-0012).
     ///
@@ -223,12 +223,8 @@ pub struct Game {
     round: Round,
     phase: Phase,
     ties: ChaCha8Rng,
-    /// How many requests have been issued; the next one's id is one more.
-    issued: u64,
-    /// The requests of the sessions now open: who was asked, and what. A
-    /// request leaves this when its session closes, which is what makes a
-    /// point arriving afterwards late rather than a bug.
-    outstanding: BTreeMap<RequestId, (AgentId, RequestKind)>,
+    /// Whether the game has begun, so that beginning twice is caught.
+    begun: bool,
     /// The sessions of the phase now open, in the order they close: at
     /// night the pack, the seer and the doctor, by day just the one.
     sessions: Vec<Session>,
@@ -267,8 +263,7 @@ impl Game {
             round: Round(1),
             phase: Phase::Night,
             ties: ChaCha8Rng::seed_from_u64(seed_for(seed, TIES)),
-            issued: 0,
-            outstanding: BTreeMap::new(),
+            begun: false,
             sessions: Vec::new(),
             resolved: Vec::new(),
             timing,
@@ -288,7 +283,8 @@ impl Game {
     ///
     /// If called more than once.
     pub fn begin(&mut self, now: Timestamp) -> Vec<Directive> {
-        assert_eq!(self.issued, 0, "the game has already begun");
+        assert!(!self.begun, "the game has already begun");
+        self.begun = true;
         let mut directives: Vec<Directive> = self
             .assignment
             .players()
@@ -316,45 +312,59 @@ impl Game {
     ///
     /// **A point for a session that has closed is ignored**, not a panic.
     /// It lost a race with the clock, which ADR-0011 makes an ordinary
-    /// event rather than a bug: the request is no longer outstanding, and
-    /// nothing comes of the point.
+    /// event rather than a bug: no session of that round and kind is open
+    /// any more, and nothing comes of the point.
     ///
     /// # Panics
     ///
-    /// If the point names a request that was never asked or was asked of
-    /// another agent, or a target outside the request's action space as
-    /// [`roles::action_space`] computes it: the player itself, somebody
-    /// not living, or, for a doctor, the player it protected the night
-    /// before. Each is a bug in a player rather than a lost race.
+    /// If the rules ask nothing of this player in a session of that kind —
+    /// because it is not living, or its role is not asked that at all — or
+    /// if the target is outside the action space [`roles::action_space`]
+    /// computes for it: the player itself, somebody not living, or, for a
+    /// doctor, the player it protected the night before. Each is a bug in
+    /// a player rather than a lost race.
+    ///
+    /// The check is made here, on arrival, rather than by handing out
+    /// permission in advance (ADR-0014). It is the same rule either way:
+    /// what a role is asked in a phase is [`Role::asked_in`], which the
+    /// player consulted to decide to point at all.
     pub fn point(&mut self, from: &AgentId, point: &Point, at: Timestamp) -> Vec<Directive> {
-        let RequestId(id) = point.request;
-        let Some((to, kind)) = self.outstanding.get(&point.request) else {
-            // Either the session closed or the game ended. Every request
-            // this game ever issued is its own, so an id it has never
-            // issued is the one thing left that is a bug.
+        let kind = point.kind;
+        // A point names the session it was made in, so a point from a
+        // round that has passed is one whose session closed while it was
+        // in flight: a lost race, and ignored like any other (ADR-0011).
+        // It is checked first, so that a stale point cannot be taken for
+        // a current one just because a session of the same kind is open.
+        if point.round != self.round {
+            return Vec::new();
+        }
+        let Some(index) = self
+            .sessions
+            .iter()
+            .position(|session| session.kind == kind && session.members.contains(from))
+        else {
+            // No open session of that kind with this member. Either it
+            // closed — a lost race again — or the rules never asked this
+            // of this player, which is a bug in the player.
             assert!(
-                point.request.0 <= self.issued,
-                "{from} pointed for request {id}, which was never asked"
+                self.assignment.role(from).is_some(),
+                "{from} pointed in a {kind:?} session but is not in this game"
+            );
+            assert_eq!(
+                self.role(from).asked_in(kind.phase()),
+                Some(kind),
+                "{from} pointed in a {kind:?} session, which a {} is never a member of",
+                self.role(from)
             );
             return Vec::new();
         };
-        assert_eq!(
-            to, from,
-            "{from} pointed for request {id}, which was asked of {to}"
-        );
-        let kind = *kind;
         let space = self.action_space_for(from, kind);
         assert!(
             space.contains(&point.target),
-            "{from} pointed at {} in request {id}, which is outside its action space for {kind:?}",
+            "{from} pointed at {} in a {kind:?} session, which is outside its action space",
             point.target
         );
-        let session = self
-            .sessions
-            .iter_mut()
-            .find(|session| session.kind == kind)
-            .expect("an outstanding request belongs to an open session");
-        session.point(from, &point.target, at);
+        self.sessions[index].point(from, &point.target, at);
 
         // The day ends the moment a majority of the living agree, and the
         // point that made it is the hammer. Everything else waits for a
@@ -453,7 +463,7 @@ impl Game {
         &self.living
     }
 
-    /// The targets the rules permit `who` for a request of `kind`, from the
+    /// The targets the rules permit `who` in a session of `kind`, from the
     /// game's own state.
     ///
     /// The same [`roles::action_space`] a player computes from its
@@ -510,17 +520,21 @@ impl Game {
         )
     }
 
-    /// Announces the current phase to the living and issues its requests,
-    /// in agent order.
+    /// Announces the current phase to the living and opens the sessions it
+    /// calls for. Nobody is asked to act: a player works that out from its
+    /// own role (ADR-0014).
     fn begin_phase(&mut self, now: Timestamp) -> Vec<Directive> {
-        let mut directives = vec![self.narrate_living(Narration::PhaseBegan {
+        let directives = vec![self.narrate_living(Narration::PhaseBegan {
             round: self.round,
             phase: self.phase,
             living: self.living.clone(),
         })];
-        // Who is asked what, and which session each belongs to. A player
-        // with an empty action space is not asked at all, so a session
-        // with no member to ask does not open.
+        // Who belongs to which of the phase's sessions. Nobody is told:
+        // a player works this out for itself from its own role, and the
+        // moderator keeps it because a session's membership is what
+        // closes the session (ADR-0014). A player the rules leave
+        // nowhere to point is not a member, so a session with no member
+        // does not open.
         let mut members: BTreeMap<RequestKind, BTreeSet<AgentId>> = BTreeMap::new();
         for who in &self.living {
             let Some(kind) = self.role(who).asked_in(self.phase) else {
@@ -532,9 +546,6 @@ impl Game {
         }
         for (kind, members) in members {
             let clock = self.timing_for(kind);
-            for who in &members {
-                directives.push(self.ask(who.clone(), kind));
-            }
             self.sessions.push(Session {
                 kind,
                 members,
@@ -558,19 +569,6 @@ impl Game {
         }
     }
 
-    /// Issues one request, drawing its id from the counter.
-    fn ask(&mut self, to: AgentId, kind: RequestKind) -> Directive {
-        self.issued += 1;
-        let id = RequestId(self.issued);
-        self.outstanding.insert(id, (to.clone(), kind));
-        let request = Request {
-            id,
-            round: self.round,
-            kind,
-        };
-        Directive::Ask { to, request }
-    }
-
     /// Closes one night session: its tally to its observers, and the
     /// seer's finding if it looked at anybody.
     ///
@@ -580,8 +578,6 @@ impl Game {
     /// that its own session's clock is the only one it waits on; a seer
     /// devoured the same night still learns what it learned.
     fn close_night_session(&mut self, session: &Session) -> Vec<Directive> {
-        self.outstanding
-            .retain(|_, (who, kind)| !(*kind == session.kind && session.members.contains(who)));
         // To its members, and to nobody else; the moderator is not a
         // recipient of its own narrations.
         //
@@ -659,7 +655,6 @@ impl Game {
     /// majority called for, or `NoLynch` when the limit passed without one.
     fn close_day(&mut self, hammer: Option<AgentId>, now: Timestamp) -> Vec<Directive> {
         let session = self.sessions.remove(0);
-        self.outstanding.clear();
         // The hammer is the point that made the majority, and the target
         // of that majority is who dies for it.
         let lynched = hammer
@@ -822,8 +817,8 @@ mod tests {
 
     const SEED: u64 = 20_260_918;
 
-    /// One phase of a script: every request's answer, keyed by the agent
-    /// asked, in the order the answers are to be recorded.
+    /// One phase of a script: every member's point, keyed by the agent
+    /// making it, in the order they are to be recorded.
     type Answers = Vec<(&'static str, AgentId)>;
 
     fn answers(pairs: &[(&'static str, &str)]) -> Answers {
@@ -862,19 +857,25 @@ mod tests {
     /// [`fast`]'s longest limit is 50 ms, so this closes everything.
     const LATER: u64 = 10_000;
 
-    /// The requests among some directives, by the agent asked.
-    fn asks(directives: &[Directive]) -> BTreeMap<AgentId, Request> {
-        directives
+    /// Who is a member of which of the phase's open sessions.
+    ///
+    /// Nothing tells a player this any more (ADR-0014): each works it out
+    /// from its own role, and the moderator keeps the membership only
+    /// because it is what closes a session. A test script stands in for
+    /// every player at once, so it reads the same membership off the game
+    /// rather than off a directive that no longer exists.
+    fn asks(game: &Game) -> BTreeMap<AgentId, RequestKind> {
+        game.sessions
             .iter()
-            .filter_map(|directive| match directive {
-                Directive::Ask { to, request } => Some((to.clone(), request.clone())),
-                Directive::Narrate { .. } | Directive::Stop { .. } => None,
+            .flat_map(|session| {
+                session
+                    .members
+                    .iter()
+                    .map(move |who| (who.clone(), session.kind))
             })
             .collect()
     }
 
-    /// Records one phase's answers in the order given, asserting that
-    /// nothing comes back until the last, and returns what the last caused.
     /// Records one phase's points in the order given, then lets every
     /// session's clock run out, and returns everything that came of it.
     ///
@@ -882,27 +883,24 @@ mod tests {
     /// the expiry that follows finds nothing left to close; a night always
     /// closes on its clocks. Either way the phase is over when this
     /// returns, which is what lets a script name one phase per entry.
-    fn answer(
-        game: &mut Game,
-        asked: &[Directive],
-        answers: &Answers,
-        at: Timestamp,
-    ) -> Vec<Directive> {
-        let asks = asks(asked);
+    fn answer(game: &mut Game, answers: &Answers, at: Timestamp) -> Vec<Directive> {
+        let asks = asks(game);
         assert_eq!(
             asks.keys().cloned().collect::<BTreeSet<_>>(),
             answers.iter().map(|(who, _)| id(who)).collect(),
-            "a script answers exactly the requests issued"
+            "a script points for exactly the members of the open sessions"
         );
-        // The phase these answers belong to, taken before any of them is
+        // The phase these points belong to, taken before any of them is
         // recorded: a day ends on the point that makes a majority, so
         // pointing alone may finish it.
         let phase = (game.phase, game.round);
+        let round = game.round;
         let mut caused = Vec::new();
         for (who, chosen) in answers {
             let who = id(who);
             let point = Point {
-                request: asks[&who].id,
+                round,
+                kind: asks[&who],
                 target: chosen.clone(),
             };
             caused.extend(game.point(&who, &point, at));
@@ -929,11 +927,9 @@ mod tests {
     /// one phase's clocks can never reach into the next.
     fn play(game: &mut Game, script: &[Answers]) -> Vec<Directive> {
         let mut all = game.begin(at(0));
-        let mut latest = all.clone();
         for (index, phase) in script.iter().enumerate() {
             let now = at((index as u64 + 1) * LATER);
-            latest = answer(game, &latest, phase, now);
-            all.extend(latest.iter().cloned());
+            all.extend(answer(game, phase, now));
         }
         all
     }
@@ -964,17 +960,6 @@ mod tests {
                 living: ids(living),
             },
         )
-    }
-
-    fn ask(to: &str, id: u64, round: u32, kind: RequestKind) -> Directive {
-        Directive::Ask {
-            to: AgentId::new(to),
-            request: Request {
-                id: RequestId(id),
-                round: Round(round),
-                kind,
-            },
-        }
     }
 
     /// The closing tally of one session, to the members it goes to.
@@ -1074,10 +1059,30 @@ mod tests {
         )
     }
 
-    /// Records one point for the request with the given id.
-    fn respond(game: &mut Game, from: &str, request: u64, target: AgentId) -> Vec<Directive> {
+    /// Records one point in the session of `kind` of the round now under
+    /// way. A point says for itself which session it belongs to
+    /// (ADR-0014), so there is no id to look up.
+    fn respond(game: &mut Game, from: &str, kind: RequestKind, target: AgentId) -> Vec<Directive> {
+        let round = game.round;
         let point = Point {
-            request: RequestId(request),
+            round,
+            kind,
+            target,
+        };
+        game.point(&id(from), &point, at(0))
+    }
+
+    /// The same, for a point naming a round of the caller's choosing.
+    fn respond_in(
+        game: &mut Game,
+        from: &str,
+        round: u32,
+        kind: RequestKind,
+        target: AgentId,
+    ) -> Vec<Directive> {
+        let point = Point {
+            round: Round(round),
+            kind,
             target,
         };
         game.point(&id(from), &point, at(0))
@@ -1170,17 +1175,10 @@ mod tests {
                 assigned("dave", Doctor, []),
                 assigned("erin", Villager, []),
                 phase_began(1, Phase::Night, everyone),
-                ask("bob", 1, 1, RequestKind::Devour),
-                ask("carol", 2, 1, RequestKind::Investigate),
-                ask("dave", 3, 1, RequestKind::Protect),
                 investigated("carol", "bob", Faction::Werewolves),
                 eliminated(everyone, "alice", Villager, 1, Cause::Devoured),
                 stopped("alice"),
                 phase_began(1, Phase::Day, survivors),
-                ask("bob", 4, 1, RequestKind::Nominate),
-                ask("carol", 5, 1, RequestKind::Nominate),
-                ask("dave", 6, 1, RequestKind::Nominate),
-                ask("erin", 7, 1, RequestKind::Nominate),
                 day_tally(
                     survivors,
                     1,
@@ -1212,8 +1210,11 @@ mod tests {
     fn the_werewolves_win_at_parity() {
         let mut game = game(village());
         let directives = play(&mut game, &werewolves_win());
+        // Five deals and the first PhaseBegan, and then the night: no
+        // request stands between the phase and what the pointing caused
+        // (ADR-0014).
         assert_eq!(
-            directives[9..],
+            directives[6..],
             [
                 // The seer is devoured tonight and still learns what it
                 // learned, because its own session closed before the
@@ -1228,10 +1229,6 @@ mod tests {
                 ),
                 stopped("carol"),
                 phase_began(1, Phase::Day, ["alice", "bob", "dave", "erin"]),
-                ask("alice", 4, 1, RequestKind::Nominate),
-                ask("bob", 5, 1, RequestKind::Nominate),
-                ask("dave", 6, 1, RequestKind::Nominate),
-                ask("erin", 7, 1, RequestKind::Nominate),
                 // dave's point is the third of four living, a majority,
                 // so it is the hammer and erin never points at all.
                 day_tally(
@@ -1250,8 +1247,6 @@ mod tests {
                 stopped("erin"),
                 // No seer lives, so the second night asks nothing of one.
                 phase_began(2, Phase::Night, ["alice", "bob", "dave"]),
-                ask("bob", 8, 2, RequestKind::Devour),
-                ask("dave", 9, 2, RequestKind::Protect),
                 eliminated(
                     ["alice", "bob", "dave"],
                     "alice",
@@ -1269,11 +1264,12 @@ mod tests {
         );
     }
 
-    /// Plays a game to its end, answering every request with a move drawn
+    /// Plays a game to its end, pointing in every open session with a
+    /// target drawn
     /// from the action space the rules compute, and returns the outcome
     /// and how many were living at the start of each round.
     ///
-    /// The answers are arbitrary, so nothing but the rules keeps the game
+    /// The points are arbitrary, so nothing but the rules keeps the game
     /// finite: this is the termination guarantee under adversity.
     fn play_out(assignment: Assignment, seed: u64) -> (Outcome, Vec<usize>) {
         let (game, _, living) = played(assignment, seed);
@@ -1295,7 +1291,7 @@ mod tests {
         let mut game = Game::new(assignment, seed, timing);
         let mut moves = ChaCha8Rng::seed_from_u64(seed);
         let mut clock = 0;
-        let mut latest = game.begin(at(clock));
+        game.begin(at(clock));
         let mut living = vec![game.living.len()];
         let mut round = game.round;
         while game.outcome().is_none() {
@@ -1303,28 +1299,27 @@ mod tests {
                 round = game.round;
                 living.push(game.living.len());
             }
-            let asked = asks(&latest);
-            assert!(!asked.is_empty(), "a running game always asks something");
+            let asked = asks(&game);
+            assert!(
+                !asked.is_empty(),
+                "a running game always has a session open"
+            );
             clock += LATER;
             let now = at(clock);
-            let mut caused = Vec::new();
-            for (who, request) in asked {
-                let space = roles::action_space(
-                    &who,
-                    &game.living,
-                    request.kind,
-                    game.last_protected.get(&who),
-                );
+            let point_round = game.round;
+            for (who, kind) in asked {
+                let space =
+                    roles::action_space(&who, &game.living, kind, game.last_protected.get(&who));
                 let point = Point {
-                    request: request.id,
+                    round: point_round,
+                    kind,
                     target: pick(&mut moves, &space).clone(),
                 };
-                caused.extend(game.point(&who, &point, now));
+                game.point(&who, &point, now);
             }
             // Every player points once and never changes its mind, so
             // running the clock out is what closes the phase.
-            caused.extend(game.expire(at(clock + LATER)));
-            latest = caused;
+            game.expire(at(clock + LATER));
         }
         let outcome = game.outcome().unwrap().clone();
         (game, outcome, living)
@@ -1542,11 +1537,11 @@ mod tests {
         // members have settled, so pointing says nothing on its own — not
         // even the point that leaves nothing outstanding.
         let mut game = game(village());
-        let asks = asks(&game.begin(at(0)));
-        let request = |who: &str| asks[&id(who)].id.0;
+        game.begin(at(0));
+        let asks = asks(&game);
         for (who, whom) in [("bob", "alice"), ("carol", "bob"), ("dave", "erin")] {
             assert_eq!(
-                respond(&mut game, who, request(who), target(whom)),
+                respond(&mut game, who, asks[&id(who)], target(whom)),
                 [],
                 "{who}'s point resolved something"
             );
@@ -1624,7 +1619,7 @@ mod tests {
                     | Narration::Outcome(_) => Some(narration.clone()),
                     _ => None,
                 },
-                Directive::Ask { .. } | Directive::Stop { .. } => None,
+                Directive::Stop { .. } => None,
             })
             .collect()
     }
@@ -1647,8 +1642,9 @@ mod tests {
         let mut game = game(pack_of_three());
         let directives = play(&mut game, &[split]);
         // Golden: dave is the victim the generator picks for this seed.
+        // Seven deals and the first PhaseBegan come before it.
         assert_eq!(
-            directives[11..],
+            directives[8..],
             [
                 tally(
                     ["alice", "bob", "carol"],
@@ -1717,17 +1713,12 @@ mod tests {
         let mut game = game(village());
         let directives = play(&mut game, &saved());
         assert_eq!(
-            directives[9..],
+            directives[6..],
             [
                 // The seer looked at bob and found the pack.
                 investigated("carol", "bob", Faction::Werewolves),
                 narrate(everyone, Narration::NoDeath { round: Round(1) }),
                 phase_began(1, Phase::Day, everyone),
-                ask("alice", 4, 1, RequestKind::Nominate),
-                ask("bob", 5, 1, RequestKind::Nominate),
-                ask("carol", 6, 1, RequestKind::Nominate),
-                ask("dave", 7, 1, RequestKind::Nominate),
-                ask("erin", 8, 1, RequestKind::Nominate),
             ]
         );
         assert_eq!(*game.living(), ids(everyone));
@@ -1787,22 +1778,28 @@ mod tests {
     }
 
     #[test]
-    fn no_request_is_issued_for_a_missing_seer_or_doctor() {
+    fn no_session_opens_for_a_missing_seer_or_doctor() {
+        // Nobody is asked anything any more (ADR-0014), so what there is
+        // to check is the membership itself: with no seer and no doctor
+        // in the deal, the night opens the pack's session and no other.
         let mut game = game(pack_of_three());
-        let asked = asks(&game.begin(at(0)));
+        game.begin(at(0));
+        let asked = asks(&game);
         assert_eq!(
             asked.keys().cloned().collect::<BTreeSet<_>>(),
             ids(["alice", "bob", "carol"])
         );
-        assert!(
-            asked
-                .values()
-                .all(|request| request.kind == RequestKind::Devour)
-        );
+        assert!(asked.values().all(|kind| *kind == RequestKind::Devour));
+        assert_eq!(game.sessions.len(), 1, "one session, the pack's");
     }
 
     #[test]
-    fn a_dead_doctor_is_asked_nothing() {
+    fn a_dead_doctor_is_no_longer_a_member_of_the_nights_sessions() {
+        // Nothing is issued to anybody now (ADR-0014), so what "the dead
+        // doctor is asked nothing" means is that it is not a member of
+        // the second night's sessions — and, dave being the only doctor,
+        // that no Protect session opens at all. Membership is what closes
+        // a session, so a dead member would hang the night.
         let mut game = game(village());
         let directives = play(
             &mut game,
@@ -1816,9 +1813,22 @@ mod tests {
                 ]),
             ],
         );
-        // The second night opens with the phase and the requests it asks,
-        // and dave, the dead doctor, is asked nothing: two requests where
-        // the first night had three.
+        assert!(!game.living().contains(&id("dave")), "dave is dead");
+        assert_eq!(game.phase, Phase::Night);
+        assert_eq!(game.round, Round(2));
+        // Two sessions where the first night had three, and dave is in
+        // neither of them.
+        assert_eq!(
+            asks(&game),
+            [
+                (id("bob"), RequestKind::Devour),
+                (id("carol"), RequestKind::Investigate),
+            ]
+            .into_iter()
+            .collect::<BTreeMap<_, _>>()
+        );
+        // The second night opens on the phase and nothing else: there is
+        // no longer anything between the announcement and the pointing.
         let second_night = directives
             .iter()
             .rposition(|directive| {
@@ -1835,21 +1845,8 @@ mod tests {
             })
             .expect("the game reached a second night");
         assert_eq!(
-            directives[second_night..second_night + 3],
-            [
-                phase_began(2, Phase::Night, ["alice", "bob", "carol"]),
-                ask("bob", 8, 2, RequestKind::Devour),
-                ask("carol", 9, 2, RequestKind::Investigate),
-            ]
-        );
-        // Nothing else is asked of that night, so dave was not asked.
-        assert!(
-            !directives[second_night..].iter().any(|directive| matches!(
-                directive,
-                Directive::Ask { to, request }
-                    if *to == id("dave") && request.round == Round(2)
-            )),
-            "the dead doctor was asked something"
+            directives[second_night..],
+            [phase_began(2, Phase::Night, ["alice", "bob", "carol"])]
         );
     }
 
@@ -1874,9 +1871,6 @@ mod tests {
                         if let Narration::Eliminated { who, .. } = narration {
                             assert!(!to.contains(who), "{who} is told of its own death");
                         }
-                    }
-                    Directive::Ask { to, request } => {
-                        assert!(!dead.contains(to), "{to} is dead but is asked {request:?}");
                     }
                     // The death and the stop are one cycle's work, so a
                     // player counts as dead from the stop onward.
@@ -1988,10 +1982,10 @@ mod tests {
     #[test]
     fn the_living_set_strictly_shrinks_every_round() {
         let mut game = game(village());
-        let mut latest = game.begin(at(0));
+        game.begin(at(0));
         let mut sizes = vec![game.living().len()];
         for (index, phase) in werewolves_win().iter().enumerate() {
-            latest = answer(&mut game, &latest, phase, at((index as u64 + 1) * LATER));
+            answer(&mut game, phase, at((index as u64 + 1) * LATER));
             if index % 2 == 1 {
                 sizes.push(game.living().len());
             }
@@ -2020,52 +2014,86 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "bob pointed for request 99, which was never asked")]
-    fn an_id_the_game_never_issued_panics() {
-        // A request the game never asked is still a bug in a player: it
-        // cannot be a session that closed, because no session ever had it.
+    #[should_panic(
+        expected = "carol pointed in a Devour session, which a Seer is never a member of"
+    )]
+    fn pointing_in_a_session_the_role_is_never_a_member_of_panics() {
+        // There is no longer an id to get wrong, so the bug that was
+        // "a request nobody was asked" and the bug that was "a request
+        // asked of somebody else" are now one bug: pointing in a session
+        // the rules never made you a member of (ADR-0014). A seer at
+        // night belongs to the Investigate session and no other, and the
+        // game can say so from the role alone.
         let mut game = game(village());
         game.begin(at(0));
-        respond(&mut game, "bob", 99, target("alice"));
+        respond(&mut game, "carol", RequestKind::Devour, target("alice"));
+    }
+
+    #[test]
+    #[should_panic(expected = "zara pointed in a Devour session but is not in this game")]
+    fn pointing_from_outside_the_game_panics() {
+        let mut game = game(village());
+        game.begin(at(0));
+        respond(&mut game, "zara", RequestKind::Devour, target("alice"));
     }
 
     #[test]
     fn a_point_for_a_closed_session_is_ignored() {
         // It lost a race with the clock, which ADR-0011 makes an ordinary
-        // event rather than a bug.
+        // event rather than a bug. bob is a werewolf, so the Devour
+        // session was genuinely its own: what is wrong with the point is
+        // only that it is late.
         let mut game = game(village());
         game.begin(at(0));
         // The pack's session closes at its limit with nobody having
-        // pointed, so bob's request is no longer outstanding.
+        // pointed, so bob has no session left to point in.
         let closed = game.expire(at(LATER));
         assert!(!closed.is_empty(), "the night's sessions closed");
         assert!(
-            respond(&mut game, "bob", 1, target("alice")).is_empty(),
+            respond_in(&mut game, "bob", 1, RequestKind::Devour, target("alice")).is_empty(),
             "a point for a closed session causes nothing"
         );
     }
 
     #[test]
-    #[should_panic(expected = "carol pointed for request 1, which was asked of bob")]
-    fn a_request_id_asked_of_another_agent_panics() {
+    fn a_point_naming_a_round_that_has_passed_is_ignored() {
+        // A point carries its own round now, so a point in flight while
+        // its phase ended names a round the game has left behind. That is
+        // the same lost race, and is ignored rather than mistaken for a
+        // point in the session of the same kind now open (ADR-0014).
         let mut game = game(village());
-        game.begin(at(0));
-        respond(&mut game, "carol", 1, target("alice"));
+        play(
+            &mut game,
+            &[
+                answers(&[("bob", "alice"), ("carol", "bob"), ("dave", "erin")]),
+                answers(&[
+                    ("bob", "carol"),
+                    ("carol", "dave"),
+                    ("dave", "carol"),
+                    ("erin", "bob"),
+                ]),
+            ],
+        );
+        assert_eq!(game.round, Round(2), "the second night is under way");
+        assert!(
+            respond_in(&mut game, "bob", 1, RequestKind::Devour, target("erin")).is_empty(),
+            "a point from round one causes nothing in round two"
+        );
     }
 
     #[test]
     #[should_panic(
-        expected = "dave pointed at dave in request 3, which is outside its action space for Protect"
+        expected = "dave pointed at dave in a Protect session, which is outside its action space"
     )]
     fn a_doctor_protecting_itself_panics() {
         let mut game = game(village());
         game.begin(at(0));
-        respond(&mut game, "dave", 3, target("dave"));
+        respond(&mut game, "dave", RequestKind::Protect, target("dave"));
     }
 
     /// In the village, alice is devoured while the doctor protects erin,
-    /// then carol is lynched, so that the second night asks bob (request
-    /// 8) and dave (request 9) again.
+    /// then carol is lynched, so that the second night opens a pack
+    /// session for bob and a Protect session for dave again.
     fn doctor_protected_erin() -> Vec<Answers> {
         vec![
             answers(&[("bob", "alice"), ("carol", "bob"), ("dave", "erin")]),
@@ -2080,12 +2108,12 @@ mod tests {
 
     #[test]
     #[should_panic(
-        expected = "dave pointed at erin in request 9, which is outside its action space for Protect"
+        expected = "dave pointed at erin in a Protect session, which is outside its action space"
     )]
     fn a_doctor_protecting_the_same_player_two_nights_running_panics() {
         let mut game = game(village());
         play(&mut game, &doctor_protected_erin());
-        respond(&mut game, "dave", 9, target("erin"));
+        respond(&mut game, "dave", RequestKind::Protect, target("erin"));
     }
 
     /// Nine players and two werewolves, bob and frank; carol is the seer
@@ -2108,8 +2136,10 @@ mod tests {
     fn the_doctor_may_return_to_a_player_after_a_night_off() {
         // In the hamlet, dave protects erin on the first night, then
         // carol on the second, and on the third may protect erin again:
-        // the constraint is last night's protection alone. The requests of
-        // the third night are 23 to 26, and dave's is 25.
+        // the constraint is last night's protection alone. There is no
+        // request to find any more (ADR-0014) — dave's own role says it
+        // is the Protect session it belongs to, so the point names that
+        // and the game checks the doctor's rule on arrival.
         for second_night in ["carol", "frank"] {
             let mut game = game(hamlet());
             play(
@@ -2151,7 +2181,8 @@ mod tests {
                 *game.living(),
                 ids(["bob", "carol", "dave", "erin", "frank"])
             );
-            assert_eq!(game.outstanding.len(), 4, "the third night is under way");
+            assert_eq!(game.round, Round(3), "the third night is under way");
+            assert_eq!(asks(&game).len(), 4, "four members point tonight");
             let permitted = roles::action_space(
                 &id("dave"),
                 game.living(),
@@ -2162,22 +2193,18 @@ mod tests {
                 permitted.contains(&target("erin")),
                 "{second_night}: {permitted:?}"
             );
-            // The request the third night asked dave, whatever number it
-            // fell on: the ids move when the sessions do, and this test is
-            // about the doctor's constraint rather than about counting.
-            let asked = game
-                .outstanding
-                .iter()
-                .find(|(_, (who, kind))| *who == id("dave") && *kind == RequestKind::Protect)
-                .map(|(request, _)| request.0)
-                .expect("the third night asked dave to protect");
-            respond(&mut game, "dave", asked, target("erin"));
+            assert_eq!(
+                asks(&game).get(&id("dave")),
+                Some(&RequestKind::Protect),
+                "the doctor is a member of the third night's Protect session"
+            );
+            respond(&mut game, "dave", RequestKind::Protect, target("erin"));
         }
     }
 
     #[test]
     #[should_panic(
-        expected = "bob pointed at alice in request 4, which is outside its action space for Nominate"
+        expected = "bob pointed at alice in a Nominate session, which is outside its action space"
     )]
     fn targeting_a_dead_player_panics() {
         let mut game = game(village());
@@ -2189,7 +2216,7 @@ mod tests {
                 ("dave", "erin"),
             ])],
         );
-        respond(&mut game, "bob", 4, target("alice"));
+        respond(&mut game, "bob", RequestKind::Nominate, target("alice"));
     }
 
     #[test]
@@ -2199,7 +2226,7 @@ mod tests {
         let mut game = game(village());
         play(&mut game, &village_wins());
         assert!(game.outcome().is_some());
-        assert!(respond(&mut game, "carol", 5, target("dave")).is_empty());
+        assert!(respond(&mut game, "carol", RequestKind::Nominate, target("dave")).is_empty());
     }
 
     #[test]

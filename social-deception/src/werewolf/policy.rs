@@ -4,7 +4,8 @@
 //! A policy is a conditional distribution over the action space given the
 //! state, in the vocabulary the [module](super) documentation states and
 //! ADR-0005 explains. [`View`] is what it conditions on: the state, the
-//! request in front of it, and the action space. Nothing here decides what
+//! kind of session in front of it, and the action space. Nothing here
+//! decides what
 //! the rules permit; this module only picks from what they permit.
 //!
 //! # Every policy sees the same action space
@@ -79,21 +80,21 @@ use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 
 use super::knowledge::Knowledge;
-use super::message::{Request, RequestKind};
+use super::message::RequestKind;
 use super::role::Role;
 use super::seed::{pick, seed_for};
 use crate::event::AgentId;
 
-/// What a policy sees when it decides: the agent's state, the request in
-/// front of it, and the action space.
+/// What a policy sees when it decides: the agent's state, the kind of
+/// session in front of it, and the action space.
 ///
 /// It carries no strategy hints; see the [module documentation](self).
 #[derive(Debug, Clone, Copy)]
 pub struct View<'a> {
     /// The agent's state: the fold of everything it has been told.
     pub knowledge: &'a Knowledge,
-    /// The request being answered.
-    pub request: &'a Request,
+    /// Which of the phase's sessions this is: what the pointing is for.
+    pub kind: RequestKind,
     /// Every target the rules permit, in canonical order: sorted agent
     /// order. May be empty, and a policy handed an empty one has nowhere to
     /// point.
@@ -183,12 +184,12 @@ fn candidates<'a>(view: &View<'a>) -> Vec<&'a AgentId> {
     targets
 }
 
-/// Whether the heuristic drops `who` as a target for this request: a
+/// Whether the heuristic drops `who` as a target in this session: a
 /// werewolf's living packmates for `Devour` and `Nominate`, and the targets
 /// the seer has already investigated for `Investigate`.
 fn excluded(view: &View<'_>, who: &AgentId) -> bool {
     let knowledge = view.knowledge;
-    match (knowledge.role, view.request.kind) {
+    match (knowledge.role, view.kind) {
         (Role::Werewolf, RequestKind::Devour | RequestKind::Nominate) => {
             knowledge.pack.contains(who)
         }
@@ -203,7 +204,7 @@ mod tests {
     use std::ops::Range;
 
     use super::*;
-    use crate::testing::{id, knowing, request, seer_knowing, target, werewolf_knowing};
+    use crate::testing::{id, knowing, seer_knowing, target, werewolf_knowing};
     use crate::werewolf::roles::base_action_space;
 
     const MASTER: u64 = 20_260_918;
@@ -219,7 +220,7 @@ mod tests {
     ) -> Option<AgentId> {
         policy.choose(View {
             knowledge,
-            request: &request(kind),
+            kind,
             action_space: space,
         })
     }
@@ -227,7 +228,7 @@ mod tests {
     /// The first action a fresh policy under each of [`SEEDS`] takes for
     /// `kind`, in the action space the rules would hand it.
     fn first_choices(knowledge: &Knowledge, kind: RequestKind) -> Vec<(u64, Option<AgentId>)> {
-        let space = base_action_space(knowledge, &request(kind));
+        let space = base_action_space(knowledge, kind);
         SEEDS
             .map(|seed| {
                 let action = choose(&mut RandomPolicy::from_seed(seed), knowledge, kind, &space);
@@ -240,7 +241,7 @@ mod tests {
     /// [`OTHERS`], where no heuristic is in play.
     fn nominations(mut policy: RandomPolicy, n: usize) -> Vec<Option<AgentId>> {
         let knowledge = knowing(Role::Villager, OTHERS);
-        let space = base_action_space(&knowledge, &request(RequestKind::Nominate));
+        let space = base_action_space(&knowledge, RequestKind::Nominate);
         (0..n)
             .map(|_| choose(&mut policy, &knowledge, RequestKind::Nominate, &space))
             .collect()
@@ -284,7 +285,7 @@ mod tests {
             (&villager, RequestKind::Nominate),
         ];
         for (knowledge, kind) in cases {
-            let space = base_action_space(knowledge, &request(kind));
+            let space = base_action_space(knowledge, kind);
             for (seed, action) in first_choices(knowledge, kind) {
                 let action = action.expect("a non-empty action space is pointed into");
                 assert!(
@@ -298,9 +299,9 @@ mod tests {
     #[test]
     fn the_sequence_is_stable_under_interleaved_single_option_decisions() {
         let doctor = knowing(Role::Doctor, ["alice"]);
-        let forced = base_action_space(&doctor, &request(RequestKind::Protect));
+        let forced = base_action_space(&doctor, RequestKind::Protect);
         let villager = knowing(Role::Villager, OTHERS);
-        let open = base_action_space(&villager, &request(RequestKind::Nominate));
+        let open = base_action_space(&villager, RequestKind::Nominate);
 
         let mut policy = RandomPolicy::from_seed(7);
         let mut interleaved = Vec::new();
@@ -366,7 +367,7 @@ mod tests {
             (&doctor, RequestKind::Protect),
             (&seer, RequestKind::Investigate),
         ] {
-            assert!(!base_action_space(knowledge, &request(kind)).is_empty());
+            assert!(!base_action_space(knowledge, kind).is_empty());
             for (seed, action) in first_choices(knowledge, kind) {
                 assert!(action.is_some(), "seed {seed}, {kind:?}");
             }
@@ -377,7 +378,7 @@ mod tests {
     fn a_werewolf_whose_only_living_others_are_packmates_still_acts() {
         let knowledge = werewolf_knowing(["bob", "dave"], ["bob", "dave"]);
         for kind in [RequestKind::Devour, RequestKind::Nominate] {
-            let space = base_action_space(&knowledge, &request(kind));
+            let space = base_action_space(&knowledge, kind);
             for (seed, action) in first_choices(&knowledge, kind) {
                 let action = action.expect("a non-empty action space is pointed into");
                 assert!(space.contains(&action), "seed {seed}, {kind:?}: {action:?}");
@@ -391,7 +392,7 @@ mod tests {
         // non-empty space still points: the space itself is the fallback,
         // so it re-investigates rather than wasting its night.
         let knowledge = seer_knowing(["alice", "bob"], ["alice", "bob"]);
-        let space = base_action_space(&knowledge, &request(RequestKind::Investigate));
+        let space = base_action_space(&knowledge, RequestKind::Investigate);
         for (seed, action) in first_choices(&knowledge, RequestKind::Investigate) {
             let action = action.expect("a non-empty action space is pointed into");
             assert!(space.contains(&action), "seed {seed}: {action:?}");

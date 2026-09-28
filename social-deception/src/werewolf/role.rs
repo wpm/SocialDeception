@@ -67,13 +67,22 @@ impl Role {
         }
     }
 
-    /// The request a living player of this role is asked in `phase`, if
-    /// any: everyone nominates by day; at night a werewolf devours, the
-    /// seer investigates, the doctor protects, and a villager sleeps.
+    /// The kind of session a living player of this role is a member of in
+    /// `phase`, if any: everyone nominates by day; at night a werewolf
+    /// devours, the seer investigates, the doctor protects, and a villager
+    /// sleeps.
     ///
-    /// The one statement of who is asked what. The moderator issues its
-    /// requests from it, and a role checks the requests it receives against
-    /// it, so the two cannot disagree.
+    /// This is what a player calls on itself to decide whether to act.
+    /// Nobody tells it to: on hearing that a phase has begun it asks its
+    /// own role what that phase wants of it, and points if the answer is
+    /// something. That is ADR-0014 — an event to an agent is a fact it
+    /// conditions on, and an instruction telling a player what its own role
+    /// already says is not one.
+    ///
+    /// It is also the one statement of who is asked what. The moderator
+    /// opens a phase's sessions from it and checks an arriving point
+    /// against it, and a role computes its action space from it, so the two
+    /// cannot disagree about who is a member of what.
     #[must_use]
     pub const fn asked_in(self, phase: Phase) -> Option<RequestKind> {
         match (phase, self) {

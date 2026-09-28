@@ -1,5 +1,5 @@
-//! One type per role, each enforcing its own rules: which requests it
-//! answers, and the action space it permits for each.
+//! One type per role, each enforcing its own rules: which sessions it is a
+//! member of, and the action space it permits in each.
 //!
 //! Each type is a [`Player`] whose state is a [`Knowledge`] constructed for
 //! its role, so that the `Assigned` narration the moderator later sends is
@@ -31,17 +31,19 @@
 //! permit: a player that is not one of these types, a language-model agent
 //! or a test stub, is held to exactly the space these types compute.
 //!
-//! Which requests a role answers is [`Role::asked_in`]'s to say, and a
-//! request of any other kind is a bug in the moderator: the role panics
-//! naming itself and the kind. The one role-specific rule in the game is
+//! Which sessions a role is a member of is [`Role::asked_in`]'s to say,
+//! and asking one of these types for an action space of a kind its role is
+//! never asked is a bug in the caller: the role panics naming itself and
+//! the kind. The one role-specific rule in the game is
 //! the doctor's: it may not protect the same player on two consecutive
 //! nights, so its `Protect` action space also excludes
 //! [`Knowledge::last_protected`]. That is a rule of the variant, not
 //! advice, and it is why `Abstain` has to be in that action space: with few
 //! players living, the targets minus last night's can be empty.
 //!
-//! The action space is never empty when a request is legitimately issued:
-//! `Nominate` and `Devour` are only asked while at least one valid target
+//! The action space is empty only where the rules really do leave a player
+//! nowhere to point, and such a player is not a member of the session at
+//! all: `Nominate` and `Devour` open only while at least one valid target
 //! lives, since the game would be over otherwise, and `Protect` and
 //! `Investigate` always have `Abstain`.
 //!
@@ -54,14 +56,14 @@
 use std::collections::BTreeSet;
 
 use super::knowledge::Knowledge;
-use super::message::{Request, RequestKind};
+use super::message::RequestKind;
 use super::player::Player;
 use super::role::Role;
 use crate::event::AgentId;
 
-/// The action space the rules permit `me` for a request of `kind` while
+/// The action space the rules permit `me` in a session of `kind` while
 /// `living` are alive: a target for each living player other than `me`, in
-/// sorted agent order, less `last_protected` if the request is a `Protect`.
+/// sorted agent order, less `last_protected` if the session is a `Protect`.
 ///
 /// This is the whole of the rules about what a player may do, and the one
 /// place they are written: the roles below compute their action spaces with
@@ -85,17 +87,16 @@ pub fn action_space(
     living.iter().filter(excluded).cloned().collect()
 }
 
-/// The action space [`action_space`] permits a player with `knowledge` for
-/// `request`, from what it knows: who is living, and, for a doctor, whom it
-/// protected last night.
+/// The action space [`action_space`] permits a player with `knowledge` in a
+/// session of `kind`, from what it knows: who is living, and, for a doctor,
+/// whom it protected last night.
 ///
 /// # Panics
 ///
-/// If the request is of a kind the player's role is never asked, by
-/// [`Role::asked_in`]: a bug in the moderator, not a runtime condition.
+/// If the kind is one the player's role is never asked, by
+/// [`Role::asked_in`]: a bug in the caller, not a runtime condition.
 #[must_use]
-pub fn base_action_space(knowledge: &Knowledge, request: &Request) -> Vec<AgentId> {
-    let kind = request.kind;
+pub fn base_action_space(knowledge: &Knowledge, kind: RequestKind) -> Vec<AgentId> {
     assert_eq!(
         knowledge.role.asked_in(kind.phase()),
         Some(kind),
@@ -135,8 +136,8 @@ impl Player for Villager {
         &mut self.knowledge
     }
 
-    fn action_space(&self, request: &Request) -> Vec<AgentId> {
-        base_action_space(&self.knowledge, request)
+    fn action_space(&self, kind: RequestKind) -> Vec<AgentId> {
+        base_action_space(&self.knowledge, kind)
     }
 }
 
@@ -168,8 +169,8 @@ impl Player for Werewolf {
 
     /// Eating a packmate is in the action space; see the
     /// [module documentation](self).
-    fn action_space(&self, request: &Request) -> Vec<AgentId> {
-        base_action_space(&self.knowledge, request)
+    fn action_space(&self, kind: RequestKind) -> Vec<AgentId> {
+        base_action_space(&self.knowledge, kind)
     }
 }
 
@@ -200,8 +201,8 @@ impl Player for Seer {
 
     /// Re-investigating someone is in the action space: permitted but
     /// pointless, and "pointless" is the policy's judgment to make.
-    fn action_space(&self, request: &Request) -> Vec<AgentId> {
-        base_action_space(&self.knowledge, request)
+    fn action_space(&self, kind: RequestKind) -> Vec<AgentId> {
+        base_action_space(&self.knowledge, kind)
     }
 }
 
@@ -235,15 +236,15 @@ impl Player for Doctor {
     /// For `Protect`, everyone living but itself and whoever it protected
     /// last night, which its knowledge remembers. `Abstain` is always there,
     /// so the space is never empty.
-    fn action_space(&self, request: &Request) -> Vec<AgentId> {
-        base_action_space(&self.knowledge, request)
+    fn action_space(&self, kind: RequestKind) -> Vec<AgentId> {
+        base_action_space(&self.knowledge, kind)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{ME, id, ids, knowing, request, seer_knowing, target, werewolf_knowing};
+    use crate::testing::{ME, id, ids, knowing, seer_knowing, target, werewolf_knowing};
 
     /// `player` with `knowledge` in place of what it was constructed with.
     fn with<R: Player>(mut player: R, knowledge: Knowledge) -> R {
@@ -269,9 +270,7 @@ mod tests {
 
     /// Points at `target` for a `Protect`, the way a seat would.
     fn protected(doctor: &mut Doctor, target: &AgentId) {
-        doctor
-            .knowledge_mut()
-            .acted(&request(RequestKind::Protect), target);
+        doctor.knowledge_mut().acted(RequestKind::Protect, target);
     }
 
     #[test]
@@ -291,36 +290,18 @@ mod tests {
         let with_abstain = targets;
 
         assert_eq!(
-            villager(others).action_space(&request(RequestKind::Nominate)),
+            villager(others).action_space(RequestKind::Nominate),
             targets()
         );
         let werewolf = werewolf(others, []);
-        assert_eq!(
-            werewolf.action_space(&request(RequestKind::Nominate)),
-            targets()
-        );
-        assert_eq!(
-            werewolf.action_space(&request(RequestKind::Devour)),
-            targets()
-        );
+        assert_eq!(werewolf.action_space(RequestKind::Nominate), targets());
+        assert_eq!(werewolf.action_space(RequestKind::Devour), targets());
         let seer = seer(others, []);
-        assert_eq!(
-            seer.action_space(&request(RequestKind::Nominate)),
-            targets()
-        );
-        assert_eq!(
-            seer.action_space(&request(RequestKind::Investigate)),
-            with_abstain()
-        );
+        assert_eq!(seer.action_space(RequestKind::Nominate), targets());
+        assert_eq!(seer.action_space(RequestKind::Investigate), with_abstain());
         let doctor = doctor(others);
-        assert_eq!(
-            doctor.action_space(&request(RequestKind::Nominate)),
-            targets()
-        );
-        assert_eq!(
-            doctor.action_space(&request(RequestKind::Protect)),
-            with_abstain()
-        );
+        assert_eq!(doctor.action_space(RequestKind::Nominate), targets());
+        assert_eq!(doctor.action_space(RequestKind::Protect), with_abstain());
     }
 
     #[test]
@@ -328,7 +309,7 @@ mod tests {
         let mut villager = villager(["alice", "bob", "carol"]);
         villager.knowledge_mut().living.remove(&id("bob"));
         assert_eq!(
-            villager.action_space(&request(RequestKind::Nominate)),
+            villager.action_space(RequestKind::Nominate),
             ["alice", "carol"].map(target)
         );
     }
@@ -341,9 +322,9 @@ mod tests {
         let first = seer(others, []);
         let second = seer(others, []);
         for kind in [RequestKind::Nominate, RequestKind::Investigate] {
-            let space = first.action_space(&request(kind));
-            assert_eq!(first.action_space(&request(kind)), space, "{kind:?}");
-            assert_eq!(second.action_space(&request(kind)), space, "{kind:?}");
+            let space = first.action_space(kind);
+            assert_eq!(first.action_space(kind), space, "{kind:?}");
+            assert_eq!(second.action_space(kind), space, "{kind:?}");
         }
     }
 
@@ -352,7 +333,7 @@ mod tests {
         let werewolf = werewolf(["alice", "bob", "carol"], ["bob"]);
         for kind in [RequestKind::Devour, RequestKind::Nominate] {
             assert_eq!(
-                werewolf.action_space(&request(kind)),
+                werewolf.action_space(kind),
                 ["alice", "bob", "carol"].map(target),
                 "{kind:?}"
             );
@@ -363,7 +344,7 @@ mod tests {
     fn a_seer_may_investigate_someone_it_has_already_seen() {
         let seer = seer(["alice", "bob"], ["alice"]);
         assert_eq!(
-            seer.action_space(&request(RequestKind::Investigate)),
+            seer.action_space(RequestKind::Investigate),
             [target("alice"), target("bob")]
         );
     }
@@ -371,18 +352,18 @@ mod tests {
     #[test]
     fn a_doctor_may_not_protect_the_same_player_two_nights_running() {
         let mut doctor = doctor(["alice", "bob"]);
-        let protect = request(RequestKind::Protect);
+        let protect = RequestKind::Protect;
         assert_eq!(
-            doctor.action_space(&protect),
+            doctor.action_space(protect),
             [target("alice"), target("bob")]
         );
 
         protected(&mut doctor, &target("alice"));
-        assert_eq!(doctor.action_space(&protect), [target("bob")]);
+        assert_eq!(doctor.action_space(protect), [target("bob")]);
 
         // The night after, alice is available again.
         protected(&mut doctor, &target("bob"));
-        assert_eq!(doctor.action_space(&protect), [target("alice")]);
+        assert_eq!(doctor.action_space(protect), [target("alice")]);
     }
 
     #[test]
@@ -391,11 +372,7 @@ mod tests {
         // a player with an empty one is not asked at all (ADR-0011).
         let mut doctor = doctor(["alice"]);
         protected(&mut doctor, &target("alice"));
-        assert!(
-            doctor
-                .action_space(&request(RequestKind::Protect))
-                .is_empty()
-        );
+        assert!(doctor.action_space(RequestKind::Protect).is_empty());
     }
 
     #[test]
@@ -407,7 +384,7 @@ mod tests {
         let living = ids(["alice", "bob", "carol", ME]);
         for kind in [RequestKind::Protect, RequestKind::Nominate] {
             assert_eq!(
-                doctor.action_space(&request(kind)),
+                doctor.action_space(kind),
                 action_space(&id(ME), &living, kind, Some(&id("bob"))),
                 "{kind:?}"
             );
@@ -424,7 +401,7 @@ mod tests {
         let mut doctor = doctor(["alice", "bob"]);
         protected(&mut doctor, &target("alice"));
         assert_eq!(
-            doctor.action_space(&request(RequestKind::Nominate)),
+            doctor.action_space(RequestKind::Nominate),
             [target("alice"), target("bob")]
         );
     }
@@ -432,24 +409,24 @@ mod tests {
     #[test]
     #[should_panic(expected = "a Villager is never asked to Devour")]
     fn a_villager_is_never_asked_to_devour() {
-        villager(["alice"]).action_space(&request(RequestKind::Devour));
+        villager(["alice"]).action_space(RequestKind::Devour);
     }
 
     #[test]
     #[should_panic(expected = "a Werewolf is never asked to Investigate")]
     fn a_werewolf_is_never_asked_to_investigate() {
-        werewolf(["alice"], []).action_space(&request(RequestKind::Investigate));
+        werewolf(["alice"], []).action_space(RequestKind::Investigate);
     }
 
     #[test]
     #[should_panic(expected = "a Seer is never asked to Protect")]
     fn a_seer_is_never_asked_to_protect() {
-        seer(["alice"], []).action_space(&request(RequestKind::Protect));
+        seer(["alice"], []).action_space(RequestKind::Protect);
     }
 
     #[test]
     #[should_panic(expected = "a Doctor is never asked to Devour")]
     fn a_doctor_is_never_asked_to_devour() {
-        doctor(["alice"]).action_space(&request(RequestKind::Devour));
+        doctor(["alice"]).action_space(RequestKind::Devour);
     }
 }

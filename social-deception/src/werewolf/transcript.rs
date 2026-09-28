@@ -34,9 +34,9 @@
 //! A reward is also the one record here with no sequence number, so it is
 //! outside the contiguity check the moderator's records are held to. The
 //! moderator is the authoritative view: its `action` records are every
-//! narration and every request it sent, and its `observation` records are
-//! every response it received, each naming the responding player as its
-//! sender. Which record type a line is *is* the direction, so the reader
+//! narration it sent, and its `observation` records are every point it
+//! received, each naming the player that made it as its sender. Which
+//! record type a line is *is* the direction, so the reader
 //! needs no direction of its own. Reassembling the game from the players'
 //! records would mean recovering hidden information from partial views,
 //! which is the thing the design prevents. Within one agent's records the
@@ -59,9 +59,7 @@ use std::fmt;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
-use super::message::{
-    Cause, Message, Narration, Outcome, Phase, Point, Request, RequestId, RequestKind, Round,
-};
+use super::message::{Cause, Message, Narration, Outcome, Phase, Point, RequestKind, Round};
 use super::role::{Faction, Role};
 use crate::event::AgentId;
 
@@ -106,8 +104,8 @@ pub struct PhaseRecord {
     /// Everyone in the game when the phase began.
     pub living: BTreeSet<AgentId>,
     /// Every point made this phase, by the player that made it, paired
-    /// with the kind of request it answered. The target alone does not say
-    /// whether it was devoured, protected, investigated or nominated.
+    /// with the kind of session it was made in. The target alone does not
+    /// say whether it was devoured, protected, investigated or nominated.
     pub moves: BTreeMap<AgentId, (RequestKind, AgentId)>,
     /// What each seer learned: whom it investigated and the faction that
     /// came back, by seer. Empty on a phase where no seer investigated,
@@ -188,25 +186,27 @@ pub enum TranscriptError {
         /// The one found.
         found: u64,
     },
-    /// A response answers a request the moderator did not send, has already
-    /// had answered, or sent to somebody else.
-    UnknownRequest {
+    /// A point was made in a session its sender is not a member of: the
+    /// phase does not ask that of its role, or the point names a round
+    /// that is not the one under way.
+    NotAMember {
         /// The line.
         line: usize,
-        /// The responding agent.
+        /// The pointing agent.
         from: AgentId,
-        /// The request it named.
-        request: RequestId,
+        /// The session it pointed in.
+        kind: RequestKind,
     },
-    /// A record belongs to a phase that has not begun: a response, an
+    /// A record belongs to a phase that has not begun: a point, an
     /// investigation or an elimination before the first night, or a day
     /// whose night has not begun or that has begun already.
     NoPhase {
         /// The line.
         line: usize,
     },
-    /// A message the moderator never records: a narration or a request
-    /// observed by it, or a response it took as an action.
+    /// A message the moderator never records: a narration it observed
+    /// rather than sent, or a point it took as an action rather than
+    /// received.
     Misdirected {
         /// The line.
         line: usize,
@@ -239,13 +239,9 @@ impl fmt::Display for TranscriptError {
                 f,
                 "line {line} has sequence number {found} where {expected} was expected"
             ),
-            Self::UnknownRequest {
-                line,
-                from,
-                request: RequestId(id),
-            } => write!(
+            Self::NotAMember { line, from, kind } => write!(
                 f,
-                "line {line}: {from} answered request {id}, which was not asked of it"
+                "line {line}: {from} pointed in a {kind:?} session, which it is not a member of"
             ),
             Self::NoPhase { line } => {
                 write!(f, "line {line} belongs to a phase, but none has begun")
@@ -580,8 +576,9 @@ fn only(
 struct Reader {
     assignment: BTreeMap<AgentId, Role>,
     rounds: Vec<RoundRecord>,
-    /// The requests sent and not yet answered: who was asked, and what.
-    outstanding: BTreeMap<RequestId, (AgentId, RequestKind)>,
+    /// How the game ended, once the moderator has announced it. `None`
+    /// until then, and still `None` at the end of a truncated transcript,
+    /// which is [`TranscriptError::NoOutcome`].
     outcome: Option<Outcome>,
 }
 
@@ -598,7 +595,6 @@ impl Reader {
             (Direction::Sent, Message::Narration(narration)) => {
                 self.narrated(line, recipients, narration)
             }
-            (Direction::Sent, Message::Request(request)) => self.asked(line, recipients, &request),
             (Direction::Received, Message::Point(point)) => self.answered(line, sender, point),
             _ => Err(TranscriptError::Misdirected { line }),
         }
@@ -658,35 +654,35 @@ impl Reader {
         Ok(())
     }
 
-    fn asked(
-        &mut self,
-        line: usize,
-        recipients: BTreeSet<AgentId>,
-        request: &Request,
-    ) -> Result<(), TranscriptError> {
-        let who = only(line, recipients, "a request is addressed to one player")?;
-        self.outstanding.insert(request.id, (who, request.kind));
-        Ok(())
-    }
-
     fn answered(
         &mut self,
         line: usize,
         from: AgentId,
         point: Point,
     ) -> Result<(), TranscriptError> {
-        // A mismatch ends the read, so removing before checking loses nothing.
-        let kind = match self.outstanding.remove(&point.request) {
-            Some((asked, kind)) if asked == from => kind,
-            _ => {
-                return Err(TranscriptError::UnknownRequest {
-                    line,
-                    from,
-                    request: point.request,
-                });
-            }
-        };
-        self.current(line)?.moves.insert(from, (kind, point.target));
+        // The point says which session it was made in, so there is
+        // nothing to look up (ADR-0014). What has to be checked is that
+        // its sender's role is asked that in that phase: a reader learns
+        // the roles from the deal, which precedes every point.
+        let role = self
+            .assignment
+            .get(&from)
+            .copied()
+            .ok_or(TranscriptError::NotAMember {
+                line,
+                from: from.clone(),
+                kind: point.kind,
+            })?;
+        if role.asked_in(point.kind.phase()) != Some(point.kind) {
+            return Err(TranscriptError::NotAMember {
+                line,
+                from,
+                kind: point.kind,
+            });
+        }
+        self.current(line)?
+            .moves
+            .insert(from, (point.kind, point.target));
         Ok(())
     }
 
@@ -1435,27 +1431,63 @@ mod tests {
     }
 
     #[test]
-    fn a_response_to_an_unknown_request_is_an_error() {
+    fn a_point_in_a_session_the_senders_role_is_not_in_is_an_error() {
+        // There is no id to invent an unknown value for any more
+        // (ADR-0014): a point says which session it was made in, and
+        // what the reader checks is that the sender's role puts it in
+        // that session. So the forgery is a kind the sender's own role
+        // is never asked — which one that is depends on the role the
+        // fixture dealt, so it is derived rather than written in.
         let mut lines = fixture();
         let index = moderator_record(&lines, is_point);
-        lines[index]["event"]["payload"]["Point"]["request"] = json!(99);
+        let kind: RequestKind =
+            serde_json::from_value(lines[index]["event"]["payload"]["Point"]["kind"].clone())
+                .expect("a point names its session");
+        let forged = [
+            RequestKind::Devour,
+            RequestKind::Investigate,
+            RequestKind::Protect,
+        ]
+        .into_iter()
+        .find(|other| *other != kind)
+        .expect("a night has three kinds and a role is asked one");
+        lines[index]["event"]["payload"]["Point"]["kind"] = json!(forged);
         let error = read(&lines).unwrap_err();
         assert!(
-            matches!(&error, TranscriptError::UnknownRequest { line, request: RequestId(99), .. }
-                if *line == index + 1),
+            matches!(&error, TranscriptError::NotAMember { line, kind, .. }
+                if *line == index + 1 && *kind == forged),
             "{error:?}"
         );
-        assert!(error.to_string().contains("request 99"), "{error}");
+        assert!(
+            error.to_string().contains(&format!("{forged:?} session")),
+            "{error}"
+        );
     }
 
     #[test]
-    fn a_response_from_someone_the_request_was_not_asked_of_is_an_error() {
+    fn a_point_from_someone_the_phase_asks_nothing_of_is_an_error() {
+        // frank is a villager, and a villager is a member of no night
+        // session at all.
         let mut lines = fixture();
         let index = moderator_record(&lines, is_point);
         lines[index]["event"]["sender"] = json!("frank");
         let error = read(&lines).unwrap_err();
         assert!(
-            matches!(&error, TranscriptError::UnknownRequest { from, .. } if from.as_str() == "frank"),
+            matches!(&error, TranscriptError::NotAMember { from, .. } if from.as_str() == "frank"),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn a_point_from_someone_not_in_the_deal_is_an_error() {
+        // A reader learns the roles from the deal, which precedes every
+        // point. A sender the deal never named has no role to check.
+        let mut lines = fixture();
+        let index = moderator_record(&lines, is_point);
+        lines[index]["event"]["sender"] = json!("zara");
+        let error = read(&lines).unwrap_err();
+        assert!(
+            matches!(&error, TranscriptError::NotAMember { from, .. } if from.as_str() == "zara"),
             "{error:?}"
         );
     }
@@ -1514,25 +1546,20 @@ mod tests {
         );
     }
 
-    fn is_request(payload: &Value) -> bool {
-        !payload["Request"].is_null()
-    }
-
     #[test]
-    fn a_request_addressed_to_other_than_one_player_is_an_error() {
-        // Naming the request's line, not the line of whichever response
-        // later fails to match it.
-        for to in [json!([]), json!(["alice", "bob"])] {
-            let mut lines = fixture();
-            let index = moderator_record(&lines, is_request);
-            lines[index]["event"]["recipients"] = to.clone();
-            let error = read(&lines).unwrap_err();
-            assert!(
-                matches!(&error, TranscriptError::Malformed { line, what }
-                    if *line == index + 1 && what == "a request is addressed to one player"),
-                "{to}: {error:?}"
-            );
-        }
+    fn a_transcript_holds_no_request_at_all() {
+        // Nothing is asked of anybody (ADR-0014), so no record in a
+        // transcript is a request, and the "addressed to one player"
+        // check a request once needed has nothing left to guard. The
+        // check itself lives on for a finding, which is still addressed
+        // to one seer.
+        let lines = fixture();
+        assert!(
+            !lines
+                .iter()
+                .any(|line| !line["event"]["payload"]["Request"].is_null()),
+            "a transcript still holds a request"
+        );
     }
 
     #[test]
@@ -1556,7 +1583,7 @@ mod tests {
     fn a_response_before_any_phase_is_an_error() {
         let mut lines = fixture();
         // The first night's announcement becomes something harmless, so the
-        // first response answers a request in no phase.
+        // first point is made in no phase at all.
         let index = moderator_record(&lines, |payload| {
             !payload["Narration"]["PhaseBegan"].is_null()
         });
@@ -1663,7 +1690,6 @@ mod tests {
             for directive in directives {
                 let (to, payload) = match directive {
                     Directive::Narrate { to, narration } => (to, Message::Narration(narration)),
-                    Directive::Ask { to, request } => ([to].into(), Message::Request(request)),
                     // A stop is a control, and `Transcript::read` skips
                     // control records: they say nothing about the game.
                     Directive::Stop { .. } => continue,
@@ -1682,37 +1708,38 @@ mod tests {
         }
     }
 
-    /// Plays `script`, one phase's answers per entry, through a game over
+    /// Plays `script`, one phase's points per entry, through a game over
     /// `assignment`, and returns the moderator's records.
     fn scripted(assignment: Assignment, script: &[Vec<(&str, AgentId)>]) -> Vec<Value> {
         /// Far enough apart that one phase's clocks never reach the next.
         const STEP: u64 = 10_000;
 
         let mut scribe = Scribe::new();
+        let roles = assignment.clone();
         let mut game = Game::new(assignment, 1, fast());
-        let mut latest = game.begin(Timestamp::default());
-        scribe.directives(latest.clone());
+        scribe.directives(game.begin(Timestamp::default()));
         for (index, answers) in script.iter().enumerate() {
-            let asked: BTreeMap<AgentId, RequestId> = latest
-                .iter()
-                .filter_map(|directive| match directive {
-                    Directive::Ask { to, request } => Some((to.clone(), request.id)),
-                    Directive::Narrate { .. } | Directive::Stop { .. } => None,
-                })
-                .collect();
             let now = Timestamp::from(Duration::from_millis((index as u64 + 1) * STEP));
             // Taken before any point is recorded: a day ends on the point
             // that makes a majority, so pointing alone may finish it.
             let phase = game.phase_now();
-            let mut caused = Vec::new();
+            let (phase_kind, round) = phase;
             for (who, chosen) in answers {
+                // Which session a point belongs to is the pointer's own
+                // business (ADR-0014): the script stands in for the
+                // player, so it reads it off the role the same way the
+                // player would, rather than off a request.
+                let kind = roles
+                    .role(&id(who))
+                    .and_then(|role| role.asked_in(phase_kind))
+                    .expect("the phase asks something of this role");
                 let point = Point {
-                    request: asked[&id(who)],
+                    round,
+                    kind,
                     target: chosen.clone(),
                 };
                 scribe.point(who, point.clone());
-                caused = game.point(&id(who), &point, now);
-                scribe.directives(caused.clone());
+                scribe.directives(game.point(&id(who), &point, now));
             }
             // Close this phase and no more. Expiring at the earliest
             // deadline open, and stopping as soon as the phase moves,
@@ -1725,10 +1752,8 @@ mod tests {
                 if expired.is_empty() {
                     break;
                 }
-                scribe.directives(expired.clone());
-                caused = expired;
+                scribe.directives(expired);
             }
-            latest = caused;
         }
         scribe.lines
     }
@@ -1817,14 +1842,14 @@ mod tests {
 
     #[test]
     fn errors_display_the_line_they_were_found_on() {
-        let error = TranscriptError::UnknownRequest {
+        let error = TranscriptError::NotAMember {
             line: 12,
             from: id("bob"),
-            request: RequestId(7),
+            kind: RequestKind::Protect,
         };
         assert_eq!(
             error.to_string(),
-            "line 12: bob answered request 7, which was not asked of it"
+            "line 12: bob pointed in a Protect session, which it is not a member of"
         );
         assert!(error.source().is_none());
     }

@@ -48,7 +48,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::WerewolfDomain;
-use super::message::{Cause, Message, Narration, Outcome, Phase, Request, RequestKind, Round};
+use super::message::{Cause, Message, Narration, Outcome, Phase, RequestKind, Round};
 use super::role::{Faction, Role};
 use crate::agent::Observation;
 use crate::event::AgentId;
@@ -140,16 +140,16 @@ impl Knowledge {
         }
     }
 
-    /// Folds one of this agent's own moves into the state: the answer it
-    /// gave to `request`.
+    /// Folds one of this agent's own moves into the state: the target it
+    /// pointed at in a session of `kind`.
     ///
     /// Total, like [`observe`](Self::observe), and almost always a no-op,
     /// because the moderator narrates the consequences of nearly every
     /// point back to the agent. The one exception is a `Protect`, which is
     /// announced to nobody: its target is remembered as
     /// [`last_protected`](Self::last_protected).
-    pub fn acted(&mut self, request: &Request, chosen: &AgentId) {
-        if request.kind == RequestKind::Protect {
+    pub fn acted(&mut self, kind: RequestKind, chosen: &AgentId) {
+        if kind == RequestKind::Protect {
             self.last_protected = Some(chosen.clone());
         }
     }
@@ -158,10 +158,8 @@ impl Knowledge {
     ///
     /// Total: every observation has a defined effect, and most have none.
     /// A narration changes the state, and so does a point, which under
-    /// ADR-0011 another player may see. A request tells the agent nothing
-    /// the phase's announcement did not, and answering it is the role's
-    /// job. Nothing here is an error, so the state stays a total function
-    /// of whatever arrives.
+    /// ADR-0011 another player may see. Nothing here is an error, so the
+    /// state stays a total function of whatever arrives.
     ///
     /// Controls do not appear here at all: they are out-of-domain, the
     /// agent loop acts on them, and no handler ever sees one.
@@ -176,15 +174,14 @@ impl Knowledge {
     pub fn observe(&mut self, observation: &Observation<WerewolfDomain>) {
         match &observation.event.payload {
             Message::Narration(narration) => self.narrated(narration),
-            // The sender's latest point, which replaces whatever it pointed
-            // at before. The request id is not checked: a point this agent
-            // was addressed at all is one the moderator let it see, and the
-            // phase's own `PhaseBegan` is what clears the slate.
+            // The sender's latest point, which replaces whatever it
+            // pointed at before. The session is not checked: a point this
+            // agent was addressed at all is one the rules let it see, and
+            // the phase's own `PhaseBegan` is what clears the slate.
             Message::Point(point) => {
                 self.points
                     .insert(observation.event.sender.clone(), point.target.clone());
             }
-            Message::Request(_) => {}
         }
     }
 
@@ -273,8 +270,8 @@ impl Knowledge {
 mod tests {
     use super::*;
     use crate::event::Event;
-    use crate::testing::{ME, from, id, ids, narrated, observed, phase_began, request, target};
-    use crate::werewolf::message::{Point, RequestId};
+    use crate::testing::{ME, from, id, ids, narrated, observed, phase_began, target};
+    use crate::werewolf::message::Point;
 
     fn votes<const N: usize>(votes: [(&str, AgentId); N]) -> BTreeMap<AgentId, AgentId> {
         votes
@@ -501,17 +498,7 @@ mod tests {
         // A control is not among these: the loop acts on controls and a
         // handler, and so this fold, never sees one.
         let knowledge = folded(Role::Seer, &a_seers_game()[..8]);
-        let no_ops = [
-            from(
-                "moderator",
-                Message::Request(Request {
-                    id: RequestId(3),
-                    round: Round(2),
-                    kind: RequestKind::Investigate,
-                }),
-            ),
-            narrated(Narration::NoDeath { round: Round(2) }),
-        ];
+        let no_ops = [narrated(Narration::NoDeath { round: Round(2) })];
         for event in &no_ops {
             let mut after = knowledge.clone();
             after.observe(&observed(event.clone()));
@@ -522,13 +509,12 @@ mod tests {
     #[test]
     fn a_protection_is_remembered_until_the_next_one() {
         let mut knowledge = Knowledge::new(id(ME), Role::Doctor);
-        let protect = request(RequestKind::Protect);
         assert_eq!(knowledge.last_protected, None);
 
-        knowledge.acted(&protect, &target("alice"));
+        knowledge.acted(RequestKind::Protect, &target("alice"));
         assert_eq!(knowledge.last_protected, Some(id("alice")));
 
-        knowledge.acted(&protect, &target("bob"));
+        knowledge.acted(RequestKind::Protect, &target("bob"));
         assert_eq!(knowledge.last_protected, Some(id("bob")));
     }
 
@@ -542,7 +528,8 @@ mod tests {
             from(
                 who,
                 Message::Point(Point {
-                    request: RequestId(1),
+                    round: Round(1),
+                    kind: RequestKind::Nominate,
                     target: id(target),
                 }),
             )
@@ -583,7 +570,7 @@ mod tests {
             RequestKind::Investigate,
         ] {
             let mut after = before.clone();
-            after.acted(&request(kind), &target("alice"));
+            after.acted(kind, &target("alice"));
             assert_eq!(after, before, "{kind:?}");
         }
     }
@@ -638,7 +625,7 @@ mod tests {
                 Phase::Night,
                 ids(["alice", "bob", ME]),
             )));
-            knowledge.acted(&request(RequestKind::Protect), &target("alice"));
+            knowledge.acted(RequestKind::Protect, &target("alice"));
             knowledge.observe(&observed(narrated(Narration::NoDeath { round: Round(1) })));
         };
         let mut first = Knowledge::new(id(ME), Role::Doctor);

@@ -16,8 +16,7 @@ use crate::clock::Timestamp;
 use crate::event::{AgentId, Domain, Event};
 use crate::trajectory::{JsonLines, LogRecord, Policy, Sink, Writer};
 use crate::werewolf::{
-    Assignment, Faction, Knowledge, Message, Narration, Phase, Request, RequestId, RequestKind,
-    Role, Round, WerewolfDomain,
+    Assignment, Faction, Knowledge, Message, Narration, Phase, Role, Round, WerewolfDomain,
 };
 
 pub(crate) use temp::TempDir;
@@ -170,15 +169,6 @@ pub(crate) fn fast() -> crate::werewolf::config::Timing {
         day: DayTiming {
             limit: Duration::from_millis(80),
         },
-    }
-}
-
-/// A request of `kind`, for tests where its id and round do not matter.
-pub(crate) fn request(kind: RequestKind) -> Request {
-    Request {
-        id: RequestId(1),
-        round: Round(1),
-        kind,
     }
 }
 

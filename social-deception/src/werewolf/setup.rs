@@ -20,7 +20,7 @@
 //!
 //! The moderator is the episode's [`Environment`](crate::Environment), so
 //! an episode ends when the moderator says it does, which is when it has
-//! announced the outcome. A player that fails to answer a request leaves
+//! announced the outcome. A player that never points leaves
 //! nothing in flight and nobody stopped, which the episode reports as
 //! [`EpisodeError::Stalled`] naming the players still running. So there is
 //! nothing for this module to detect: [`run`] takes the outcome from the
@@ -70,8 +70,8 @@ pub enum RunError {
         /// What went wrong.
         source: io::Error,
     },
-    /// The episode did not run cleanly. A game in which some player did not
-    /// answer a request arrives here as
+    /// The episode did not run cleanly. A game in which some player never
+    /// pointed arrives here as
     /// [`EpisodeError::Stalled`].
     Episode(EpisodeError),
     /// The episode ran cleanly and the moderator announced no outcome.
@@ -224,7 +224,7 @@ fn add(
 ///
 /// [`RunError::Io`] if the trajectory cannot be created or written,
 /// [`RunError::Episode`] if the episode did not run cleanly — a player that
-/// did not answer a request arrives as
+/// never pointed arrives as
 /// [`EpisodeError::Stalled`] — and
 /// [`RunError::NoOutcome`] if a clean run left no outcome on the channel.
 ///
@@ -442,7 +442,7 @@ mod tests {
         assert!(error::Error::source(&error).is_some());
     }
 
-    /// A player that never answers.
+    /// A player that never points.
     struct Silent;
 
     impl Handler<WerewolfDomain> for Silent {
@@ -454,7 +454,7 @@ mod tests {
     #[test]
     fn a_silent_player_no_longer_stalls_the_run() {
         // The same roster `episode` would build, except that one werewolf
-        // never answers. Under ADR-0004 that was a stall: the phase
+        // never points. Under ADR-0004 that was a stall: the phase
         // resolved on its last answer and one that never came stopped the
         // game. Under ADR-0011 a session closes on its clock, so the
         // silent player is simply a member that never pointed, and the

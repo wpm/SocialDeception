@@ -4,17 +4,25 @@
 //! The checks are written against the parsed lines, the way the runtime's
 //! own checks are, and read the game the way the transcript reader does:
 //! from the moderator's records, whose `action` records are every narration
-//! and request it sent and whose `observation` records are every response it
-//! received, in the order it recorded them. The players' records are
-//! consulted only for what the moderator cannot vouch for, which is what
-//! actually reached each of them.
+//! it sent and whose `observation` records are every point it received, in
+//! the order it recorded them. The players' records are consulted only for
+//! what the moderator cannot vouch for, which is what actually reached each
+//! of them.
+//!
+//! Since ADR-0014 a trajectory holds no request at all. Nobody is told to
+//! act: a player observes that a phase has begun, asks its own role what
+//! that phase wants of it, and points. So a point is no longer half of a
+//! pair to be joined up — it carries the round and the kind of the session
+//! it was made in, and every check below reads what it needs straight off
+//! the point and off the phase narrations that frame it.
 //!
 //! They fall into four groups:
 //!
-//! - **protocol**: every request is answered exactly once, by the agent it
-//!   was asked of, with an action inside the action space the rules allowed
-//!   it; the dead are neither asked nor heard from; players only ever
-//!   address the moderator; and the moderator's last word is the outcome. A
+//! - **protocol**: every point names a session its sender's role really
+//!   is a member of, in the phase under way when it was made, with a
+//!   target inside the action space the rules allow it; the dead are never
+//!   heard from; players only ever address the moderator; and the
+//!   moderator's last word is the outcome. A
 //!   trajectory whose last narration is not an outcome is a game the
 //!   moderator never ended, which the episode also catches as a stall;
 //! - **hidden information**: the realized observations stay inside each
@@ -55,8 +63,8 @@ use serde::Deserialize;
 use serde_json::Value;
 use social_deception::AgentId;
 use social_deception::werewolf::{
-    Assignment, Cause, Config, Faction, Message, Narration, Outcome, Phase, Point, Request,
-    RequestId, RequestKind, Role, Round,
+    Assignment, Cause, Config, Faction, Message, Narration, Outcome, Phase, Point, RequestKind,
+    Role, Round, roles,
 };
 
 /// Something the moderator said.
@@ -76,7 +84,7 @@ struct Heard<'a> {
 }
 
 /// A game as its moderator recorded it, with the facts every check needs
-/// read out once: who holds which role, which request is which, when each
+/// read out once: who holds which role, where each phase began, when each
 /// player was eliminated, and how it ended.
 struct Play<'a> {
     config: &'a Config,
@@ -84,8 +92,14 @@ struct Play<'a> {
     said: Vec<Said<'a>>,
     /// Every point the moderator heard, in sequence order.
     heard: Vec<Heard<'a>>,
-    /// Where in `said` each request was asked.
-    requests: BTreeMap<RequestId, usize>,
+    /// Each phase, in the order it began: its round, its phase, and the
+    /// sequence number of the narration that announced it.
+    ///
+    /// This is what a point is placed in. Nothing is issued to a player
+    /// any more (ADR-0014), so the phase narration is the only record of
+    /// a session opening, and the phase a point falls in is the latest
+    /// one announced before it.
+    phases: Vec<(Round, Phase, u64)>,
     /// Each player's role, from the `Assigned` narration it was sent.
     assignment: Assignment,
     /// The sequence number of the narration that eliminated each player.
@@ -105,9 +119,13 @@ struct Play<'a> {
 /// On the first invariant that does not hold, naming the record.
 pub fn check(lines: &[Value], config: &Config) {
     let play = Play::read(lines, config);
-    play.check_requests_and_points();
-    play.check_action_spaces();
+    // The phases first: a point is placed by the phase it names
+    // (ADR-0014), so a trajectory whose phases are themselves wrong
+    // should fail by that name rather than as a point that cannot be
+    // placed in them.
     play.check_phases();
+    play.check_points();
+    play.check_action_spaces();
     play.check_recipients();
     play.check_hidden_information();
     play.check_outcome();
@@ -224,7 +242,7 @@ impl<'a> Play<'a> {
                 let message = message(line);
                 assert!(
                     !matches!(message, Message::Point(_)),
-                    "the moderator only narrates and asks: {line}"
+                    "the moderator only narrates: {line}"
                 );
                 let to = recipients(line);
                 assert!(
@@ -258,18 +276,14 @@ impl<'a> Play<'a> {
             })
             .collect();
 
-        let mut requests = BTreeMap::new();
+        let mut phases = Vec::new();
         let mut roles = Vec::new();
         let mut eliminated = BTreeMap::new();
-        for (index, said) in said.iter().enumerate() {
+        for said in &said {
             let line = said.line;
             match &said.message {
-                Message::Request(request) => {
-                    only(&said.to, line);
-                    assert!(
-                        requests.insert(request.id, index).is_none(),
-                        "a request id is issued once: {line}"
-                    );
+                Message::Narration(Narration::PhaseBegan { round, phase, .. }) => {
+                    phases.push((*round, *phase, said.seq));
                 }
                 Message::Narration(Narration::Assigned { role, .. }) => {
                     roles.push((only(&said.to, line).clone(), *role));
@@ -308,7 +322,7 @@ impl<'a> Play<'a> {
             config,
             said,
             heard,
-            requests,
+            phases,
             assignment,
             eliminated,
             outcome,
@@ -346,140 +360,205 @@ impl<'a> Play<'a> {
             .collect()
     }
 
-    /// The members of a night session of `kind` at the record numbered
-    /// `seq`: the living players asked that kind, which is who its
-    /// closing tally is addressed to.
+    /// The phase a record numbered `seq` falls in: the latest phase
+    /// announced before it.
     ///
-    /// Read from the requests actually issued rather than from the roles,
-    /// so that a player the rules left nothing to point at — a doctor with
-    /// nobody it may protect — is not counted as a member it never was.
-    fn night_members(&self, kind: RequestKind, seq: u64) -> BTreeSet<AgentId> {
-        let living = self.living_at(seq);
-        self.requests
-            .values()
-            .map(|index| &self.said[*index])
-            .filter_map(|said| match &said.message {
-                Message::Request(request) if request.kind == kind && said.seq < seq => {
-                    said.to.iter().next().cloned()
-                }
-                _ => None,
-            })
-            .filter(|who| living.contains(who))
+    /// A phase narration is the only record that a phase's sessions
+    /// opened (ADR-0014), so this is what places everything the
+    /// moderator said or heard within the game.
+    fn phase_at(&self, seq: u64) -> Option<(Round, Phase)> {
+        self.phases
+            .iter()
+            .take_while(|(_, _, began)| *began < seq)
+            .last()
+            .map(|(round, phase, _)| (*round, *phase))
+    }
+
+    /// Whom each doctor protected in `round`, from the points it made.
+    ///
+    /// A point says which round and which session it belongs to, so this
+    /// reads straight off the points with no request to join to. The
+    /// doctor's latest point of the round is its protection, the same
+    /// rule the session itself applies (ADR-0011).
+    fn protections_in(&self, round: Round) -> BTreeMap<AgentId, AgentId> {
+        self.heard
+            .iter()
+            .filter(|heard| heard.point.round == round && heard.point.kind == RequestKind::Protect)
+            .map(|heard| (heard.from.clone(), heard.point.target.clone()))
             .collect()
     }
 
-    /// The request with the given id, if one was asked: the record it was
-    /// asked in, the player it was asked of, and the request.
-    fn asked(&self, id: RequestId) -> Option<(&Said<'a>, &AgentId, &Request)> {
-        let said = &self.said[*self.requests.get(&id)?];
-        match &said.message {
-            Message::Request(request) => Some((said, said.to.first().unwrap(), request)),
-            _ => unreachable!("`requests` indexes only requests"),
-        }
+    /// The action space the rules permit `who` in a session of `kind` in
+    /// `round`, with `living` alive.
+    ///
+    /// The only history it depends on is last night's protection, which
+    /// is the doctor's own rule; everything else is the living set.
+    fn action_space(
+        &self,
+        who: &AgentId,
+        kind: RequestKind,
+        round: Round,
+        living: &BTreeSet<AgentId>,
+    ) -> Vec<AgentId> {
+        let last_protected = (kind == RequestKind::Protect && round.0 > 1)
+            .then(|| self.protections_in(Round(round.0 - 1)))
+            .and_then(|protections| protections.get(who).cloned());
+        roles::action_space(who, living, kind, last_protected.as_ref())
     }
 
-    /// Every request the moderator asked, in id order.
-    fn requests(&self) -> impl Iterator<Item = (&Said<'a>, &AgentId, &Request)> {
-        self.requests.keys().map(|&id| self.asked(id).unwrap())
+    /// The members of the session of `kind` in `round`, with `living`
+    /// alive: the living players whose role is asked that kind in that
+    /// phase and whom the rules leave somewhere to point.
+    ///
+    /// Nobody is told this and nothing in the trajectory states it
+    /// (ADR-0014), so the check derives it the way the players and the
+    /// moderator each derive it: from the roles. The non-empty action
+    /// space matters — a doctor the rules leave nobody it may protect is
+    /// not a member, and its session does not open — so a check that
+    /// went by role alone would expect a tally that never comes.
+    fn members_of(
+        &self,
+        kind: RequestKind,
+        round: Round,
+        living: &BTreeSet<AgentId>,
+    ) -> BTreeSet<AgentId> {
+        living
+            .iter()
+            .filter(|who| self.role(who).asked_in(kind.phase()) == Some(kind))
+            .filter(|who| !self.action_space(who, kind, round, living).is_empty())
+            .cloned()
+            .collect()
     }
 
-    /// No request goes to a dead player, and every request has exactly one
-    /// point, from the player it was asked of, echoing its id, arriving
-    /// after it, and before that player's elimination.
-    fn check_requests_and_points(&self) {
-        for (said, who, _) in self.requests() {
-            assert!(
-                !self.dead_at(who, said.seq),
-                "no request is asked of a player after its elimination: {}",
-                said.line
-            );
-        }
-        let mut answered = BTreeSet::new();
+    /// The members of a night session of `kind` at the record numbered
+    /// `seq`, which is who its closing tally is addressed to.
+    fn night_members(&self, kind: RequestKind, seq: u64) -> BTreeSet<AgentId> {
+        let living = self.living_at(seq);
+        let (round, _) = self
+            .phase_at(seq)
+            .expect("a night tally falls within a phase");
+        self.members_of(kind, round, &living)
+    }
+
+    /// The record that began the phase a point names, if the game ever
+    /// had such a phase.
+    fn began(&self, round: Round, phase: Phase) -> Option<u64> {
+        self.phases
+            .iter()
+            .find(|(had, was, _)| *had == round && *was == phase)
+            .map(|(_, _, seq)| *seq)
+    }
+
+    /// Every point names a session the game really opened, with its
+    /// sender a member of it.
+    ///
+    /// There is no request to answer any more, so what was once "every
+    /// request is answered exactly once by the agent it was asked of"
+    /// becomes a claim about the points alone (ADR-0014): each one is a
+    /// point its sender could legitimately have made, in a session that
+    /// really existed and that it really belonged to.
+    ///
+    /// Each point is placed by the phase it *names*, never by the phase
+    /// under way when the moderator recorded hearing it. A point that
+    /// lost a race with its own session's clock — or with its sender's
+    /// stop — arrives after that phase has ended, and ADR-0011 makes
+    /// that an ordinary event rather than a bug. Naming its own round is
+    /// exactly what lets a reader place such a point correctly instead
+    /// of mistaking it for a point in the phase that has since opened.
+    ///
+    /// Nothing here claims a member points. A session closes on its
+    /// clock, so a member that never pointed is simply absent from its
+    /// tally, which is how it abstains (ADR-0011).
+    fn check_points(&self) {
         for heard in &self.heard {
             let line = heard.line;
-            let Some((asked, who, _)) = self.asked(heard.point.request) else {
-                panic!("a point answers a request that was asked: {line}");
-            };
+            let who = &heard.from;
+            let kind = heard.point.kind;
             assert_eq!(
-                *who, heard.from,
-                "a point comes from the player the request was asked of: {line}"
+                self.role(who).asked_in(kind.phase()),
+                Some(kind),
+                "a point names a session its sender's role is a member of: {line}"
             );
+            let round = heard.point.round;
+            let began = self
+                .began(round, kind.phase())
+                .unwrap_or_else(|| panic!("a point names a phase the game played: {line}"));
             assert!(
-                asked.seq < heard.seq,
-                "a point arrives after its request was sent: {line}"
+                began < heard.seq,
+                "a point is heard after the phase it names began: {line}"
             );
-            // A member may point as often as it likes while its session
-            // is open, so a request answered twice is a change of mind
-            // rather than a bug (ADR-0011).
-            answered.insert(heard.point.request);
+            // Membership as it stood when that phase began, which is
+            // when the session opened. A point heard later may have lost
+            // a race with the clock or with its sender's own stop, and
+            // neither makes it a point its sender could not have made.
+            assert!(
+                self.members_of(kind, round, &self.living_at(began))
+                    .contains(who),
+                "a point comes from a member of the session it names: {line}"
+            );
         }
-        // Nor is every request answered. A session closes on its clock, so
-        // a member that never pointed is simply absent from its tally, and
-        // a player may point once more just before its stop reaches it. A
-        // random player points immediately, so in practice these are rare;
-        // the rules allow them, and the check is that they are the only
-        // way a request goes unanswered.
-        for (said, who, request) in self.requests() {
-            if answered.contains(&request.id) {
+    }
+
+    /// Every point's target is in the action space the rules allow its
+    /// sender in the session it names: a living player other than the one
+    /// pointing, and for the doctor never the player it protected the
+    /// night before.
+    ///
+    /// The action space is recomputed here from the living set and, for
+    /// a doctor, from the previous round's protection, because the point
+    /// says which round and which session it belongs to (ADR-0014).
+    /// Nothing has to be joined to a request to know what the rules
+    /// allowed, and nothing has to be carried across rounds by hand: the
+    /// doctor's constraint is last night's protection alone, so it is
+    /// read from last night's points and from nowhere else.
+    ///
+    /// Like [`check_points`](Self::check_points), a point is judged
+    /// against the phase it names rather than the one under way when the
+    /// moderator heard it: a point that lost a race with the clock is
+    /// still a point the rules allowed when it was made.
+    fn check_action_spaces(&self) {
+        // The doctor's rule first, on its own, because it is the one
+        // rule that reaches across a round boundary and the general
+        // action-space check below would otherwise swallow it and
+        // report it as an anonymous "outside the space".
+        for (round, phase, _) in &self.phases {
+            if *phase != Phase::Night || round.0 == 1 {
                 continue;
             }
-            assert!(
-                self.closed_before_answering(request.id) || self.dead_at(who, said.seq),
-                "a request goes unanswered only when its session closed first: {}",
-                said.line
-            );
+            let before = self.protections_in(Round(round.0 - 1));
+            for (doctor, chosen) in self.protections_in(*round) {
+                if let Some(last) = before.get(&doctor) {
+                    assert_ne!(
+                        *last, chosen,
+                        "the doctor never protects the same player two nights running: \
+                         {doctor} protected {chosen} in round {}",
+                        round.0
+                    );
+                }
+            }
         }
-    }
-
-    /// Whether the session `request` belonged to closed: its closing tally
-    /// is the moderator's record that it did.
-    fn closed_before_answering(&self, request: RequestId) -> bool {
-        let Some((_, _, request)) = self.asked(request) else {
-            return false;
-        };
-        self.said.iter().any(|said| {
-            matches!(
-                &said.message,
-                Message::Narration(Narration::Tally { round, kind, .. })
-                    if *round == request.round && *kind == request.kind
-            )
-        })
-    }
-
-    /// Every request asks a player what its role is asked in that phase,
-    /// and every point's target is in the action space its request
-    /// allowed: a living player other than the one pointing, and for the
-    /// doctor never the player it protected the night before.
-    fn check_action_spaces(&self) {
-        for (said, who, request) in self.requests() {
-            assert_eq!(
-                self.role(who).asked_in(request.kind.phase()),
-                Some(request.kind),
-                "a request asks a player what its role is asked: {}",
-                said.line
-            );
-        }
-        let mut last_protected: BTreeMap<&AgentId, &AgentId> = BTreeMap::new();
         for heard in &self.heard {
             let line = heard.line;
-            let (asked, _, request) = self.asked(heard.point.request).unwrap();
             let chosen = &heard.point.target;
             assert_ne!(
                 chosen, &heard.from,
                 "no point targets the player making it: {line}"
             );
+            let round = heard.point.round;
+            let kind = heard.point.kind;
+            let began = self
+                .began(round, kind.phase())
+                .expect("`check_points` ran first and found the phase");
+            let living = self.living_at(began);
             assert!(
-                self.assignment.role(chosen).is_some() && !self.dead_at(chosen, asked.seq),
+                self.assignment.role(chosen).is_some() && living.contains(chosen),
                 "a point targets a living player: {line}"
             );
-            if request.kind == RequestKind::Protect {
-                if let Some(last) = last_protected.insert(&heard.from, chosen) {
-                    assert_ne!(
-                        last, chosen,
-                        "the doctor never protects the same player two nights running: {line}"
-                    );
-                }
-            }
+            assert!(
+                self.action_space(&heard.from, kind, round, &living)
+                    .contains(chosen),
+                "a point targets somebody the rules allow it: {line}"
+            );
         }
     }
 
@@ -499,7 +578,7 @@ impl<'a> Play<'a> {
         for said in &self.said {
             let line = said.line;
             match &said.message {
-                Message::Request(_) | Message::Narration(Narration::Assigned { .. }) => {}
+                Message::Narration(Narration::Assigned { .. }) => {}
                 Message::Narration(Narration::Investigated { .. }) => {
                     assert_eq!(said.to, seers, "a finding goes to the seer alone: {line}");
                 }
@@ -611,16 +690,14 @@ impl<'a> Play<'a> {
     /// role and names the phase's cause; and the living strictly shrink
     /// from one round to the next.
     fn check_phases(&self) {
+        // Straight off the points: each says which round and which
+        // session it was made in (ADR-0014), so there is nothing to join
+        // it to. A doctor's latest point of a round is its protection.
         let protected: BTreeMap<Round, &AgentId> = self
             .heard
             .iter()
-            .filter_map(|heard| {
-                let (_, _, request) = self.asked(heard.point.request)?;
-                match request.kind {
-                    RequestKind::Protect => Some((request.round, &heard.point.target)),
-                    _ => None,
-                }
-            })
+            .filter(|heard| heard.point.kind == RequestKind::Protect)
+            .map(|heard| (heard.point.round, &heard.point.target))
             .collect();
         let mut phases = Phases {
             play: self,
@@ -637,7 +714,6 @@ impl<'a> Play<'a> {
                     living,
                 }) => phases.began(said, *round, *phase, living),
                 Message::Narration(narration) => phases.narrated(said, narration),
-                Message::Request(request) => phases.asked(said, request),
                 Message::Point(_) => unreachable!("the moderator sends no points"),
             }
         }
@@ -767,12 +843,9 @@ impl<'a> Play<'a> {
                     to.contains(moderator),
                     "every point reaches the moderator: {line}"
                 );
-                let (_, _, request) = self
-                    .asked(point.request)
-                    .unwrap_or_else(|| panic!("a point answers a request that was asked: {line}"));
                 let others: BTreeSet<&AgentId> =
                     to.iter().filter(|seer| *seer != moderator).collect();
-                match request.kind {
+                match point.kind {
                     // The pack sees its own pointing and nobody else does.
                     RequestKind::Devour => assert!(
                         others
@@ -789,7 +862,7 @@ impl<'a> Play<'a> {
                     RequestKind::Investigate | RequestKind::Protect => assert!(
                         others.is_empty(),
                         "a {:?} point is seen by the moderator alone: {line}",
-                        request.kind
+                        point.kind
                     ),
                 }
             }
@@ -913,11 +986,11 @@ impl<'p, 'a> Phases<'p, 'a> {
     ///
     /// Read from the points the moderator observed rather than from the
     /// tally it narrated. A point is the primary record — an action a
-    /// player took, joined to the request it answers — and it is there
-    /// whether or not anybody was told a tally. A tally is a message to
-    /// the members of a session, and a session of one is sent none,
-    /// because a lone seer, doctor or wolf would be told only what it
-    /// has just said.
+    /// player took, naming for itself the session it was made in
+    /// (ADR-0014) — and it is there whether or not anybody was told a
+    /// tally. A tally is a message to the members of a session, and a
+    /// session of one is sent none, because a lone seer, doctor or wolf
+    /// would be told only what it has just said.
     fn leaders_of(&self, round: Round, phase: Phase) -> BTreeSet<AgentId> {
         let deciding = match phase {
             Phase::Night => RequestKind::Devour,
@@ -927,11 +1000,8 @@ impl<'p, 'a> Phases<'p, 'a> {
             .play
             .heard
             .iter()
-            .filter_map(|heard| {
-                let (_, _, request) = self.play.asked(heard.point.request)?;
-                (request.round == round && request.kind == deciding)
-                    .then(|| (heard.from.clone(), heard.point.target.clone()))
-            })
+            .filter(|heard| heard.point.round == round && heard.point.kind == deciding)
+            .map(|heard| (heard.from.clone(), heard.point.target.clone()))
             .collect();
         leaders(&votes)
     }
@@ -1038,19 +1108,6 @@ impl<'p, 'a> Phases<'p, 'a> {
             }
             _ => {}
         }
-    }
-
-    /// A request: asked within the phase it belongs to.
-    fn asked(&self, said: &Said<'a>, request: &Request) {
-        let line = said.line;
-        let Some((round, phase, _)) = self.current else {
-            panic!("a request is asked within a phase: {line}");
-        };
-        assert_eq!(
-            (request.round, request.kind.phase()),
-            (round, phase),
-            "a request belongs to the phase it is asked in: {line}"
-        );
     }
 }
 
@@ -1233,25 +1290,41 @@ mod tests {
         move |payload| payload["Narration"]["Eliminated"]["who"] == who
     }
 
-    /// The request with the given id.
-    fn request(id: u64) -> impl Fn(&Value) -> bool {
-        move |payload| payload["Request"]["id"] == id
+    /// The point `who` made in the session of `kind` in `round`.
+    ///
+    /// A point says for itself which session it belongs to (ADR-0014),
+    /// so a record is named by the round, the kind and the sender rather
+    /// than by an id looked up in a request that no longer exists. The
+    /// sender lives in the envelope rather than the payload, which is
+    /// why this matches the whole record.
+    fn point_of<'w>(who: &'w str, round: u32, kind: &'w str) -> impl Fn(&Value) -> bool + 'w {
+        move |line| {
+            let point = &line["event"]["payload"]["Point"];
+            line["event"]["sender"] == who && point["round"] == round && point["kind"] == kind
+        }
     }
 
-    /// The point made for the request with the given id.
-    fn response(id: u64) -> impl Fn(&Value) -> bool {
-        move |payload| payload["Point"]["request"] == id
+    /// The index of the first record of `agent` of the given type that
+    /// satisfies `wanted`, which is given the whole record.
+    fn find_record(
+        lines: &[Value],
+        agent: &str,
+        kind: &str,
+        wanted: impl Fn(&Value) -> bool,
+    ) -> usize {
+        lines
+            .iter()
+            .position(|line| line["type"] == kind && line["agent"] == agent && wanted(line))
+            .expect("the fixture has such a record")
     }
 
-    /// The id of the request of `kind` asked of `who` in `round`.
-    fn asked(who: &str, round: u32, kind: &str) -> u64 {
-        let lines = fixture();
-        let index = find(&lines, who, "observation", |payload| {
-            payload["Request"]["round"] == round && payload["Request"]["kind"] == kind
-        });
-        lines[index]["event"]["payload"]["Request"]["id"]
-            .as_u64()
-            .unwrap()
+    /// The fixture with `edit` applied to the point `point_of` names,
+    /// as the moderator recorded hearing it.
+    fn heard_point(wanted: impl Fn(&Value) -> bool, edit: impl FnOnce(&mut Value)) -> Vec<Value> {
+        let mut lines = fixture();
+        let index = find_record(&lines, config().moderator.as_str(), "observation", &wanted);
+        edit(&mut lines[index]);
+        lines
     }
 
     /// The fixture with `edit` applied to the record `find` names.
@@ -1270,11 +1343,6 @@ mod tests {
     /// The fixture with `edit` applied to something the moderator said.
     fn said(wanted: impl Fn(&Value) -> bool, edit: impl FnOnce(&mut Value)) -> Vec<Value> {
         edited(config().moderator.as_str(), "action", wanted, edit)
-    }
-
-    /// The fixture with `edit` applied to a response the moderator heard.
-    fn heard(wanted: impl Fn(&Value) -> bool, edit: impl FnOnce(&mut Value)) -> Vec<Value> {
-        edited(config().moderator.as_str(), "observation", wanted, edit)
     }
 
     /// The fixture without the record `find` names.
@@ -1367,58 +1435,97 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "a point comes from the player the request was asked of")]
-    fn a_response_from_the_wrong_player_is_caught() {
-        let nominate = asked("alice", 1, "Nominate");
-        check(
-            &heard(response(nominate), |line| sender(line, "bob")),
-            &config(),
-        );
-    }
-
-    #[test]
-    #[should_panic(expected = "a point answers a request that was asked")]
-    fn a_response_to_nothing_is_caught() {
-        let lines = heard(response(asked("alice", 1, "Nominate")), |line| {
-            line["event"]["payload"]["Point"]["request"] = json!(99);
+    #[should_panic(expected = "a point names a session its sender's role is a member of")]
+    fn a_point_in_a_session_the_role_is_never_in_is_caught() {
+        // bob is a villager, so no phase ever puts him in a `Protect`
+        // session. This is what a point "answering nothing" became under
+        // ADR-0014: with no request to fail to match, a forged point is
+        // one nobody of that role could have made.
+        //
+        // A day point is chosen so that rewriting it leaves the nights
+        // alone: a night's save is read from the protections, and losing
+        // one would fail as a quiet night without a save instead.
+        let lines = heard_point(point_of("bob", 3, "Nominate"), |line| {
+            line["event"]["payload"]["Point"]["kind"] = json!("Protect");
         });
         check(&lines, &config());
     }
 
     #[test]
-    fn a_request_answered_twice_is_a_change_of_mind() {
+    #[should_panic(expected = "a point names a phase the game played")]
+    fn a_point_naming_a_phase_the_game_never_played_is_caught() {
+        // A point says which round it was made in (ADR-0014), so a point
+        // naming a round the game never reached describes a session that
+        // never opened. This is what replaced the check that a point
+        // arrived after the request it answered.
+        let lines = heard_point(point_of("bob", 3, "Nominate"), |line| {
+            line["event"]["payload"]["Point"]["round"] = json!(9);
+        });
+        check(&lines, &config());
+    }
+
+    #[test]
+    #[should_panic(expected = "a point is heard after the phase it names began")]
+    fn a_point_heard_before_its_own_phase_began_is_caught() {
+        // A point may arrive late — that is a lost race, and ADR-0011
+        // makes it ordinary. Arriving early is the impossible direction:
+        // nobody points in a session that has not opened, because what
+        // opens it is the phase narration the player points in answer to.
+        let lines = heard_point(point_of("bob", 1, "Nominate"), |line| {
+            line["event"]["payload"]["Point"]["round"] = json!(3);
+        });
+        check(&lines, &config());
+    }
+
+    #[test]
+    #[should_panic(expected = "a point comes from a member of the session it names")]
+    fn a_point_from_the_dead_is_caught() {
+        // carol was devoured on night 2; bob's nomination on day 3 is
+        // recorded as hers. Nothing is asked of anybody any more
+        // (ADR-0014), so "the dead are asked nothing" is now "the dead
+        // are members of nothing": carol is the doctor, and a doctor
+        // really is a member of a `Nominate` session — but only while
+        // it lives.
+        //
+        // This is the one way a point can come from somebody whose role
+        // is right and who is still not a member, which is why the two
+        // are one test rather than two.
+        let lines = heard_point(point_of("bob", 3, "Nominate"), |line| {
+            sender(line, "carol");
+        });
+        check(&lines, &config());
+    }
+
+    #[test]
+    fn a_session_pointed_in_twice_is_a_change_of_mind() {
         // A member may point as often as it likes while its session is
-        // open, so the same request answered twice is the rules working
-        // rather than a bug (ADR-0011).
-        let nominate = asked("alice", 1, "Nominate");
-        check(
-            &doubled("moderator", "observation", response(nominate)),
-            &config(),
+        // open, so two points in one session is the rules working rather
+        // than a bug (ADR-0011).
+        let mut lines = fixture();
+        let index = find_record(
+            &lines,
+            "moderator",
+            "observation",
+            point_of("alice", 1, "Nominate"),
         );
+        lines.insert(index, lines[index].clone());
+        check(&lines, &config());
     }
 
     #[test]
-    fn a_request_may_go_unanswered_once_its_session_has_closed() {
+    fn a_member_may_never_point_at_all() {
         // A session closes on its clock, so a member that never pointed
-        // is simply absent from its tally (ADR-0011).
-        let nominate = asked("alice", 1, "Nominate");
-        check(
-            &without("moderator", "observation", response(nominate)),
-            &config(),
+        // is simply absent from its tally (ADR-0011). Nothing claims a
+        // member points, so removing a point is a game, not a forgery.
+        let mut lines = fixture();
+        let index = find_record(
+            &lines,
+            "moderator",
+            "observation",
+            point_of("alice", 1, "Nominate"),
         );
-    }
-
-    #[test]
-    #[should_panic(expected = "no request is asked of a player after its elimination")]
-    fn a_request_to_the_dead_is_caught() {
-        // carol was devoured on night 2; bob's nomination on day 3 goes to
-        // her instead. The dead are asked nothing, and this is the whole of
-        // what that means: the request itself, before any point answers it.
-        let nominate = asked("bob", 3, "Nominate");
-        check(
-            &said(request(nominate), |line| recipients(line, &["carol"])),
-            &config(),
-        );
+        lines.remove(index);
+        check(&lines, &config());
     }
 
     #[test]
@@ -1426,31 +1533,19 @@ mod tests {
         // alice's nomination on day 1, dated after her lynching that day:
         // a point she sent before her stop reached her. ADR-0011 makes
         // that a lost race rather than a bug, and the game ignores it.
-        let lines = heard(response(asked("alice", 1, "Nominate")), |line| {
+        let lines = heard_point(point_of("alice", 1, "Nominate"), |line| {
             line["seq"] = json!(81);
         });
         check(&lines, &config());
     }
 
     #[test]
-    #[should_panic(expected = "a request asks a player what its role is asked")]
-    fn a_request_of_the_wrong_kind_is_caught() {
-        // dave, a werewolf, is asked to devour; bob is a villager.
-        let devour = asked("dave", 1, "Devour");
-        let mut lines = said(request(devour), |line| recipients(line, &["bob"]));
-        let index = find(&lines, "moderator", "observation", response(devour));
-        sender(&mut lines[index], "bob");
-        check(&lines, &config());
-    }
-
-    #[test]
     #[should_panic(expected = "no point targets the player making it")]
     fn a_self_target_is_caught() {
-        let nominate = asked("alice", 1, "Nominate");
-        check(
-            &heard(response(nominate), |line| target(line, "alice")),
-            &config(),
-        );
+        let lines = heard_point(point_of("alice", 1, "Nominate"), |line| {
+            target(line, "alice");
+        });
+        check(&lines, &config());
     }
 
     #[test]
@@ -1458,25 +1553,24 @@ mod tests {
     fn a_dead_target_is_caught() {
         // carol was devoured on night 2; bob nominates her on day 3, a
         // round after she stopped being a player anyone may point at.
-        let nominate = asked("bob", 3, "Nominate");
-        check(
-            &heard(response(nominate), |line| target(line, "carol")),
-            &config(),
-        );
+        let lines = heard_point(point_of("bob", 3, "Nominate"), |line| {
+            target(line, "carol");
+        });
+        check(&lines, &config());
     }
 
     #[test]
     #[should_panic(expected = "the doctor never protects the same player two nights running")]
     fn a_repeated_protection_is_caught() {
         // carol is the doctor; bob lives through both nights.
-        let mut lines = heard(response(asked("carol", 1, "Protect")), |line| {
+        let mut lines = heard_point(point_of("carol", 1, "Protect"), |line| {
             target(line, "bob");
         });
-        let index = find(
+        let index = find_record(
             &lines,
             "moderator",
             "observation",
-            response(asked("carol", 2, "Protect")),
+            point_of("carol", 2, "Protect"),
         );
         target(&mut lines[index], "bob");
         check(&lines, &config());
@@ -1598,15 +1692,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "a request belongs to the phase it is asked in")]
-    fn a_request_from_another_round_is_caught() {
-        let lines = said(request(asked("alice", 1, "Nominate")), |line| {
-            line["event"]["payload"]["Request"]["round"] = json!(2);
-        });
-        check(&lines, &config());
-    }
-
-    #[test]
     #[should_panic(expected = "a night has one death or one NoDeath")]
     fn a_night_that_says_nothing_of_deaths_is_caught() {
         check(
@@ -1666,23 +1751,23 @@ mod tests {
         // Bob dies in carol's place, so from that death on the two are
         // exchanged everywhere: carol goes on to play out bob's rounds 2
         // through 4 and survives, and bob, never eliminated again, still
-        // dies exactly once. Rounds 3 and 4 ask nobody to protect, so a
-        // doctor living through them leaves no request unaccounted for.
+        // dies exactly once. Rounds 3 and 4 open no Protect session, so
+        // a doctor living through them leaves nothing unaccounted for.
         let mut lines = fixture();
         for who in ["dave", "erin"] {
-            let index = find(
+            let index = find_record(
                 &lines,
                 "moderator",
                 "observation",
-                response(asked(who, 2, "Devour")),
+                point_of(who, 2, "Devour"),
             );
             target(&mut lines[index], "bob");
         }
-        let protect = find(
+        let protect = find_record(
             &lines,
             "moderator",
             "observation",
-            response(asked("carol", 2, "Protect")),
+            point_of("carol", 2, "Protect"),
         );
         target(&mut lines[protect], "bob");
         let tally = find(&lines, "moderator", "action", tally(2, "Night"));
@@ -1703,7 +1788,7 @@ mod tests {
         // that reports no death although the pack named somebody and
         // nobody shielded them — neither of the two ways a night is
         // quiet (ADR-0011).
-        let lines = heard(response(asked("carol", 1, "Protect")), |line| {
+        let lines = heard_point(point_of("carol", 1, "Protect"), |line| {
             target(line, "grace");
         });
         check(&lines, &config());
@@ -1961,42 +2046,32 @@ mod tests {
     fn a_seers_point_shown_to_another_player_is_caught() {
         // A nomination reaching another player is the rule now, so what a
         // leak looks like is the seer's own business traveling.
-        let lines = edited(
+        let mut lines = fixture();
+        let index = find_record(
+            &lines,
             "grace",
             "action",
-            response(asked("grace", 1, "Investigate")),
-            |line| {
-                recipients(line, &["bob", "moderator"]);
-            },
+            point_of("grace", 1, "Investigate"),
         );
+        recipients(&mut lines[index], &["bob", "moderator"]);
         check(&lines, &config());
     }
 
     #[test]
     #[should_panic(expected = "a devour point is seen by the pack alone")]
     fn a_devour_point_shown_to_a_villager_is_caught() {
-        let lines = edited(
-            "dave",
-            "action",
-            response(asked("dave", 1, "Devour")),
-            |line| {
-                recipients(line, &["alice", "erin", "moderator"]);
-            },
-        );
+        let mut lines = fixture();
+        let index = find_record(&lines, "dave", "action", point_of("dave", 1, "Devour"));
+        recipients(&mut lines[index], &["alice", "erin", "moderator"]);
         check(&lines, &config());
     }
 
     #[test]
     #[should_panic(expected = "every point reaches the moderator")]
     fn a_point_that_never_reaches_the_moderator_is_caught() {
-        let lines = edited(
-            "alice",
-            "action",
-            response(asked("alice", 1, "Nominate")),
-            |line| {
-                recipients(line, &["bob"]);
-            },
-        );
+        let mut lines = fixture();
+        let index = find_record(&lines, "alice", "action", point_of("alice", 1, "Nominate"));
+        recipients(&mut lines[index], &["bob"]);
         check(&lines, &config());
     }
 }

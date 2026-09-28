@@ -99,7 +99,7 @@ fn default_moderator() -> AgentId {
 /// The clocks a game's pointing sessions run on (ADR-0011).
 ///
 /// A phase is made of sessions, and a session closes on a clock rather than
-/// when the last member has answered. Each night session has a quiet period
+/// when the last member has pointed. Each night session has a quiet period
 /// and a hard limit of its own, so that a slow role cannot spend another
 /// role's time; the day has a hard limit only, since it closes on a
 /// majority rather than on quiet.

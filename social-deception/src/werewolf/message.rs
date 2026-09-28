@@ -1,5 +1,5 @@
 //! Everything said in a Werewolf episode: the [`Message`] payload and the
-//! vocabulary of rounds, phases, requests and moves it is built from.
+//! vocabulary of rounds, phases, sessions and targets it is built from.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -24,16 +24,6 @@ pub enum Phase {
     Day,
 }
 
-/// The identity of one [`Request`], echoed by every [`Point`] answering it.
-///
-/// The id makes "is this point an answer to something asked?" an exact
-/// check rather than an inferred one, and it is what tells a point meant for
-/// a session that has closed from one meant for the session now open.
-/// Serializes as a bare integer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct RequestId(pub u64);
-
 /// Everything said in a Werewolf episode.
 ///
 /// Every agent in an episode shares this one payload type, so it covers
@@ -43,10 +33,8 @@ pub struct RequestId(pub u64);
 pub enum Message {
     /// Moderator to chosen players: something they now observe.
     Narration(Narration),
-    /// Moderator to one player: act now.
-    Request(Request),
     /// Player to the moderator and to whoever else may see it: a target
-    /// pointed at. A player may send more than one for the same request;
+    /// pointed at. A player may send more than one in the same session;
     /// its latest is its vote (ADR-0011).
     Point(Point),
 }
@@ -153,23 +141,11 @@ pub struct Outcome {
     pub living: BTreeSet<AgentId>,
 }
 
-/// The moderator telling one player it is a member of an open session.
+/// What one of a phase's sessions is for.
 ///
-/// Under ADR-0011 a request is not a question expecting one answer. It says
-/// "you may point at any time until this session closes", and a member may
-/// point as often as it likes until then; the session's clock, not the
-/// answer, is what ends it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Request {
-    /// The id the response must echo.
-    pub id: RequestId,
-    /// The round the request belongs to.
-    pub round: Round,
-    /// What is being asked.
-    pub kind: RequestKind,
-}
-
-/// What a [`Request`] asks a player to do.
+/// A phase opens a session per kind it calls for, and a player works out
+/// from its own role which of them it is a member of (ADR-0014). Nobody is
+/// told: a player that has observed the phase begin already knows.
 ///
 /// Ordered so that a night's sessions can be kept in a map: the order is
 /// the declaration order below and carries no meaning of its own.
@@ -188,7 +164,7 @@ pub enum RequestKind {
 }
 
 impl RequestKind {
-    /// The phase this kind of request is asked in: nomination by day,
+    /// The phase a session of this kind belongs to: nomination by day,
     /// everything else at night.
     #[must_use]
     pub const fn phase(self) -> Phase {
@@ -207,8 +183,10 @@ impl RequestKind {
 /// message, which is why there is no move that means "nobody".
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Point {
-    /// The id of the request this points for.
-    pub request: RequestId,
+    /// The round the session belongs to.
+    pub round: Round,
+    /// Which of the phase's sessions this is: what the pointing is for.
+    pub kind: RequestKind,
     /// The player pointed at.
     pub target: AgentId,
 }
@@ -299,19 +277,12 @@ mod tests {
             .map(|(narration, shape)| (Message::Narration(narration), json!({"Narration": shape})))
             .collect();
         messages.push((
-            Message::Request(Request {
-                id: RequestId(7),
+            Message::Point(Point {
                 round: Round(1),
                 kind: RequestKind::Devour,
-            }),
-            json!({"Request": {"id": 7, "round": 1, "kind": "Devour"}}),
-        ));
-        messages.push((
-            Message::Point(Point {
-                request: RequestId(7),
                 target: AgentId::new("alice"),
             }),
-            json!({"Point": {"request": 7, "target": "alice"}}),
+            json!({"Point": {"round": 1, "kind": "Devour", "target": "alice"}}),
         ));
         messages
     }
@@ -350,26 +321,25 @@ mod tests {
     }
 
     #[test]
-    fn rounds_and_request_ids_are_bare_integers() {
+    fn a_round_is_a_bare_integer() {
         assert_eq!(json(&Round(4)), json!(4));
-        assert_eq!(json(&RequestId(12)), json!(12));
         let round: Round = serde_json::from_value(json!(4)).unwrap();
         assert_eq!(round, Round(4));
-        let id: RequestId = serde_json::from_value(json!(12)).unwrap();
-        assert_eq!(id, RequestId(12));
     }
 
     #[test]
-    fn a_point_carries_a_bare_agent_id() {
-        // A target is an agent and nothing else: there is no longer a move
-        // wrapping it, and nothing that means "nobody". Pointing nowhere is
-        // the absence of a point (ADR-0011).
+    fn a_point_names_its_session_and_a_bare_agent_id() {
+        // A target is an agent and nothing else: no move wraps it, and
+        // nothing means "nobody" (ADR-0011). The session is the round and
+        // the kind, which both sides derive rather than correlate by an
+        // id the moderator mints (ADR-0014).
         assert_eq!(
             json(&Point {
-                request: RequestId(3),
+                round: Round(3),
+                kind: RequestKind::Nominate,
                 target: AgentId::new("alice"),
             }),
-            json!({"request": 3, "target": "alice"})
+            json!({"round": 3, "kind": "Nominate", "target": "alice"})
         );
     }
 

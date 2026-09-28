@@ -18,9 +18,11 @@
 //! one that stops it; those are the loop's, which is why there is no arm for
 //! either here.
 //!
-//! A [`Narration`](super::Narration) or a [`Request`](super::Request)
-//! arriving from a player is a bug, and the moderator panics rather than run
-//! a game whose state it cannot vouch for.
+//! A [`Narration`](super::Narration) arriving from a player is a bug, and
+//! the moderator panics rather than run a game whose state it cannot vouch
+//! for. So is a point in a session the rules never make that player a
+//! member of; the moderator checks that when the point arrives, rather
+//! than handing out permission in advance (ADR-0014).
 //!
 //! Once the game is over the moderator emits nothing, whatever arrives. The
 //! episode is winding down, and a late response is not the game's problem.
@@ -72,9 +74,9 @@
 //! player is sent no outcome and only the stop. The episode stops the
 //! moderator itself once every player's thread has ended.
 //!
-//! A game that never reaches an outcome, because some player did not answer
-//! a request, is nobody's to notice here: nothing is in flight, no player
-//! has been stopped, and the episode calls that
+//! A game that never reaches an outcome is nobody's to notice here:
+//! nothing is in flight, no player has been stopped, and the episode
+//! calls that
 //! [`EpisodeError::Stalled`](crate::EpisodeError::Stalled).
 
 use crossbeam_channel::Sender;
@@ -118,14 +120,13 @@ impl Moderator {
     ///
     /// # Panics
     ///
-    /// If a player sends the moderator a narration or a request.
+    /// If a player sends the moderator a narration.
     fn fold(&mut self, observation: &Observation<WerewolfDomain>) -> Vec<Directive> {
         let sender = &observation.event.sender;
         let now = observation.received;
         let mut directives = match &observation.event.payload {
             Message::Point(point) => self.game.point(sender, point, now),
             Message::Narration(_) => panic!("{sender} sent the moderator a narration"),
-            Message::Request(_) => panic!("{sender} sent the moderator a request"),
         };
         // A deadline that passed while this observation waited joins its
         // cycle (ADR-0008), so a session whose time is up closes here
@@ -177,15 +178,14 @@ fn send(directive: Directive) -> Effect<WerewolfDomain> {
             recipients: Recipients::To(to),
             payload: Message::Narration(narration),
         }),
-        Directive::Ask { to, request } => Effect::Act(Action::to([to], Message::Request(request))),
         Directive::Stop { who } => Effect::control([who], Control::Stop),
     }
 }
 
 impl Environment<WerewolfDomain> for Moderator {
-    /// Starts every player, then begins the game and says what it wants said
-    /// at the start: the roles, the first phase, and the first night's
-    /// requests.
+    /// Starts every player, then begins the game and says what it wants
+    /// said at the start: the roles, and that the first night has begun.
+    /// The players take it from there (ADR-0014).
     ///
     /// The `Start` comes first among the effects, but the episode routes a
     /// cycle's events before its controls either way, so what a player
@@ -205,8 +205,8 @@ impl Environment<WerewolfDomain> for Moderator {
     ///
     /// # Panics
     ///
-    /// If a player sends the moderator a narration or a request, or if a
-    /// point is one the game cannot accept; see [`Game::point`].
+    /// If a player sends the moderator a narration, or if a point is one
+    /// the game cannot accept; see [`Game::point`].
     fn handle(&mut self, observation: &Observation<WerewolfDomain>) -> Vec<Effect<WerewolfDomain>> {
         // Whether the game is over is the game's to say, and it is asked
         // before every observation, so the one that ends it is the last
@@ -255,9 +255,7 @@ mod tests {
     use crate::event::{AgentId, Event};
     use crate::testing::{fast, id, ids, observed, town, village};
     use crate::werewolf::assignment::Assignment;
-    use crate::werewolf::message::{
-        Narration, Phase, Point, Request, RequestId, RequestKind, Round,
-    };
+    use crate::werewolf::message::{Narration, Phase, Point, RequestKind, Round};
     use crate::werewolf::role::Faction;
     use crate::werewolf::role::Role::{self, Doctor, Seer, Villager, Werewolf};
 
@@ -284,8 +282,20 @@ mod tests {
         ))
     }
 
-    fn response(who: &AgentId, request: RequestId, target: AgentId) -> Observation<WerewolfDomain> {
-        from_player(who.as_str(), Message::Point(Point { request, target }))
+    fn response(
+        who: &AgentId,
+        round: Round,
+        kind: RequestKind,
+        target: AgentId,
+    ) -> Observation<WerewolfDomain> {
+        from_player(
+            who.as_str(),
+            Message::Point(Point {
+                round,
+                kind,
+                target,
+            }),
+        )
     }
 
     /// A stub player: whom it points at, out of the targets the rules
@@ -294,35 +304,25 @@ mod tests {
     /// The space is the game's own, so a stub cannot point outside it; the
     /// doctor's "not last night's patient" in particular is the rules'
     /// business rather than every stub's.
-    type Policy = fn(&Request, &[AgentId]) -> AgentId;
+    type Policy = fn(RequestKind, &[AgentId]) -> AgentId;
 
     /// Points at the first target the rules permit.
-    fn first_other(_: &Request, space: &[AgentId]) -> AgentId {
+    fn first_other(_: RequestKind, space: &[AgentId]) -> AgentId {
         space.first().unwrap().clone()
     }
 
     /// Points at the last target the rules permit.
-    fn last_other(_: &Request, space: &[AgentId]) -> AgentId {
+    fn last_other(_: RequestKind, space: &[AgentId]) -> AgentId {
         space.last().unwrap().clone()
     }
 
     /// Points at the last permitted target by night and the first by day,
     /// so that the pack and the village disagree about whom to blame.
-    fn two_minded(request: &Request, space: &[AgentId]) -> AgentId {
-        match request.kind.phase() {
-            Phase::Night => last_other(request, space),
-            Phase::Day => first_other(request, space),
+    fn two_minded(kind: RequestKind, space: &[AgentId]) -> AgentId {
+        match kind.phase() {
+            Phase::Night => last_other(kind, space),
+            Phase::Day => first_other(kind, space),
         }
-    }
-
-    /// The agents an action is addressed to, which for a request is exactly
-    /// one.
-    fn asked(action: &Action<WerewolfDomain>) -> &AgentId {
-        let Recipients::To(to) = &action.recipients else {
-            panic!("a request was broadcast: {action:?}");
-        };
-        assert_eq!(to.len(), 1, "a request to several players: {action:?}");
-        to.iter().next().unwrap()
     }
 
     /// The actions among some effects, in order.
@@ -359,22 +359,48 @@ mod tests {
             .collect()
     }
 
-    /// The responses stub players following `policy` give to the requests
-    /// among some actions, choosing among `living`.
+    /// The points stub players following `policy` make when a phase
+    /// begins.
+    ///
+    /// This is a stub of [`Seat`](super::Seat) and acts the way one does
+    /// (ADR-0014): a phase beginning is what makes a player point, and
+    /// each recipient asks its own role what that phase wants of it
+    /// rather than waiting to be told. Nothing among the actions is a
+    /// request, because the moderator no longer sends any.
+    ///
+    /// A player the rules leave nowhere to point says nothing, which is
+    /// the same thing the game means by leaving it out of the session.
     fn respond(
         actions: &[Action<WerewolfDomain>],
         policy: Policy,
         game: &Game,
+        roles: &Assignment,
     ) -> Vec<Observation<WerewolfDomain>> {
         actions
             .iter()
             .filter_map(|action| match &action.payload {
-                Message::Request(request) => {
-                    let who = asked(action);
-                    let space = game.action_space_for(who, request.kind);
-                    Some(response(who, request.id, policy(request, &space)))
+                Message::Narration(Narration::PhaseBegan { round, phase, .. }) => {
+                    let Recipients::To(to) = &action.recipients else {
+                        panic!("a phase was broadcast: {action:?}");
+                    };
+                    Some((*round, *phase, to))
                 }
-                Message::Narration(_) | Message::Point(_) => None,
+                _ => None,
+            })
+            .flat_map(|(round, phase, to)| {
+                to.iter().filter_map(move |who| {
+                    // Its own role, from the deal, is what tells a stub
+                    // whether this phase wants anything of it. That the
+                    // moderator happens to hold the same assignment is
+                    // beside the point: a player consults the role it
+                    // was dealt.
+                    let kind = roles.role(who)?.asked_in(phase)?;
+                    let space = game.action_space_for(who, kind);
+                    if space.is_empty() {
+                        return None;
+                    }
+                    Some(response(who, round, kind, policy(kind, &space)))
+                })
             })
             .collect()
     }
@@ -386,13 +412,17 @@ mod tests {
     /// each response then arrives in a cycle of its own, as the loop hands
     /// them over one at a time (ADR-0008). The game runs until the
     /// moderator asks nothing more.
-    fn play(moderator: &mut Moderator, policy: Policy) -> Vec<Effect<WerewolfDomain>> {
+    fn play(
+        moderator: &mut Moderator,
+        policy: Policy,
+        roles: &Assignment,
+    ) -> Vec<Effect<WerewolfDomain>> {
         /// Far enough apart that one phase's clocks never reach the next.
         const STEP: u64 = 10_000;
 
         let mut clock = 0;
         let mut produced = moderator.start(at(clock));
-        let mut pending = respond(&actions(&produced), policy, &moderator.game);
+        let mut pending = respond(&actions(&produced), policy, &moderator.game, roles);
         while moderator.game.outcome().is_none() {
             clock += STEP;
             let mut effects: Vec<Effect<WerewolfDomain>> = pending
@@ -403,7 +433,7 @@ mod tests {
             // running the clock out is what closes the phase (ADR-0011).
             clock += STEP;
             effects.extend(moderator.timeout(at(clock)));
-            pending = respond(&actions(&effects), policy, &moderator.game);
+            pending = respond(&actions(&effects), policy, &moderator.game, roles);
             produced.extend(effects);
             assert!(
                 clock < STEP * 200,
@@ -441,7 +471,7 @@ mod tests {
         for assignment in [village(), town()] {
             for policy in policies {
                 let (mut moderator, receiver) = moderator(assignment.clone());
-                let effects = play(&mut moderator, policy);
+                let effects = play(&mut moderator, policy, &assignment);
                 games.push(Played {
                     assignment: assignment.clone(),
                     outcome: moderator.game.outcome().unwrap().clone(),
@@ -484,17 +514,6 @@ mod tests {
         )
     }
 
-    fn ask(to: &str, id: u64, round: u32, kind: RequestKind) -> Action<WerewolfDomain> {
-        Action::to(
-            [to],
-            Message::Request(Request {
-                id: RequestId(id),
-                round: Round(round),
-                kind,
-            }),
-        )
-    }
-
     #[test]
     fn starting_the_moderator_starts_the_players_and_begins_the_game() {
         let everyone = ["alice", "bob", "carol", "dave", "erin"];
@@ -521,10 +540,8 @@ mod tests {
                         living: ids(everyone),
                     }
                 ),
-                ask("bob", 1, 1, RequestKind::Devour),
-                ask("carol", 2, 1, RequestKind::Investigate),
-                ask("dave", 3, 1, RequestKind::Protect),
-            ]
+            ],
+            "the deals and the phase, and nothing asked of anybody"
         );
     }
 
@@ -775,17 +792,14 @@ mod tests {
 
     #[test]
     fn nothing_is_emitted_after_the_outcome() {
+        // A point that arrives once the game has ended. It is built by
+        // hand rather than found among the requests sent, because none
+        // are sent (ADR-0014): the outcome guard stops the fold before
+        // anything about the point is looked at, so any point will do.
         let (mut moderator, _receiver) = moderator(village());
-        let sent = actions(&play(&mut moderator, first_other));
-        let (who, request) = sent
-            .iter()
-            .rev()
-            .find_map(|message| match &message.payload {
-                Message::Request(request) => Some((asked(message).clone(), request.id)),
-                _ => None,
-            })
-            .unwrap();
-        let late = response(&who, request, id("bob"));
+        play(&mut moderator, first_other, &village());
+        assert!(moderator.game.outcome().is_some());
+        let late = response(&id("carol"), Round(1), RequestKind::Nominate, id("bob"));
         assert_eq!(moderator.handle(&late), []);
     }
 
@@ -801,7 +815,7 @@ mod tests {
         let mut clock = 0;
         let opening = reference.start(at(clock));
         assert_eq!(doubled.start(at(clock)), opening);
-        let mut pending = respond(&actions(&opening), first_other, &reference.game);
+        let mut pending = respond(&actions(&opening), first_other, &reference.game, &village());
         while reference.game.outcome().is_none() {
             clock += 10_000;
             let mut effects = Vec::new();
@@ -820,7 +834,7 @@ mod tests {
             let expired = reference.timeout(at(clock));
             assert_eq!(doubled.timeout(at(clock)), expired);
             effects.extend(expired);
-            pending = respond(&actions(&effects), first_other, &reference.game);
+            pending = respond(&actions(&effects), first_other, &reference.game, &village());
             assert!(clock < 2_000_000, "a stub game should have ended by now");
         }
         assert!(reference.game.outcome().is_some() && doubled.game.outcome().is_some());
@@ -838,25 +852,10 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "carol sent the moderator a request")]
-    fn a_request_from_a_player_panics() {
-        let (mut moderator, _receiver) = moderator(village());
-        moderator.start(Timestamp::default());
-        moderator.handle(&from_player(
-            "carol",
-            Message::Request(Request {
-                id: RequestId(1),
-                round: Round(1),
-                kind: RequestKind::Nominate,
-            }),
-        ));
-    }
-
-    #[test]
     fn a_dropped_receiver_is_not_an_error() {
         let (mut moderator, receiver) = moderator(town());
         drop(receiver);
-        let sent = actions(&play(&mut moderator, last_other));
+        let sent = actions(&play(&mut moderator, last_other, &town()));
         assert_eq!(moderator.game.outcome(), Some(announced_outcome(&sent).1));
     }
 }
