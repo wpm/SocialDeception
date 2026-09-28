@@ -20,7 +20,7 @@
 //!
 //! The moderator is the episode's [`Environment`](crate::Environment), so
 //! an episode ends when the moderator says it does, which is when it has
-//! announced the outcome. A player that fails to answer a request leaves
+//! announced the outcome. A player that never selects leaves
 //! nothing in flight and nobody stopped, which the episode reports as
 //! [`EpisodeError::Stalled`] naming the players still running. So there is
 //! nothing for this module to detect: [`run`] takes the outcome from the
@@ -70,8 +70,8 @@ pub enum RunError {
         /// What went wrong.
         source: io::Error,
     },
-    /// The episode did not run cleanly. A game in which some player did not
-    /// answer a request arrives here as
+    /// The episode did not run cleanly. A game in which some player never
+    /// selected arrives here as
     /// [`EpisodeError::Stalled`].
     Episode(EpisodeError),
     /// The episode ran cleanly and the moderator announced no outcome.
@@ -152,7 +152,7 @@ fn moderate(
     records: Sender<LogRecord<WerewolfDomain>>,
 ) -> (Episode<WerewolfDomain>, Receiver<Outcome>) {
     let (outcome, outcomes) = unbounded();
-    let game = Game::new(assignment, config.seed);
+    let game = Game::new(assignment, config.seed, config.timing);
     let episode = Episode::new(
         records,
         config.moderator.clone(),
@@ -224,7 +224,7 @@ fn add(
 ///
 /// [`RunError::Io`] if the trajectory cannot be created or written,
 /// [`RunError::Episode`] if the episode did not run cleanly — a player that
-/// did not answer a request arrives as
+/// never selected arrives as
 /// [`EpisodeError::Stalled`] — and
 /// [`RunError::NoOutcome`] if a clean run left no outcome on the channel.
 ///
@@ -285,9 +285,8 @@ mod tests {
 
     use super::*;
     use crate::agent::{Action, Observation};
-    use crate::testing::{TempDir, id, ids, parse_lines};
+    use crate::testing::{TempDir, fast, id, ids, parse_lines};
     use crate::werewolf::config::{DEFAULT_MODERATOR, RoleCounts};
-    use crate::werewolf::message::Round;
     use crate::werewolf::transcript::{self, Transcript};
 
     const SEED: u64 = 20_260_918;
@@ -310,6 +309,7 @@ mod tests {
             },
             trajectory: None,
             moderator: id(DEFAULT_MODERATOR),
+            timing: fast(),
         };
         config.validate().unwrap();
         config
@@ -335,9 +335,10 @@ mod tests {
     /// decided within as many rounds as there are players.
     fn check(config: &Config, outcome: &Outcome) {
         let players: BTreeSet<&AgentId> = config.players.iter().collect();
-        assert!(outcome.rounds >= Round(1), "{outcome:?}");
+        // No lower bound to check: a `Round` cannot be zero, so that a
+        // finished game lasted at least one round is the type's guarantee.
         assert!(
-            outcome.rounds.0 as usize <= config.players.len(),
+            outcome.rounds.number() as usize <= config.players.len(),
             "{outcome:?}"
         );
         assert!(!outcome.living.is_empty(), "{outcome:?}");
@@ -441,7 +442,7 @@ mod tests {
         assert!(error::Error::source(&error).is_some());
     }
 
-    /// A player that never answers.
+    /// A player that never selects.
     struct Silent;
 
     impl Handler<WerewolfDomain> for Silent {
@@ -451,11 +452,13 @@ mod tests {
     }
 
     #[test]
-    fn a_silent_player_stalls_the_run() {
+    fn a_silent_player_no_longer_stalls_the_run() {
         // The same roster `episode` would build, except that one werewolf
-        // never answers. The first night's request to it goes unanswered,
-        // nothing is left in flight, and the moderator has stopped nobody,
-        // which is a stall naming every player.
+        // never selects. Under ADR-0004 that was a stall: the phase
+        // resolved on its last answer and one that never came stopped the
+        // game. Under ADR-0011 a session closes on its clock, so the
+        // silent player is simply a member that never selected, and the
+        // game finishes without it.
         let config = config(["alice", "bob", "carol"], 1, 0, 0);
         let assignment = Assignment::deal(&config);
         let silent = assignment.pack().iter().next().unwrap().clone();
@@ -469,11 +472,12 @@ mod tests {
             }
         }
 
-        let error = play(episode, &outcomes, writer, None).unwrap_err();
-        let RunError::Episode(EpisodeError::Stalled { running }) = &error else {
-            panic!("unexpected error: {error:?}");
-        };
-        assert_eq!(*running, config.players.iter().cloned().collect());
-        assert!(error.to_string().contains("stalled"), "{error}");
+        // A pack of one that never selects devours nobody, and three
+        // random players never put two on one target either, so nobody
+        // dies at all and the game runs to its day cap: a stalemate,
+        // which pays -1 to everyone (ADR-0011).
+        let outcome = play(episode, &outcomes, writer, None).unwrap();
+        assert_eq!(outcome.winner, None);
+        assert_eq!(outcome.living.len(), 3, "nobody died");
     }
 }

@@ -34,9 +34,9 @@
 //! A reward is also the one record here with no sequence number, so it is
 //! outside the contiguity check the moderator's records are held to. The
 //! moderator is the authoritative view: its `action` records are every
-//! narration and every request it sent, and its `observation` records are
-//! every response it received, each naming the responding player as its
-//! sender. Which record type a line is *is* the direction, so the reader
+//! narration it sent, and its `observation` records are every selection it
+//! received, each naming the player that made it as its sender. Which
+//! record type a line is *is* the direction, so the reader
 //! needs no direction of its own. Reassembling the game from the players'
 //! records would mean recovering hidden information from partial views,
 //! which is the thing the design prevents. Within one agent's records the
@@ -47,8 +47,8 @@
 //! # No game logic
 //!
 //! Nothing here decides anything. The reader records what the moderator
-//! said, in the order it said it, and nothing more: it does not tally votes,
-//! check a win condition or infer a save. If reconstructing the game ever
+//! said and passed on, in the order it did so, and nothing more: it does not
+//! count votes, check a win condition or infer a save. If reconstructing the game ever
 //! needed a rule, the moderator would not be recording enough, and the fix
 //! would belong with the moderator.
 
@@ -59,10 +59,7 @@ use std::fmt;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
-use super::message::{
-    Cause, Message, Move, Narration, Outcome, Phase, Request, RequestId, RequestKind, Response,
-    Round,
-};
+use super::message::{Cause, Message, Narration, Outcome, Phase, RequestKind, Round, Select};
 use super::role::{Faction, Role};
 use crate::event::AgentId;
 
@@ -106,18 +103,25 @@ pub struct RoundRecord {
 pub struct PhaseRecord {
     /// Everyone in the game when the phase began.
     pub living: BTreeSet<AgentId>,
-    /// Every move made this phase, by the agent that made it, paired
-    /// with the kind of request it answered. The move alone does not say
-    /// whether a target was devoured, protected, investigated or nominated.
-    pub moves: BTreeMap<AgentId, (RequestKind, Move)>,
+    /// Every selection made this phase, by the player that made it, paired
+    /// with the kind of session it was made in. The target alone does not
+    /// say whether it was devoured, protected, investigated or nominated.
+    pub moves: BTreeMap<AgentId, (RequestKind, AgentId)>,
     /// What each seer learned: whom it investigated and the faction that
     /// came back, by seer. Empty on a phase where no seer investigated,
     /// and holding one entry per seer that did, since a game may deal
     /// more than one.
     pub investigations: BTreeMap<AgentId, (AgentId, Faction)>,
     /// Who was eliminated, the role their death revealed, and how. `None`
-    /// on a night when nobody died.
+    /// on a night when nobody died and on a day that ran out of time.
     pub eliminated: Option<(AgentId, Role, Cause)>,
+    /// Whether this day closed at its limit with no majority, so that a
+    /// day with nobody lynched is told from a day still being read
+    /// (ADR-0011). Always false for a night.
+    pub no_lynch: bool,
+    /// The player whose selection completed the majority that ended the day:
+    /// the *hammer*. `None` for a night, and for a day that ran out.
+    pub hammer: Option<AgentId>,
 }
 
 impl PhaseRecord {
@@ -128,6 +132,8 @@ impl PhaseRecord {
             moves: BTreeMap::new(),
             investigations: BTreeMap::new(),
             eliminated: None,
+            no_lynch: false,
+            hammer: None,
         }
     }
 }
@@ -180,25 +186,27 @@ pub enum TranscriptError {
         /// The one found.
         found: u64,
     },
-    /// A response answers a request the moderator did not send, has already
-    /// had answered, or sent to somebody else.
-    UnknownRequest {
+    /// A selection was made in a session its sender is not a member of: the
+    /// phase does not ask that of its role, or the selection names a round
+    /// that is not the one under way.
+    NotAMember {
         /// The line.
         line: usize,
-        /// The responding agent.
+        /// The selecting agent.
         from: AgentId,
-        /// The request it named.
-        request: RequestId,
+        /// The session it selected in.
+        kind: RequestKind,
     },
-    /// A record belongs to a phase that has not begun: a response, an
+    /// A record belongs to a phase that has not begun: a selection, an
     /// investigation or an elimination before the first night, or a day
     /// whose night has not begun or that has begun already.
     NoPhase {
         /// The line.
         line: usize,
     },
-    /// A message the moderator never records: a narration or a request
-    /// observed by it, or a response it took as an action.
+    /// A message the moderator never records: a narration it observed
+    /// rather than sent, or a selection it took as an action rather than
+    /// received.
     Misdirected {
         /// The line.
         line: usize,
@@ -231,13 +239,9 @@ impl fmt::Display for TranscriptError {
                 f,
                 "line {line} has sequence number {found} where {expected} was expected"
             ),
-            Self::UnknownRequest {
-                line,
-                from,
-                request: RequestId(id),
-            } => write!(
+            Self::NotAMember { line, from, kind } => write!(
                 f,
-                "line {line}: {from} answered request {id}, which was not asked of it"
+                "line {line}: {from} selected in a {kind:?} session, which it is not a member of"
             ),
             Self::NoPhase { line } => {
                 write!(f, "line {line} belongs to a phase, but none has begun")
@@ -322,7 +326,71 @@ struct Record {
     message: Message,
 }
 
+/// What one phase settled, as ADR-0011 guarantees it to be reproducible.
+///
+/// A projection of a [`PhaseRecord`] onto its outcome alone: who died and
+/// what each seer found. The selections that led there, and their order, are
+/// not part of it, because with timed sessions they are not reproducible.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Verdict {
+    /// Who was eliminated and how, or `None` for a night nobody died in
+    /// and a day nobody was lynched in.
+    pub eliminated: Option<(AgentId, Role, Cause)>,
+    /// What each seer learned this phase.
+    pub investigations: BTreeMap<AgentId, (AgentId, Faction)>,
+}
+
+/// Everything a run of one seed must reproduce (ADR-0011).
+///
+/// A game played with timed sessions is reproducible in its *outcomes* and
+/// not in its traffic: every death, every finding, the winner and the rewards
+/// are the same on every run of a seed, while the order of selections, and
+/// which late selections arrive before a session closes, are not. This is the
+/// part the determinism tests compare.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Verdicts {
+    /// Each player's role, as the moderator dealt it.
+    pub assignment: BTreeMap<AgentId, Role>,
+    /// Each phase in order, night before day.
+    pub phases: Vec<Verdict>,
+    /// How the game ended.
+    pub outcome: Outcome,
+    /// What each player's game was worth.
+    pub rewards: BTreeMap<AgentId, i32>,
+}
+
 impl Transcript {
+    /// The game projected onto what ADR-0011 guarantees to be
+    /// reproducible: the deal, each phase's elimination and findings, the
+    /// outcome and the rewards.
+    ///
+    /// Two runs of one seed agree on this and need not agree on anything
+    /// else, so it is what the determinism tests compare. Comparing whole
+    /// transcripts would compare the order selections arrived in, which is a
+    /// fact about thread scheduling rather than about the game.
+    #[must_use]
+    pub fn verdicts(&self) -> Verdicts {
+        let verdict = |record: &PhaseRecord| Verdict {
+            eliminated: record.eliminated.clone(),
+            investigations: record.investigations.clone(),
+        };
+        Verdicts {
+            assignment: self.assignment.clone(),
+            phases: self
+                .rounds
+                .iter()
+                .flat_map(|round| {
+                    [Some(&round.night), round.day.as_ref()]
+                        .into_iter()
+                        .flatten()
+                        .map(verdict)
+                })
+                .collect(),
+            outcome: self.outcome.clone(),
+            rewards: self.rewards.clone(),
+        }
+    }
+
     /// Reconstructs the game from the moderator's records in a trajectory.
     ///
     /// `lines` is the whole file, one value per line, as [`lines`] returns
@@ -508,8 +576,20 @@ fn only(
 struct Reader {
     assignment: BTreeMap<AgentId, Role>,
     rounds: Vec<RoundRecord>,
-    /// The requests sent and not yet answered: who was asked, and what.
-    outstanding: BTreeMap<RequestId, (AgentId, RequestKind)>,
+    /// The player that made the latest nomination the moderator passed
+    /// on, and which is therefore still a candidate for the hammer.
+    ///
+    /// The moderator forwards each nomination it accepts as it accepts
+    /// it, and the selection that completes a majority is forwarded before
+    /// the lynching it causes is narrated. So the sender of the last
+    /// forward before an `Eliminated { cause: Lynched }` is the player
+    /// whose selection ended the day, and no narration has to say so
+    /// (ADR-0015). Cleared when a phase begins, so that a lynching can
+    /// never take its hammer from the day before.
+    latest_nomination: Option<AgentId>,
+    /// How the game ended, once the moderator has announced it. `None`
+    /// until then, and still `None` at the end of a truncated transcript,
+    /// which is [`TranscriptError::NoOutcome`].
     outcome: Option<Outcome>,
 }
 
@@ -526,9 +606,21 @@ impl Reader {
             (Direction::Sent, Message::Narration(narration)) => {
                 self.narrated(line, recipients, narration)
             }
-            (Direction::Sent, Message::Request(request)) => self.asked(line, recipients, &request),
-            (Direction::Received, Message::Response(response)) => {
-                self.answered(line, sender, response)
+            (Direction::Received, Message::Select(selection)) => {
+                self.answered(line, sender, selection)
+            }
+            // A selection the moderator sent is one it is passing on to the
+            // players who should see it (ADR-0014). It is stamped with the
+            // player that made it, so it is the same selection this reader
+            // already folded when the moderator received it, and folding
+            // it twice would count one vote as two. What it does say, and
+            // the received selection does not, is that the moderator accepted
+            // it: that is where the hammer comes from (ADR-0015).
+            (Direction::Sent, Message::Select(selection)) => {
+                if selection.kind == RequestKind::Nominate {
+                    self.latest_nomination = Some(sender);
+                }
+                Ok(())
             }
             _ => Err(TranscriptError::Misdirected { line }),
         }
@@ -550,21 +642,27 @@ impl Reader {
                 round,
                 phase: Phase::Night,
                 living,
-            } => self.rounds.push(RoundRecord {
-                round,
-                night: PhaseRecord::begun(living),
-                day: None,
-            }),
+            } => {
+                self.latest_nomination = None;
+                self.rounds.push(RoundRecord {
+                    round,
+                    night: PhaseRecord::begun(living),
+                    day: None,
+                });
+            }
             Narration::PhaseBegan {
                 round,
                 phase: Phase::Day,
                 living,
-            } => match self.rounds.last_mut() {
-                Some(latest) if latest.round == round && latest.day.is_none() => {
-                    latest.day = Some(PhaseRecord::begun(living));
+            } => {
+                self.latest_nomination = None;
+                match self.rounds.last_mut() {
+                    Some(latest) if latest.round == round && latest.day.is_none() => {
+                        latest.day = Some(PhaseRecord::begun(living));
+                    }
+                    _ => return Err(TranscriptError::NoPhase { line }),
                 }
-                _ => return Err(TranscriptError::NoPhase { line }),
-            },
+            }
             Narration::Investigated { target, faction } => {
                 let seer = only(line, recipients, "a finding is addressed to one seer")?;
                 self.current(line)?
@@ -573,23 +671,21 @@ impl Reader {
             }
             Narration::Eliminated {
                 who, role, cause, ..
-            } => self.current(line)?.eliminated = Some((who, role, cause)),
-            // The tally repeats the responses already recorded, and a night
-            // without a death is one without an elimination.
-            Narration::Tally { .. } | Narration::NoDeath { .. } => {}
+            } => {
+                // The nomination that lynched somebody is the last one
+                // the moderator passed on before saying so (ADR-0015).
+                let hammer = (cause == Cause::Lynched)
+                    .then(|| self.latest_nomination.clone())
+                    .flatten();
+                let phase = self.current(line)?;
+                phase.eliminated = Some((who, role, cause));
+                phase.hammer = hammer;
+            }
+            Narration::NoLynch { .. } => self.current(line)?.no_lynch = true,
+            // A night without a death is one without an elimination.
+            Narration::NoDeath { .. } => {}
             Narration::Outcome(outcome) => self.outcome = Some(outcome),
         }
-        Ok(())
-    }
-
-    fn asked(
-        &mut self,
-        line: usize,
-        recipients: BTreeSet<AgentId>,
-        request: &Request,
-    ) -> Result<(), TranscriptError> {
-        let who = only(line, recipients, "a request is addressed to one player")?;
-        self.outstanding.insert(request.id, (who, request.kind));
         Ok(())
     }
 
@@ -597,22 +693,31 @@ impl Reader {
         &mut self,
         line: usize,
         from: AgentId,
-        response: Response,
+        selection: Select,
     ) -> Result<(), TranscriptError> {
-        // A mismatch ends the read, so removing before checking loses nothing.
-        let kind = match self.outstanding.remove(&response.request) {
-            Some((asked, kind)) if asked == from => kind,
-            _ => {
-                return Err(TranscriptError::UnknownRequest {
-                    line,
-                    from,
-                    request: response.request,
-                });
-            }
-        };
+        // The selection says which session it was made in, so there is
+        // nothing to look up (ADR-0014). What has to be checked is that
+        // its sender's role is asked that in that phase: a reader learns
+        // the roles from the deal, which precedes every selection.
+        let role = self
+            .assignment
+            .get(&from)
+            .copied()
+            .ok_or(TranscriptError::NotAMember {
+                line,
+                from: from.clone(),
+                kind: selection.kind,
+            })?;
+        if role.asked_in(selection.kind.phase()) != Some(selection.kind) {
+            return Err(TranscriptError::NotAMember {
+                line,
+                from,
+                kind: selection.kind,
+            });
+        }
         self.current(line)?
             .moves
-            .insert(from, (kind, response.chosen));
+            .insert(from, (selection.kind, selection.target));
         Ok(())
     }
 
@@ -627,7 +732,7 @@ impl Reader {
     }
 }
 
-/// How many cells a roster or a tally lays out per line.
+/// How many cells a roster or a phase's moves lay out per line.
 const COLUMNS: usize = 4;
 
 impl fmt::Display for Transcript {
@@ -662,17 +767,19 @@ impl fmt::Display for Transcript {
         });
         columns(f, roster)?;
         for round in &self.rounds {
-            let Round(number) = round.round;
+            let number = round.round.number();
             phase(f, &format!("Night {number}"), &round.night, width)?;
             if let Some(day) = &round.day {
                 phase(f, &format!("Day {number}"), day, width)?;
             }
         }
         writeln!(f)?;
-        let Round(rounds) = self.outcome.rounds;
+        let rounds = self.outcome.rounds.number();
         match self.outcome.winner {
-            Faction::Village => write!(f, "Village wins")?,
-            Faction::Werewolves => write!(f, "Werewolves win")?,
+            Some(Faction::Village) => write!(f, "Village wins")?,
+            Some(Faction::Werewolves) => write!(f, "Werewolves win")?,
+            // A game that reached the day cap without a winner.
+            None => write!(f, "Stalemate")?,
         }
         let plural = if rounds == 1 { "" } else { "s" };
         write!(f, " after {rounds} round{plural}.  Survivors: ")?;
@@ -715,11 +822,7 @@ fn phase(
     columns(
         f,
         votes.iter().map(|(who, (_, chosen))| {
-            format!(
-                "{:<width$} -> {:<width$}",
-                who.as_str(),
-                chosen.target().map_or("no one", AgentId::as_str)
-            )
+            format!("{:<width$} -> {:<width$}", who.as_str(), chosen.as_str())
         }),
     )?;
     for (who, (kind, chosen)) in deeds {
@@ -729,17 +832,22 @@ fn phase(
             RequestKind::Protect => "protects",
             RequestKind::Nominate => "nominates",
         };
-        let whom = chosen.target().map_or("no one", AgentId::as_str);
+        let whom = chosen.as_str();
         write!(f, "  {:<width$} {verb} {whom}", who.as_str())?;
         match record.investigations.get(who) {
             Some((_, faction)) => writeln!(f, "  ->  {faction}")?,
             None => writeln!(f)?,
         }
     }
-    match &record.eliminated {
-        Some((who, role, Cause::Devoured)) => writeln!(f, "  {who} is devoured   ({role})"),
-        Some((who, role, Cause::Lynched)) => writeln!(f, "  {who} is lynched   ({role})"),
-        None => writeln!(f, "  no one died"),
+    match (&record.eliminated, record.no_lynch) {
+        (Some((who, role, Cause::Devoured)), _) => writeln!(f, "  {who} is devoured   ({role})"),
+        (Some((who, role, Cause::Lynched)), _) => match &record.hammer {
+            Some(hammer) => writeln!(f, "  {who} is lynched   ({role}; hammer: {hammer})"),
+            None => writeln!(f, "  {who} is lynched   ({role})"),
+        },
+        // A day that ran out of time is not a night that nobody died in.
+        (None, true) => writeln!(f, "  no one was lynched"),
+        (None, false) => writeln!(f, "  no one died"),
     }
 }
 
@@ -757,7 +865,10 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::testing::{id, ids, village};
+    use std::time::Duration;
+
+    use crate::clock::Timestamp;
+    use crate::testing::{fast, id, ids, village};
     use crate::werewolf::assignment::Assignment;
     use crate::werewolf::game::{Directive, Game};
     use crate::werewolf::role::Role::{Doctor, Seer, Villager, Werewolf};
@@ -792,13 +903,13 @@ mod tests {
         Transcript::read(lines, &moderator())
     }
 
-    fn target(who: &str) -> Move {
-        Move::Target(id(who))
+    fn target(who: &str) -> AgentId {
+        id(who)
     }
 
     fn moves<const N: usize>(
-        moves: [(&str, RequestKind, Move); N],
-    ) -> BTreeMap<AgentId, (RequestKind, Move)> {
+        moves: [(&str, RequestKind, AgentId); N],
+    ) -> BTreeMap<AgentId, (RequestKind, AgentId)> {
         moves
             .into_iter()
             .map(|(who, kind, chosen)| (id(who), (kind, chosen)))
@@ -807,7 +918,7 @@ mod tests {
 
     fn nominations<const N: usize>(
         votes: [(&str, &str); N],
-    ) -> BTreeMap<AgentId, (RequestKind, Move)> {
+    ) -> BTreeMap<AgentId, (RequestKind, AgentId)> {
         votes
             .into_iter()
             .map(|(who, whom)| (id(who), (RequestKind::Nominate, target(whom))))
@@ -816,11 +927,13 @@ mod tests {
 
     fn phase<const N: usize>(
         living: [&str; N],
-        moves: BTreeMap<AgentId, (RequestKind, Move)>,
+        moves: BTreeMap<AgentId, (RequestKind, AgentId)>,
         investigation: Option<(&str, &str, Faction)>,
         eliminated: Option<(&str, Role, Cause)>,
     ) -> PhaseRecord {
         PhaseRecord {
+            no_lynch: false,
+            hammer: None,
             living: ids(living),
             moves,
             investigations: investigation
@@ -834,9 +947,6 @@ mod tests {
     /// The game the fixture records, written out by hand from the
     /// moderator's records.
     fn expected() -> Transcript {
-        use Cause::{Devoured, Lynched};
-        use RequestKind::{Devour, Investigate, Protect};
-        let everyone = ["alice", "bob", "carol", "dave", "erin", "frank", "grace"];
         Transcript {
             assignment: [
                 ("alice", Villager),
@@ -851,71 +961,15 @@ mod tests {
             .map(|(who, role)| (id(who), role))
             .collect(),
             rounds: vec![
-                RoundRecord {
-                    round: Round(1),
-                    // The pack splits, the tie-break picks alice, and the
-                    // doctor has protected her: a saved night.
-                    night: phase(
-                        everyone,
-                        moves([
-                            ("carol", Protect, target("alice")),
-                            ("dave", Devour, target("alice")),
-                            ("erin", Devour, target("bob")),
-                            ("grace", Investigate, target("alice")),
-                        ]),
-                        Some(("grace", "alice", Faction::Village)),
-                        None,
-                    ),
-                    day: Some(phase(
-                        everyone,
-                        nominations([
-                            ("alice", "frank"),
-                            ("bob", "carol"),
-                            ("carol", "bob"),
-                            ("dave", "alice"),
-                            ("erin", "alice"),
-                            ("frank", "grace"),
-                            ("grace", "erin"),
-                        ]),
-                        None,
-                        Some(("alice", Villager, Lynched)),
-                    )),
-                },
-                RoundRecord {
-                    round: Round(2),
-                    // The pack agrees on carol, whom the doctor did not
-                    // protect, and the seer finds a werewolf too late.
-                    night: phase(
-                        ["bob", "carol", "dave", "erin", "frank", "grace"],
-                        moves([
-                            ("carol", Protect, target("erin")),
-                            ("dave", Devour, target("carol")),
-                            ("erin", Devour, target("carol")),
-                            ("grace", Investigate, target("dave")),
-                        ]),
-                        Some(("grace", "dave", Faction::Werewolves)),
-                        Some(("carol", Doctor, Devoured)),
-                    ),
-                    // Grace and frank tie, and the tie-break lynches grace:
-                    // two werewolves among four living is parity.
-                    day: Some(phase(
-                        ["bob", "dave", "erin", "frank", "grace"],
-                        nominations([
-                            ("bob", "grace"),
-                            ("dave", "bob"),
-                            ("erin", "frank"),
-                            ("frank", "grace"),
-                            ("grace", "frank"),
-                        ]),
-                        None,
-                        Some(("grace", Seer, Lynched)),
-                    )),
-                },
+                expected_round_one(),
+                expected_round_two(),
+                expected_round_three(),
+                expected_round_four(),
             ],
             outcome: Outcome {
-                winner: Faction::Werewolves,
-                rounds: Round(2),
-                living: ids(["bob", "dave", "erin", "frank"]),
+                winner: Some(Faction::Werewolves),
+                rounds: Round::new(4),
+                living: ids(["bob", "dave", "erin", "grace"]),
             },
             // The werewolves dave and erin won; everybody else, living or
             // dead, lost with the village.
@@ -932,6 +986,139 @@ mod tests {
             .map(|(who, value)| (id(who), value))
             .collect(),
         }
+    }
+
+    /// Everyone, for the rounds before anybody has died.
+    const EVERYONE: [&str; 7] = ["alice", "bob", "carol", "dave", "erin", "frank", "grace"];
+
+    /// The pack splits, the tie-break picks alice, and the doctor has
+    /// protected her: a saved night. Then seven players scatter over five
+    /// targets, so nobody reaches the four a majority of the living needs
+    /// and the day runs out (ADR-0011).
+    fn expected_round_one() -> RoundRecord {
+        use RequestKind::{Devour, Investigate, Protect};
+        RoundRecord {
+            round: Round::new(1),
+            night: phase(
+                EVERYONE,
+                moves([
+                    ("carol", Protect, target("alice")),
+                    ("dave", Devour, target("alice")),
+                    ("erin", Devour, target("bob")),
+                    ("grace", Investigate, target("alice")),
+                ]),
+                Some(("grace", "alice", Faction::Village)),
+                None,
+            ),
+            day: Some(no_lynch(phase(
+                EVERYONE,
+                nominations([
+                    ("alice", "frank"),
+                    ("bob", "carol"),
+                    ("carol", "bob"),
+                    ("dave", "alice"),
+                    ("erin", "alice"),
+                    ("frank", "grace"),
+                    ("grace", "erin"),
+                ]),
+                None,
+                None,
+            ))),
+        }
+    }
+
+    /// The pack agrees on carol, whom the doctor did not protect, and the
+    /// seer finds a werewolf too late to say so.
+    fn expected_round_two() -> RoundRecord {
+        use Cause::Devoured;
+        use RequestKind::{Devour, Investigate, Protect};
+        RoundRecord {
+            round: Round::new(2),
+            night: phase(
+                EVERYONE,
+                moves([
+                    ("carol", Protect, target("erin")),
+                    ("dave", Devour, target("carol")),
+                    ("erin", Devour, target("bob")),
+                    ("grace", Investigate, target("dave")),
+                ]),
+                Some(("grace", "dave", Faction::Werewolves)),
+                Some(("carol", Doctor, Devoured)),
+            ),
+            day: Some(no_lynch(phase(
+                ["alice", "bob", "dave", "erin", "frank", "grace"],
+                nominations([
+                    ("alice", "grace"),
+                    ("bob", "grace"),
+                    ("dave", "alice"),
+                    ("erin", "bob"),
+                    ("frank", "grace"),
+                    ("grace", "erin"),
+                ]),
+                None,
+                None,
+            ))),
+        }
+    }
+
+    /// No doctor lives, so no protection session opens and nothing stands
+    /// between the pack and the player it agrees on.
+    fn expected_round_three() -> RoundRecord {
+        use Cause::Devoured;
+        use RequestKind::{Devour, Investigate};
+        RoundRecord {
+            round: Round::new(3),
+            night: phase(
+                ["alice", "bob", "dave", "erin", "frank", "grace"],
+                moves([
+                    ("dave", Devour, target("frank")),
+                    ("erin", Devour, target("frank")),
+                    ("grace", Investigate, target("frank")),
+                ]),
+                Some(("grace", "frank", Faction::Village)),
+                Some(("frank", Villager, Devoured)),
+            ),
+            day: Some(no_lynch(phase(
+                ["alice", "bob", "dave", "erin", "grace"],
+                nominations([
+                    ("alice", "erin"),
+                    ("bob", "dave"),
+                    ("dave", "alice"),
+                    ("erin", "alice"),
+                    ("grace", "dave"),
+                ]),
+                None,
+                None,
+            ))),
+        }
+    }
+
+    /// The pack splits again, the tie-break picks alice, and two
+    /// werewolves among four living is parity: the game ends at night, so
+    /// the round has no day.
+    fn expected_round_four() -> RoundRecord {
+        use Cause::Devoured;
+        use RequestKind::{Devour, Investigate};
+        RoundRecord {
+            round: Round::new(4),
+            night: phase(
+                ["alice", "bob", "dave", "erin", "grace"],
+                moves([
+                    ("dave", Devour, target("alice")),
+                    ("erin", Devour, target("grace")),
+                    ("grace", Investigate, target("bob")),
+                ]),
+                Some(("grace", "bob", Faction::Village)),
+                Some(("alice", Villager, Devoured)),
+            ),
+            day: None,
+        }
+    }
+
+    /// A day that reached its limit without a majority.
+    fn no_lynch(mut record: PhaseRecord) -> PhaseRecord {
+        record.no_lynch = true;
+        record
     }
 
     #[test]
@@ -961,11 +1148,12 @@ mod tests {
             "every player is paid, and nobody else"
         );
         for (who, value) in &transcript.rewards {
-            let expected = if transcript.assignment[who].faction() == transcript.outcome.winner {
-                1
-            } else {
-                -1
-            };
+            let expected =
+                if transcript.outcome.winner == Some(transcript.assignment[who].faction()) {
+                    1
+                } else {
+                    -1
+                };
             assert_eq!(*value, expected, "{who}");
         }
         assert!(
@@ -1057,7 +1245,7 @@ mod tests {
         let rendered = transcript.to_string();
         assert!(!rendered.contains("Rewards"), "{rendered}");
         assert!(
-            rendered.ends_with("Survivors: bob, dave, erin, frank\n"),
+            rendered.ends_with("Survivors: bob, dave, erin, grace\n"),
             "{rendered}"
         );
         // And is otherwise the same game.
@@ -1085,7 +1273,8 @@ mod tests {
                 };
                 assert_eq!(*kind, expected, "{who} in round {:?}", round.round);
             }
-            for (who, (kind, _)) in &round.day.as_ref().unwrap().moves {
+            // The last round ends at night, so it has no day.
+            for (who, (kind, _)) in round.day.iter().flat_map(|day| &day.moves) {
                 assert_eq!(
                     *kind,
                     RequestKind::Nominate,
@@ -1147,8 +1336,8 @@ mod tests {
             .expect("the fixture has such a record")
     }
 
-    fn is_response(payload: &Value) -> bool {
-        !payload["Response"].is_null()
+    fn is_selection(payload: &Value) -> bool {
+        !payload["Select"].is_null()
     }
 
     #[test]
@@ -1211,7 +1400,7 @@ mod tests {
 
     #[test]
     fn a_record_missing_part_of_its_envelope_is_an_error() {
-        let index = moderator_record(&fixture(), is_response);
+        let index = moderator_record(&fixture(), is_selection);
         for key in ["agent", "seq", "event"] {
             let mut lines = fixture();
             lines[index].as_object_mut().unwrap().remove(key);
@@ -1251,7 +1440,7 @@ mod tests {
     #[test]
     fn a_payload_that_will_not_deserialize_is_an_error() {
         let mut lines = fixture();
-        let index = moderator_record(&lines, is_response);
+        let index = moderator_record(&lines, is_selection);
         lines[index]["event"]["payload"] = json!({"Response": {"request": "seven"}});
         let error = read(&lines).unwrap_err();
         assert!(
@@ -1265,7 +1454,7 @@ mod tests {
     #[test]
     fn a_gap_in_the_moderators_sequence_numbers_is_an_error() {
         let mut lines = fixture();
-        let index = moderator_record(&lines, is_response);
+        let index = moderator_record(&lines, is_selection);
         lines[index]["seq"] = json!(lines[index]["seq"].as_u64().unwrap() + 1);
         let error = read(&lines).unwrap_err();
         assert!(
@@ -1277,27 +1466,63 @@ mod tests {
     }
 
     #[test]
-    fn a_response_to_an_unknown_request_is_an_error() {
+    fn a_selection_in_a_session_the_senders_role_is_not_in_is_an_error() {
+        // There is no id to invent an unknown value for any more
+        // (ADR-0014): a selection says which session it was made in, and
+        // what the reader checks is that the sender's role puts it in
+        // that session. So the forgery is a kind the sender's own role
+        // is never asked — which one that is depends on the role the
+        // fixture dealt, so it is derived rather than written in.
         let mut lines = fixture();
-        let index = moderator_record(&lines, is_response);
-        lines[index]["event"]["payload"]["Response"]["request"] = json!(99);
+        let index = moderator_record(&lines, is_selection);
+        let kind: RequestKind =
+            serde_json::from_value(lines[index]["event"]["payload"]["Select"]["kind"].clone())
+                .expect("a selection names its session");
+        let forged = [
+            RequestKind::Devour,
+            RequestKind::Investigate,
+            RequestKind::Protect,
+        ]
+        .into_iter()
+        .find(|other| *other != kind)
+        .expect("a night has three kinds and a role is asked one");
+        lines[index]["event"]["payload"]["Select"]["kind"] = json!(forged);
         let error = read(&lines).unwrap_err();
         assert!(
-            matches!(&error, TranscriptError::UnknownRequest { line, request: RequestId(99), .. }
-                if *line == index + 1),
+            matches!(&error, TranscriptError::NotAMember { line, kind, .. }
+                if *line == index + 1 && *kind == forged),
             "{error:?}"
         );
-        assert!(error.to_string().contains("request 99"), "{error}");
+        assert!(
+            error.to_string().contains(&format!("{forged:?} session")),
+            "{error}"
+        );
     }
 
     #[test]
-    fn a_response_from_someone_the_request_was_not_asked_of_is_an_error() {
+    fn a_selection_from_someone_the_phase_asks_nothing_of_is_an_error() {
+        // frank is a villager, and a villager is a member of no night
+        // session at all.
         let mut lines = fixture();
-        let index = moderator_record(&lines, is_response);
+        let index = moderator_record(&lines, is_selection);
         lines[index]["event"]["sender"] = json!("frank");
         let error = read(&lines).unwrap_err();
         assert!(
-            matches!(&error, TranscriptError::UnknownRequest { from, .. } if from.as_str() == "frank"),
+            matches!(&error, TranscriptError::NotAMember { from, .. } if from.as_str() == "frank"),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn a_selection_from_someone_not_in_the_deal_is_an_error() {
+        // A reader learns the roles from the deal, which precedes every
+        // selection. A sender the deal never named has no role to check.
+        let mut lines = fixture();
+        let index = moderator_record(&lines, is_selection);
+        lines[index]["event"]["sender"] = json!("zara");
+        let error = read(&lines).unwrap_err();
+        assert!(
+            matches!(&error, TranscriptError::NotAMember { from, .. } if from.as_str() == "zara"),
             "{error:?}"
         );
     }
@@ -1323,7 +1548,7 @@ mod tests {
         // empty id in the envelope is a malformed envelope and one in the
         // payload is a payload that is not a Werewolf message, each naming
         // the line.
-        let index = moderator_record(&fixture(), is_response);
+        let index = moderator_record(&fixture(), is_selection);
         for (key, empty) in [("sender", json!("")), ("recipients", json!([""]))] {
             let mut lines = fixture();
             lines[index]["event"][key] = empty;
@@ -1336,7 +1561,7 @@ mod tests {
             assert!(error.to_string().contains("non-empty agent id"), "{error}");
         }
         let mut lines = fixture();
-        lines[index]["event"]["payload"]["Response"]["chosen"]["Target"] = json!("");
+        lines[index]["event"]["payload"]["Select"]["target"] = json!("");
         let error = read(&lines).unwrap_err();
         assert!(
             matches!(&error, TranscriptError::Payload { line, .. } if *line == index + 1),
@@ -1356,25 +1581,20 @@ mod tests {
         );
     }
 
-    fn is_request(payload: &Value) -> bool {
-        !payload["Request"].is_null()
-    }
-
     #[test]
-    fn a_request_addressed_to_other_than_one_player_is_an_error() {
-        // Naming the request's line, not the line of whichever response
-        // later fails to match it.
-        for to in [json!([]), json!(["alice", "bob"])] {
-            let mut lines = fixture();
-            let index = moderator_record(&lines, is_request);
-            lines[index]["event"]["recipients"] = to.clone();
-            let error = read(&lines).unwrap_err();
-            assert!(
-                matches!(&error, TranscriptError::Malformed { line, what }
-                    if *line == index + 1 && what == "a request is addressed to one player"),
-                "{to}: {error:?}"
-            );
-        }
+    fn a_transcript_holds_no_request_at_all() {
+        // Nothing is asked of anybody (ADR-0014), so no record in a
+        // transcript is a request, and the "addressed to one player"
+        // check a request once needed has nothing left to guard. The
+        // check itself lives on for a finding, which is still addressed
+        // to one seer.
+        let lines = fixture();
+        assert!(
+            !lines
+                .iter()
+                .any(|line| !line["event"]["payload"]["Request"].is_null()),
+            "a transcript still holds a request"
+        );
     }
 
     #[test]
@@ -1398,13 +1618,13 @@ mod tests {
     fn a_response_before_any_phase_is_an_error() {
         let mut lines = fixture();
         // The first night's announcement becomes something harmless, so the
-        // first response answers a request in no phase.
+        // first selection is made in no phase at all.
         let index = moderator_record(&lines, |payload| {
             !payload["Narration"]["PhaseBegan"].is_null()
         });
         lines[index]["event"]["payload"] = json!({"Narration": {"NoDeath": {"round": 1}}});
         let error = read(&lines).unwrap_err();
-        let first_response = moderator_record(&lines, is_response);
+        let first_response = moderator_record(&lines, is_selection);
         assert!(
             matches!(error, TranscriptError::NoPhase { line } if line == first_response + 1),
             "{error:?}"
@@ -1437,28 +1657,45 @@ mod tests {
 
     #[test]
     fn a_message_the_moderator_never_records_is_an_error() {
-        // A response the moderator took as an action of its own.
-        let mut lines = fixture();
-        let index = moderator_record(&lines, is_response);
-        lines[index]["type"] = json!("action");
-        lines[index].as_object_mut().unwrap().remove("received");
-        let error = read(&lines).unwrap_err();
-        assert!(
-            matches!(error, TranscriptError::Misdirected { line } if line == index + 1),
-            "{error:?}"
-        );
-        assert!(error.to_string().contains("never records"), "{error}");
-
-        // A narration the moderator observed rather than sent.
+        // A narration the moderator observed rather than sent. It only
+        // ever sends one, so a narration among its observations is a
+        // trajectory that does not describe this game.
         let mut lines = fixture();
         let index = moderator_record(&lines, |payload| !payload["Narration"].is_null());
         lines[index]["type"] = json!("observation");
         lines[index]["received"] = lines[index]["created"].clone();
         let error = read(&lines).unwrap_err();
         assert!(
-            matches!(error, TranscriptError::Misdirected { .. }),
+            matches!(error, TranscriptError::Misdirected { line } if line == index + 1),
             "{error:?}"
         );
+        assert!(error.to_string().contains("never records"), "{error}");
+    }
+
+    #[test]
+    fn a_selection_the_moderator_sent_is_one_it_forwarded() {
+        // The moderator both receives a selection and sends it on to the
+        // players who should see it (ADR-0014), so a selection among its
+        // actions is no error: the fixture contains both, and it reads.
+        let lines = fixture();
+        let forwarded = lines.iter().filter(|line| {
+            line["type"] == "action" && !line["event"]["payload"]["Select"].is_null()
+        });
+        let forwarded: Vec<&Value> = forwarded.collect();
+        assert!(
+            !forwarded.is_empty(),
+            "the fixture exercises forwarding, or this proves nothing"
+        );
+        // Each is stamped with the player that made it, never with the
+        // moderator: that is what makes the relay invisible.
+        for line in forwarded {
+            assert_ne!(
+                line["event"]["sender"],
+                json!(MODERATOR),
+                "a forwarded selection is sent as the player that made it: {line}"
+            );
+        }
+        read(&lines).expect("a trajectory with forwarded selections reads");
     }
 
     /// Writes the moderator's records of a game played through [`Game`]
@@ -1505,63 +1742,112 @@ mod tests {
             for directive in directives {
                 let (to, payload) = match directive {
                     Directive::Narrate { to, narration } => (to, Message::Narration(narration)),
-                    Directive::Ask { to, request } => ([to].into(), Message::Request(request)),
+                    // A forwarded selection is recorded as the player that
+                    // made it, not as the moderator, so the scribe writes
+                    // it under that name rather than its own.
+                    Directive::Forward {
+                        from,
+                        to,
+                        selection,
+                        ..
+                    } => {
+                        self.record("action", from.as_str(), &to, &Message::Select(selection));
+                        continue;
+                    }
+                    // A stop is a control, and `Transcript::read` skips
+                    // control records: they say nothing about the game.
+                    Directive::Stop { .. } => continue,
                 };
                 self.record("action", MODERATOR, &to, &payload);
             }
         }
 
-        fn response(&mut self, from: &str, response: Response) {
+        fn select(&mut self, from: &str, selection: Select) {
             self.record(
                 "observation",
                 from,
                 &ids([MODERATOR]),
-                &Message::Response(response),
+                &Message::Select(selection),
             );
         }
     }
 
-    /// Plays `script`, one phase's answers per entry, through a game over
+    /// Plays `script`, one phase's selections per entry, through a game over
     /// `assignment`, and returns the moderator's records.
-    fn scripted(assignment: Assignment, script: &[Vec<(&str, Move)>]) -> Vec<Value> {
+    fn scripted(assignment: Assignment, script: &[Vec<(&str, AgentId)>]) -> Vec<Value> {
+        /// Far enough apart that one phase's clocks never reach the next.
+        const STEP: u64 = 10_000;
+
         let mut scribe = Scribe::new();
-        let mut game = Game::new(assignment, 1);
-        let mut latest = game.begin();
-        scribe.directives(latest.clone());
-        for answers in script {
-            let asked: BTreeMap<AgentId, RequestId> = latest
-                .iter()
-                .filter_map(|directive| match directive {
-                    Directive::Ask { to, request } => Some((to.clone(), request.id)),
-                    Directive::Narrate { .. } => None,
-                })
-                .collect();
+        let roles = assignment.clone();
+        let mut game = Game::new(assignment, 1, fast());
+        scribe.directives(game.begin(Timestamp::default()));
+        for (index, answers) in script.iter().enumerate() {
+            let now = Timestamp::from(Duration::from_millis((index as u64 + 1) * STEP));
+            // Taken before any selection is recorded: a day ends on the selection
+            // that makes a majority, so selecting alone may finish it.
+            let phase = game.phase_now();
+            let (phase_kind, round) = phase;
             for (who, chosen) in answers {
-                let response = Response {
-                    request: asked[&id(who)],
-                    chosen: chosen.clone(),
+                // Which session a selection belongs to is the selector's own
+                // business (ADR-0014): the script stands in for the
+                // player, so it reads it off the role the same way the
+                // player would, rather than off a request.
+                let kind = roles
+                    .role(&id(who))
+                    .and_then(|role| role.asked_in(phase_kind))
+                    .expect("the phase asks something of this role");
+                // The audience the player would name, so the fixture
+                // exercises the moderator's forwarding the way a real game
+                // does: a nomination is public, a devour is the pack's, and
+                // the seer's and doctor's business is nobody else's.
+                let seen_by = match kind {
+                    RequestKind::Nominate => game
+                        .living()
+                        .iter()
+                        .filter(|other| *other != &id(who))
+                        .cloned()
+                        .collect(),
+                    RequestKind::Devour => roles
+                        .players()
+                        .filter(|(other, role)| {
+                            role.faction() == Faction::Werewolves && *other != &id(who)
+                        })
+                        .map(|(other, _)| other.clone())
+                        .filter(|other| game.living().contains(other))
+                        .collect(),
+                    RequestKind::Investigate | RequestKind::Protect => BTreeSet::new(),
                 };
-                scribe.response(who, response.clone());
-                latest = game.record(&id(who), &response);
-                scribe.directives(latest.clone());
+                let selection = Select {
+                    round,
+                    kind,
+                    target: chosen.clone(),
+                    seen_by,
+                };
+                scribe.select(who, selection.clone());
+                scribe.directives(game.select(&id(who), &selection, now, now));
+            }
+            // Close this phase and no more. Expiring at the earliest
+            // deadline open, and stopping as soon as the phase moves,
+            // keeps one pass from cascading through every later phase.
+            while game.phase_now() == phase && game.outcome().is_none() {
+                let Some(deadline) = game.next_deadline() else {
+                    break;
+                };
+                let expired = game.expire(deadline);
+                if expired.is_empty() {
+                    break;
+                }
+                scribe.directives(expired);
             }
         }
         scribe.lines
     }
 
-    fn answers<const N: usize>(answers: [(&'static str, &str); N]) -> Vec<(&'static str, Move)> {
+    fn answers<const N: usize>(answers: [(&'static str, &str); N]) -> Vec<(&'static str, AgentId)> {
         answers
             .into_iter()
-            .map(|(who, whom)| {
-                (
-                    who,
-                    if whom == "-" {
-                        Move::Abstain
-                    } else {
-                        target(whom)
-                    },
-                )
-            })
+            .map(|(who, whom)| (who, target(whom)))
             .collect()
     }
 
@@ -1573,13 +1859,10 @@ mod tests {
             village(),
             &[
                 answers([("bob", "carol"), ("carol", "bob"), ("dave", "alice")]),
-                answers([
-                    ("alice", "erin"),
-                    ("bob", "erin"),
-                    ("dave", "erin"),
-                    ("erin", "alice"),
-                ]),
-                answers([("bob", "alice"), ("dave", "-")]),
+                // Three of four living select erin, so dave's is the
+                // hammer and the day closes before erin is asked.
+                answers([("alice", "erin"), ("bob", "erin"), ("dave", "erin")]),
+                answers([("bob", "alice"), ("dave", "bob")]),
             ],
         );
         let transcript = read(&lines).unwrap();
@@ -1590,22 +1873,109 @@ mod tests {
             last.night.moves,
             moves([
                 ("bob", RequestKind::Devour, target("alice")),
-                ("dave", RequestKind::Protect, Move::Abstain),
+                ("dave", RequestKind::Protect, target("bob")),
             ])
         );
         assert_eq!(
             last.night.eliminated,
             Some((id("alice"), Villager, Cause::Devoured))
         );
-        assert_eq!(transcript.outcome.winner, Faction::Werewolves);
+        assert_eq!(transcript.outcome.winner, Some(Faction::Werewolves));
         let rendered = transcript.to_string();
         assert!(rendered.contains("Night 2  (3 living)\n"), "{rendered}");
         assert!(!rendered.contains("Day 2"), "{rendered}");
-        assert!(rendered.contains("  dave  protects no one\n"), "{rendered}");
+        assert!(rendered.contains("  dave  protects bob\n"), "{rendered}");
         assert!(
             rendered.ends_with("Werewolves win after 2 rounds.  Survivors: bob, dave\n"),
             "{rendered}"
         );
+    }
+
+    #[test]
+    fn the_hammer_is_the_last_nomination_passed_on_before_the_lynching() {
+        // Nothing narrates the hammer any more (ADR-0015). It is read
+        // from the moderator's own actions: a nomination it passed on is
+        // one it accepted, and the last such before it announced the
+        // lynching is the selection that completed the majority.
+        let lines = scripted(
+            village(),
+            &[
+                answers([("bob", "carol"), ("carol", "bob"), ("dave", "alice")]),
+                // alice, then bob, then dave, all at erin. dave's is the
+                // third of four living, so it makes the majority and ends
+                // the day; erin is never asked.
+                answers([("alice", "erin"), ("bob", "erin"), ("dave", "erin")]),
+                answers([("bob", "alice"), ("dave", "bob")]),
+            ],
+        );
+        let day = read(&lines).unwrap().rounds[0]
+            .day
+            .clone()
+            .expect("the game had a day");
+        assert_eq!(
+            day.eliminated,
+            Some((id("erin"), Villager, Cause::Lynched)),
+            "erin is lynched"
+        );
+        assert_eq!(day.hammer, Some(id("dave")), "dave's selection made it");
+
+        // And nothing said so: the day's narrations are the lynching and
+        // what follows it, with no summary of the session that decided.
+        let narrated: Vec<String> = lines
+            .iter()
+            .filter(|line| line["type"] == "action" && line["event"]["sender"] == "moderator")
+            .filter_map(|line| line["event"]["payload"]["Narration"].as_object())
+            .flat_map(|narration| narration.keys().cloned())
+            .collect();
+        assert!(
+            narrated
+                .iter()
+                .all(|name| name != "Tally" && !name.contains("Hammer")),
+            "the hammer is derived, never narrated: {narrated:?}"
+        );
+    }
+
+    #[test]
+    fn a_hammer_never_carries_over_from_an_earlier_day() {
+        // A day that runs out of time has no hammer, and must not
+        // inherit one from a day that had it. Day 1 is lynched on dave's
+        // selection; day 2 is left to the clock.
+        let lines = scripted(
+            Assignment::new([
+                ("alice", Werewolf),
+                ("bob", Villager),
+                ("carol", Villager),
+                ("dave", Villager),
+                ("erin", Villager),
+                ("frank", Villager),
+                ("grace", Villager),
+            ]),
+            &[
+                answers([("alice", "bob")]),
+                // Four of six living at frank: the fourth is the hammer.
+                answers([
+                    ("alice", "frank"),
+                    ("carol", "frank"),
+                    ("dave", "frank"),
+                    ("erin", "frank"),
+                ]),
+                answers([("alice", "carol")]),
+                // Two of four living: never a majority, so the day runs
+                // out and nobody is lynched.
+                answers([("alice", "dave"), ("dave", "alice")]),
+                // The pack takes dave, leaving alice with erin and
+                // grace; then a majority of three lynches alice and the
+                // village wins.
+                answers([("alice", "dave")]),
+                answers([("alice", "erin"), ("erin", "alice"), ("grace", "alice")]),
+            ],
+        );
+        let rounds = read(&lines).unwrap().rounds;
+        let first = rounds[0].day.clone().expect("day 1");
+        assert_eq!(first.hammer, Some(id("erin")), "day 1 ended on a selection");
+        let second = rounds[1].day.clone().expect("day 2");
+        assert!(second.no_lynch, "day 2 ran out of time");
+        assert_eq!(second.hammer, None, "a day that ran out has no hammer");
     }
 
     #[test]
@@ -1645,14 +2015,14 @@ mod tests {
 
     #[test]
     fn errors_display_the_line_they_were_found_on() {
-        let error = TranscriptError::UnknownRequest {
+        let error = TranscriptError::NotAMember {
             line: 12,
             from: id("bob"),
-            request: RequestId(7),
+            kind: RequestKind::Protect,
         };
         assert_eq!(
             error.to_string(),
-            "line 12: bob answered request 7, which was not asked of it"
+            "line 12: bob selected in a Protect session, which it is not a member of"
         );
         assert!(error.source().is_none());
     }

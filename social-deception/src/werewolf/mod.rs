@@ -6,9 +6,9 @@
 //! they play for, the [`Round`] and [`Phase`] that locate a moment in a
 //! game, and [`Message`], the one payload type that travels over the
 //! runtime's [`Event`](crate::Event) between the moderator and the players.
-//! The only facts it states are properties of a request kind itself, such as
-//! which phase it belongs to; every rule that depends on who is alive lives
-//! with the moderator and the roles, not here.
+//! The only facts it states are properties of a session kind itself, such
+//! as which phase it belongs to; every rule that depends on who is alive
+//! lives with the moderator and the roles, not here.
 //!
 //! The setup is a [`Config`] read from a TOML file ([`config`]), the
 //! [`Assignment`] of roles dealt from its seed ([`assignment`]), and
@@ -36,31 +36,47 @@
 //! are equal exactly when the same game was played. The `werewolf` binary's
 //! `replay` renders one.
 //!
-//! # Three kinds of message
+//! # Two kinds of message
 //!
 //! | Message | Direction | Is |
 //! |---|---|---|
 //! | [`Narration`] | moderator → a chosen set of players | a true statement the recipients now observe |
-//! | [`Request`] | moderator → one player | a decision point: the moment a policy is invoked |
-//! | [`Response`] | player → moderator | the reply, echoing the request's id and carrying one [`Move`] |
+//! | [`Select`] | player → the moderator and whoever else may see it | a target, which the player may revise |
+//!
+//! There is no third kind, and in particular nothing that asks a player to
+//! act. A player observes that a phase has begun and consults its own role
+//! (ADR-0014); being told what its own role already says would inform it of
+//! nothing.
 //!
 //! In the reinforcement-learning vocabulary of the design, `Event<Message>`
-//! is the observation type and [`Move`] is the move a player's action
-//! carries: the choice inside the response, not the response itself. The
-//! set of moves the rules permit for one request is the *action space*, a
-//! `Vec<Move>` computed by the rules; a move outside it is a policy bug.
-//! A request and its response are correlated by [`RequestId`] on purpose:
-//! they are RPC-shaped, and a response naming an id the moderator is not
-//! waiting for is a bug rather than a judgment call.
+//! is the observation type and the move a player's action carries is an
+//! [`AgentId`](crate::AgentId): the target inside the selection, not the
+//! selection itself. The set of targets the rules permit in a session is the
+//! *action space*, a `Vec<AgentId>` computed by the rules; a target outside
+//! it is a policy bug. A selection names the session it was made in, by round
+//! and [`RequestKind`], which both sides derive from what they each know — so
+//! there is nothing to correlate, and a selection naming a round that has
+//! passed is one whose session closed while it was in flight.
 //!
-//! # Narration is addressed, not broadcast
+//! A member may select as often as it likes while its session is open, and
+//! its most recent selection is its vote; selecting nowhere is how it
+//! abstains, which is why there is no move meaning "nobody" (ADR-0011).
 //!
-//! No message here names its recipients, because that is the moderator's
+//! # Nothing is broadcast
+//!
+//! No message here names its recipients, because that is the sender's
 //! decision: a narration goes to one player, to the living, or to the pack,
 //! and that choice of recipients is the whole hidden-information mechanism
-//! (see ADR-0004). A player observes many narrations but acts only on a
-//! request, which is what gives an agent in a turnless runtime its decision
-//! points.
+//! (see ADR-0004). A player acts on observing that a phase has begun,
+//! which is what gives an agent in a turnless runtime its decision points:
+//! nobody asks it to, and it works out from its own role whether the
+//! phase asks anything of it (ADR-0014).
+//!
+//! A selection is addressed the same way, by the player making it: a `Devour`
+//! to the living pack, a `Nominate` to every other living player, and the
+//! seer's and the doctor's to the moderator alone. That is how a pack
+//! agrees on a victim without speaking and how a village's vote forms in
+//! the open (ADR-0011).
 //!
 //! Nothing is excepted. ADR-0004 broadcast the final [`Outcome`] to every
 //! player, living and dead, because it was a dead player's terminal reward
@@ -77,19 +93,20 @@
 //! every observation it has received, and what a policy conditions on. It
 //! records only what the moderator said, so nothing in it can be false.
 //!
-//! A [`Policy`] is handed a [`View`] of that state, the request in front of
-//! it and the action space, and returns one [`Move`]. [`RandomPolicy`] is
-//! the uniform random baseline; a language-model policy is the same trait
-//! ([`policy`]).
+//! A [`Policy`] is handed a [`View`] of that state, the kind of session in
+//! front of it and the action space, and returns a target or none.
+//! [`RandomPolicy`] is the uniform random baseline; a language-model
+//! policy is the same trait ([`policy`]).
 //!
 //! The action space is the rules' to compute, and the rules are a role's:
 //! [`Villager`], [`Werewolf`], [`Seer`] and [`Doctor`] ([`roles`]) each
-//! carry their own [`Knowledge`] and say which moves a request permits
-//! them, and nothing else. A [`Seat`] ([`player`]) pairs a role with the
-//! policy that decides for it and is the agent the episode runs: it folds
-//! every event into the role's state, answers each request with the
-//! policy's choice from the role's action space, and addresses nobody but
-//! the moderator.
+//! carry their own [`Knowledge`] and say which targets a session permits
+//! them, and nothing else. It may be empty — the doctor may be left with
+//! nobody it can protect — and a player with an empty one selects nowhere.
+//! A [`Seat`] ([`player`]) pairs a role with the policy that decides for
+//! it and is the agent the episode runs: it folds every event into the
+//! role's state, acts when it observes a phase begin, and addresses each
+//! selection as the rules allow.
 //!
 //! # What no message carries
 //!
@@ -149,12 +166,9 @@ impl Domain for WerewolfDomain {
 pub use assignment::Assignment;
 pub use config::{Config, ConfigError, RoleCounts};
 pub use game::{Directive, Game};
-pub use knowledge::{Death, Heard, Knowledge};
+pub use knowledge::{Death, Knowledge, Phased};
 pub use live::Text;
-pub use message::{
-    Cause, Message, Move, Narration, Outcome, Phase, Request, RequestId, RequestKind, Response,
-    Round,
-};
+pub use message::{Cause, Message, Narration, Outcome, Phase, RequestKind, Round, Select};
 pub use moderator::Moderator;
 pub use player::{Player, Seat};
 pub use policy::{Policy, RandomPolicy, View};

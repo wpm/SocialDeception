@@ -4,7 +4,8 @@
 **Date:** 2026-09-26
 **Deciders:** Bill McNeill
 **Amends:** [ADR-0004](0004-moderator-agent-runs-the-game.md),
-[ADR-0007](0007-reinforcement-learning-vocabulary.md)
+[ADR-0007](0007-reinforcement-learning-vocabulary.md),
+[ADR-0009](0009-one-queue-and-no-cancellation.md)
 
 ## Context
 
@@ -34,15 +35,28 @@ money to do it.
 
 ## Decision
 
-**When a player dies, the moderator announces the death to the living and to
-the victim, and stops the victim's agent. From then on the dead player hears
-nothing.**
+**When a player dies, the moderator announces the death to the living and
+stops the victim's agent. The victim is not told, and from then on it
+observes nothing at all.**
 
-The victim's `Stop` is sent in the same cycle as the announcement. With one
-queue per agent ([ADR-0009](0009-one-queue-and-no-cancellation.md)), the
-victim observes its own death before it reaches its `Stop`. Anything queued
-between them it also observes, but a player that knows it is dead takes no
-further action: players cooperate with the moderator in enforcing the rules.
+The victim's `Stop` is sent in the same cycle as the announcement, and the
+victim is not among the announcement's recipients. There is nobody left to
+tell: the agent is on its way out, and its reward is logged rather than
+said (ADR-0007), so it needs to hear nothing to be paid. A dead player's
+trajectory simply ends.
+
+This is stricter than an earlier draft of this record, which had the victim
+observe its own death and then stop. That left a window: with one queue per
+agent ([ADR-0009](0009-one-queue-and-no-cancellation.md)), anything queued
+between the death and the stop was observed too, and it was to be excused
+on the grounds that a player that knows it is dead takes no further action.
+Once points travel player to player
+([ADR-0011](0011-werewolf-phases-are-timed-pointing-sessions.md)) that
+window is real and observable: a peer working from its own `Knowledge`
+addresses the dead, and the dead observes it. An agent observing anything
+after it has died is a bug, not a tolerance, so the window is closed rather
+than documented. Nothing is queued for an agent the router has been told
+has stopped.
 
 **A `Stop` to some agents while others run is delivered at once.** ADR-0007
 holds every `Stop` until nothing is in flight, so that an agent hears
@@ -64,8 +78,25 @@ reward logged for every player, living and dead.
 
 ## Consequences
 
-A dead player's trajectory ends with the observation of its own death and
-its stop, which is where the game ended for it.
+A dead player's trajectory ends with its last action and its stop. It does
+not record the death, because the player never observed one: what the
+trajectory shows is an agent that was playing and then was stopped, which
+is what happened.
+
+**A death is not in the victim's own trajectory.** Anything reconstructing
+a player's view of the game reads its death from the moderator's records,
+as it already reads the deal and the outcome.
+
+**A cycle's stop applies before its events are routed,** so an event the
+same batch created *earlier* than the stop is dropped too. Werewolf does
+this every time a night resolves: a session's closing tally goes to its
+members, and the death that the night then resolves to falls in the same
+cycle, so a victim loses the tally of its own session. That is right. The
+game cannot know who dies when it closes a session — the pack's victim is
+not settled until every session has — and what the victim would have been
+told there, it already knows, having chosen it. The general rule is the
+one that matters: an agent the episode has stopped is addressed by nobody,
+and a batch is applied as a unit.
 
 An event sent to a dead player now leaves a trace in the sender's trajectory
 and none in the recipient's: an action with a recipient who never observed

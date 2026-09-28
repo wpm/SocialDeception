@@ -46,3 +46,5 @@ from the earlier attempt at the project are not part of its history.
 | [0011](0011-werewolf-phases-are-timed-pointing-sessions.md) | Werewolf phases are timed pointing sessions | Accepted |
 | [0012](0012-a-dead-player-stops.md) | A dead player stops | Accepted |
 | [0013](0013-speech-typing-and-a-scheduler-for-when-to-speak.md) | Speech and typing are events, and a scheduler decides when to speak | Accepted |
+| [0014](0014-events-carry-information-controls-carry-instruction.md) | Events carry information, controls carry instruction | Accepted |
+| [0015](0015-an-environment-does-not-summarize-what-agents-observed.md) | An environment does not summarize what its agents already observed | Accepted |

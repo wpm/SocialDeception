@@ -51,10 +51,21 @@
 //! In-flight work is counted in **deliveries, not events**: one event
 //! addressed to six agents is six handles that have not happened yet.
 //!
-//! An episode's agents have no timeout yet. The reason they could not have
-//! one is gone — an agent that wakes on its own no longer keeps an episode
-//! from ending, because quiescence no longer ends it — but giving them one
-//! is another issue's.
+//! # An agent that wakes on its own is not a stall
+//!
+//! A count of zero is only "nobody will ever speak again" if nobody is
+//! waiting on a clock. An agent that set a deadline (ADR-0010) runs another
+//! cycle when its instant arrives whether or not anything is said to it, so
+//! each cycle reports whether it left one pending
+//! ([`CycleDispatch::waking`]) and the episode holds the stall while any
+//! agent is waiting.
+//!
+//! Werewolf needs this: the moderator's sessions close on their clocks
+//! (ADR-0011), so a night where every player has already selected is
+//! quiescent by the count and yet has three sessions still to close. A
+//! stall now means what it always meant, that nobody will speak again, and
+//! in Werewolf it is a player that never answered a request *and* a
+//! moderator with no clock left to wake for.
 
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
@@ -65,7 +76,7 @@ use std::panic::{self, AssertUnwindSafe};
 use crossbeam_channel::{Receiver, Sender, select, unbounded};
 
 use crate::agent::{self, Action, Agent, CycleDispatch, Handler, Observation, Wiring};
-use crate::clock::Clock;
+use crate::clock::{Clock, Timestamp};
 use crate::environment::{Adapter, Commanded, Environment, Rewarded};
 use crate::event::{AgentId, Control, Delivery, Domain};
 use crate::router::{Queues, RouteError, Router};
@@ -319,7 +330,7 @@ impl<D: Domain> Episode<D> {
             agents,
         } = spawn(handlers, &ids, &dispatch, &obituary, &records, clock);
         drop((dispatch, obituary, records));
-        let router = Router::new(queues, environment_id.clone(), clock);
+        let mut router = Router::new(queues, environment_id.clone(), clock);
 
         let environment_only = BTreeSet::from([environment_id.clone()]);
         let mut running = router.agents();
@@ -333,7 +344,7 @@ impl<D: Domain> Episode<D> {
             .map_err(|error| Halt::Error(EpisodeError::Control(error)))
             .and_then(|in_flight| {
                 drive(
-                    &router,
+                    &mut router,
                     &seat,
                     &dispatches,
                     &obituaries,
@@ -510,7 +521,7 @@ use Halt::Departure;
 /// Nothing in flight, no stop waiting to be issued, and some agent still
 /// running is a stall; see the [module documentation](self).
 fn drive<D: Domain>(
-    router: &Router<D>,
+    router: &mut Router<D>,
     environment: &Seat,
     dispatches: &Receiver<CycleDispatch<D>>,
     obituaries: &Receiver<AgentId>,
@@ -523,8 +534,12 @@ fn drive<D: Domain>(
         rewarded,
     } = environment;
     let mut held: Vec<BTreeSet<AgentId>> = Vec::new();
+    // Whoever reported a deadline pending on its last cycle. Such an agent
+    // will run another cycle when its instant arrives, whatever anybody
+    // says to it, so the roster is waiting rather than stalled.
+    let mut waking: BTreeSet<AgentId> = BTreeSet::new();
     while !running.is_empty() {
-        if in_flight == 0 {
+        if in_flight == 0 && waking.is_empty() {
             if held.is_empty() {
                 return Err(Halt::Error(EpisodeError::Stalled {
                     running: running.clone(),
@@ -560,6 +575,13 @@ fn drive<D: Domain>(
         in_flight = in_flight
             .checked_sub(dispatch.deliveries)
             .expect("an agent reported more deliveries than were routed to it");
+        // What this agent said about its own next cycle replaces whatever
+        // it said before.
+        if dispatch.waking {
+            waking.insert(dispatch.agent.clone());
+        } else {
+            waking.remove(&dispatch.agent);
+        }
         let refused = |error| {
             Halt::Error(EpisodeError::Route {
                 agent: dispatch.agent.clone(),
@@ -585,14 +607,42 @@ fn drive<D: Domain>(
                             .command(&dispatch.agent, &to, control)
                             .map_err(refused)?;
                     }
-                    // Validated now, so that a stop addressed to a stranger
-                    // fails the episode where it was asked for rather than
-                    // once everything has gone quiet.
+                    // A `Stop` asked for while others are still running
+                    // goes out at once, and only the end-of-episode stop
+                    // is held for quiescence (ADR-0012). Holding this one
+                    // would defeat its purpose: the point of stopping a
+                    // dead player mid-game is that it does *not* hear what
+                    // comes next, and during a phase there is always
+                    // something in flight, so a held stop might never go.
                     Control::Stop => {
-                        router
-                            .validate(&dispatch.agent, &to)
-                            .map_err(refused)
-                            .map(|()| held.push(to))?;
+                        router.validate(&dispatch.agent, &to).map_err(refused)?;
+                        let to: BTreeSet<AgentId> = to.intersection(running).cloned().collect();
+                        if to.is_empty() {
+                            continue;
+                        }
+                        // The stop that ends the episode is held for
+                        // quiescence, so that every agent hears what was
+                        // said to it before it stops (ADR-0009). A stop
+                        // for *some* of the running agents goes out at
+                        // once: the point of stopping a dead player
+                        // mid-game is that it does not hear what comes
+                        // next, and during a phase there is always
+                        // something in flight, so holding it might never
+                        // let it go (ADR-0012).
+                        if to == *running {
+                            held.push(to);
+                            continue;
+                        }
+                        in_flight += router
+                            .command(&dispatch.agent, &to, Control::Stop)
+                            .map_err(refused)?;
+                        // Nothing further is routed to them, and the
+                        // episode no longer waits on them.
+                        for who in &to {
+                            router.stopped(who);
+                        }
+                        running.retain(|id| !to.contains(id));
+                        waking.retain(|id| !to.contains(id));
                     }
                 }
             }
@@ -620,16 +670,20 @@ struct Watched<D: Domain> {
 }
 
 impl<D: Domain> Handler<D> for Watched<D> {
-    fn start(&mut self) -> Vec<Action<D>> {
-        self.handler.start()
+    fn start(&mut self, now: Timestamp) -> Vec<Action<D>> {
+        self.handler.start(now)
     }
 
     fn handle(&mut self, observation: &Observation<D>) -> Vec<Action<D>> {
         self.handler.handle(observation)
     }
 
-    fn timeout(&mut self) -> Vec<Action<D>> {
-        self.handler.timeout()
+    fn timeout(&mut self, now: Timestamp) -> Vec<Action<D>> {
+        self.handler.timeout(now)
+    }
+
+    fn deadline(&self) -> Option<Timestamp> {
+        self.handler.deadline()
     }
 }
 
@@ -723,7 +777,7 @@ mod tests {
     }
 
     impl Environment<Counting> for Referee {
-        fn start(&mut self) -> Vec<Effect<Counting>> {
+        fn start(&mut self, _now: Timestamp) -> Vec<Effect<Counting>> {
             vec![Effect::control(self.agents.clone(), Control::Start)]
         }
 
@@ -761,7 +815,7 @@ mod tests {
     }
 
     impl Environment<Counting> for Paymaster {
-        fn start(&mut self) -> Vec<Effect<Counting>> {
+        fn start(&mut self, _now: Timestamp) -> Vec<Effect<Counting>> {
             vec![
                 Effect::control(["a", "b"], Control::Start),
                 Effect::reward(self.to.clone(), self.value),
@@ -857,7 +911,7 @@ mod tests {
     struct Absent<const N: usize>([&'static str; N]);
 
     impl<const N: usize> Environment<Counting> for Absent<N> {
-        fn start(&mut self) -> Vec<Effect<Counting>> {
+        fn start(&mut self, _now: Timestamp) -> Vec<Effect<Counting>> {
             vec![Effect::control(self.0, Control::Start)]
         }
 
@@ -903,7 +957,7 @@ mod tests {
     }
 
     impl Handler<Counting> for Rally {
-        fn start(&mut self) -> Vec<Action<Counting>> {
+        fn start(&mut self, _now: Timestamp) -> Vec<Action<Counting>> {
             if self.serves {
                 vec![self.to_partner(1)]
             } else {
@@ -940,7 +994,7 @@ mod tests {
     }
 
     impl Handler<Counting> for Hub {
-        fn start(&mut self) -> Vec<Action<Counting>> {
+        fn start(&mut self, _now: Timestamp) -> Vec<Action<Counting>> {
             vec![Action::broadcast(Say(0))]
         }
 
@@ -975,7 +1029,7 @@ mod tests {
     struct Addresses(&'static str);
 
     impl Handler<Counting> for Addresses {
-        fn start(&mut self) -> Vec<Action<Counting>> {
+        fn start(&mut self, _now: Timestamp) -> Vec<Action<Counting>> {
             vec![Action::to([self.0], Say(1))]
         }
 
@@ -996,7 +1050,7 @@ mod tests {
     struct Panics;
 
     impl Handler<Counting> for Panics {
-        fn start(&mut self) -> Vec<Action<Counting>> {
+        fn start(&mut self, _now: Timestamp) -> Vec<Action<Counting>> {
             panic!("the handler is broken")
         }
 

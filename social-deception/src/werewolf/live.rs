@@ -25,16 +25,16 @@
 //! # The order is the writer's
 //!
 //! Lines appear in the order the writer received the records, which
-//! interleaves agents arbitrarily (see [`trajectory`](crate::trajectory)).
-//! A player's response can appear before the request that prompted it is
-//! rendered. That is expected of a live view of concurrent agents, and is
-//! the same interleaving the trajectory file records.
+//! interleaves agents arbitrarily (see [`trajectory`](crate::trajectory)). A
+//! player's selection can appear before the phase announcement that prompted
+//! it is rendered. That is expected of a live view of concurrent agents, and
+//! is the same interleaving the trajectory file records.
 
 use std::fmt;
 use std::io::{self, Write};
 
 use super::WerewolfDomain;
-use super::message::{Cause, Message, Move, Narration, Phase, Request, Response};
+use super::message::{Cause, Message, Narration, Phase, Select};
 use crate::event::AgentId;
 use crate::trajectory::{ActionRecord, LogRecord, Sink};
 
@@ -71,7 +71,7 @@ fn rendered(action: &ActionRecord<WerewolfDomain>, senders: usize) -> String {
         "{:>TIME_WIDTH$} {:<senders$}  \u{2192} {}  {}",
         Elapsed(action.created.nanos()),
         action.agent.as_str(),
-        Ids(action.event.recipients.iter()),
+        listed(&action.event.recipients),
         action.event.payload,
     )
 }
@@ -101,8 +101,7 @@ impl fmt::Display for Message {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Narration(narration) => narration.fmt(f),
-            Self::Request(request) => request.fmt(f),
-            Self::Response(response) => response.fmt(f),
+            Self::Select(selection) => selection.fmt(f),
         }
     }
 }
@@ -114,7 +113,7 @@ impl fmt::Display for Narration {
             Self::Assigned { role, pack } => {
                 write!(f, "Assigned({role}")?;
                 if !pack.is_empty() {
-                    write!(f, "; pack: {}", Ids(pack.iter()))?;
+                    write!(f, "; pack: {}", listed(pack))?;
                 }
                 f.write_str(")")
             }
@@ -125,62 +124,37 @@ impl fmt::Display for Narration {
             } => write!(
                 f,
                 "PhaseBegan({phase} {}; {} living)",
-                round.0,
+                round.number(),
                 living.len()
             ),
             Self::Investigated { target, faction } => {
                 write!(f, "Investigated({target}: {faction})")
             }
-            Self::Tally {
-                round,
-                phase,
-                votes,
-            } => {
-                write!(f, "Tally({phase} {}: ", round.0)?;
-                for (i, (who, chosen)) in votes.iter().enumerate() {
-                    if i > 0 {
-                        f.write_str(", ")?;
-                    }
-                    write!(f, "{who}\u{2192}{chosen}")?;
-                }
-                f.write_str(")")
-            }
             Self::Eliminated {
                 who, role, cause, ..
             } => write!(f, "Eliminated({who}, {role}, {cause})"),
-            Self::NoDeath { round } => write!(f, "NoDeath(Night {})", round.0),
-            Self::Outcome(outcome) => write!(
-                f,
-                "Outcome({} win after {} rounds; survivors: {})",
-                outcome.winner,
-                outcome.rounds.0,
-                Ids(outcome.living.iter()),
-            ),
+            Self::NoDeath { round } => write!(f, "NoDeath(Night {})", round.number()),
+            Self::NoLynch { round } => write!(f, "NoLynch(Day {})", round.number()),
+            Self::Outcome(outcome) => {
+                let ended = match outcome.winner {
+                    Some(winner) => format!("{winner} win"),
+                    None => "stalemate".to_owned(),
+                };
+                write!(
+                    f,
+                    "Outcome({ended} after {} rounds; survivors: {})",
+                    outcome.rounds.number(),
+                    listed(&outcome.living),
+                )
+            }
         }
     }
 }
 
-impl fmt::Display for Request {
-    /// The request's id and what it asks.
+impl fmt::Display for Select {
+    /// The session it selects in and whom it selects.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Request(#{}: {:?})", self.id.0, self.kind)
-    }
-}
-
-impl fmt::Display for Response {
-    /// The id it answers and the move it carries.
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Response(#{}: {})", self.request.0, self.chosen)
-    }
-}
-
-impl fmt::Display for Move {
-    /// The player targeted, or `abstain`.
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Target(who) => who.fmt(f),
-            Self::Abstain => f.write_str("abstain"),
-        }
+        write!(f, "Select({:?}: {})", self.kind, self.target)
     }
 }
 
@@ -206,18 +180,14 @@ impl fmt::Display for Phase {
 }
 
 /// A comma-separated list of agent ids, in the order given.
-struct Ids<I>(I);
-
-impl<'a, I: Iterator<Item = &'a AgentId> + Clone> fmt::Display for Ids<I> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for (i, who) in self.0.clone().enumerate() {
-            if i > 0 {
-                f.write_str(", ")?;
-            }
-            who.fmt(f)?;
-        }
-        Ok(())
-    }
+///
+/// Not named `ids`: the test helper `testing::ids` builds a set of them,
+/// and two functions of that name in one file would be a puzzle.
+fn listed<'a>(who: impl IntoIterator<Item = &'a AgentId>) -> String {
+    who.into_iter()
+        .map(AgentId::as_str)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// The live text sink: every action as a line, flushed as it is written.
@@ -270,7 +240,7 @@ impl<W: Write + Send> Sink<WerewolfDomain> for Text<W> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeSet;
     use std::time::Duration;
 
     use super::*;
@@ -280,7 +250,7 @@ mod tests {
     use crate::trajectory::{
         ControlRecord, CycleRecord, ObservationRecord, RewardRecord, Seq, Woken,
     };
-    use crate::werewolf::message::{Outcome, RequestId, RequestKind, Round};
+    use crate::werewolf::message::{Outcome, RequestKind, Round};
     use crate::werewolf::role::{Faction, Role};
 
     fn at(nanos: u64) -> Timestamp {
@@ -346,7 +316,7 @@ mod tests {
     fn a_phase_names_its_round_and_how_many_are_left() {
         assert_eq!(
             shown(Message::Narration(Narration::PhaseBegan {
-                round: Round(1),
+                round: Round::new(1),
                 phase: Phase::Night,
                 living: ids(["alice", "bob", "carol", "dave", "erin", "frank", "grace"]),
             })),
@@ -354,7 +324,7 @@ mod tests {
         );
         assert_eq!(
             shown(Message::Narration(Narration::PhaseBegan {
-                round: Round(2),
+                round: Round::new(2),
                 phase: Phase::Day,
                 living: ids(["alice"]),
             })),
@@ -374,28 +344,12 @@ mod tests {
     }
 
     #[test]
-    fn a_tally_lists_every_vote_in_order() {
-        assert_eq!(
-            shown(Message::Narration(Narration::Tally {
-                round: Round(1),
-                phase: Phase::Day,
-                votes: BTreeMap::from([
-                    (id("alice"), Move::Target(id("frank"))),
-                    (id("bob"), Move::Target(id("carol"))),
-                    (id("dave"), Move::Abstain),
-                ]),
-            })),
-            "Tally(Day 1: alice\u{2192}frank, bob\u{2192}carol, dave\u{2192}abstain)"
-        );
-    }
-
-    #[test]
     fn an_elimination_names_who_what_they_were_and_how() {
         assert_eq!(
             shown(Message::Narration(Narration::Eliminated {
                 who: id("alice"),
                 role: Role::Villager,
-                round: Round(1),
+                round: Round::new(1),
                 cause: Cause::Lynched,
             })),
             "Eliminated(alice, Villager, lynched)"
@@ -404,7 +358,7 @@ mod tests {
             shown(Message::Narration(Narration::Eliminated {
                 who: id("bob"),
                 role: Role::Seer,
-                round: Round(2),
+                round: Round::new(2),
                 cause: Cause::Devoured,
             })),
             "Eliminated(bob, Seer, devoured)"
@@ -414,8 +368,23 @@ mod tests {
     #[test]
     fn a_quiet_night_names_its_round() {
         assert_eq!(
-            shown(Message::Narration(Narration::NoDeath { round: Round(2) })),
+            shown(Message::Narration(Narration::NoDeath {
+                round: Round::new(2)
+            })),
             "NoDeath(Night 2)"
+        );
+    }
+
+    #[test]
+    fn a_day_that_ran_out_names_its_round() {
+        // A day that reached its limit without a majority is its own
+        // narration, told from a night nobody died in by the phase it
+        // names (ADR-0011).
+        assert_eq!(
+            shown(Message::Narration(Narration::NoLynch {
+                round: Round::new(3)
+            })),
+            "NoLynch(Day 3)"
         );
     }
 
@@ -423,8 +392,8 @@ mod tests {
     fn an_outcome_names_the_winner_the_rounds_and_the_survivors() {
         assert_eq!(
             shown(Message::Narration(Narration::Outcome(Outcome {
-                winner: Faction::Werewolves,
-                rounds: Round(2),
+                winner: Some(Faction::Werewolves),
+                rounds: Round::new(2),
                 living: ids(["bob", "dave"]),
             }))),
             "Outcome(Werewolves win after 2 rounds; survivors: bob, dave)"
@@ -432,32 +401,18 @@ mod tests {
     }
 
     #[test]
-    fn a_request_names_its_id_and_what_it_asks() {
+    fn a_selection_names_its_session_and_the_target() {
+        // Nothing renders a request any more: there is none to render.
+        // A selection says for itself what it is for (ADR-0014), so the line
+        // reads without a request to look the id up in.
         assert_eq!(
-            shown(Message::Request(Request {
-                id: RequestId(3),
-                round: Round(1),
+            shown(Message::Select(Select {
+                round: Round::new(1),
                 kind: RequestKind::Nominate,
+                target: id("frank"),
+                seen_by: BTreeSet::new(),
             })),
-            "Request(#3: Nominate)"
-        );
-    }
-
-    #[test]
-    fn a_response_names_the_request_and_the_move() {
-        assert_eq!(
-            shown(Message::Response(Response {
-                request: RequestId(3),
-                chosen: Move::Target(id("frank")),
-            })),
-            "Response(#3: frank)"
-        );
-        assert_eq!(
-            shown(Message::Response(Response {
-                request: RequestId(3),
-                chosen: Move::Abstain,
-            })),
-            "Response(#3: abstain)"
+            "Select(Nominate: frank)"
         );
     }
 
@@ -472,7 +427,9 @@ mod tests {
                 "a",
                 ["b"],
                 nanos,
-                Message::Narration(Narration::NoDeath { round: Round(1) }),
+                Message::Narration(Narration::NoDeath {
+                    round: Round::new(1),
+                }),
             );
             let rendered = line(&record, 0).unwrap();
             assert!(
@@ -488,7 +445,9 @@ mod tests {
             "moderator",
             ["bob", "alice"],
             1_250_000_000,
-            Message::Narration(Narration::NoDeath { round: Round(3) }),
+            Message::Narration(Narration::NoDeath {
+                round: Round::new(3),
+            }),
         );
         // The recipients are sorted and comma-separated, whatever order
         // they were given in.
@@ -504,20 +463,22 @@ mod tests {
             "bob",
             ["moderator"],
             0,
-            Message::Response(Response {
-                request: RequestId(1),
-                chosen: Move::Abstain,
+            Message::Select(Select {
+                round: Round::new(1),
+                kind: RequestKind::Devour,
+                target: id("alice"),
+                seen_by: BTreeSet::new(),
             }),
         );
         assert_eq!(
             line(&record, 9).unwrap(),
-            "0:00.000 bob        \u{2192} moderator  Response(#1: abstain)"
+            "0:00.000 bob        \u{2192} moderator  Select(Devour: alice)"
         );
         // An id wider than the column simply overflows it rather than being
         // cut: a name is worth more than an aligned column.
         assert_eq!(
             line(&record, 2).unwrap(),
-            "0:00.000 bob  \u{2192} moderator  Response(#1: abstain)"
+            "0:00.000 bob  \u{2192} moderator  Select(Devour: alice)"
         );
     }
 
@@ -527,7 +488,9 @@ mod tests {
             "moderator",
             ["alice"],
             at(0),
-            Message::Narration(Narration::NoDeath { round: Round(1) }),
+            Message::Narration(Narration::NoDeath {
+                round: Round::new(1),
+            }),
         );
         let records: Vec<LogRecord<WerewolfDomain>> = vec![
             ObservationRecord {
@@ -580,7 +543,9 @@ mod tests {
             "moderator",
             ["alice"],
             0,
-            Message::Narration(Narration::NoDeath { round: Round(1) }),
+            Message::Narration(Narration::NoDeath {
+                round: Round::new(1),
+            }),
         );
         let cycle: LogRecord<WerewolfDomain> = CycleRecord {
             agent: id("alice"),
@@ -610,7 +575,9 @@ mod tests {
             "a",
             ["b"],
             0,
-            Message::Narration(Narration::NoDeath { round: Round(1) }),
+            Message::Narration(Narration::NoDeath {
+                round: Round::new(1),
+            }),
         ))
         .unwrap();
         assert_eq!(

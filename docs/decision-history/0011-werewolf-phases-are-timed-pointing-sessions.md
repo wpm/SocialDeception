@@ -6,6 +6,12 @@
 **Amends:** [ADR-0004](0004-moderator-agent-runs-the-game.md),
 [ADR-0005](0005-policy-separates-decisions-from-rules.md)
 **Depends on:** [ADR-0010](0010-a-handler-sets-its-own-deadline.md)
+**Amended by:** [ADR-0014](0014-events-carry-information-controls-carry-instruction.md), under which a session of one member is sent no
+tally, and a player points because it observed the phase begin rather than
+because it was asked;
+[ADR-0015](0015-an-environment-does-not-summarize-what-agents-observed.md),
+under which no session is sent a tally at all, because each of its members
+has already seen every point the moderator accepted
 
 ## Context
 

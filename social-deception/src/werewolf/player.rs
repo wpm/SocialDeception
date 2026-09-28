@@ -1,32 +1,55 @@
 //! A player as an agent: a role's rules, the policy that decides for it, and
 //! the one handler body every role shares.
 //!
-//! A player's turn is a fold, the same as any agent's: every observation is
-//! folded into its [`Knowledge`], and every [`Request`] among them is
-//! answered with one [`Response`] to the moderator. A seat has no opening
-//! move: it says nothing until it is asked, so it needs no
-//! [`start`](Handler::start). The two halves of
-//! answering are kept apart, and ADR-0005 says why: a [`Player`] is a role,
+//! A player's turn is a fold, the same as any agent's: every observation
+//! is folded into its [`Knowledge`], and a phase beginning is what makes it
+//! act.
+//!
+//! **Nobody asks it to.** On observing that a phase has begun, a living
+//! player asks its own role what that phase wants of it
+//! ([`Role::asked_in`](super::Role::asked_in)) and selects if the answer is
+//! something. That is ADR-0014: an event to an agent is a fact it
+//! conditions on, and an instruction telling a player what its own role
+//! already says is not one. In the live game nobody waits to be asked — the
+//! moderator says night has fallen and the werewolves select, because they
+//! are werewolves and it is night.
+//!
+//! A seat has no opening move: it says nothing until the first phase
+//! begins, so it needs no [`start`](Handler::start). The two halves of
+//! deciding are kept apart, and ADR-0005 says why: a [`Player`] is a role,
 //! and computes the action space the rules permit it and nothing else; a
-//! [`Policy`] is the strategy, and picks one move from that space. The
-//! roles are in [`roles`](super::roles), the baseline policy in
+//! [`Policy`] is the strategy, and picks one target from that space or
+//! none. The roles are in [`roles`](super::roles), the baseline policy in
 //! [`policy`](super::policy).
 //!
 //! [`Seat`] joins the two. It is the [`Handler`] the episode runs, the same
-//! for every role, and it is where an action outside the action space is
+//! for every role, and it is where a target outside the action space is
 //! caught: a policy that returns one has a bug, and the game cannot
 //! continue from it.
 //!
-//! # Players only ever address the moderator
+//! # Who a selection is addressed to
 //!
-//! Every action a seat takes is addressed to the moderator alone. A player
-//! is a peer of every other player, so a broadcast would reach them all,
-//! and that must never happen: a response is a sealed ballot, and the others
-//! learn of it only from the tally the moderator narrates.
+//! A selection is not a sealed ballot. Under ADR-0011 selecting is how a pack
+//! agrees on a victim without speaking, and how a village's argument turns
+//! into a vote, so a selection goes to everyone the rules let see it:
+//!
+//! | Kind | Recipients |
+//! |---|---|
+//! | `Devour` | the moderator and every other living member of the pack |
+//! | `Investigate`, `Protect` | the moderator |
+//! | `Nominate` | the moderator and every other living player |
+//!
+//! A seat addresses each selection itself, from its own [`Knowledge`]: the
+//! pack it was told at the deal, and the living it learns from each
+//! `PhaseBegan`. It never broadcasts, because a broadcast reaches every agent
+//! in the roster and the night's secrets are exactly what must not travel
+//! that far.
+
+use std::collections::BTreeSet;
 
 use super::WerewolfDomain;
 use super::knowledge::Knowledge;
-use super::message::{Message, Move, Request, Response};
+use super::message::{Message, Narration, RequestKind, Round, Select};
 use super::policy::{Policy, View};
 use crate::agent::{self, Handler, Observation};
 use crate::event::AgentId;
@@ -44,24 +67,29 @@ pub trait Player {
     /// The state, to fold the next observation into.
     fn knowledge_mut(&mut self) -> &mut Knowledge;
 
-    /// The action space for this request, in canonical order: targets in
-    /// sorted agent order, [`Move::Abstain`] last where permitted, so
-    /// that an index into it is a stable action label. Never empty for a
-    /// request the rules legitimately issue.
+    /// The action space for a session of this kind: the targets the rules
+    /// permit, in sorted agent order, so that an index into it is a stable
+    /// action label.
+    ///
+    /// It may be empty — a doctor can be left with nobody it may protect —
+    /// and a player whose action space is empty is not a member of the
+    /// session at all, so a player that does select always had somewhere to
+    /// select.
     ///
     /// # Panics
     ///
-    /// If the request is of a kind this role is never asked, which is a bug
-    /// in the moderator rather than a runtime condition.
-    fn action_space(&self, request: &Request) -> Vec<Move>;
+    /// If the kind is one this role is never asked, which is a bug in the
+    /// caller rather than a runtime condition.
+    fn action_space(&self, kind: RequestKind) -> Vec<AgentId>;
 }
 
 /// A player as an agent in the episode: a role, the policy that decides for
-/// it, and the moderator it answers to.
+/// it, and the moderator it addresses its selections to.
 ///
 /// One type for every role, because the handler body is the same for all of
-/// them: fold each event into the role's state and answer each request with
-/// the policy's choice from the role's action space.
+/// them: fold each event into the role's state and, when a phase begins a
+/// session this role is a member of, selects where the policy chooses from
+/// the role's action space.
 #[derive(Debug, Clone)]
 pub struct Seat<R, P> {
     player: R,
@@ -70,7 +98,7 @@ pub struct Seat<R, P> {
 }
 
 impl<R: Player, P: Policy> Seat<R, P> {
-    /// A seat for `player`, deciding with `policy`, answering to
+    /// A seat for `player`, deciding with `policy`, selecting to
     /// `moderator`.
     #[must_use]
     pub const fn new(player: R, policy: P, moderator: AgentId) -> Self {
@@ -81,49 +109,102 @@ impl<R: Player, P: Policy> Seat<R, P> {
         }
     }
 
-    /// The response to one request: the policy's choice from the role's
-    /// action space, checked against it and folded into the role's state.
+    /// The selection this player makes in the session of `kind` now open, if
+    /// the policy names a target: its choice from the role's action
+    /// space, checked against it and folded into the role's state.
     ///
-    fn answer(&mut self, request: &Request) -> Response {
-        let action_space = self.player.action_space(request);
+    /// `None` is a policy declining to select for now, which is how a
+    /// member abstains, and it is also what an empty action space leaves
+    /// it: a doctor with nobody it may protect selects nowhere. Nothing is
+    /// sent and nothing is folded either way — a selection never made is not
+    /// a vote.
+    fn select(&mut self, round: Round, kind: RequestKind) -> Option<Select> {
+        let action_space = self.player.action_space(kind);
         let chosen = self.policy.choose(View {
             knowledge: self.player.knowledge(),
-            request,
+            kind,
             action_space: &action_space,
-        });
+        })?;
         assert!(
             action_space.contains(&chosen),
             "{}'s policy chose {chosen:?}, which is outside the action space {action_space:?}",
             self.player.knowledge().me
         );
-        self.player.knowledge_mut().acted(request, &chosen);
-        Response {
-            request: request.id,
-            chosen,
-        }
+        self.player.knowledge_mut().acted(kind, &chosen);
+        Some(Select {
+            round,
+            kind,
+            target: chosen,
+            seen_by: self.audience(kind),
+        })
+    }
+
+    /// Who else should see a selection of this kind: the pack for a `Devour`,
+    /// every other living player for a `Nominate`, and nobody for the
+    /// seer's and the doctor's own business.
+    ///
+    /// These are not recipients. A selection is addressed to the moderator
+    /// alone; this is who the moderator forwards it to, and only if the
+    /// session is still open when it arrives. Naming them is the player's
+    /// job because the audience follows from the player's own role and its
+    /// own knowledge of who is alive.
+    ///
+    /// Always without itself: a player does not observe its own actions.
+    /// The moderator is not named either, since it receives every selection
+    /// directly and has no need to be forwarded one.
+    fn audience(&self, kind: RequestKind) -> BTreeSet<AgentId> {
+        let knowledge = self.player.knowledge();
+        let me = &knowledge.me;
+        let seen_by = match kind {
+            RequestKind::Devour => &knowledge.pack,
+            RequestKind::Nominate => &knowledge.living,
+            RequestKind::Investigate | RequestKind::Protect => return BTreeSet::new(),
+        };
+        seen_by
+            .iter()
+            .filter(|who| *who != me && knowledge.living.contains(*who))
+            .cloned()
+            .collect()
     }
 }
 
 impl<R: Player, P: Policy> Handler<WerewolfDomain> for Seat<R, P> {
-    /// Folds the observation into the role's state and answers it if it was
-    /// a request, so that the answer is given from the state every earlier
-    /// observation produced, this one included. An observation that is not a
-    /// request produces nothing but the fold.
+    /// Folds the observation into the role's state and, if it was a phase
+    /// beginning a session this role is a member of, selections from the
+    /// state every earlier observation produced, this one included. Every
+    /// other observation produces nothing but the fold.
+    ///
+    /// The fold comes first for exactly that reason: the phase's own
+    /// narration says who is still living, and the selection has to be
+    /// decided from the living set that includes it.
     ///
     /// # Panics
     ///
-    /// If the policy chooses an action outside the action space, or if the
-    /// request is of a kind this role is never asked; see
-    /// [`Player::action_space`].
+    /// If the policy chooses a target outside the action space. It cannot
+    /// panic for the other reason [`Player::action_space`] gives, since the
+    /// kind it passes came from this role's own
+    /// [`Role::asked_in`](super::Role::asked_in).
     fn handle(
         &mut self,
         observation: &Observation<WerewolfDomain>,
     ) -> Vec<agent::Action<WerewolfDomain>> {
         self.player.knowledge_mut().observe(observation);
         match &observation.event.payload {
-            Message::Request(request) => {
-                let response = Message::Response(self.answer(request));
-                vec![agent::Action::to([self.moderator.clone()], response)]
+            // A phase beginning is what makes a player act, and it acts
+            // on its own role rather than on anybody's instruction
+            // (ADR-0014). A player the phase asks nothing of, and one
+            // the rules leave nowhere to select, both say nothing.
+            Message::Narration(Narration::PhaseBegan { round, phase, .. }) => {
+                let round = *round;
+                let Some(kind) = self.player.knowledge().role.asked_in(*phase) else {
+                    return Vec::new();
+                };
+                self.select(round, kind)
+                    .map(|selection| {
+                        agent::Action::to([self.moderator.clone()], Message::Select(selection))
+                    })
+                    .into_iter()
+                    .collect()
             }
             _ => Vec::new(),
         }
@@ -134,11 +215,13 @@ impl<R: Player, P: Policy> Handler<WerewolfDomain> for Seat<R, P> {
 mod tests {
     use std::collections::BTreeSet;
 
+    use crate::clock::Timestamp;
+
     use super::*;
     use crate::agent::Recipients;
     use crate::event::Event;
-    use crate::testing::{ME, from, id, ids, narrated, observed, phase_began, target};
-    use crate::werewolf::message::{Cause, Narration, Phase, RequestId, RequestKind, Round};
+    use crate::testing::{ME, id, ids, narrated, observed, phase_began, target};
+    use crate::werewolf::message::{Cause, Narration, Phase, RequestKind, Round};
     use crate::werewolf::role::Role;
     use crate::werewolf::roles::{Doctor, Villager};
 
@@ -146,30 +229,39 @@ mod tests {
 
     const MODERATOR: &str = "moderator";
 
-    /// Picks the first action in the action space.
+    /// Selects the first target in the action space.
     struct First;
 
     impl Policy for First {
-        fn choose(&mut self, view: View<'_>) -> Move {
-            view.action_space[0].clone()
+        fn choose(&mut self, view: View<'_>) -> Option<AgentId> {
+            view.action_space.first().cloned()
         }
     }
 
-    /// Picks the last action in the action space.
+    /// Selects the last target in the action space.
     struct Last;
 
     impl Policy for Last {
-        fn choose(&mut self, view: View<'_>) -> Move {
-            view.action_space.last().unwrap().clone()
+        fn choose(&mut self, view: View<'_>) -> Option<AgentId> {
+            view.action_space.last().cloned()
         }
     }
 
-    /// Picks a player who is not in the game at all.
+    /// Selects a player who is not in the game at all.
     struct Outside;
 
     impl Policy for Outside {
-        fn choose(&mut self, _: View<'_>) -> Move {
-            target("nobody")
+        fn choose(&mut self, _: View<'_>) -> Option<AgentId> {
+            Some(target("nobody"))
+        }
+    }
+
+    /// Selects nowhere, which is how a member abstains.
+    struct Nowhere;
+
+    impl Policy for Nowhere {
+        fn choose(&mut self, _: View<'_>) -> Option<AgentId> {
+            None
         }
     }
 
@@ -177,32 +269,41 @@ mod tests {
         narrated(Narration::Eliminated {
             who: id(who),
             role: Role::Villager,
-            round: Round(round),
+            round: Round::new(round),
             cause: Cause::Devoured,
         })
     }
 
-    fn request(id: u64, round: u32, kind: RequestKind) -> Event<WerewolfDomain> {
-        from(
-            MODERATOR,
-            Message::Request(Request {
-                id: RequestId(id),
-                round: Round(round),
+    /// The action `Seat` takes when a phase begins: a selection naming its
+    /// own session, addressed to the moderator alone and naming `seen_by` as
+    /// the players the moderator should forward it to.
+    ///
+    /// There is no request to echo (ADR-0014), so a selection is identified
+    /// by the round and the kind it was made in, which is what the reader of
+    /// a trajectory reads off it directly. And there is no player among the
+    /// recipients: a player addresses the moderator and nobody else, which is
+    /// what keeps a selection from outliving its session in a peer's queue.
+    fn selecting<const N: usize>(
+        round: u32,
+        kind: RequestKind,
+        target: AgentId,
+        seen_by: [&str; N],
+    ) -> Action<WerewolfDomain> {
+        Action::to(
+            [AgentId::new(MODERATOR)],
+            Message::Select(Select {
+                round: Round::new(round),
                 kind,
+                target,
+                seen_by: seen_by.iter().map(|who| AgentId::new(*who)).collect(),
             }),
         )
     }
 
-    /// The action `Seat` takes in reply to a request: a response to the
-    /// moderator.
-    fn response(id: u64, chosen: Move) -> Action<WerewolfDomain> {
-        Action::to(
-            [MODERATOR],
-            Message::Response(Response {
-                request: RequestId(id),
-                chosen,
-            }),
-        )
+    /// A selection of a kind only the moderator sees: the seer's and the
+    /// doctor's own business.
+    fn privately(round: u32, kind: RequestKind, target: AgentId) -> Action<WerewolfDomain> {
+        selecting(round, kind, target, [])
     }
 
     /// What a seat does with a run of events, each in a cycle of its own,
@@ -227,7 +328,25 @@ mod tests {
     }
 
     #[test]
-    fn each_request_is_answered_from_the_state_every_earlier_observation_left() {
+    fn a_policy_that_selects_nowhere_sends_nothing() {
+        // Selecting nowhere is how a member abstains (ADR-0011). Nothing is
+        // sent, and nothing is folded: a selection never made is not a vote,
+        // so the doctor has no protection to be kept from repeating.
+        let mut seat = doctor(Nowhere);
+        let silent = handling(
+            &mut seat,
+            [phase_began(1, Phase::Night, ids(["alice", "bob", ME]))],
+        );
+        assert!(silent.is_empty(), "{silent:?}");
+        assert_eq!(seat.player.knowledge().last_protected, None);
+    }
+
+    #[test]
+    fn each_phase_is_acted_on_from_the_state_every_earlier_observation_left() {
+        // What makes a player select is the phase beginning, not anybody
+        // asking it to (ADR-0014). The selection it makes is a function of
+        // everything folded in before that phase began, so the second day
+        // is selected in from a village bob has left.
         let mut seat = villager(Last);
         let cycle = [
             narrated(Narration::Assigned {
@@ -235,18 +354,20 @@ mod tests {
                 pack: BTreeSet::new(),
             }),
             phase_began(1, Phase::Day, ids(["alice", "bob", ME])),
-            request(1, 1, RequestKind::Nominate),
             eliminated("bob", 1),
-            request(2, 1, RequestKind::Nominate),
+            phase_began(2, Phase::Day, ids(["alice", ME])),
         ];
         assert_eq!(
             handling(&mut seat, cycle),
-            [response(1, target("bob")), response(2, target("alice"))]
+            [
+                selecting(1, RequestKind::Nominate, target("bob"), ["alice", "bob"]),
+                selecting(2, RequestKind::Nominate, target("alice"), ["alice"]),
+            ]
         );
     }
 
     #[test]
-    fn an_observation_that_is_not_a_request_produces_nothing_and_still_updates_the_state() {
+    fn an_observation_that_is_not_a_phase_beginning_produces_nothing_and_still_updates_the_state() {
         let mut seat = villager(Last);
         let silent = handling(
             &mut seat,
@@ -255,21 +376,28 @@ mod tests {
                 eliminated("bob", 1),
             ],
         );
+        // A villager has nothing to do at night, and an elimination asks
+        // nothing of anybody; both are folded in silently.
         assert!(silent.is_empty(), "{silent:?}");
 
-        // The elimination folded in the silent cycle shapes the next answer.
+        // The elimination folded in the silent cycle shapes the next selection.
         assert_eq!(
-            handling(&mut seat, [request(1, 1, RequestKind::Nominate)]),
-            [response(1, target("alice"))]
+            handling(&mut seat, [phase_began(2, Phase::Day, ids(["alice", ME]))]),
+            [selecting(
+                2,
+                RequestKind::Nominate,
+                target("alice"),
+                ["alice"]
+            )]
         );
     }
 
     #[test]
     fn a_seat_opens_with_nothing() {
-        // A player says nothing until the moderator asks it something, so
-        // the default start hook is the right one for every role.
-        assert!(villager(First).start().is_empty());
-        assert!(doctor(First).start().is_empty());
+        // A player says nothing until the first phase begins, so the
+        // default start hook is the right one for every role.
+        assert!(villager(First).start(Timestamp::default()).is_empty());
+        assert!(doctor(First).start(Timestamp::default()).is_empty());
     }
 
     #[test]
@@ -278,7 +406,7 @@ mod tests {
         // calls `timeout`, not `handle`, and a player has nothing to say on
         // a deadline.
         let mut seat = villager(Last);
-        assert!(seat.timeout().is_empty());
+        assert!(seat.timeout(Timestamp::default()).is_empty());
     }
 
     #[test]
@@ -288,16 +416,31 @@ mod tests {
             &mut seat,
             [
                 phase_began(1, Phase::Night, ids(["alice", "bob", "carol", ME])),
-                request(1, 1, RequestKind::Protect),
                 phase_began(1, Phase::Day, ids(["alice", "bob", "carol", ME])),
-                request(2, 1, RequestKind::Nominate),
             ],
         );
         assert_eq!(actions.len(), 2);
+        // Every action, whatever it is, goes to the moderator and to
+        // nobody else. A player never addresses another player, which is
+        // what stops a selection outliving its session in a peer's queue
+        // (ADR-0014).
         for action in &actions {
-            assert_eq!(action.recipients, Recipients::To(ids([MODERATOR])));
-            assert!(matches!(action.payload, Message::Response(_)), "{action:?}");
+            assert!(matches!(action.payload, Message::Select(_)), "{action:?}");
+            assert_eq!(
+                action.recipients,
+                Recipients::To(ids([MODERATOR])),
+                "{action:?}"
+            );
         }
+        // What differs is the audience the moderator is asked to forward
+        // to: the protect is nobody else's business, the nomination is
+        // public.
+        let seen_by = |action: &Action<WerewolfDomain>| match &action.payload {
+            Message::Select(selection) => selection.seen_by.clone(),
+            other @ Message::Narration(_) => panic!("a selection, not {other:?}"),
+        };
+        assert_eq!(seen_by(&actions[0]), BTreeSet::new());
+        assert_eq!(seen_by(&actions[1]), ids(["alice", "bob", "carol"]));
     }
 
     #[test]
@@ -305,48 +448,44 @@ mod tests {
         // The doctor may not protect the same player two nights running,
         // and it is the seat that folds each protection into its knowledge.
         let mut seat = doctor(First);
-        let night = |round| {
-            [
-                phase_began(round, Phase::Night, ids(["alice", "bob", ME])),
-                request(u64::from(round), round, RequestKind::Protect),
-            ]
-        };
+        let night = |round| [phase_began(round, Phase::Night, ids(["alice", "bob", ME]))];
         assert_eq!(
             handling(&mut seat, night(1)),
-            [response(1, target("alice"))]
+            [privately(1, RequestKind::Protect, target("alice"))]
         );
-        assert_eq!(handling(&mut seat, night(2)), [response(2, target("bob"))]);
+        assert_eq!(
+            handling(&mut seat, night(2)),
+            [privately(2, RequestKind::Protect, target("bob"))]
+        );
         assert_eq!(
             handling(&mut seat, night(3)),
-            [response(3, target("alice"))]
+            [privately(3, RequestKind::Protect, target("alice"))]
         );
     }
 
     #[test]
     #[should_panic(
-        expected = "me's policy chose Target(AgentId(\"nobody\")), which is outside the action space"
+        expected = "me's policy chose AgentId(\"nobody\"), which is outside the action space"
     )]
     fn an_action_outside_the_action_space_panics() {
         let mut seat = villager(Outside);
-        handling(
-            &mut seat,
-            [
-                phase_began(1, Phase::Day, ids(["alice", ME])),
-                request(1, 1, RequestKind::Nominate),
-            ],
-        );
+        handling(&mut seat, [phase_began(1, Phase::Day, ids(["alice", ME]))]);
     }
 
     #[test]
-    #[should_panic(expected = "a Villager is never asked to Devour")]
-    fn a_request_of_a_kind_the_role_is_never_asked_panics() {
+    fn a_phase_the_role_is_asked_nothing_in_passes_in_silence() {
+        // Under ADR-0014 a role that is asked nothing in a phase cannot be
+        // handed a request of the wrong kind, because nothing is handed to
+        // it at all: it reads its own role and says nothing. A villager at
+        // night never reaches its action space, so the panic that guarded
+        // against a miscast request has no path through a seat left. The
+        // assertion itself is still exercised, by calling `action_space`
+        // directly; `roles` has those tests.
         let mut seat = villager(First);
-        handling(
+        let silent = handling(
             &mut seat,
-            [
-                phase_began(1, Phase::Night, ids(["alice", ME])),
-                request(1, 1, RequestKind::Devour),
-            ],
+            [phase_began(1, Phase::Night, ids(["alice", ME]))],
         );
+        assert!(silent.is_empty(), "{silent:?}");
     }
 }

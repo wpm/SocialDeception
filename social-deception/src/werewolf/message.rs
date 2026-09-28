@@ -1,9 +1,9 @@
 //! Everything said in a Werewolf episode: the [`Message`] payload and the
-//! vocabulary of rounds, phases, requests and moves it is built from.
-
-use std::collections::{BTreeMap, BTreeSet};
+//! vocabulary of rounds, phases, sessions and targets it is built from.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
+use std::num::NonZero;
 
 use super::role::{Faction, Role};
 use crate::event::AgentId;
@@ -13,7 +13,47 @@ use crate::event::AgentId;
 /// Serializes as a bare integer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct Round(pub u32);
+pub struct Round(pub NonZero<u32>);
+
+impl Round {
+    /// The round a game starts in.
+    pub const FIRST: Self = Self(NonZero::<u32>::MIN);
+
+    /// The round numbered `number`.
+    ///
+    /// # Panics
+    ///
+    /// If `number` is zero: rounds are counted from 1, and there is no
+    /// round before the first.
+    #[must_use]
+    pub const fn new(number: u32) -> Self {
+        match NonZero::new(number) {
+            Some(number) => Self(number),
+            None => panic!("a round is counted from 1"),
+        }
+    }
+
+    /// Which round this is, counted from 1.
+    #[must_use]
+    pub const fn number(self) -> u32 {
+        self.0.get()
+    }
+
+    /// The round after this one.
+    #[must_use]
+    pub const fn next(self) -> Self {
+        Self::new(self.number() + 1)
+    }
+
+    /// The round before this one, or `None` for the first.
+    #[must_use]
+    pub const fn previous(self) -> Option<Self> {
+        match NonZero::new(self.number() - 1) {
+            Some(number) => Some(Self(number)),
+            None => None,
+        }
+    }
+}
 
 /// Half of a round.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -24,15 +64,6 @@ pub enum Phase {
     Day,
 }
 
-/// The identity of one [`Request`], echoed by the [`Response`] to it.
-///
-/// The id makes "is this response an answer to something asked?" an exact
-/// check rather than an inferred one, and lets late and duplicate responses
-/// be recognized once a policy can be slow. Serializes as a bare integer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct RequestId(pub u64);
-
 /// Everything said in a Werewolf episode.
 ///
 /// Every agent in an episode shares this one payload type, so it covers
@@ -42,10 +73,10 @@ pub struct RequestId(pub u64);
 pub enum Message {
     /// Moderator to chosen players: something they now observe.
     Narration(Narration),
-    /// Moderator to one player: act now.
-    Request(Request),
-    /// Player to moderator: the move chosen.
-    Response(Response),
+    /// Player to the moderator and to whoever else may see it: a target
+    /// selected. A player may send more than one in the same session;
+    /// its latest is its vote (ADR-0011).
+    Select(Select),
 }
 
 /// A true statement from the moderator to the players it is addressed to.
@@ -75,16 +106,6 @@ pub enum Narration {
         /// The side that player is on.
         faction: Faction,
     },
-    /// How a phase's requests were answered: the day's tally to the living,
-    /// the night's to the living werewolves alone.
-    Tally {
-        /// The round the tally belongs to.
-        round: Round,
-        /// Which half of the round.
-        phase: Phase,
-        /// Each responding player's move, in canonical order.
-        votes: BTreeMap<AgentId, Move>,
-    },
     /// To the living, and to the eliminated player itself: someone is out
     /// of the game, and their role is revealed.
     Eliminated {
@@ -98,9 +119,15 @@ pub enum Narration {
         cause: Cause,
     },
     /// To the living: the night ended with nobody dead. A save is never
-    /// announced as one.
+    /// announced as one, and neither is a pack that selected nowhere.
     NoDeath {
         /// The round whose night it was.
+        round: Round,
+    },
+    /// To the living: the day ran out of time without a majority, so
+    /// nobody was lynched (ADR-0011).
+    NoLynch {
+        /// The round whose day it was.
         round: Round,
     },
     /// To everyone, living and dead: the game is over.
@@ -119,28 +146,28 @@ pub enum Cause {
 /// How a game ended. The one narration addressed to every player.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Outcome {
-    /// The winning side. Every game has one: a day always eliminates
-    /// someone, so no game can run out of rounds undecided.
-    pub winner: Faction,
+    /// The winning side, or `None` for a **stalemate**: a game that
+    /// reached the day cap with nobody having won (ADR-0011).
+    ///
+    /// A day may end without a lynch, so a doctor who keeps saving and a
+    /// village that keeps running out the clock could otherwise go on
+    /// forever. A game has a winner unless it reaches the cap.
+    pub winner: Option<Faction>,
     /// The round the game ended in.
     pub rounds: Round,
     /// Everyone still in the game at the end.
     pub living: BTreeSet<AgentId>,
 }
 
-/// A decision point: the moderator asking one player to act.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Request {
-    /// The id the response must echo.
-    pub id: RequestId,
-    /// The round the request belongs to.
-    pub round: Round,
-    /// What is being asked.
-    pub kind: RequestKind,
-}
-
-/// What a [`Request`] asks a player to do.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// What one of a phase's sessions is for.
+///
+/// A phase opens a session per kind it calls for, and a player works out
+/// from its own role which of them it is a member of (ADR-0014). Nobody is
+/// told: a player that has observed the phase begin already knows.
+///
+/// Ordered so that a night's sessions can be kept in a map: the order is
+/// the declaration order below and carries no meaning of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum RequestKind {
     /// Name a player to lynch. Asked of every living player by day.
     Nominate,
@@ -155,7 +182,7 @@ pub enum RequestKind {
 }
 
 impl RequestKind {
-    /// The phase this kind of request is asked in: nomination by day,
+    /// The phase a session of this kind belongs to: nomination by day,
     /// everything else at night.
     #[must_use]
     pub const fn phase(self) -> Phase {
@@ -164,56 +191,38 @@ impl RequestKind {
             Self::Devour | Self::Investigate | Self::Protect => Phase::Night,
         }
     }
-
-    /// Whether [`Move::Abstain`] is in the action space for this kind:
-    /// true for `Protect` and `Investigate` only.
-    ///
-    /// `Nominate` and `Devour` always have at least one valid target when
-    /// they are asked, because the game would already be over otherwise.
-    /// Protection can genuinely run out of targets, since the doctor may
-    /// protect neither itself nor the player it protected last night, so
-    /// abstaining has to exist.
-    #[must_use]
-    pub const fn may_abstain(self) -> bool {
-        match self {
-            Self::Investigate | Self::Protect => true,
-            Self::Nominate | Self::Devour => false,
-        }
-    }
 }
 
-/// A player's reply to a request.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Response {
-    /// The id of the request being answered.
-    pub request: RequestId,
-    /// The move chosen.
-    pub chosen: Move,
-}
-
-/// The move a player's action carries: one of these, drawn from the action
-/// space, is what a policy returns and what a [`Response`] reports.
+/// A player selecting a target.
 ///
-/// The derived ordering puts every `Target` before `Abstain`, targets in
-/// agent-id order, which is the order the action space lists them in.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub enum Move {
-    /// Act on this player. Serializes as `{"Target": "<agent id>"}`.
-    Target(AgentId),
-    /// Decline to act. In the action space only where
-    /// [`RequestKind::may_abstain`] says so.
-    Abstain,
-}
-
-impl Move {
-    /// The player this move targets, if it is not an abstention.
-    #[must_use]
-    pub const fn target(&self) -> Option<&AgentId> {
-        match self {
-            Self::Target(who) => Some(who),
-            Self::Abstain => None,
-        }
-    }
+/// A member of an open session may select whenever it likes and as often as
+/// it likes; its most recent selection is its vote (ADR-0011). Selecting
+/// nowhere is how a member abstains, and it is the absence of a selection
+/// rather than a message, which is why there is no move that means "nobody".
+///
+/// A selection is addressed to the moderator and to nobody else. The other
+/// players who should see it are named in `seen_by`, and the moderator
+/// forwards it to them if the session it names is still open. A player
+/// never sends another player anything directly, so there is no path by
+/// which a selection can outlive its session in somebody else's queue.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Select {
+    /// The round the session belongs to.
+    pub round: Round,
+    /// Which of the phase's sessions this is: what the selection is for.
+    pub kind: RequestKind,
+    /// The player selected.
+    pub target: AgentId,
+    /// The other players who should see this selection, for the moderator to
+    /// forward it to.
+    ///
+    /// Empty for a selection that is nobody else's business: the seer's
+    /// investigation and the doctor's protection are between that player
+    /// and the moderator. A `Devour` names the rest of the pack and a
+    /// `Nominate` the rest of the living, and in neither case does it name
+    /// the sender or the moderator.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub seen_by: BTreeSet<AgentId>,
 }
 
 #[cfg(test)]
@@ -236,7 +245,7 @@ mod tests {
             ),
             (
                 Narration::PhaseBegan {
-                    round: Round(1),
+                    round: Round::new(1),
                     phase: Phase::Night,
                     living: ["alice", "bob"].map(AgentId::new).into(),
                 },
@@ -250,37 +259,24 @@ mod tests {
                 json!({"Investigated": {"target": "bob", "faction": "Village"}}),
             ),
             (
-                Narration::Tally {
-                    round: Round(2),
-                    phase: Phase::Day,
-                    votes: BTreeMap::from([
-                        (AgentId::new("alice"), Move::Target(AgentId::new("bob"))),
-                        (AgentId::new("bob"), Move::Abstain),
-                    ]),
-                },
-                json!({"Tally": {
-                    "round": 2,
-                    "phase": "Day",
-                    "votes": {"alice": {"Target": "bob"}, "bob": "Abstain"},
-                }}),
-            ),
-            (
                 Narration::Eliminated {
                     who: AgentId::new("bob"),
                     role: Role::Seer,
-                    round: Round(2),
+                    round: Round::new(2),
                     cause: Cause::Lynched,
                 },
                 json!({"Eliminated": {"who": "bob", "role": "Seer", "round": 2, "cause": "Lynched"}}),
             ),
             (
-                Narration::NoDeath { round: Round(3) },
+                Narration::NoDeath {
+                    round: Round::new(3),
+                },
                 json!({"NoDeath": {"round": 3}}),
             ),
             (
                 Narration::Outcome(Outcome {
-                    winner: Faction::Werewolves,
-                    rounds: Round(3),
+                    winner: Some(Faction::Werewolves),
+                    rounds: Round::new(3),
                     living: ["wanda"].map(AgentId::new).into(),
                 }),
                 json!({"Outcome": {"winner": "Werewolves", "rounds": 3, "living": ["wanda"]}}),
@@ -298,19 +294,13 @@ mod tests {
             .map(|(narration, shape)| (Message::Narration(narration), json!({"Narration": shape})))
             .collect();
         messages.push((
-            Message::Request(Request {
-                id: RequestId(7),
-                round: Round(1),
+            Message::Select(Select {
+                round: Round::new(1),
                 kind: RequestKind::Devour,
+                target: AgentId::new("alice"),
+                seen_by: BTreeSet::new(),
             }),
-            json!({"Request": {"id": 7, "round": 1, "kind": "Devour"}}),
-        ));
-        messages.push((
-            Message::Response(Response {
-                request: RequestId(7),
-                chosen: Move::Target(AgentId::new("alice")),
-            }),
-            json!({"Response": {"request": 7, "chosen": {"Target": "alice"}}}),
+            json!({"Select": {"round": 1, "kind": "Devour", "target": "alice"}}),
         ));
         messages
     }
@@ -334,14 +324,6 @@ mod tests {
     }
 
     #[test]
-    fn only_protect_and_investigate_may_abstain() {
-        assert!(RequestKind::Protect.may_abstain());
-        assert!(RequestKind::Investigate.may_abstain());
-        assert!(!RequestKind::Nominate.may_abstain());
-        assert!(!RequestKind::Devour.may_abstain());
-    }
-
-    #[test]
     fn every_message_serializes_to_its_shape() {
         for (message, expected) in every_message() {
             assert_eq!(json(&message), expected, "{message:?}");
@@ -357,66 +339,50 @@ mod tests {
     }
 
     #[test]
-    fn rounds_and_request_ids_are_bare_integers() {
-        assert_eq!(json(&Round(4)), json!(4));
-        assert_eq!(json(&RequestId(12)), json!(12));
+    fn a_round_is_a_bare_integer() {
+        assert_eq!(json(&Round::new(4)), json!(4));
         let round: Round = serde_json::from_value(json!(4)).unwrap();
-        assert_eq!(round, Round(4));
-        let id: RequestId = serde_json::from_value(json!(12)).unwrap();
-        assert_eq!(id, RequestId(12));
+        assert_eq!(round, Round::new(4));
     }
 
     #[test]
-    fn a_target_carries_a_bare_agent_id() {
-        assert_eq!(
-            json(&Move::Target(AgentId::new("alice"))),
-            json!({"Target": "alice"})
-        );
-        assert_eq!(json(&Move::Abstain), json!("Abstain"));
+    fn a_game_starts_at_round_one() {
+        assert_eq!(Round::FIRST, Round::new(1));
+        assert_eq!(Round::FIRST.number(), 1);
     }
 
     #[test]
-    fn only_a_target_names_a_player() {
-        assert_eq!(
-            Move::Target(AgentId::new("alice")).target(),
-            Some(&AgentId::new("alice"))
-        );
-        assert_eq!(Move::Abstain.target(), None);
+    fn a_round_is_followed_by_the_next_one() {
+        assert_eq!(Round::FIRST.next(), Round::new(2));
+        assert_eq!(Round::new(7).next(), Round::new(8));
     }
 
     #[test]
-    fn targets_sort_by_agent_and_precede_abstain() {
-        let mut moves = vec![
-            Move::Abstain,
-            Move::Target(AgentId::new("bob")),
-            Move::Target(AgentId::new("alice")),
-        ];
-        moves.sort();
-        assert_eq!(
-            moves,
-            [
-                Move::Target(AgentId::new("alice")),
-                Move::Target(AgentId::new("bob")),
-                Move::Abstain,
-            ]
-        );
+    fn a_round_knows_the_one_before_it_unless_it_is_the_first() {
+        assert_eq!(Round::new(2).previous(), Some(Round::FIRST));
+        assert_eq!(Round::FIRST.previous(), None);
     }
 
     #[test]
-    fn a_tally_serializes_its_voters_in_sorted_order() {
-        let tally = Narration::Tally {
-            round: Round(1),
-            phase: Phase::Night,
-            votes: ["carol", "alice", "bob"]
-                .into_iter()
-                .map(|who| (AgentId::new(who), Move::Target(AgentId::new("dave"))))
-                .collect(),
-        };
-        // A `serde_json::Value` object sorts its own keys, so the order has
-        // to be checked on the text.
+    #[should_panic(expected = "a round is counted from 1")]
+    fn there_is_no_round_zero() {
+        let _ = Round::new(0);
+    }
+
+    #[test]
+    fn a_selection_names_its_session_and_a_bare_agent_id() {
+        // A target is an agent and nothing else: no move wraps it, and
+        // nothing means "nobody" (ADR-0011). The session is the round and
+        // the kind, which both sides derive rather than correlate by an
+        // id the moderator mints (ADR-0014).
         assert_eq!(
-            serde_json::to_string(&tally).unwrap(),
-            r#"{"Tally":{"round":1,"phase":"Night","votes":{"alice":{"Target":"dave"},"bob":{"Target":"dave"},"carol":{"Target":"dave"}}}}"#
+            json(&Select {
+                round: Round::new(3),
+                kind: RequestKind::Nominate,
+                target: AgentId::new("alice"),
+                seen_by: BTreeSet::new(),
+            }),
+            json!({"round": 3, "kind": "Nominate", "target": "alice"})
         );
     }
 

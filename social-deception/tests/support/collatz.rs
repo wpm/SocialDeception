@@ -34,7 +34,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Serialize;
 use social_deception::{
-    Action, AgentId, Control, Domain, Effect, Environment, Handler, Observation,
+    Action, AgentId, Control, Domain, Effect, Environment, Handler, Observation, Timestamp,
 };
 
 /// The Collatz environment as a [`Domain`].
@@ -173,7 +173,7 @@ impl Collatz {
 
 impl Handler<CollatzDomain> for Collatz {
     /// Opens this agent's own chains, each at its starting value.
-    fn start(&mut self) -> Vec<Action<CollatzDomain>> {
+    fn start(&mut self, _now: Timestamp) -> Vec<Action<CollatzDomain>> {
         self.opens
             .iter()
             .map(|&start| {
@@ -271,7 +271,7 @@ impl Environment<CollatzDomain> for CollatzEnvironment {
     ///
     /// A ring that opens nothing is over before it begins, and is stopped in
     /// the same cycle it is started.
-    fn start(&mut self) -> Vec<Effect<CollatzDomain>> {
+    fn start(&mut self, _now: Timestamp) -> Vec<Effect<CollatzDomain>> {
         let mut effects = vec![Effect::control(self.agents.clone(), Control::Start)];
         effects.extend(self.stop_if_done());
         effects
@@ -299,7 +299,7 @@ impl Environment<CollatzDomain> for CollatzEnvironment {
 
 #[cfg(test)]
 mod tests {
-    use social_deception::{Event, Timestamp};
+    use social_deception::Event;
 
     use super::*;
 
@@ -394,9 +394,9 @@ mod tests {
         let mut opener = agent().opening(6).opening(7);
         assert_eq!(opener.opens(), [6, 7]);
         assert_eq!(opener.to(), &AgentId::new("b"));
-        assert_eq!(opener.start(), [to_b(6, 6), to_b(7, 7)]);
+        assert_eq!(opener.start(Timestamp::default()), [to_b(6, 6), to_b(7, 7)]);
         // An agent that opens nothing opens nothing.
-        assert!(agent().start().is_empty());
+        assert!(agent().start(Timestamp::default()).is_empty());
     }
 
     #[test]
@@ -415,7 +415,7 @@ mod tests {
         // calls `timeout`, not `handle`, and this agent has nothing to do on
         // a deadline.
         let mut agent = agent().opening(5);
-        assert!(agent.timeout().is_empty());
+        assert!(agent.timeout(Timestamp::default()).is_empty());
     }
 
     #[test]
@@ -463,7 +463,7 @@ mod tests {
     #[test]
     fn the_environment_starts_the_ring_and_stops_it_when_every_chain_is_over() {
         let mut environment = environment([6, 7]);
-        assert_eq!(environment.start(), [start(["a", "b"])]);
+        assert_eq!(environment.start(Timestamp::default()), [start(["a", "b"])]);
         assert!(folded(&mut environment, &reports("a", 6)).is_empty());
         assert_eq!(
             folded(&mut environment, &reports("b", 7)),
@@ -476,7 +476,7 @@ mod tests {
         // Both are called 6, so only the count tells them apart: one report
         // leaves one running.
         let mut environment = environment([6, 6]);
-        environment.start();
+        environment.start(Timestamp::default());
         assert!(folded(&mut environment, &reports("a", 6)).is_empty());
         assert_eq!(
             folded(&mut environment, &reports("a", 6)),
@@ -487,14 +487,17 @@ mod tests {
     #[test]
     fn a_ring_that_opens_nothing_is_started_and_stopped_at_once() {
         let mut environment = CollatzEnvironment::new(["a", "b"], []);
-        assert_eq!(environment.start(), [start(["a", "b"]), stop(["a", "b"])]);
+        assert_eq!(
+            environment.start(Timestamp::default()),
+            [start(["a", "b"]), stop(["a", "b"])]
+        );
     }
 
     #[test]
     #[should_panic(expected = "chain 9 finished, but none was outstanding")]
     fn a_chain_nobody_opened_panics() {
         let mut environment = environment([6, 7]);
-        environment.start();
+        environment.start(Timestamp::default());
         let _ = folded(&mut environment, &reports("a", 9));
     }
 
@@ -502,7 +505,7 @@ mod tests {
     #[should_panic(expected = "a sent the environment step 3 of chain 6")]
     fn a_step_sent_to_the_environment_panics() {
         let mut environment = environment([6, 7]);
-        environment.start();
+        environment.start(Timestamp::default());
         let _ = folded(
             &mut environment,
             &observation(

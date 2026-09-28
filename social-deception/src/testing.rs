@@ -16,8 +16,7 @@ use crate::clock::Timestamp;
 use crate::event::{AgentId, Domain, Event};
 use crate::trajectory::{JsonLines, LogRecord, Policy, Sink, Writer};
 use crate::werewolf::{
-    Assignment, Faction, Knowledge, Message, Move, Narration, Phase, Request, RequestId,
-    RequestKind, Role, Round, WerewolfDomain,
+    Assignment, Faction, Knowledge, Message, Narration, Phase, Role, Round, WerewolfDomain,
 };
 
 pub(crate) use temp::TempDir;
@@ -136,18 +135,40 @@ pub(crate) fn ids<const N: usize>(names: [&str; N]) -> BTreeSet<AgentId> {
     names.map(AgentId::new).into()
 }
 
-/// A move targeting the named agent, for tests that name agents by
-/// string literal.
-pub(crate) fn target(name: &str) -> Move {
-    Move::Target(id(name))
+/// The agent a selection targets, for tests that name agents by string
+/// literal. The same thing as [`id`], named for the place it is used: it
+/// reads as "the target" where a selection's target is what is meant.
+pub(crate) fn target(name: &str) -> AgentId {
+    id(name)
 }
 
-/// A request of `kind`, for tests where its id and round do not matter.
-pub(crate) fn request(kind: RequestKind) -> Request {
-    Request {
-        id: RequestId(1),
-        round: Round(1),
-        kind,
+/// Timing fast enough that a test does not wait on a real clock, for the
+/// unit tests that drive a game with explicit instants and never let a
+/// wall-clock deadline fire at all.
+pub(crate) fn fast() -> crate::werewolf::config::Timing {
+    use std::time::Duration;
+
+    use crate::werewolf::config::{DayTiming, NightTiming, Timing};
+
+    // A night's limit has to outlast the slowest player's one selection, or a
+    // selection misses its session and the game differs from run to run
+    // (ADR-0011); a day's is what costs real time, since a random day
+    // rarely reaches a majority and so usually runs it out. These unit
+    // tests drive a game with explicit instants and never let a
+    // wall-clock deadline fire, so neither number decides anything here —
+    // they match the integration suite's so that the two agree.
+    let night = NightTiming {
+        quiet: Duration::from_millis(10),
+        limit: Duration::from_millis(400),
+    };
+    Timing {
+        day_cap: None,
+        pack: night,
+        seer: night,
+        doctor: night,
+        day: DayTiming {
+            limit: Duration::from_millis(80),
+        },
     }
 }
 
@@ -181,7 +202,7 @@ pub(crate) fn phase_began(
     living: BTreeSet<AgentId>,
 ) -> Event<WerewolfDomain> {
     narrated(Narration::PhaseBegan {
-        round: Round(round),
+        round: Round::new(round),
         phase,
         living,
     })

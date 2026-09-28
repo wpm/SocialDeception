@@ -135,7 +135,7 @@ impl Assignment {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::werewolf::config::RoleCounts;
+    use crate::werewolf::config::{RoleCounts, Timing};
 
     fn game(seed: u64, players: &[&str], roles: RoleCounts) -> Config {
         let config = Config {
@@ -144,6 +144,7 @@ mod tests {
             roles,
             trajectory: None,
             moderator: AgentId::new("moderator"),
+            timing: Timing::default(),
         };
         config.validate().unwrap();
         config

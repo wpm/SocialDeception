@@ -16,7 +16,7 @@
 //! # Determinism, precisely
 //!
 //! For a fixed configuration and seed, the *logical transcript* (the role
-//! assignment, every request, response, tally, elimination and the outcome)
+//! assignment, every selection, elimination and the outcome)
 //! is identical on every run. The *wall-clock timestamps* and the
 //! *interleaving of different agents' records* in the trajectory are not,
 //! and cannot be, because the agents are threads. So the determinism tests
@@ -29,8 +29,11 @@ use std::fs;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
+use std::time::Duration;
+
 use social_deception::AgentId;
 use social_deception::werewolf::config::DEFAULT_MODERATOR;
+use social_deception::werewolf::config::{DayTiming, NightTiming, Timing};
 use social_deception::werewolf::{self, Config, Faction, RoleCounts, Transcript, config};
 use support::TempDir;
 
@@ -49,12 +52,56 @@ const WEREWOLF: &str = env!("CARGO_BIN_EXE_werewolf");
 const SEED: u64 = 20_260_918;
 
 /// How many seeds a search for particular kinds of game tries at most.
-/// With a uniform policy over seven players the events searched for turn
-/// up in a good fraction of games, so this is generous.
-const SEEDS: u64 = 40;
+///
+/// A village win is the scarce one. Under ADR-0011 a day closes on a
+/// majority of the living, and seven uniform players seldom put four on
+/// one target, so most days run out and the pack wins by attrition; the
+/// first village win is at seed 41. This is that with room to spare, and
+/// it is why the number is no longer small.
+const SEEDS: u64 = 120;
 
 /// A validated configuration for `players` with the given special roles,
 /// played from `seed`, writing no trajectory.
+/// Timing fast enough that a test does not spend real time waiting on a
+/// session's clock, and slow enough that a random player's one selection
+/// always lands inside it.
+///
+/// A game of random players selects once and never changes its mind, so a
+/// night session closes a quiet period after its last member's only
+/// selection, and a day runs to its limit unless a majority falls out of the
+/// deal. The outcome is reproducible only while every one of those selections
+/// arrives before its session closes (ADR-0011), which is a claim about
+/// thread latency: the limits have to exceed however long the slowest
+/// player takes to be scheduled and answer.
+///
+/// The two clocks are set for different reasons. A **hard limit** has to
+/// outlast the slowest player's one selection, or a selection misses its
+/// session and the game genuinely differs from run to run; at 50 ms these
+/// tests passed alone and failed a few times in ten with several suites at
+/// once, because seven agent threads on a loaded machine can outrun a margin
+/// that small. A **quiet period** costs real time on every night, since a
+/// night closes one quiet period after its members settle, so it stays short.
+///
+/// The day's limit is the expensive one — a random day rarely reaches a
+/// majority, so most days run it out — but it is also the one a slow
+/// selection matters least for, because a day closes on a majority of the
+/// living and a selection that misses cannot have made one. It is kept below
+/// the night's for that reason.
+const FAST: Timing = Timing {
+    day_cap: None,
+    pack: FAST_NIGHT,
+    seer: FAST_NIGHT,
+    doctor: FAST_NIGHT,
+    day: DayTiming {
+        limit: Duration::from_millis(80),
+    },
+};
+
+const FAST_NIGHT: NightTiming = NightTiming {
+    quiet: Duration::from_millis(10),
+    limit: Duration::from_millis(400),
+};
+
 fn config(players: &[&str], werewolves: usize, seers: usize, doctors: usize, seed: u64) -> Config {
     let config = Config {
         seed,
@@ -66,6 +113,7 @@ fn config(players: &[&str], werewolves: usize, seers: usize, doctors: usize, see
         },
         trajectory: None,
         moderator: AgentId::new(DEFAULT_MODERATOR),
+        timing: FAST,
     };
     config.validate().unwrap();
     config
@@ -121,7 +169,8 @@ fn werewolf(args: &[&str]) -> String {
     let output = Command::new(WEREWOLF).args(args).output().unwrap();
     assert!(
         output.status.success(),
-        "werewolf {args:?} failed: {}",
+        "werewolf {args:?} failed with {:?}: {}",
+        output.status,
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8(output.stdout).unwrap()
@@ -147,7 +196,7 @@ fn three_players_with_one_werewolf_is_the_smallest_game() {
     // The werewolf devours one of the other two on the first night, and
     // with no doctor to save them that is parity, whatever the seed.
     let transcript = run(&config(&["alice", "bob", "carol"], 1, 0, 0, SEED));
-    assert_eq!(transcript.outcome.winner, Faction::Werewolves);
+    assert_eq!(transcript.outcome.winner, Some(Faction::Werewolves));
     assert_eq!(transcript.rounds.len(), 1);
 }
 
@@ -166,7 +215,10 @@ fn a_game_without_a_seer_or_a_doctor_or_either() {
 fn the_seeds_hold_a_save_and_a_win_for_each_side() {
     // None of these can be arranged by choosing the roles, so search the
     // seeds for them rather than contrive them, and stop once all three
-    // have turned up. Every game searched goes through the full invariant
+    // have turned up. A stalemate is not among them: at the default cap
+    // of one day per player a seven-player random game always resolves
+    // first, which 400 seeds confirm. Where the cap does bite is a unit
+    // test of its own, `a_random_game_stalemates_only_when_the_cap_is_tight`. Every game searched goes through the full invariant
     // suite on the way, which is where "the doctor is working" is actually
     // asserted: a quiet night is one on which it protected the pack's
     // choice. Here it need only happen.
@@ -179,7 +231,10 @@ fn the_seeds_hold_a_save_and_a_win_for_each_side() {
             .iter()
             .any(|round| round.night.eliminated.is_none());
         winners.push(transcript.outcome.winner);
-        if saved && winners.contains(&Faction::Village) && winners.contains(&Faction::Werewolves) {
+        if saved
+            && winners.contains(&Some(Faction::Village))
+            && winners.contains(&Some(Faction::Werewolves))
+        {
             return;
         }
     }
@@ -193,23 +248,23 @@ fn the_seeds_hold_a_save_and_a_win_for_each_side() {
 #[test]
 fn the_same_seed_plays_the_same_game() {
     let config = town(SEED);
-    assert_eq!(run(&config), run(&config));
-    // The two trajectory *files* are deliberately not compared. They record
-    // wall-clock timestamps, and the records of different agents' threads
-    // interleave however the scheduler ran them, so the files of the same
-    // game differ from run to run. Tightening this test to compare them
-    // would assert something the runtime cannot honor, and is not meant
-    // to. The transcript is the claim.
+    assert_eq!(run(&config).verdicts(), run(&config).verdicts());
+    // What is compared is the *verdicts*, not the whole transcript, and
+    // certainly not the trajectory files. Under ADR-0011 a phase is a
+    // timed session: every death, every finding and the winner are the
+    // same on every run of a seed, while the order selections arrived in, and
+    // which late ones landed before a session closed, are facts about
+    // thread scheduling. The files differ for that reason and for their
+    // wall-clock stamps. Comparing more than the verdicts would assert
+    // something the runtime does not promise.
 }
 
 #[test]
 fn different_seeds_play_different_games() {
     // A `seed_for` that ignored its input would pass every other test here.
-    let transcripts: Vec<Transcript> = (1..=4).map(|seed| run(&town(seed))).collect();
+    let verdicts: Vec<_> = (1..=4).map(|seed| run(&town(seed)).verdicts()).collect();
     assert!(
-        transcripts
-            .iter()
-            .any(|transcript| *transcript != transcripts[0]),
+        verdicts.iter().any(|verdict| *verdict != verdicts[0]),
         "four seeds played the same game"
     );
 }
@@ -219,9 +274,13 @@ fn a_dozen_runs_play_the_same_game() {
     // A determinism bug that depends on thread scheduling will not show up
     // in two runs.
     let config = town(SEED);
-    let first = run(&config);
+    let first = run(&config).verdicts();
     for i in 1..12 {
-        assert_eq!(run(&config), first, "run {i} played a different game");
+        assert_eq!(
+            run(&config).verdicts(),
+            first,
+            "run {i} played a different game"
+        );
     }
 }
 
@@ -258,7 +317,10 @@ fn a_run_is_reproduced_from_its_artifacts() {
     let transcript = read(&original, &effective);
     let winner = transcript.outcome.winner;
     assert!(
-        played.starts_with(&format!("seed: {SEED}\nwinner: {winner}\n")),
+        played.starts_with(&format!(
+            "seed: {SEED}\nwinner: {}\n",
+            winner.expect("a random game has a winner")
+        )),
         "{played}"
     );
     assert!(played.contains(&format!("effective config: {}\n", effective_path.display())));
@@ -277,7 +339,7 @@ fn a_run_is_reproduced_from_its_artifacts() {
         rerun.to_str().unwrap(),
         "--quiet",
     ]);
-    assert_eq!(read(&rerun, &effective), transcript);
+    assert_eq!(read(&rerun, &effective).verdicts(), transcript.verdicts());
 }
 
 #[test]
@@ -304,11 +366,18 @@ fn a_reader_that_stops_early_is_not_an_error() {
 fn playable(dir: &TempDir) -> (std::path::PathBuf, std::path::PathBuf) {
     let trajectory = dir.join("played.jsonl");
     let config = dir.join("game.toml");
+    // Fast clocks, or the game would run on the defaults a
+    // language-model game wants: twenty seconds a night session and sixty
+    // for the day (ADR-0011).
     fs::write(
         &config,
         format!(
             "seed = 26\nplayers = [\"alice\", \"bob\", \"carol\", \"dave\", \"erin\", \"frank\", \
-             \"grace\"]\ntrajectory = '{}'\n[roles]\nwerewolves = 2\nseers = 1\ndoctors = 1\n",
+             \"grace\"]\ntrajectory = '{}'\n[roles]\nwerewolves = 2\nseers = 1\ndoctors = 1\n\
+             [timing.pack]\nquiet = 0.01\nlimit = 0.4\n\
+             [timing.seer]\nquiet = 0.01\nlimit = 0.4\n\
+             [timing.doctor]\nquiet = 0.01\nlimit = 0.4\n\
+             [timing.day]\nlimit = 0.08\n",
             trajectory.display()
         ),
     )
@@ -383,8 +452,12 @@ fn a_watcher_who_stops_reading_still_leaves_a_whole_trajectory() {
     assert_eq!(String::from_utf8_lossy(&output.stderr), "");
 
     // The whole game is on disk, and it is the game the fixed seed plays.
+    // Four rounds where the old rules took two: a day closes on a
+    // majority now, and seven random players seldom put four on one
+    // target, so most days run out and the pack wins by attrition
+    // (ADR-0011).
     let effective = config::load(config::effective_path(&trajectory)).unwrap();
     let transcript = read(&trajectory, &effective);
-    assert_eq!(transcript.outcome.winner, Faction::Werewolves);
-    assert_eq!(transcript.rounds.len(), 2);
+    assert_eq!(transcript.outcome.winner, Some(Faction::Werewolves));
+    assert_eq!(transcript.rounds.len(), 4);
 }
