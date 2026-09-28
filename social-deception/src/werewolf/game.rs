@@ -142,6 +142,28 @@ pub enum Directive {
         /// What they are told.
         narration: Narration,
     },
+    /// Pass a player's point on to the other players who should see it.
+    ///
+    /// The moderator is the only agent a player addresses, so this is how
+    /// a point reaches anybody else (ADR-0014). The forwarded event names
+    /// the player that pointed and the instant it pointed, so a recipient
+    /// cannot tell the point came by way of the moderator; see
+    /// [`Action::relay`](crate::agent::Action::relay).
+    ///
+    /// Only a point the game accepted is forwarded. One whose session has
+    /// closed is dropped here, which is the whole reason a point goes
+    /// through the moderator at all: it is the only agent that knows
+    /// whether the session is still open.
+    Forward {
+        /// The player whose point it is.
+        from: AgentId,
+        /// When that player made it.
+        created: Timestamp,
+        /// The other players who should see it, never empty.
+        to: BTreeSet<AgentId>,
+        /// The point itself, exactly as it was sent.
+        point: Point,
+    },
     /// Stop this agent: it is out of the game (ADR-0012).
     ///
     /// A dead player is stopped in the cycle its death is announced, and
@@ -328,7 +350,13 @@ impl Game {
     /// permission in advance (ADR-0014). It is the same rule either way:
     /// what a role is asked in a phase is [`Role::asked_in`], which the
     /// player consulted to decide to point at all.
-    pub fn point(&mut self, from: &AgentId, point: &Point, at: Timestamp) -> Vec<Directive> {
+    pub fn point(
+        &mut self,
+        from: &AgentId,
+        point: &Point,
+        created: Timestamp,
+        at: Timestamp,
+    ) -> Vec<Directive> {
         let kind = point.kind;
         // A point names the session it was made in, so a point from a
         // round that has passed is one whose session closed while it was
@@ -366,15 +394,33 @@ impl Game {
         );
         self.sessions[index].point(from, &point.target, at);
 
+        // Accepted, so the players who should see it are told, in the
+        // order the moderator accepted the points rather than in whatever
+        // order a queue happened to deliver them (ADR-0014). This is the
+        // only way a point reaches another player.
+        let mut directives = Vec::new();
+        if !point.seen_by.is_empty() {
+            directives.push(Directive::Forward {
+                from: from.clone(),
+                created,
+                to: point.seen_by.clone(),
+                point: point.clone(),
+            });
+        }
+
         // The day ends the moment a majority of the living agree, and the
         // point that made it is the hammer. Everything else waits for a
         // clock.
+        //
+        // The forward comes first: a player learns of the point that
+        // lynched somebody before it learns of the lynch, which is the
+        // order the events happened in.
         if kind == RequestKind::Nominate && self.majority().is_some() {
             // This point is the one that completed the majority, so the
             // player who made it is the hammer.
-            return self.close_day(Some(from.clone()), at);
+            directives.extend(self.close_day(Some(from.clone()), at));
         }
-        Vec::new()
+        directives
     }
 
     /// Closes every session whose time is up at `now`, and resolves what
@@ -902,8 +948,9 @@ mod tests {
                 round,
                 kind: asks[&who],
                 target: chosen.clone(),
+                seen_by: BTreeSet::new(),
             };
-            caused.extend(game.point(&who, &point, at));
+            caused.extend(game.point(&who, &point, at, at));
         }
         // Close this phase and no more. If pointing already closed it,
         // there is nothing to run: running the clocks anyway would close
@@ -1068,8 +1115,9 @@ mod tests {
             round,
             kind,
             target,
+            seen_by: BTreeSet::new(),
         };
-        game.point(&id(from), &point, at(0))
+        game.point(&id(from), &point, at(0), at(0))
     }
 
     /// The same, for a point naming a round of the caller's choosing.
@@ -1084,8 +1132,366 @@ mod tests {
             round: Round(round),
             kind,
             target,
+            seen_by: BTreeSet::new(),
         };
-        game.point(&id(from), &point, at(0))
+        game.point(&id(from), &point, at(0), at(0))
+    }
+
+    /// Points as a player really would, naming the audience the moderator
+    /// should forward to, at the instants a caller chooses.
+    ///
+    /// `created` is when the player pointed and `at` when the moderator
+    /// received it: the two instants a forward turns on, and the reason
+    /// this takes both.
+    fn points_seen_by<const N: usize>(
+        game: &mut Game,
+        from: &str,
+        round: u32,
+        kind: RequestKind,
+        target: &str,
+        seen_by: [&str; N],
+        when: (Timestamp, Timestamp),
+    ) -> Vec<Directive> {
+        let (created, at) = when;
+        let point = Point {
+            round: Round(round),
+            kind,
+            target: id(target),
+            seen_by: ids(seen_by),
+        };
+        game.point(&id(from), &point, created, at)
+    }
+
+    /// The forwards among some directives: who is told of whose point.
+    fn forwards(directives: &[Directive]) -> Vec<(&AgentId, &BTreeSet<AgentId>, &Point)> {
+        directives
+            .iter()
+            .filter_map(|directive| match directive {
+                Directive::Forward {
+                    from, to, point, ..
+                } => Some((from, to, point)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Whether any of these directives forwards anything.
+    fn forwarded_anything(directives: &[Directive]) -> bool {
+        !forwards(directives).is_empty()
+    }
+
+    #[test]
+    fn a_point_for_a_round_that_has_passed_is_forwarded_to_nobody() {
+        // Scenario 1. The session it names closed when its round did, so
+        // there is nobody it is still news to.
+        let mut game = game(village());
+        game.begin(at(0));
+        // Let each phase run out its clock rather than scripting points:
+        // the night closes with nobody dead, the day with nobody lynched,
+        // and round 2's night is the session now open.
+        let mut now = at(0);
+        while game.round == Round(1) {
+            now = game.next_deadline().expect("an open phase has a clock");
+            game.expire(now);
+        }
+        assert_eq!(game.round, Round(2), "the game moved on");
+        let late = points_seen_by(
+            &mut game,
+            "bob",
+            1,
+            RequestKind::Devour,
+            "carol",
+            ["alice"],
+            (at(1), now + Duration::from_millis(1)),
+        );
+        assert!(
+            !forwarded_anything(&late),
+            "a point from round 1 is nobody's news in round 2: {late:?}"
+        );
+    }
+
+    #[test]
+    fn a_point_whose_session_has_closed_is_forwarded_to_nobody() {
+        // Scenario 2. The round still stands; the session does not.
+        let mut game = game(village());
+        game.begin(at(0));
+        // Close the night on its own hard limit.
+        let deadline = game.next_deadline().expect("the night has a clock");
+        game.expire(deadline);
+        let late = points_seen_by(
+            &mut game,
+            "bob",
+            1,
+            RequestKind::Devour,
+            "carol",
+            ["alice"],
+            (at(1), deadline + Duration::from_millis(1)),
+        );
+        assert!(
+            !forwarded_anything(&late),
+            "the pack's session is closed, so nothing more is passed on: {late:?}"
+        );
+    }
+
+    #[test]
+    fn a_point_that_arrives_after_the_game_has_ended_is_forwarded_to_nobody() {
+        // Scenario 3: the failure this was all found through. A
+        // straggler's nomination arrives after the last elimination ended
+        // the game, and must reach nobody — a survivor's last observation
+        // is the outcome.
+        let mut game = game(village());
+        let directives = play(&mut game, &village_wins());
+        assert!(
+            directives.iter().any(|directive| matches!(
+                directive,
+                Directive::Narrate {
+                    narration: Narration::Outcome(_),
+                    ..
+                }
+            )),
+            "the script ends the game"
+        );
+        let round = game.round.0;
+        let straggler = points_seen_by(
+            &mut game,
+            "erin",
+            round,
+            RequestKind::Nominate,
+            "carol",
+            ["carol", "dave"],
+            (at(1), at(10 * LATER)),
+        );
+        assert!(
+            !forwarded_anything(&straggler),
+            "the game is over; a point is news to nobody: {straggler:?}"
+        );
+    }
+
+    #[test]
+    fn a_point_is_forwarded_to_exactly_the_audience_it_names() {
+        // Scenario 6, and the one that gives the negatives their meaning:
+        // an accepted point does reach the players it names, and nobody
+        // else.
+        let mut game = game(village());
+        game.begin(at(0));
+        let forwarded = points_seen_by(
+            &mut game,
+            "bob",
+            1,
+            RequestKind::Devour,
+            "carol",
+            ["alice", "erin"],
+            (at(1), at(2)),
+        );
+        let seen = forwards(&forwarded);
+        let [(from, to, point)] = seen.as_slice() else {
+            panic!("exactly one forward: {forwarded:?}");
+        };
+        assert_eq!(*from, &id("bob"), "whose point it is");
+        assert_eq!(**to, ids(["alice", "erin"]), "and who is told of it");
+        assert_eq!(point.target, id("carol"));
+    }
+
+    #[test]
+    fn the_hammers_point_is_forwarded_before_the_day_closes() {
+        // Scenario 4. A player learns of the point that lynched somebody
+        // before it learns of the lynch, because that is the order the two
+        // things happened in.
+        let mut game = game(village());
+        game.begin(at(0));
+        // Round 1's night runs out with nobody dead, so all five live into
+        // the day and three of them are a majority.
+        let night = game.next_deadline().expect("the night has a clock");
+        game.expire(night);
+        let living: Vec<AgentId> = game.living().iter().cloned().collect();
+        assert_eq!(living.len(), 5, "nobody died in the night");
+        let target = living[0].clone();
+        let mut closing = Vec::new();
+        for (index, who) in living.iter().skip(1).take(3).enumerate() {
+            let seen_by: Vec<&str> = living
+                .iter()
+                .filter(|other| *other != who)
+                .map(AgentId::as_str)
+                .collect();
+            let at_instant = night + Duration::from_millis(index as u64 + 1);
+            let point = Point {
+                round: game.round,
+                kind: RequestKind::Nominate,
+                target: target.clone(),
+                seen_by: seen_by.iter().map(|who| id(who)).collect(),
+            };
+            closing = game.point(who, &point, at_instant, at_instant);
+        }
+        // The last of the three completed the majority, so its cycle both
+        // forwards its point and closes the day.
+        let forwarded = closing
+            .iter()
+            .position(|directive| matches!(directive, Directive::Forward { .. }))
+            .unwrap_or_else(|| panic!("the hammer's point is forwarded: {closing:?}"));
+        let narrated = closing
+            .iter()
+            .position(|directive| matches!(directive, Directive::Narrate { .. }))
+            .unwrap_or_else(|| panic!("the hammer closes the day: {closing:?}"));
+        assert!(
+            forwarded < narrated,
+            "the point comes before the lynch it caused: {closing:?}"
+        );
+    }
+
+    #[test]
+    fn a_point_that_arrives_on_the_deadline_is_forwarded_and_one_after_it_is_not() {
+        // Scenario 5. `Game::point` is called before `Game::expire` for
+        // one observation, because a deadline that passed while that
+        // observation waited joins its cycle (ADR-0008). So a point
+        // received *at* the deadline is still in an open session, and one
+        // received after the session was expired is not. The boundary is
+        // asserted from both sides rather than assumed.
+        let mut game = game(village());
+        game.begin(at(0));
+        let deadline = game.next_deadline().expect("the night has a clock");
+        let on_time = points_seen_by(
+            &mut game,
+            "bob",
+            1,
+            RequestKind::Devour,
+            "carol",
+            ["alice"],
+            (at(1), deadline),
+        );
+        assert!(
+            forwarded_anything(&on_time),
+            "a point received on the deadline is still in an open session: {on_time:?}"
+        );
+        // Now the clock is allowed to close it, and the next point is late.
+        game.expire(deadline);
+        let too_late = points_seen_by(
+            &mut game,
+            "bob",
+            1,
+            RequestKind::Devour,
+            "erin",
+            ["alice"],
+            (at(2), deadline + Duration::from_millis(1)),
+        );
+        assert!(
+            !forwarded_anything(&too_late),
+            "and one arriving after the session closed is not: {too_late:?}"
+        );
+    }
+
+    #[test]
+    fn a_change_of_mind_is_forwarded_in_the_order_the_moderator_accepted_it() {
+        // Scenario 8. The divergence peer-to-peer delivery cannot rule
+        // out: one player points twice and every recipient must be told of
+        // both, in the order the moderator took them, so that everybody's
+        // idea of that player's vote ends the same way.
+        let mut game = game(village());
+        game.begin(at(0));
+        let night = game.next_deadline().expect("the night has a clock");
+        game.expire(night);
+        let living: Vec<AgentId> = game.living().iter().cloned().collect();
+        let voter = living[0].clone();
+        let seen_by: Vec<&str> = living
+            .iter()
+            .filter(|other| **other != voter)
+            .map(AgentId::as_str)
+            .collect();
+        let mut targets = Vec::new();
+        for (index, target) in [&living[1], &living[2]].into_iter().enumerate() {
+            let at_instant = night + Duration::from_millis(index as u64 + 1);
+            let point = Point {
+                round: game.round,
+                kind: RequestKind::Nominate,
+                target: target.clone(),
+                seen_by: seen_by.iter().map(|who| id(who)).collect(),
+            };
+            let directives = game.point(&voter, &point, at_instant, at_instant);
+            let seen = forwards(&directives);
+            let [(from, to, forwarded)] = seen.as_slice() else {
+                panic!("each point is forwarded once: {directives:?}");
+            };
+            assert_eq!(*from, &voter);
+            let expected: BTreeSet<AgentId> = seen_by.iter().map(|who| id(who)).collect();
+            assert_eq!(**to, expected);
+            targets.push(forwarded.target.clone());
+        }
+        assert_eq!(
+            targets,
+            vec![living[1].clone(), living[2].clone()],
+            "both points are forwarded, in the order they were accepted"
+        );
+        // And the vote the game counts is the later of the two.
+        let tally = game.sessions[0].points.get(&voter);
+        assert_eq!(tally, Some(&living[2]), "the most recent point is the vote");
+    }
+
+    #[test]
+    fn a_point_the_game_rejects_is_forwarded_to_nobody_and_changes_no_vote() {
+        // Scenario 9's other half: what a player could compute from what
+        // it observed agrees with what the game counts, because the game
+        // forwards exactly the points it accepted and no others.
+        let mut game = game(village());
+        game.begin(at(0));
+        let accepted = points_seen_by(
+            &mut game,
+            "bob",
+            1,
+            RequestKind::Devour,
+            "carol",
+            ["alice"],
+            (at(1), at(2)),
+        );
+        assert!(forwarded_anything(&accepted));
+        let counted = game
+            .sessions
+            .iter()
+            .find(|session| session.kind == RequestKind::Devour);
+        let counted = counted.expect("the pack's session is open");
+        assert_eq!(
+            counted.points.get(&id("bob")),
+            Some(&id("carol")),
+            "the accepted point is the vote"
+        );
+        // A point for a round that has passed changes nothing and is told
+        // to nobody, so no observer can believe otherwise.
+        let stale = points_seen_by(
+            &mut game,
+            "bob",
+            0,
+            RequestKind::Devour,
+            "erin",
+            ["alice"],
+            (at(3), at(4)),
+        );
+        assert!(!forwarded_anything(&stale), "{stale:?}");
+        let counted = game
+            .sessions
+            .iter()
+            .find(|session| session.kind == RequestKind::Devour)
+            .expect("still open");
+        assert_eq!(
+            counted.points.get(&id("bob")),
+            Some(&id("carol")),
+            "and the vote it would have changed is untouched"
+        );
+    }
+
+    #[test]
+    fn a_point_nobody_else_sees_is_forwarded_to_nobody() {
+        // Scenario 7. The seer's and the doctor's business is their own,
+        // and they name no audience, so nothing is forwarded.
+        let mut game = game(village());
+        game.begin(at(0));
+        for (who, kind) in [
+            ("carol", RequestKind::Investigate),
+            ("dave", RequestKind::Protect),
+        ] {
+            let directives = points_seen_by(&mut game, who, 1, kind, "alice", [], (at(1), at(2)));
+            assert!(
+                !forwarded_anything(&directives),
+                "{who}'s {kind:?} is nobody else's business: {directives:?}"
+            );
+        }
     }
 
     /// In the village, alice is devoured and then bob, the only werewolf,
@@ -1314,8 +1720,9 @@ mod tests {
                     round: point_round,
                     kind,
                     target: pick(&mut moves, &space).clone(),
+                    seen_by: BTreeSet::new(),
                 };
-                game.point(&who, &point, now);
+                game.point(&who, &point, now, now);
             }
             // Every player points once and never changes its mind, so
             // running the clock out is what closes the phase.
@@ -1619,7 +2026,9 @@ mod tests {
                     | Narration::Outcome(_) => Some(narration.clone()),
                     _ => None,
                 },
-                Directive::Stop { .. } => None,
+                // A forward is one player's point passed on, not
+                // something the game settled.
+                Directive::Forward { .. } | Directive::Stop { .. } => None,
             })
             .collect()
     }
@@ -1871,6 +2280,18 @@ mod tests {
                         if let Narration::Eliminated { who, .. } = narration {
                             assert!(!to.contains(who), "{who} is told of its own death");
                         }
+                    }
+                    // A forwarded point is an observation like any
+                    // other, so the same rule holds: the dead are told
+                    // nothing, a point included.
+                    Directive::Forward { from, to, .. } => {
+                        for who in to {
+                            assert!(
+                                !dead.contains(who),
+                                "{who} is dead but is forwarded a point from {from}"
+                            );
+                        }
+                        assert!(!to.contains(from), "{from} is forwarded its own point");
                     }
                     // The death and the stop are one cycle's work, so a
                     // player counts as dead from the stop onward.

@@ -125,7 +125,13 @@ impl Moderator {
         let sender = &observation.event.sender;
         let now = observation.received;
         let mut directives = match &observation.event.payload {
-            Message::Point(point) => self.game.point(sender, point, now),
+            // Two instants, and the difference matters. `created` is when
+            // the player pointed, and a forwarded point carries it so the
+            // relay costs latency and nothing else. `now` is when the
+            // moderator got it, which is what the session clocks run on.
+            Message::Point(point) => self
+                .game
+                .point(sender, point, observation.event.created, now),
             Message::Narration(_) => panic!("{sender} sent the moderator a narration"),
         };
         // A deadline that passed while this observation waited joins its
@@ -177,7 +183,17 @@ fn send(directive: Directive) -> Effect<WerewolfDomain> {
         Directive::Narrate { to, narration } => Effect::Act(Action {
             recipients: Recipients::To(to),
             payload: Message::Narration(narration),
+            origin: None,
         }),
+        // A forwarded point is sent as the player that made it, not as the
+        // moderator: what a recipient observes is what it would have
+        // observed had the player addressed it directly (ADR-0014).
+        Directive::Forward {
+            from,
+            created,
+            to,
+            point,
+        } => Effect::Act(Action::relay(from, created, to, Message::Point(point))),
         Directive::Stop { who } => Effect::control([who], Control::Stop),
     }
 }
@@ -294,6 +310,7 @@ mod tests {
                 round,
                 kind,
                 target,
+                seen_by: BTreeSet::new(),
             }),
         )
     }
@@ -494,6 +511,7 @@ mod tests {
                 Action {
                     recipients: Recipients::To(to),
                     payload: Message::Narration(Narration::Outcome(outcome)),
+                    ..
                 } => Some((to, outcome)),
                 _ => None,
             })

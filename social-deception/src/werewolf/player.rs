@@ -45,6 +45,8 @@
 //! agent in the roster and the night's secrets are exactly what must not
 //! travel that far.
 
+use std::collections::BTreeSet;
+
 use super::WerewolfDomain;
 use super::knowledge::Knowledge;
 use super::message::{Message, Narration, Point, RequestKind, Round};
@@ -133,29 +135,35 @@ impl<R: Player, P: Policy> Seat<R, P> {
             round,
             kind,
             target: chosen,
+            seen_by: self.audience(kind),
         })
     }
 
-    /// Who sees a point of this kind, besides the moderator: the pack for a
-    /// `Devour`, every other living player for a `Nominate`, and nobody for
-    /// the seer's and the doctor's own business.
+    /// Who else should see a point of this kind: the pack for a `Devour`,
+    /// every other living player for a `Nominate`, and nobody for the
+    /// seer's and the doctor's own business.
     ///
-    /// Always from the seat's own knowledge, and always without itself: a
-    /// player does not observe its own actions, and the router forbids an
-    /// agent addressing one to itself.
-    fn audience(&self, kind: RequestKind) -> Vec<AgentId> {
+    /// These are not recipients. A point is addressed to the moderator
+    /// alone; this is who the moderator forwards it to, and only if the
+    /// session is still open when it arrives. Naming them is the player's
+    /// job because the audience follows from the player's own role and its
+    /// own knowledge of who is alive.
+    ///
+    /// Always without itself: a player does not observe its own actions.
+    /// The moderator is not named either, since it receives every point
+    /// directly and has no need to be forwarded one.
+    fn audience(&self, kind: RequestKind) -> BTreeSet<AgentId> {
         let knowledge = self.player.knowledge();
         let me = &knowledge.me;
         let seen_by = match kind {
             RequestKind::Devour => &knowledge.pack,
             RequestKind::Nominate => &knowledge.living,
-            RequestKind::Investigate | RequestKind::Protect => return vec![self.moderator.clone()],
+            RequestKind::Investigate | RequestKind::Protect => return BTreeSet::new(),
         };
         seen_by
             .iter()
             .filter(|who| *who != me && knowledge.living.contains(*who))
             .cloned()
-            .chain([self.moderator.clone()])
             .collect()
     }
 }
@@ -192,7 +200,7 @@ impl<R: Player, P: Policy> Handler<WerewolfDomain> for Seat<R, P> {
                     return Vec::new();
                 };
                 self.point(round, kind)
-                    .map(|point| agent::Action::to(self.audience(kind), Message::Point(point)))
+                    .map(|point| agent::Action::to([self.moderator.clone()], Message::Point(point)))
                     .into_iter()
                     .collect()
             }
@@ -265,25 +273,27 @@ mod tests {
     }
 
     /// The action `Seat` takes when a phase begins: a point naming its own
-    /// session, addressed to `seen_by` and always to the moderator.
+    /// session, addressed to the moderator alone and naming `seen_by` as
+    /// the players the moderator should forward it to.
     ///
     /// There is no request to echo (ADR-0014), so a point is identified by
     /// the round and the kind it was made in, which is what the reader of a
-    /// trajectory reads off it directly.
+    /// trajectory reads off it directly. And there is no player among the
+    /// recipients: a player addresses the moderator and nobody else, which
+    /// is what keeps a point from outliving its session in a peer's queue.
     fn pointing<const N: usize>(
         round: u32,
         kind: RequestKind,
         target: AgentId,
         seen_by: [&str; N],
     ) -> Action<WerewolfDomain> {
-        let mut to: Vec<AgentId> = seen_by.iter().map(|who| AgentId::new(*who)).collect();
-        to.push(AgentId::new(MODERATOR));
         Action::to(
-            to,
+            [AgentId::new(MODERATOR)],
             Message::Point(Point {
                 round: Round(round),
                 kind,
                 target,
+                seen_by: seen_by.iter().map(|who| AgentId::new(*who)).collect(),
             }),
         )
     }
@@ -408,15 +418,27 @@ mod tests {
             ],
         );
         assert_eq!(actions.len(), 2);
+        // Every action, whatever it is, goes to the moderator and to
+        // nobody else. A player never addresses another player, which is
+        // what stops a point outliving its session in a peer's queue
+        // (ADR-0014).
         for action in &actions {
             assert!(matches!(action.payload, Message::Point(_)), "{action:?}");
+            assert_eq!(
+                action.recipients,
+                Recipients::To(ids([MODERATOR])),
+                "{action:?}"
+            );
         }
-        // The protect is the moderator's alone; the nomination is public.
-        assert_eq!(actions[0].recipients, Recipients::To(ids([MODERATOR])));
-        assert_eq!(
-            actions[1].recipients,
-            Recipients::To(ids([MODERATOR, "alice", "bob", "carol"]))
-        );
+        // What differs is the audience the moderator is asked to forward
+        // to: the protect is nobody else's business, the nomination is
+        // public.
+        let seen_by = |action: &Action<WerewolfDomain>| match &action.payload {
+            Message::Point(point) => point.seen_by.clone(),
+            other @ Message::Narration(_) => panic!("a point, not {other:?}"),
+        };
+        assert_eq!(seen_by(&actions[0]), BTreeSet::new());
+        assert_eq!(seen_by(&actions[1]), ids(["alice", "bob", "carol"]));
     }
 
     #[test]

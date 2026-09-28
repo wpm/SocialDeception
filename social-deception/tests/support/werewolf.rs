@@ -238,11 +238,16 @@ impl<'a> Play<'a> {
     fn read(lines: &'a [Value], config: &'a Config) -> Self {
         let players: BTreeSet<&AgentId> = config.players.iter().collect();
         let said: Vec<Said> = records_of(lines, &config.moderator, "action")
+            // What the moderator says for itself. A point among its
+            // actions is one it passed on for a player, stamped with that
+            // player as sender (ADR-0014); it is that player's action, and
+            // it is read below from the moderator's observation of it.
+            .filter(|line| line["event"]["sender"] == config.moderator.as_str())
             .map(|line| {
                 let message = message(line);
                 assert!(
                     !matches!(message, Message::Point(_)),
-                    "the moderator only narrates: {line}"
+                    "the moderator narrates what it says for itself: {line}"
                 );
                 let to = recipients(line);
                 assert!(
@@ -838,13 +843,30 @@ impl<'a> Play<'a> {
                 let Message::Point(point) = message(line) else {
                     panic!("a player sends only points: {line}");
                 };
+                // A player addresses the moderator and nobody else. That
+                // is the whole of the fix for a point outliving its
+                // session: there is no path to a peer that does not pass
+                // the one agent that knows whether the session is open
+                // (ADR-0014).
                 let to = recipients(line);
-                assert!(
-                    to.contains(moderator),
-                    "every point reaches the moderator: {line}"
+                assert_eq!(
+                    to,
+                    [moderator.clone()]
+                        .into_iter()
+                        .collect::<BTreeSet<AgentId>>(),
+                    "a point is addressed to the moderator alone: {line}"
                 );
-                let others: BTreeSet<&AgentId> =
-                    to.iter().filter(|seer| *seer != moderator).collect();
+                // Who should see it is named in the point, for the
+                // moderator to forward to.
+                let others: BTreeSet<&AgentId> = point.seen_by.iter().collect();
+                assert!(
+                    !others.contains(&who),
+                    "a point does not name its own author as an observer: {line}"
+                );
+                assert!(
+                    !others.contains(moderator),
+                    "the moderator hears every point directly and is not forwarded one: {line}"
+                );
                 match point.kind {
                     // The pack sees its own pointing and nobody else does.
                     RequestKind::Devour => assert!(
@@ -856,12 +878,12 @@ impl<'a> Play<'a> {
                     // The day's vote is public among the living.
                     RequestKind::Nominate => assert!(
                         others.iter().all(|other| *other != who),
-                        "a nomination is not addressed to its own author: {line}"
+                        "a nomination does not name its own author: {line}"
                     ),
                     // Nobody's business but the moderator's.
                     RequestKind::Investigate | RequestKind::Protect => assert!(
                         others.is_empty(),
-                        "a {:?} point is seen by the moderator alone: {line}",
+                        "a {:?} point is nobody else's business: {line}",
                         point.kind
                     ),
                 }
@@ -1403,6 +1425,12 @@ mod tests {
 
     fn recipients(line: &mut Value, to: &[&str]) {
         line["event"]["recipients"] = json!(to);
+    }
+
+    /// Rewrites the audience a point names: who the moderator is asked to
+    /// forward it to. A leak is a name in here that does not belong.
+    fn seen_by(line: &mut Value, to: &[&str]) {
+        line["event"]["payload"]["Point"]["seen_by"] = json!(to);
     }
 
     fn sender(line: &mut Value, from: &str) {
@@ -2042,10 +2070,11 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "a Investigate point is seen by the moderator alone")]
+    #[should_panic(expected = "a Investigate point is nobody else's business")]
     fn a_seers_point_shown_to_another_player_is_caught() {
-        // A nomination reaching another player is the rule now, so what a
-        // leak looks like is the seer's own business traveling.
+        // A point goes to the moderator alone, so a leak is no longer a
+        // recipient: it is the seer naming somebody for the moderator to
+        // forward its own business to.
         let mut lines = fixture();
         let index = find_record(
             &lines,
@@ -2053,7 +2082,7 @@ mod tests {
             "action",
             point_of("grace", 1, "Investigate"),
         );
-        recipients(&mut lines[index], &["bob", "moderator"]);
+        seen_by(&mut lines[index], &["bob"]);
         check(&lines, &config());
     }
 
@@ -2062,13 +2091,16 @@ mod tests {
     fn a_devour_point_shown_to_a_villager_is_caught() {
         let mut lines = fixture();
         let index = find_record(&lines, "dave", "action", point_of("dave", 1, "Devour"));
-        recipients(&mut lines[index], &["alice", "erin", "moderator"]);
+        seen_by(&mut lines[index], &["alice", "erin"]);
         check(&lines, &config());
     }
 
     #[test]
-    #[should_panic(expected = "every point reaches the moderator")]
+    #[should_panic(expected = "a point is addressed to the moderator alone")]
     fn a_point_that_never_reaches_the_moderator_is_caught() {
+        // A point addressed to a player instead of the moderator is the
+        // very thing this design removes: there would be no check on
+        // whether its session is still open (ADR-0014).
         let mut lines = fixture();
         let index = find_record(&lines, "alice", "action", point_of("alice", 1, "Nominate"));
         recipients(&mut lines[index], &["bob"]);

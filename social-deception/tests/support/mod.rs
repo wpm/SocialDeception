@@ -256,12 +256,24 @@ fn check_record(line: &Value, kind: &str) {
             // An action has no `received`: its sender knows only when it
             // sent it, and when each recipient got it is in that
             // recipient's own observation record. The check above says so.
-            let (sender, recipients, _) = event(line);
+            let (sender, recipients, payload) = event(line);
             check_recipients(line, sender, &recipients);
-            assert_eq!(
-                sender,
-                agent(line),
-                "an action names the agent that took it as its sender: {line}"
+            if sender == agent(line) {
+                return;
+            }
+            // The one exception: an agent passing on somebody else's
+            // action. The event keeps the original sender, so that a
+            // recipient cannot tell the difference and the relay costs
+            // latency and nothing else (ADR-0014). In Werewolf only the
+            // moderator relays, and only a point.
+            assert!(
+                !payload["Point"].is_null(),
+                "an action names the agent that took it as its sender, \
+                 unless it is one being passed on: {line}"
+            );
+            assert!(
+                !recipients.contains(&&Value::from(agent(line))),
+                "an agent does not forward an action to itself: {line}"
             );
         }
         // `check` matched the kind before calling; there is no other.
@@ -340,6 +352,18 @@ fn check_cycle(cycle: &Value, records: &HashMap<(&str, u64), &Value>) {
             "an output is an action: {record} in {cycle}"
         );
         let created = time(record, "created");
+        // An action an agent passed on for somebody else keeps the instant
+        // that somebody made it, which is necessarily before the cycle
+        // that forwarded it: that gap is the latency the relay costs, and
+        // it is the only trace the relay leaves (ADR-0014).
+        if record["event"]["sender"] != agent(record) {
+            assert!(
+                created < t_start,
+                "a forwarded action was created before the cycle that \
+                 passed it on: {record} in {cycle}"
+            );
+            continue;
+        }
         assert!(
             t_start <= created && created <= t_stop,
             "an action is created within its cycle's window: {record} in {cycle}"
@@ -492,9 +516,17 @@ fn check_the_join(lines: &[Value]) {
             .and_modify(|latest| *latest = (*latest).max(at))
             .or_insert(at);
     }
+    // Keyed by who *acted* and when, which is what an observation names.
+    // A forwarded action is the same event as the one it passes on, so it
+    // is not a second action under this key: it is skipped here and joined
+    // through the original below (ADR-0014).
     let mut actions: BTreeMap<(&str, u64), &Value> = BTreeMap::new();
     for line in lines.iter().filter(|line| line["type"] == "action") {
-        let key = (agent(line), time(line, "created"));
+        let (sender, _, _) = event(line);
+        if sender != agent(line) {
+            continue;
+        }
+        let key = (sender, time(line, "created"));
         assert!(
             actions.insert(key, line).is_none(),
             "an agent takes at most one action per instant, or no observation could \
@@ -510,10 +542,22 @@ fn check_the_join(lines: &[Value]) {
         });
         let (_, sent_to, sent) = event(action);
         assert_eq!(
-            (&recipients, payload),
-            (&sent_to, sent),
+            payload, sent,
             "an observation and its action are the same event: {line} against {action}"
         );
+        // The recipients agree when the observer was addressed directly.
+        // They need not when the event was passed on: the original names
+        // whoever the actor addressed — in Werewolf the moderator alone —
+        // and the forwarded copy names the players it was relayed to. The
+        // observer is among the latter, which is checked for every
+        // observation regardless.
+        if sent_to.contains(&&Value::from(agent(line))) {
+            assert_eq!(
+                recipients, sent_to,
+                "an observation and its action name the same recipients: \
+                 {line} against {action}"
+            );
+        }
         assert!(
             observed.insert((key, agent(line))),
             "an agent observes an event once: {line}"
