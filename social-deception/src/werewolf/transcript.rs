@@ -1851,20 +1851,26 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn a_game_that_ends_at_night_has_no_final_day() {
-        // Carol is devoured, erin is lynched, and alice is devoured while
-        // the doctor abstains: the werewolves win at parity on night two.
-        let lines = scripted(
+    /// A game where carol is devoured, erin is lynched on dave's selection,
+    /// and alice is devoured while the doctor abstains: the werewolves win
+    /// at parity on night two, so there is no second day.
+    ///
+    /// On the lynching: three of the four living select erin, so dave's is
+    /// the hammer and the day closes before erin is ever asked.
+    fn werewolves_win_at_parity() -> Vec<Value> {
+        scripted(
             village(),
             &[
                 answers([("bob", "carol"), ("carol", "bob"), ("dave", "alice")]),
-                // Three of four living select erin, so dave's is the
-                // hammer and the day closes before erin is asked.
                 answers([("alice", "erin"), ("bob", "erin"), ("dave", "erin")]),
                 answers([("bob", "alice"), ("dave", "bob")]),
             ],
-        );
+        )
+    }
+
+    #[test]
+    fn a_game_that_ends_at_night_has_no_final_day() {
+        let lines = werewolves_win_at_parity();
         let transcript = read(&lines).unwrap();
         assert_eq!(transcript.rounds.len(), 2);
         let last = &transcript.rounds[1];
@@ -1897,17 +1903,7 @@ mod tests {
         // from the moderator's own actions: a nomination it passed on is
         // one it accepted, and the last such before it announced the
         // lynching is the selection that completed the majority.
-        let lines = scripted(
-            village(),
-            &[
-                answers([("bob", "carol"), ("carol", "bob"), ("dave", "alice")]),
-                // alice, then bob, then dave, all at erin. dave's is the
-                // third of four living, so it makes the majority and ends
-                // the day; erin is never asked.
-                answers([("alice", "erin"), ("bob", "erin"), ("dave", "erin")]),
-                answers([("bob", "alice"), ("dave", "bob")]),
-            ],
-        );
+        let lines = werewolves_win_at_parity();
         let day = read(&lines).unwrap().rounds[0]
             .day
             .clone()

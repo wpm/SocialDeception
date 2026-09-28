@@ -1006,6 +1006,16 @@ mod tests {
         writer.join()
     }
 
+    /// Sends `sample` through a writer over `sinks`, each under its policy.
+    fn play_into(sinks: [(Spy, Policy); 2]) -> io::Result<()> {
+        let sinks: Vec<(Box<dyn Sink<TestDomain>>, Policy)> = sinks
+            .into_iter()
+            .map(|(sink, policy)| (Box::new(sink) as Box<dyn Sink<TestDomain>>, policy))
+            .collect();
+        let (sender, writer) = Writer::spawn(sinks);
+        play(sender, writer)
+    }
+
     #[test]
     fn a_required_sink_s_failure_is_loud_at_both_ends() {
         let broken: Box<dyn Sink<TestDomain>> = Box::new(JsonLines::new(BrokenSink));
@@ -1108,12 +1118,11 @@ mod tests {
     fn every_sink_sees_every_record_in_the_same_order() {
         let first = Spy::new();
         let second = Spy::new();
-        let sinks: Vec<(Box<dyn Sink<TestDomain>>, Policy)> = vec![
-            (Box::new(first.clone()), Policy::Required),
-            (Box::new(second.clone()), Policy::Optional),
-        ];
-        let (sender, writer) = Writer::spawn(sinks);
-        play(sender, writer).unwrap();
+        play_into([
+            (first.clone(), Policy::Required),
+            (second.clone(), Policy::Optional),
+        ])
+        .unwrap();
 
         let expected: Vec<String> = expected_lines()
             .iter()
@@ -1133,12 +1142,11 @@ mod tests {
     #[test]
     fn a_failing_required_sink_takes_the_run_with_it() {
         let survivor = Spy::new();
-        let sinks: Vec<(Box<dyn Sink<TestDomain>>, Policy)> = vec![
-            (Box::new(Spy::failing_after(2)), Policy::Required),
-            (Box::new(survivor.clone()), Policy::Optional),
-        ];
-        let (sender, writer) = Writer::spawn(sinks);
-        let error = play(sender, writer).unwrap_err();
+        let error = play_into([
+            (Spy::failing_after(2), Policy::Required),
+            (survivor.clone(), Policy::Optional),
+        ])
+        .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
         // The writer stopped where the required sink did, so the sink beside
         // it saw no more than the record that failed.
@@ -1149,12 +1157,11 @@ mod tests {
     fn a_failing_optional_sink_is_dropped_and_nothing_else_notices() {
         let dropped = Spy::failing_after(2);
         let survivor = Spy::new();
-        let sinks: Vec<(Box<dyn Sink<TestDomain>>, Policy)> = vec![
-            (Box::new(dropped.clone()), Policy::Optional),
-            (Box::new(survivor.clone()), Policy::Required),
-        ];
-        let (sender, writer) = Writer::spawn(sinks);
-        play(sender, writer).unwrap();
+        play_into([
+            (dropped.clone(), Policy::Optional),
+            (survivor.clone(), Policy::Required),
+        ])
+        .unwrap();
         // It took two and was gone; the run and the other sink went on.
         assert_eq!(dropped.seen().len(), 2);
         assert_eq!(survivor.seen().len(), sample().len());
