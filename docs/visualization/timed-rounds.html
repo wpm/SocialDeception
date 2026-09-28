@@ -116,7 +116,7 @@ pre.mermaid{background:var(--surface);border:1px solid var(--rule);border-radius
 <header>
   <div class="eyebrow">Social Deception · ADR-0011 · ADR-0013</div>
   <h1>Timed rounds</h1>
-  <p class="lede">One night and one day of Werewolf under timed pointing sessions. At night the pack, the seer and the doctor point in separate sessions that close on their own clocks. By day everyone talks and points in public until a majority casts the hammer. See <a href="../decision-history/0011-werewolf-phases-are-timed-pointing-sessions.md">ADR-0011</a> for the rules and <a href="../decision-history/0013-speech-typing-and-a-scheduler-for-when-to-speak.md">ADR-0013</a> for speech and typing.</p>
+  <p class="lede">One night and one day of Werewolf under timed selection sessions. At night the pack, the seer and the doctor select in separate sessions that close on their own clocks. By day everyone talks and selects in public until a majority casts the hammer. See <a href="../decision-history/0011-werewolf-phases-are-timed-pointing-sessions.md">ADR-0011</a> for the rules and <a href="../decision-history/0013-speech-typing-and-a-scheduler-for-when-to-speak.md">ADR-0013</a> for speech and typing.</p>
 </header>
 <section id="table">
   
@@ -131,7 +131,7 @@ pre.mermaid{background:var(--surface);border:1px solid var(--rule);border-radius
     </div>
     <div class="stage-body">
       <div class="table-view">
-        <svg class="tbl" id="svg" viewBox="0 0 440 380" role="img" aria-label="Seven players seated in a circle, with arrows showing who points at whom">
+        <svg class="tbl" id="svg" viewBox="0 0 440 380" role="img" aria-label="Seven players seated in a circle, with arrows showing who selects whom">
           <defs>
             <marker id="ah-wolf" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--wolf)"/></marker>
             <marker id="ah-day" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--amber)"/></marker>
@@ -145,9 +145,9 @@ pre.mermaid{background:var(--surface);border:1px solid var(--rule);border-radius
       <div class="log" id="log" aria-live="polite"></div>
     </div>
     <div class="legend">
-      <span><i class="sw" style="background:var(--wolf)"></i>Wolf point, pack and moderator</span>
-      <span><i class="sw" style="background:var(--night)"></i>Private point, moderator only</span>
-      <span><i class="sw" style="background:var(--amber)"></i>Public point</span>
+      <span><i class="sw" style="background:var(--wolf)"></i>Wolf selection, pack and moderator</span>
+      <span><i class="sw" style="background:var(--night)"></i>Private selection, moderator only</span>
+      <span><i class="sw" style="background:var(--amber)"></i>Public selection</span>
       <span class="mono">…</span><span style="margin-left:-8px">typing</span>
     </div>
   </div>
@@ -170,13 +170,13 @@ pre.mermaid{background:var(--surface);border:1px solid var(--rule);border-radius
   const scenes={
     night:{label:"night",limit:8,end:5.6,dead:[],events:[
       {t:0,from:"moderator",to:"living",msg:"PhaseBegan(Night 1)"},
-      {t:0.8,from:"bob",to:"pack, moderator",msg:"Point(dave)",fx:s=>s.points.bob={to:"dave",k:"wolf"}},
-      {t:1.0,from:"erin",to:"moderator",msg:"Point(alice)  protect",fx:s=>{s.points.erin={to:"alice",k:"priv"};s.sess.doctor.quiet=1.0;}},
-      {t:1.2,from:"carol",to:"moderator",msg:"Point(frank)  investigate",fx:s=>{s.points.carol={to:"frank",k:"priv"};s.sess.seer.quiet=1.2;}},
-      {t:1.6,from:"frank",to:"pack, moderator",msg:"Point(grace)",fx:s=>{s.points.frank={to:"grace",k:"wolf"};s.sess.pack.quiet=1.6;}},
-      {t:1.6,note:"Both wolves have pointed. The pack's quiet period starts."},
-      {t:2.8,from:"bob",to:"pack, moderator",msg:"Point(grace)",fx:s=>{s.points.bob={to:"grace",k:"wolf"};s.sess.pack.quiet=2.8;}},
-      {t:2.8,note:"bob changed his point, so the pack's quiet period restarts. The pack now agrees."},
+      {t:0.8,from:"bob",to:"pack, moderator",msg:"Select(dave)",fx:s=>s.selections.bob={to:"dave",k:"wolf"}},
+      {t:1.0,from:"erin",to:"moderator",msg:"Select(alice)  protect",fx:s=>{s.selections.erin={to:"alice",k:"priv"};s.sess.doctor.quiet=1.0;}},
+      {t:1.2,from:"carol",to:"moderator",msg:"Select(frank)  investigate",fx:s=>{s.selections.carol={to:"frank",k:"priv"};s.sess.seer.quiet=1.2;}},
+      {t:1.6,from:"frank",to:"pack, moderator",msg:"Select(grace)",fx:s=>{s.selections.frank={to:"grace",k:"wolf"};s.sess.pack.quiet=1.6;}},
+      {t:1.6,note:"Both wolves have selected. The pack's quiet period starts."},
+      {t:2.8,from:"bob",to:"pack, moderator",msg:"Select(grace)",fx:s=>{s.selections.bob={to:"grace",k:"wolf"};s.sess.pack.quiet=2.8;}},
+      {t:2.8,note:"bob changed his selection, so the pack's quiet period restarts. The pack now agrees."},
       {t:3.0,note:"The doctor's session closes on its own clock: erin protects alice.",fx:s=>s.sess.doctor.closed=true},
       {t:3.2,from:"moderator",to:"carol",msg:"Investigated(frank: werewolf)",fx:s=>s.sess.seer.closed=true},
       {t:3.2,note:"The seer's session closes, and carol learns her finding."},
@@ -194,20 +194,20 @@ pre.mermaid{background:var(--surface);border:1px solid var(--rule);border-radius
       {t:2.4,from:"bob",to:"living",msg:"TypingStarted(t1)",fx:s=>s.typing.add("bob")},
       {t:3.4,from:"bob",to:"living",msg:"Say(t1, \"Carol is lying. A real seer wouldn't show her hand on day one.\")",fx:s=>{s.flash={who:"bob",t:3.4};s.typing.delete("bob");}},
       {t:3.4,from:"bob",to:"living",msg:"TypingEnded(t1)"},
-      {t:3.8,from:"alice",to:"living, moderator",msg:"Point(frank)",fx:s=>s.points.alice={to:"frank",k:"day"}},
-      {t:4.2,from:"dave",to:"living, moderator",msg:"Point(frank)",fx:s=>s.points.dave={to:"frank",k:"day"}},
-      {t:4.6,from:"bob",to:"living, moderator",msg:"Point(carol)",fx:s=>s.points.bob={to:"carol",k:"day"}},
-      {t:5.0,from:"erin",to:"living, moderator",msg:"Point(frank)",fx:s=>s.points.erin={to:"frank",k:"day"}},
-      {t:5.4,from:"frank",to:"living, moderator",msg:"Point(carol)",fx:s=>s.points.frank={to:"carol",k:"day"}},
-      {t:5.8,from:"carol",to:"living, moderator",msg:"Point(frank)",fx:s=>s.points.carol={to:"frank",k:"day"}},
-      {t:5.8,note:"Four of six living players point at frank. That's a majority, and carol's point is the hammer."},
+      {t:3.8,from:"alice",to:"living, moderator",msg:"Select(frank)",fx:s=>s.selections.alice={to:"frank",k:"day"}},
+      {t:4.2,from:"dave",to:"living, moderator",msg:"Select(frank)",fx:s=>s.selections.dave={to:"frank",k:"day"}},
+      {t:4.6,from:"bob",to:"living, moderator",msg:"Select(carol)",fx:s=>s.selections.bob={to:"carol",k:"day"}},
+      {t:5.0,from:"erin",to:"living, moderator",msg:"Select(frank)",fx:s=>s.selections.erin={to:"frank",k:"day"}},
+      {t:5.4,from:"frank",to:"living, moderator",msg:"Select(carol)",fx:s=>s.selections.frank={to:"carol",k:"day"}},
+      {t:5.8,from:"carol",to:"living, moderator",msg:"Select(frank)",fx:s=>s.selections.carol={to:"frank",k:"day"}},
+      {t:5.8,note:"Four of six living players select frank. That's a majority, and carol's selection is the hammer."},
       {t:6.0,from:"moderator",to:"living",msg:"Eliminated(frank, werewolf, lynched)",fx:s=>{s.dead.add("frank");s.done=true;}}
     ]}
   };
 
   let cur="night", state=null, clock=0, raf=null, applied=0, startWall=0;
 
-  function fresh(sc){return {points:{},dead:new Set(sc.dead),typing:new Set(),quiet:null,done:false,flash:null,sess:{pack:{quiet:null,closed:false},seer:{quiet:null,closed:false},doctor:{quiet:null,closed:false}}};}
+  function fresh(sc){return {selections:{},dead:new Set(sc.dead),typing:new Set(),quiet:null,done:false,flash:null,sess:{pack:{quiet:null,closed:false},seer:{quiet:null,closed:false},doctor:{quiet:null,closed:false}}};}
   function fmt(t){const s=t*4;return (Math.floor(s/60))+":"+String(Math.floor(s%60)).padStart(2,"0");}
 
   function drawPlayers(){
@@ -250,7 +250,7 @@ pre.mermaid{background:var(--surface);border:1px solid var(--rule);border-radius
   }
   function drawArrows(){
     const g=$("arrows"); g.innerHTML="";
-    Object.entries(state.points).forEach(([from,pt])=>{
+    Object.entries(state.selections).forEach(([from,pt])=>{
       const a=pos[from], b=pos[pt.to]; const dx=b.x-a.x, dy=b.y-a.y, L=Math.hypot(dx,dy);
       const ux=dx/L, uy=dy/L;
       // bend slightly so opposite arrows don't overlap
@@ -278,10 +278,10 @@ pre.mermaid{background:var(--surface);border:1px solid var(--rule);border-radius
       g.innerHTML=html; return;
     } else {
       const living=NAMES.filter(n=>!sc.dead.includes(n)).length, need=Math.floor(living/2)+1;
-      const counts={}; Object.values(state.points).forEach(p=>counts[p.to]=(counts[p.to]||0)+1);
+      const counts={}; Object.values(state.selections).forEach(p=>counts[p.to]=(counts[p.to]||0)+1);
       let chips=Object.entries(counts).sort((a,b)=>b[1]-a[1]).map(([w,c])=>`<span class="chip${c>=need?" hit":""}">${w} ${c}/${need}</span>`).join("");
       if(state.done)chips=`<span class="chip hit">frank lynched 4/${need}</span>`;
-      html+=`<div class="gauge"><span class="lbl">Majority</span><div class="tally">${chips||'<span class="chip">no points yet</span>'}</div><span class="val">need ${need}</span></div>`;
+      html+=`<div class="gauge"><span class="lbl">Majority</span><div class="tally">${chips||'<span class="chip">no selections yet</span>'}</div><span class="val">need ${need}</span></div>`;
     }
     html+=`<div class="gauge"><span class="lbl">Hard limit</span><div class="track"><div class="fill limit" style="width:${lim*100}%"></div></div><span class="val">${fmt(clock)}</span></div>`;
     g.innerHTML=html;

@@ -107,7 +107,7 @@
 //!
 //! A handler that names a deadline owns its schedule. The instant it gives
 //! replaces whatever was pending, so a handler whose deadline moves — the
-//! moderator's session clocks, which move every time somebody points — is
+//! moderator's session clocks, which move every time somebody selects — is
 //! re-armed where it moved to, and the wake channel is asked of the
 //! [`TimerSource`] once per *distinct* deadline rather than once and kept.
 //! A deadline already in the past fires at once, which is how a handler asks
@@ -484,8 +484,8 @@ pub trait Handler<D: Domain> {
     ///
     /// One observation, because a cycle handles exactly one (ADR-0008): this
     /// is a decision point, and what an agent conditions on at a decision
-    /// point is an observation, not a pile of them. A cycle that popped no
-    /// observation — the opening `Start`, or the timeout — does not call
+    /// selection is an observation, not a pile of them. A cycle that popped
+    /// no observation — the opening `Start`, or the timeout — does not call
     /// this at all.
     ///
     /// Nothing interrupts it. An agent does not know it is being stopped

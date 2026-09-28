@@ -61,7 +61,7 @@
 //! agent is waiting.
 //!
 //! Werewolf needs this: the moderator's sessions close on their clocks
-//! (ADR-0011), so a night where every player has already pointed is
+//! (ADR-0011), so a night where every player has already selected is
 //! quiescent by the count and yet has three sessions still to close. A
 //! stall now means what it always meant, that nobody will speak again, and
 //! in Werewolf it is a player that never answered a request *and* a

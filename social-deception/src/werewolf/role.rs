@@ -74,13 +74,13 @@ impl Role {
     ///
     /// This is what a player calls on itself to decide whether to act.
     /// Nobody tells it to: on hearing that a phase has begun it asks its
-    /// own role what that phase wants of it, and points if the answer is
+    /// own role what that phase wants of it, and selects if the answer is
     /// something. That is ADR-0014 — an event to an agent is a fact it
     /// conditions on, and an instruction telling a player what its own role
     /// already says is not one.
     ///
     /// It is also the one statement of who is asked what. The moderator
-    /// opens a phase's sessions from it and checks an arriving point
+    /// opens a phase's sessions from it and checks an arriving selection
     /// against it, and a role computes its action space from it, so the two
     /// cannot disagree about who is a member of what.
     #[must_use]

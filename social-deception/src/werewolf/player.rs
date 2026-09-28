@@ -7,11 +7,11 @@
 //!
 //! **Nobody asks it to.** On observing that a phase has begun, a living
 //! player asks its own role what that phase wants of it
-//! ([`Role::asked_in`](super::Role::asked_in)) and points if the answer is
+//! ([`Role::asked_in`](super::Role::asked_in)) and selects if the answer is
 //! something. That is ADR-0014: an event to an agent is a fact it
 //! conditions on, and an instruction telling a player what its own role
 //! already says is not one. In the live game nobody waits to be asked — the
-//! moderator says night has fallen and the werewolves point, because they
+//! moderator says night has fallen and the werewolves select, because they
 //! are werewolves and it is night.
 //!
 //! A seat has no opening move: it says nothing until the first phase
@@ -27,11 +27,11 @@
 //! caught: a policy that returns one has a bug, and the game cannot
 //! continue from it.
 //!
-//! # Who a point is addressed to
+//! # Who a selection is addressed to
 //!
-//! A point is not a sealed ballot. Under ADR-0011 pointing is how a pack
+//! A selection is not a sealed ballot. Under ADR-0011 selecting is how a pack
 //! agrees on a victim without speaking, and how a village's argument turns
-//! into a vote, so a point goes to everyone the rules let see it:
+//! into a vote, so a selection goes to everyone the rules let see it:
 //!
 //! | Kind | Recipients |
 //! |---|---|
@@ -39,17 +39,17 @@
 //! | `Investigate`, `Protect` | the moderator |
 //! | `Nominate` | the moderator and every other living player |
 //!
-//! A seat addresses each point itself, from its own [`Knowledge`]: the pack
-//! it was told at the deal, and the living it learns from each
-//! `PhaseBegan`. It never broadcasts, because a broadcast reaches every
-//! agent in the roster and the night's secrets are exactly what must not
-//! travel that far.
+//! A seat addresses each selection itself, from its own [`Knowledge`]: the
+//! pack it was told at the deal, and the living it learns from each
+//! `PhaseBegan`. It never broadcasts, because a broadcast reaches every agent
+//! in the roster and the night's secrets are exactly what must not travel
+//! that far.
 
 use std::collections::BTreeSet;
 
 use super::WerewolfDomain;
 use super::knowledge::Knowledge;
-use super::message::{Message, Narration, Point, RequestKind, Round};
+use super::message::{Message, Narration, RequestKind, Round, Select};
 use super::policy::{Policy, View};
 use crate::agent::{self, Handler, Observation};
 use crate::event::AgentId;
@@ -73,8 +73,8 @@ pub trait Player {
     ///
     /// It may be empty — a doctor can be left with nobody it may protect —
     /// and a player whose action space is empty is not a member of the
-    /// session at all, so a player that does point always had somewhere to
-    /// point.
+    /// session at all, so a player that does select always had somewhere to
+    /// select.
     ///
     /// # Panics
     ///
@@ -84,11 +84,11 @@ pub trait Player {
 }
 
 /// A player as an agent in the episode: a role, the policy that decides for
-/// it, and the moderator it addresses its points to.
+/// it, and the moderator it addresses its selections to.
 ///
 /// One type for every role, because the handler body is the same for all of
 /// them: fold each event into the role's state and, when a phase begins a
-/// session this role is a member of, point where the policy chooses from
+/// session this role is a member of, selects where the policy chooses from
 /// the role's action space.
 #[derive(Debug, Clone)]
 pub struct Seat<R, P> {
@@ -98,7 +98,7 @@ pub struct Seat<R, P> {
 }
 
 impl<R: Player, P: Policy> Seat<R, P> {
-    /// A seat for `player`, deciding with `policy`, pointing to
+    /// A seat for `player`, deciding with `policy`, selecting to
     /// `moderator`.
     #[must_use]
     pub const fn new(player: R, policy: P, moderator: AgentId) -> Self {
@@ -109,16 +109,16 @@ impl<R: Player, P: Policy> Seat<R, P> {
         }
     }
 
-    /// The point this player makes in the session of `kind` now open, if
+    /// The selection this player makes in the session of `kind` now open, if
     /// the policy names a target: its choice from the role's action
     /// space, checked against it and folded into the role's state.
     ///
-    /// `None` is a policy declining to point for now, which is how a
+    /// `None` is a policy declining to select for now, which is how a
     /// member abstains, and it is also what an empty action space leaves
-    /// it: a doctor with nobody it may protect points nowhere. Nothing is
-    /// sent and nothing is folded either way — a point never made is not
+    /// it: a doctor with nobody it may protect selects nowhere. Nothing is
+    /// sent and nothing is folded either way — a selection never made is not
     /// a vote.
-    fn point(&mut self, round: Round, kind: RequestKind) -> Option<Point> {
+    fn select(&mut self, round: Round, kind: RequestKind) -> Option<Select> {
         let action_space = self.player.action_space(kind);
         let chosen = self.policy.choose(View {
             knowledge: self.player.knowledge(),
@@ -131,7 +131,7 @@ impl<R: Player, P: Policy> Seat<R, P> {
             self.player.knowledge().me
         );
         self.player.knowledge_mut().acted(kind, &chosen);
-        Some(Point {
+        Some(Select {
             round,
             kind,
             target: chosen,
@@ -139,18 +139,18 @@ impl<R: Player, P: Policy> Seat<R, P> {
         })
     }
 
-    /// Who else should see a point of this kind: the pack for a `Devour`,
+    /// Who else should see a selection of this kind: the pack for a `Devour`,
     /// every other living player for a `Nominate`, and nobody for the
     /// seer's and the doctor's own business.
     ///
-    /// These are not recipients. A point is addressed to the moderator
+    /// These are not recipients. A selection is addressed to the moderator
     /// alone; this is who the moderator forwards it to, and only if the
     /// session is still open when it arrives. Naming them is the player's
     /// job because the audience follows from the player's own role and its
     /// own knowledge of who is alive.
     ///
     /// Always without itself: a player does not observe its own actions.
-    /// The moderator is not named either, since it receives every point
+    /// The moderator is not named either, since it receives every selection
     /// directly and has no need to be forwarded one.
     fn audience(&self, kind: RequestKind) -> BTreeSet<AgentId> {
         let knowledge = self.player.knowledge();
@@ -170,13 +170,13 @@ impl<R: Player, P: Policy> Seat<R, P> {
 
 impl<R: Player, P: Policy> Handler<WerewolfDomain> for Seat<R, P> {
     /// Folds the observation into the role's state and, if it was a phase
-    /// beginning a session this role is a member of, points from the state
-    /// every earlier observation produced, this one included. Every other
-    /// observation produces nothing but the fold.
+    /// beginning a session this role is a member of, selections from the
+    /// state every earlier observation produced, this one included. Every
+    /// other observation produces nothing but the fold.
     ///
     /// The fold comes first for exactly that reason: the phase's own
-    /// narration says who is still living, and the point has to be decided
-    /// from the living set that includes it.
+    /// narration says who is still living, and the selection has to be
+    /// decided from the living set that includes it.
     ///
     /// # Panics
     ///
@@ -193,14 +193,16 @@ impl<R: Player, P: Policy> Handler<WerewolfDomain> for Seat<R, P> {
             // A phase beginning is what makes a player act, and it acts
             // on its own role rather than on anybody's instruction
             // (ADR-0014). A player the phase asks nothing of, and one
-            // the rules leave nowhere to point, both say nothing.
+            // the rules leave nowhere to select, both say nothing.
             Message::Narration(Narration::PhaseBegan { round, phase, .. }) => {
                 let round = *round;
                 let Some(kind) = self.player.knowledge().role.asked_in(*phase) else {
                     return Vec::new();
                 };
-                self.point(round, kind)
-                    .map(|point| agent::Action::to([self.moderator.clone()], Message::Point(point)))
+                self.select(round, kind)
+                    .map(|selection| {
+                        agent::Action::to([self.moderator.clone()], Message::Select(selection))
+                    })
                     .into_iter()
                     .collect()
             }
@@ -227,7 +229,7 @@ mod tests {
 
     const MODERATOR: &str = "moderator";
 
-    /// Points at the first target in the action space.
+    /// Selects the first target in the action space.
     struct First;
 
     impl Policy for First {
@@ -236,7 +238,7 @@ mod tests {
         }
     }
 
-    /// Points at the last target in the action space.
+    /// Selects the last target in the action space.
     struct Last;
 
     impl Policy for Last {
@@ -245,7 +247,7 @@ mod tests {
         }
     }
 
-    /// Points at a player who is not in the game at all.
+    /// Selects a player who is not in the game at all.
     struct Outside;
 
     impl Policy for Outside {
@@ -254,7 +256,7 @@ mod tests {
         }
     }
 
-    /// Points nowhere, which is how a member abstains.
+    /// Selects nowhere, which is how a member abstains.
     struct Nowhere;
 
     impl Policy for Nowhere {
@@ -272,16 +274,16 @@ mod tests {
         })
     }
 
-    /// The action `Seat` takes when a phase begins: a point naming its own
-    /// session, addressed to the moderator alone and naming `seen_by` as
+    /// The action `Seat` takes when a phase begins: a selection naming its
+    /// own session, addressed to the moderator alone and naming `seen_by` as
     /// the players the moderator should forward it to.
     ///
-    /// There is no request to echo (ADR-0014), so a point is identified by
-    /// the round and the kind it was made in, which is what the reader of a
-    /// trajectory reads off it directly. And there is no player among the
-    /// recipients: a player addresses the moderator and nobody else, which
-    /// is what keeps a point from outliving its session in a peer's queue.
-    fn pointing<const N: usize>(
+    /// There is no request to echo (ADR-0014), so a selection is identified
+    /// by the round and the kind it was made in, which is what the reader of
+    /// a trajectory reads off it directly. And there is no player among the
+    /// recipients: a player addresses the moderator and nobody else, which is
+    /// what keeps a selection from outliving its session in a peer's queue.
+    fn selecting<const N: usize>(
         round: u32,
         kind: RequestKind,
         target: AgentId,
@@ -289,7 +291,7 @@ mod tests {
     ) -> Action<WerewolfDomain> {
         Action::to(
             [AgentId::new(MODERATOR)],
-            Message::Point(Point {
+            Message::Select(Select {
                 round: Round::new(round),
                 kind,
                 target,
@@ -298,10 +300,10 @@ mod tests {
         )
     }
 
-    /// A point of a kind only the moderator sees: the seer's and the
+    /// A selection of a kind only the moderator sees: the seer's and the
     /// doctor's own business.
     fn privately(round: u32, kind: RequestKind, target: AgentId) -> Action<WerewolfDomain> {
-        pointing(round, kind, target, [])
+        selecting(round, kind, target, [])
     }
 
     /// What a seat does with a run of events, each in a cycle of its own,
@@ -326,9 +328,9 @@ mod tests {
     }
 
     #[test]
-    fn a_policy_that_points_nowhere_sends_nothing() {
-        // Pointing nowhere is how a member abstains (ADR-0011). Nothing is
-        // sent, and nothing is folded: a point never made is not a vote,
+    fn a_policy_that_selects_nowhere_sends_nothing() {
+        // Selecting nowhere is how a member abstains (ADR-0011). Nothing is
+        // sent, and nothing is folded: a selection never made is not a vote,
         // so the doctor has no protection to be kept from repeating.
         let mut seat = doctor(Nowhere);
         let silent = handling(
@@ -341,10 +343,10 @@ mod tests {
 
     #[test]
     fn each_phase_is_acted_on_from_the_state_every_earlier_observation_left() {
-        // What makes a player point is the phase beginning, not anybody
-        // asking it to (ADR-0014). The point it makes is a function of
+        // What makes a player select is the phase beginning, not anybody
+        // asking it to (ADR-0014). The selection it makes is a function of
         // everything folded in before that phase began, so the second day
-        // is pointed in from a village bob has left.
+        // is selected in from a village bob has left.
         let mut seat = villager(Last);
         let cycle = [
             narrated(Narration::Assigned {
@@ -358,8 +360,8 @@ mod tests {
         assert_eq!(
             handling(&mut seat, cycle),
             [
-                pointing(1, RequestKind::Nominate, target("bob"), ["alice", "bob"]),
-                pointing(2, RequestKind::Nominate, target("alice"), ["alice"]),
+                selecting(1, RequestKind::Nominate, target("bob"), ["alice", "bob"]),
+                selecting(2, RequestKind::Nominate, target("alice"), ["alice"]),
             ]
         );
     }
@@ -378,10 +380,10 @@ mod tests {
         // nothing of anybody; both are folded in silently.
         assert!(silent.is_empty(), "{silent:?}");
 
-        // The elimination folded in the silent cycle shapes the next point.
+        // The elimination folded in the silent cycle shapes the next selection.
         assert_eq!(
             handling(&mut seat, [phase_began(2, Phase::Day, ids(["alice", ME]))]),
-            [pointing(
+            [selecting(
                 2,
                 RequestKind::Nominate,
                 target("alice"),
@@ -420,10 +422,10 @@ mod tests {
         assert_eq!(actions.len(), 2);
         // Every action, whatever it is, goes to the moderator and to
         // nobody else. A player never addresses another player, which is
-        // what stops a point outliving its session in a peer's queue
+        // what stops a selection outliving its session in a peer's queue
         // (ADR-0014).
         for action in &actions {
-            assert!(matches!(action.payload, Message::Point(_)), "{action:?}");
+            assert!(matches!(action.payload, Message::Select(_)), "{action:?}");
             assert_eq!(
                 action.recipients,
                 Recipients::To(ids([MODERATOR])),
@@ -434,8 +436,8 @@ mod tests {
         // to: the protect is nobody else's business, the nomination is
         // public.
         let seen_by = |action: &Action<WerewolfDomain>| match &action.payload {
-            Message::Point(point) => point.seen_by.clone(),
-            other @ Message::Narration(_) => panic!("a point, not {other:?}"),
+            Message::Select(selection) => selection.seen_by.clone(),
+            other @ Message::Narration(_) => panic!("a selection, not {other:?}"),
         };
         assert_eq!(seen_by(&actions[0]), BTreeSet::new());
         assert_eq!(seen_by(&actions[1]), ids(["alice", "bob", "carol"]));

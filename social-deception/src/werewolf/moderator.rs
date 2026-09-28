@@ -13,15 +13,15 @@
 //! is for: the moderator is the agent that opens play, and it does so before
 //! anybody has spoken to it. It is also where the players are started, since
 //! an episode's environment is the only thing that may send a [`Control`]
-//! (ADR-0007). Thereafter a [`Point`](super::Point) from a player is
+//! (ADR-0007). Thereafter a [`Select`](super::Select) from a player is
 //! recorded. The moderator never sees the control that started it, nor the
 //! one that stops it; those are the loop's, which is why there is no arm for
 //! either here.
 //!
 //! A [`Narration`](super::Narration) arriving from a player is a bug, and
 //! the moderator panics rather than run a game whose state it cannot vouch
-//! for. So is a point in a session the rules never make that player a
-//! member of; the moderator checks that when the point arrives, rather
+//! for. So is a selection in a session the rules never make that player a
+//! member of; the moderator checks that when the selection arrives, rather
 //! than handing out permission in advance (ADR-0014).
 //!
 //! Once the game is over the moderator emits nothing, whatever arrives. The
@@ -126,12 +126,13 @@ impl Moderator {
         let now = observation.received;
         let mut directives = match &observation.event.payload {
             // Two instants, and the difference matters. `created` is when
-            // the player pointed, and a forwarded point carries it so the
+            // the player selected, and a forwarded selection carries it so the
             // relay costs latency and nothing else. `now` is when the
             // moderator got it, which is what the session clocks run on.
-            Message::Point(point) => self
-                .game
-                .point(sender, point, observation.event.created, now),
+            Message::Select(selection) => {
+                self.game
+                    .select(sender, selection, observation.event.created, now)
+            }
             Message::Narration(_) => panic!("{sender} sent the moderator a narration"),
         };
         // A deadline that passed while this observation waited joins its
@@ -185,15 +186,15 @@ fn send(directive: Directive) -> Effect<WerewolfDomain> {
             payload: Message::Narration(narration),
             origin: None,
         }),
-        // A forwarded point is sent as the player that made it, not as the
+        // A forwarded selection is sent as the player that made it, not as the
         // moderator: what a recipient observes is what it would have
         // observed had the player addressed it directly (ADR-0014).
         Directive::Forward {
             from,
             created,
             to,
-            point,
-        } => Effect::Act(Action::relay(from, created, to, Message::Point(point))),
+            selection,
+        } => Effect::Act(Action::relay(from, created, to, Message::Select(selection))),
         Directive::Stop { who } => Effect::control([who], Control::Stop),
     }
 }
@@ -221,8 +222,8 @@ impl Environment<WerewolfDomain> for Moderator {
     ///
     /// # Panics
     ///
-    /// If a player sends the moderator a narration, or if a point is one
-    /// the game cannot accept; see [`Game::point`].
+    /// If a player sends the moderator a narration, or if a selection is one
+    /// the game cannot accept; see [`Game::select`].
     fn handle(&mut self, observation: &Observation<WerewolfDomain>) -> Vec<Effect<WerewolfDomain>> {
         // Whether the game is over is the game's to say, and it is asked
         // before every observation, so the one that ends it is the last
@@ -273,7 +274,7 @@ mod tests {
     use crate::event::{AgentId, Event};
     use crate::testing::{fast, id, ids, observed, town, village};
     use crate::werewolf::assignment::Assignment;
-    use crate::werewolf::message::{Narration, Phase, Point, RequestKind, Round};
+    use crate::werewolf::message::{Narration, Phase, RequestKind, Round, Select};
     use crate::werewolf::role::Faction;
     use crate::werewolf::role::Role::{self, Doctor, Seer, Villager, Werewolf};
 
@@ -308,7 +309,7 @@ mod tests {
     ) -> Observation<WerewolfDomain> {
         from_player(
             who.as_str(),
-            Message::Point(Point {
+            Message::Select(Select {
                 round,
                 kind,
                 target,
@@ -317,25 +318,25 @@ mod tests {
         )
     }
 
-    /// A stub player: whom it points at, out of the targets the rules
+    /// A stub player: whom it selects, out of the targets the rules
     /// permit it.
     ///
-    /// The space is the game's own, so a stub cannot point outside it; the
+    /// The space is the game's own, so a stub cannot select outside it; the
     /// doctor's "not last night's patient" in particular is the rules'
     /// business rather than every stub's.
     type Policy = fn(RequestKind, &[AgentId]) -> AgentId;
 
-    /// Points at the first target the rules permit.
+    /// Selects the first target the rules permit.
     fn first_other(_: RequestKind, space: &[AgentId]) -> AgentId {
         space.first().unwrap().clone()
     }
 
-    /// Points at the last target the rules permit.
+    /// Selects the last target the rules permit.
     fn last_other(_: RequestKind, space: &[AgentId]) -> AgentId {
         space.last().unwrap().clone()
     }
 
-    /// Points at the last permitted target by night and the first by day,
+    /// Selects the last permitted target by night and the first by day,
     /// so that the pack and the village disagree about whom to blame.
     fn two_minded(kind: RequestKind, space: &[AgentId]) -> AgentId {
         match kind.phase() {
@@ -378,16 +379,16 @@ mod tests {
             .collect()
     }
 
-    /// The points stub players following `policy` make when a phase
+    /// The selections stub players following `policy` make when a phase
     /// begins.
     ///
     /// This is a stub of [`Seat`](super::Seat) and acts the way one does
-    /// (ADR-0014): a phase beginning is what makes a player point, and
+    /// (ADR-0014): a phase beginning is what makes a player select, and
     /// each recipient asks its own role what that phase wants of it
     /// rather than waiting to be told. Nothing among the actions is a
     /// request, because the moderator no longer sends any.
     ///
-    /// A player the rules leave nowhere to point says nothing, which is
+    /// A player the rules leave nowhere to select says nothing, which is
     /// the same thing the game means by leaving it out of the session.
     fn respond(
         actions: &[Action<WerewolfDomain>],
@@ -448,7 +449,7 @@ mod tests {
                 .iter()
                 .flat_map(|observation| moderator.handle(observation))
                 .collect();
-            // Every stub points once and never changes its mind, so
+            // Every stub selects once and never changes its mind, so
             // running the clock out is what closes the phase (ADR-0011).
             clock += STEP;
             effects.extend(moderator.timeout(at(clock)));
@@ -812,10 +813,10 @@ mod tests {
 
     #[test]
     fn nothing_is_emitted_after_the_outcome() {
-        // A point that arrives once the game has ended. It is built by
+        // A selection that arrives once the game has ended. It is built by
         // hand rather than found among the requests sent, because none
         // are sent (ADR-0014): the outcome guard stops the fold before
-        // anything about the point is looked at, so any point will do.
+        // anything about the selection is looked at, so any selection will do.
         let (mut moderator, _receiver) = moderator(village());
         play(&mut moderator, first_other, &village());
         assert!(moderator.game.outcome().is_some());
@@ -847,7 +848,7 @@ mod tests {
             for observation in &pending {
                 let produced = reference.handle(observation);
                 assert_eq!(doubled.handle(observation), produced);
-                // A point repeated while its session is still open is
+                // A selection repeated while its session is still open is
                 // simply the same vote again, and says nothing new; once
                 // the game has ended the outcome guard stops the fold
                 // before it starts. Either way the repeat is silent.
