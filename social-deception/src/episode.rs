@@ -498,7 +498,7 @@ use Halt::Departure;
 /// which is strictly before its loop sends the dispatch, so by the time a
 /// dispatch of the environment's is in hand every control of that cycle is
 /// already on `commanded` waiting to be drained (see
-/// [`environment::Adapter`](crate::environment::Adapter)). What is left is
+/// [`environment::Adapter`](Adapter)). What is left is
 /// *when* to issue each, and the two controls want opposite answers.
 ///
 /// A [`Start`](Control::Start) is issued **before** the cycle's events, so
