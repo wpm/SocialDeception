@@ -135,9 +135,9 @@ pub(crate) fn ids<const N: usize>(names: [&str; N]) -> BTreeSet<AgentId> {
     names.map(AgentId::new).into()
 }
 
-/// The agent a point targets, for tests that name agents by string
+/// The agent a selection targets, for tests that name agents by string
 /// literal. The same thing as [`id`], named for the place it is used: it
-/// reads as "the target" where a point's target is what is meant.
+/// reads as "the target" where a selection's target is what is meant.
 pub(crate) fn target(name: &str) -> AgentId {
     id(name)
 }
@@ -150,8 +150,8 @@ pub(crate) fn fast() -> crate::werewolf::config::Timing {
 
     use crate::werewolf::config::{DayTiming, NightTiming, Timing};
 
-    // A night's limit has to outlast the slowest player's one point, or a
-    // point misses its session and the game differs from run to run
+    // A night's limit has to outlast the slowest player's one selection, or a
+    // selection misses its session and the game differs from run to run
     // (ADR-0011); a day's is what costs real time, since a random day
     // rarely reaches a majority and so usually runs it out. These unit
     // tests drive a game with explicit instants and never let a

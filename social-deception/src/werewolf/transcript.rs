@@ -34,7 +34,7 @@
 //! A reward is also the one record here with no sequence number, so it is
 //! outside the contiguity check the moderator's records are held to. The
 //! moderator is the authoritative view: its `action` records are every
-//! narration it sent, and its `observation` records are every point it
+//! narration it sent, and its `observation` records are every selection it
 //! received, each naming the player that made it as its sender. Which
 //! record type a line is *is* the direction, so the reader
 //! needs no direction of its own. Reassembling the game from the players'
@@ -59,7 +59,7 @@ use std::fmt;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
-use super::message::{Cause, Message, Narration, Outcome, Phase, Point, RequestKind, Round};
+use super::message::{Cause, Message, Narration, Outcome, Phase, RequestKind, Round, Select};
 use super::role::{Faction, Role};
 use crate::event::AgentId;
 
@@ -103,7 +103,7 @@ pub struct RoundRecord {
 pub struct PhaseRecord {
     /// Everyone in the game when the phase began.
     pub living: BTreeSet<AgentId>,
-    /// Every point made this phase, by the player that made it, paired
+    /// Every selection made this phase, by the player that made it, paired
     /// with the kind of session it was made in. The target alone does not
     /// say whether it was devoured, protected, investigated or nominated.
     pub moves: BTreeMap<AgentId, (RequestKind, AgentId)>,
@@ -119,7 +119,7 @@ pub struct PhaseRecord {
     /// day with nobody lynched is told from a day still being read
     /// (ADR-0011). Always false for a night.
     pub no_lynch: bool,
-    /// The player whose point completed the majority that ended the day:
+    /// The player whose selection completed the majority that ended the day:
     /// the *hammer*. `None` for a night, and for a day that ran out.
     pub hammer: Option<AgentId>,
 }
@@ -186,18 +186,18 @@ pub enum TranscriptError {
         /// The one found.
         found: u64,
     },
-    /// A point was made in a session its sender is not a member of: the
-    /// phase does not ask that of its role, or the point names a round
+    /// A selection was made in a session its sender is not a member of: the
+    /// phase does not ask that of its role, or the selection names a round
     /// that is not the one under way.
     NotAMember {
         /// The line.
         line: usize,
-        /// The pointing agent.
+        /// The selecting agent.
         from: AgentId,
-        /// The session it pointed in.
+        /// The session it selected in.
         kind: RequestKind,
     },
-    /// A record belongs to a phase that has not begun: a point, an
+    /// A record belongs to a phase that has not begun: a selection, an
     /// investigation or an elimination before the first night, or a day
     /// whose night has not begun or that has begun already.
     NoPhase {
@@ -205,7 +205,7 @@ pub enum TranscriptError {
         line: usize,
     },
     /// A message the moderator never records: a narration it observed
-    /// rather than sent, or a point it took as an action rather than
+    /// rather than sent, or a selection it took as an action rather than
     /// received.
     Misdirected {
         /// The line.
@@ -241,7 +241,7 @@ impl fmt::Display for TranscriptError {
             ),
             Self::NotAMember { line, from, kind } => write!(
                 f,
-                "line {line}: {from} pointed in a {kind:?} session, which it is not a member of"
+                "line {line}: {from} selected in a {kind:?} session, which it is not a member of"
             ),
             Self::NoPhase { line } => {
                 write!(f, "line {line} belongs to a phase, but none has begun")
@@ -329,7 +329,7 @@ struct Record {
 /// What one phase settled, as ADR-0011 guarantees it to be reproducible.
 ///
 /// A projection of a [`PhaseRecord`] onto its outcome alone: who died and
-/// what each seer found. The points that led there, and their order, are
+/// what each seer found. The selections that led there, and their order, are
 /// not part of it, because with timed sessions they are not reproducible.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Verdict {
@@ -343,10 +343,10 @@ pub struct Verdict {
 /// Everything a run of one seed must reproduce (ADR-0011).
 ///
 /// A game played with timed sessions is reproducible in its *outcomes* and
-/// not in its traffic: every death, every finding, the winner and the
-/// rewards are the same on every run of a seed, while the order of points,
-/// and which late points arrive before a session closes, are not. This is
-/// the part the determinism tests compare.
+/// not in its traffic: every death, every finding, the winner and the rewards
+/// are the same on every run of a seed, while the order of selections, and
+/// which late selections arrive before a session closes, are not. This is the
+/// part the determinism tests compare.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Verdicts {
     /// Each player's role, as the moderator dealt it.
@@ -366,7 +366,7 @@ impl Transcript {
     ///
     /// Two runs of one seed agree on this and need not agree on anything
     /// else, so it is what the determinism tests compare. Comparing whole
-    /// transcripts would compare the order points arrived in, which is a
+    /// transcripts would compare the order selections arrived in, which is a
     /// fact about thread scheduling rather than about the game.
     #[must_use]
     pub fn verdicts(&self) -> Verdicts {
@@ -580,10 +580,10 @@ struct Reader {
     /// on, and which is therefore still a candidate for the hammer.
     ///
     /// The moderator forwards each nomination it accepts as it accepts
-    /// it, and the point that completes a majority is forwarded before
+    /// it, and the selection that completes a majority is forwarded before
     /// the lynching it causes is narrated. So the sender of the last
     /// forward before an `Eliminated { cause: Lynched }` is the player
-    /// whose point ended the day, and no narration has to say so
+    /// whose selection ended the day, and no narration has to say so
     /// (ADR-0015). Cleared when a phase begins, so that a lynching can
     /// never take its hammer from the day before.
     latest_nomination: Option<AgentId>,
@@ -606,16 +606,18 @@ impl Reader {
             (Direction::Sent, Message::Narration(narration)) => {
                 self.narrated(line, recipients, narration)
             }
-            (Direction::Received, Message::Point(point)) => self.answered(line, sender, point),
-            // A point the moderator sent is one it is passing on to the
+            (Direction::Received, Message::Select(selection)) => {
+                self.answered(line, sender, selection)
+            }
+            // A selection the moderator sent is one it is passing on to the
             // players who should see it (ADR-0014). It is stamped with the
-            // player that made it, so it is the same point this reader
+            // player that made it, so it is the same selection this reader
             // already folded when the moderator received it, and folding
             // it twice would count one vote as two. What it does say, and
-            // the received point does not, is that the moderator accepted
+            // the received selection does not, is that the moderator accepted
             // it: that is where the hammer comes from (ADR-0015).
-            (Direction::Sent, Message::Point(point)) => {
-                if point.kind == RequestKind::Nominate {
+            (Direction::Sent, Message::Select(selection)) => {
+                if selection.kind == RequestKind::Nominate {
                     self.latest_nomination = Some(sender);
                 }
                 Ok(())
@@ -691,12 +693,12 @@ impl Reader {
         &mut self,
         line: usize,
         from: AgentId,
-        point: Point,
+        selection: Select,
     ) -> Result<(), TranscriptError> {
-        // The point says which session it was made in, so there is
+        // The selection says which session it was made in, so there is
         // nothing to look up (ADR-0014). What has to be checked is that
         // its sender's role is asked that in that phase: a reader learns
-        // the roles from the deal, which precedes every point.
+        // the roles from the deal, which precedes every selection.
         let role = self
             .assignment
             .get(&from)
@@ -704,18 +706,18 @@ impl Reader {
             .ok_or(TranscriptError::NotAMember {
                 line,
                 from: from.clone(),
-                kind: point.kind,
+                kind: selection.kind,
             })?;
-        if role.asked_in(point.kind.phase()) != Some(point.kind) {
+        if role.asked_in(selection.kind.phase()) != Some(selection.kind) {
             return Err(TranscriptError::NotAMember {
                 line,
                 from,
-                kind: point.kind,
+                kind: selection.kind,
             });
         }
         self.current(line)?
             .moves
-            .insert(from, (point.kind, point.target));
+            .insert(from, (selection.kind, selection.target));
         Ok(())
     }
 
@@ -1334,8 +1336,8 @@ mod tests {
             .expect("the fixture has such a record")
     }
 
-    fn is_point(payload: &Value) -> bool {
-        !payload["Point"].is_null()
+    fn is_selection(payload: &Value) -> bool {
+        !payload["Select"].is_null()
     }
 
     #[test]
@@ -1398,7 +1400,7 @@ mod tests {
 
     #[test]
     fn a_record_missing_part_of_its_envelope_is_an_error() {
-        let index = moderator_record(&fixture(), is_point);
+        let index = moderator_record(&fixture(), is_selection);
         for key in ["agent", "seq", "event"] {
             let mut lines = fixture();
             lines[index].as_object_mut().unwrap().remove(key);
@@ -1438,7 +1440,7 @@ mod tests {
     #[test]
     fn a_payload_that_will_not_deserialize_is_an_error() {
         let mut lines = fixture();
-        let index = moderator_record(&lines, is_point);
+        let index = moderator_record(&lines, is_selection);
         lines[index]["event"]["payload"] = json!({"Response": {"request": "seven"}});
         let error = read(&lines).unwrap_err();
         assert!(
@@ -1452,7 +1454,7 @@ mod tests {
     #[test]
     fn a_gap_in_the_moderators_sequence_numbers_is_an_error() {
         let mut lines = fixture();
-        let index = moderator_record(&lines, is_point);
+        let index = moderator_record(&lines, is_selection);
         lines[index]["seq"] = json!(lines[index]["seq"].as_u64().unwrap() + 1);
         let error = read(&lines).unwrap_err();
         assert!(
@@ -1464,18 +1466,18 @@ mod tests {
     }
 
     #[test]
-    fn a_point_in_a_session_the_senders_role_is_not_in_is_an_error() {
+    fn a_selection_in_a_session_the_senders_role_is_not_in_is_an_error() {
         // There is no id to invent an unknown value for any more
-        // (ADR-0014): a point says which session it was made in, and
+        // (ADR-0014): a selection says which session it was made in, and
         // what the reader checks is that the sender's role puts it in
         // that session. So the forgery is a kind the sender's own role
         // is never asked — which one that is depends on the role the
         // fixture dealt, so it is derived rather than written in.
         let mut lines = fixture();
-        let index = moderator_record(&lines, is_point);
+        let index = moderator_record(&lines, is_selection);
         let kind: RequestKind =
-            serde_json::from_value(lines[index]["event"]["payload"]["Point"]["kind"].clone())
-                .expect("a point names its session");
+            serde_json::from_value(lines[index]["event"]["payload"]["Select"]["kind"].clone())
+                .expect("a selection names its session");
         let forged = [
             RequestKind::Devour,
             RequestKind::Investigate,
@@ -1484,7 +1486,7 @@ mod tests {
         .into_iter()
         .find(|other| *other != kind)
         .expect("a night has three kinds and a role is asked one");
-        lines[index]["event"]["payload"]["Point"]["kind"] = json!(forged);
+        lines[index]["event"]["payload"]["Select"]["kind"] = json!(forged);
         let error = read(&lines).unwrap_err();
         assert!(
             matches!(&error, TranscriptError::NotAMember { line, kind, .. }
@@ -1498,11 +1500,11 @@ mod tests {
     }
 
     #[test]
-    fn a_point_from_someone_the_phase_asks_nothing_of_is_an_error() {
+    fn a_selection_from_someone_the_phase_asks_nothing_of_is_an_error() {
         // frank is a villager, and a villager is a member of no night
         // session at all.
         let mut lines = fixture();
-        let index = moderator_record(&lines, is_point);
+        let index = moderator_record(&lines, is_selection);
         lines[index]["event"]["sender"] = json!("frank");
         let error = read(&lines).unwrap_err();
         assert!(
@@ -1512,11 +1514,11 @@ mod tests {
     }
 
     #[test]
-    fn a_point_from_someone_not_in_the_deal_is_an_error() {
+    fn a_selection_from_someone_not_in_the_deal_is_an_error() {
         // A reader learns the roles from the deal, which precedes every
-        // point. A sender the deal never named has no role to check.
+        // selection. A sender the deal never named has no role to check.
         let mut lines = fixture();
-        let index = moderator_record(&lines, is_point);
+        let index = moderator_record(&lines, is_selection);
         lines[index]["event"]["sender"] = json!("zara");
         let error = read(&lines).unwrap_err();
         assert!(
@@ -1546,7 +1548,7 @@ mod tests {
         // empty id in the envelope is a malformed envelope and one in the
         // payload is a payload that is not a Werewolf message, each naming
         // the line.
-        let index = moderator_record(&fixture(), is_point);
+        let index = moderator_record(&fixture(), is_selection);
         for (key, empty) in [("sender", json!("")), ("recipients", json!([""]))] {
             let mut lines = fixture();
             lines[index]["event"][key] = empty;
@@ -1559,7 +1561,7 @@ mod tests {
             assert!(error.to_string().contains("non-empty agent id"), "{error}");
         }
         let mut lines = fixture();
-        lines[index]["event"]["payload"]["Point"]["target"] = json!("");
+        lines[index]["event"]["payload"]["Select"]["target"] = json!("");
         let error = read(&lines).unwrap_err();
         assert!(
             matches!(&error, TranscriptError::Payload { line, .. } if *line == index + 1),
@@ -1616,13 +1618,13 @@ mod tests {
     fn a_response_before_any_phase_is_an_error() {
         let mut lines = fixture();
         // The first night's announcement becomes something harmless, so the
-        // first point is made in no phase at all.
+        // first selection is made in no phase at all.
         let index = moderator_record(&lines, |payload| {
             !payload["Narration"]["PhaseBegan"].is_null()
         });
         lines[index]["event"]["payload"] = json!({"Narration": {"NoDeath": {"round": 1}}});
         let error = read(&lines).unwrap_err();
-        let first_response = moderator_record(&lines, is_point);
+        let first_response = moderator_record(&lines, is_selection);
         assert!(
             matches!(error, TranscriptError::NoPhase { line } if line == first_response + 1),
             "{error:?}"
@@ -1671,13 +1673,13 @@ mod tests {
     }
 
     #[test]
-    fn a_point_the_moderator_sent_is_one_it_forwarded() {
-        // The moderator both receives a point and sends it on to the
-        // players who should see it (ADR-0014), so a point among its
+    fn a_selection_the_moderator_sent_is_one_it_forwarded() {
+        // The moderator both receives a selection and sends it on to the
+        // players who should see it (ADR-0014), so a selection among its
         // actions is no error: the fixture contains both, and it reads.
         let lines = fixture();
         let forwarded = lines.iter().filter(|line| {
-            line["type"] == "action" && !line["event"]["payload"]["Point"].is_null()
+            line["type"] == "action" && !line["event"]["payload"]["Select"].is_null()
         });
         let forwarded: Vec<&Value> = forwarded.collect();
         assert!(
@@ -1690,10 +1692,10 @@ mod tests {
             assert_ne!(
                 line["event"]["sender"],
                 json!(MODERATOR),
-                "a forwarded point is sent as the player that made it: {line}"
+                "a forwarded selection is sent as the player that made it: {line}"
             );
         }
-        read(&lines).expect("a trajectory with forwarded points reads");
+        read(&lines).expect("a trajectory with forwarded selections reads");
     }
 
     /// Writes the moderator's records of a game played through [`Game`]
@@ -1740,13 +1742,16 @@ mod tests {
             for directive in directives {
                 let (to, payload) = match directive {
                     Directive::Narrate { to, narration } => (to, Message::Narration(narration)),
-                    // A forwarded point is recorded as the player that
+                    // A forwarded selection is recorded as the player that
                     // made it, not as the moderator, so the scribe writes
                     // it under that name rather than its own.
                     Directive::Forward {
-                        from, to, point, ..
+                        from,
+                        to,
+                        selection,
+                        ..
                     } => {
-                        self.record("action", from.as_str(), &to, &Message::Point(point));
+                        self.record("action", from.as_str(), &to, &Message::Select(selection));
                         continue;
                     }
                     // A stop is a control, and `Transcript::read` skips
@@ -1757,17 +1762,17 @@ mod tests {
             }
         }
 
-        fn point(&mut self, from: &str, point: Point) {
+        fn select(&mut self, from: &str, selection: Select) {
             self.record(
                 "observation",
                 from,
                 &ids([MODERATOR]),
-                &Message::Point(point),
+                &Message::Select(selection),
             );
         }
     }
 
-    /// Plays `script`, one phase's points per entry, through a game over
+    /// Plays `script`, one phase's selections per entry, through a game over
     /// `assignment`, and returns the moderator's records.
     fn scripted(assignment: Assignment, script: &[Vec<(&str, AgentId)>]) -> Vec<Value> {
         /// Far enough apart that one phase's clocks never reach the next.
@@ -1779,12 +1784,12 @@ mod tests {
         scribe.directives(game.begin(Timestamp::default()));
         for (index, answers) in script.iter().enumerate() {
             let now = Timestamp::from(Duration::from_millis((index as u64 + 1) * STEP));
-            // Taken before any point is recorded: a day ends on the point
-            // that makes a majority, so pointing alone may finish it.
+            // Taken before any selection is recorded: a day ends on the selection
+            // that makes a majority, so selecting alone may finish it.
             let phase = game.phase_now();
             let (phase_kind, round) = phase;
             for (who, chosen) in answers {
-                // Which session a point belongs to is the pointer's own
+                // Which session a selection belongs to is the selector's own
                 // business (ADR-0014): the script stands in for the
                 // player, so it reads it off the role the same way the
                 // player would, rather than off a request.
@@ -1813,14 +1818,14 @@ mod tests {
                         .collect(),
                     RequestKind::Investigate | RequestKind::Protect => BTreeSet::new(),
                 };
-                let point = Point {
+                let selection = Select {
                     round,
                     kind,
                     target: chosen.clone(),
                     seen_by,
                 };
-                scribe.point(who, point.clone());
-                scribe.directives(game.point(&id(who), &point, now, now));
+                scribe.select(who, selection.clone());
+                scribe.directives(game.select(&id(who), &selection, now, now));
             }
             // Close this phase and no more. Expiring at the earliest
             // deadline open, and stopping as soon as the phase moves,
@@ -1854,7 +1859,7 @@ mod tests {
             village(),
             &[
                 answers([("bob", "carol"), ("carol", "bob"), ("dave", "alice")]),
-                // Three of four living point at erin, so dave's is the
+                // Three of four living select erin, so dave's is the
                 // hammer and the day closes before erin is asked.
                 answers([("alice", "erin"), ("bob", "erin"), ("dave", "erin")]),
                 answers([("bob", "alice"), ("dave", "bob")]),
@@ -1891,7 +1896,7 @@ mod tests {
         // Nothing narrates the hammer any more (ADR-0015). It is read
         // from the moderator's own actions: a nomination it passed on is
         // one it accepted, and the last such before it announced the
-        // lynching is the point that completed the majority.
+        // lynching is the selection that completed the majority.
         let lines = scripted(
             village(),
             &[
@@ -1912,7 +1917,7 @@ mod tests {
             Some((id("erin"), Villager, Cause::Lynched)),
             "erin is lynched"
         );
-        assert_eq!(day.hammer, Some(id("dave")), "dave's point made it");
+        assert_eq!(day.hammer, Some(id("dave")), "dave's selection made it");
 
         // And nothing said so: the day's narrations are the lynching and
         // what follows it, with no summary of the session that decided.
@@ -1934,7 +1939,7 @@ mod tests {
     fn a_hammer_never_carries_over_from_an_earlier_day() {
         // A day that runs out of time has no hammer, and must not
         // inherit one from a day that had it. Day 1 is lynched on dave's
-        // point; day 2 is left to the clock.
+        // selection; day 2 is left to the clock.
         let lines = scripted(
             Assignment::new([
                 ("alice", Werewolf),
@@ -1967,7 +1972,7 @@ mod tests {
         );
         let rounds = read(&lines).unwrap().rounds;
         let first = rounds[0].day.clone().expect("day 1");
-        assert_eq!(first.hammer, Some(id("erin")), "day 1 ended on a point");
+        assert_eq!(first.hammer, Some(id("erin")), "day 1 ended on a selection");
         let second = rounds[1].day.clone().expect("day 2");
         assert!(second.no_lynch, "day 2 ran out of time");
         assert_eq!(second.hammer, None, "a day that ran out has no hammer");
@@ -2017,7 +2022,7 @@ mod tests {
         };
         assert_eq!(
             error.to_string(),
-            "line 12: bob pointed in a Protect session, which it is not a member of"
+            "line 12: bob selected in a Protect session, which it is not a member of"
         );
         assert!(error.source().is_none());
     }

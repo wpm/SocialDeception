@@ -41,7 +41,7 @@
 //! | Message | Direction | Is |
 //! |---|---|---|
 //! | [`Narration`] | moderator → a chosen set of players | a true statement the recipients now observe |
-//! | [`Point`] | player → the moderator and whoever else may see it | a target, which the player may revise |
+//! | [`Select`] | player → the moderator and whoever else may see it | a target, which the player may revise |
 //!
 //! There is no third kind, and in particular nothing that asks a player to
 //! act. A player observes that a phase has begun and consults its own role
@@ -50,17 +50,17 @@
 //!
 //! In the reinforcement-learning vocabulary of the design, `Event<Message>`
 //! is the observation type and the move a player's action carries is an
-//! [`AgentId`](crate::AgentId): the target inside the point, not the point
-//! itself. The set of targets the rules permit in a session is the *action
-//! space*, a `Vec<AgentId>` computed by the rules; a target outside it is a
-//! policy bug. A point names the session it was made in, by round and
-//! [`RequestKind`], which both sides derive from what they each know — so
-//! there is nothing to correlate, and a point naming a round that has
+//! [`AgentId`](crate::AgentId): the target inside the selection, not the
+//! selection itself. The set of targets the rules permit in a session is the
+//! *action space*, a `Vec<AgentId>` computed by the rules; a target outside
+//! it is a policy bug. A selection names the session it was made in, by round
+//! and [`RequestKind`], which both sides derive from what they each know — so
+//! there is nothing to correlate, and a selection naming a round that has
 //! passed is one whose session closed while it was in flight.
 //!
-//! A member may point as often as it likes while its session is open, and
-//! its most recent point is its vote; pointing nowhere is how it abstains,
-//! which is why there is no move meaning "nobody" (ADR-0011).
+//! A member may select as often as it likes while its session is open, and
+//! its most recent selection is its vote; selecting nowhere is how it
+//! abstains, which is why there is no move meaning "nobody" (ADR-0011).
 //!
 //! # Nothing is broadcast
 //!
@@ -72,7 +72,7 @@
 //! nobody asks it to, and it works out from its own role whether the
 //! phase asks anything of it (ADR-0014).
 //!
-//! A point is addressed the same way, by the player making it: a `Devour`
+//! A selection is addressed the same way, by the player making it: a `Devour`
 //! to the living pack, a `Nominate` to every other living player, and the
 //! seer's and the doctor's to the moderator alone. That is how a pack
 //! agrees on a victim without speaking and how a village's vote forms in
@@ -102,11 +102,11 @@
 //! [`Villager`], [`Werewolf`], [`Seer`] and [`Doctor`] ([`roles`]) each
 //! carry their own [`Knowledge`] and say which targets a session permits
 //! them, and nothing else. It may be empty — the doctor may be left with
-//! nobody it can protect — and a player with an empty one points nowhere.
+//! nobody it can protect — and a player with an empty one selects nowhere.
 //! A [`Seat`] ([`player`]) pairs a role with the policy that decides for
 //! it and is the agent the episode runs: it folds every event into the
 //! role's state, acts when it observes a phase begin, and addresses each
-//! point as the rules allow.
+//! selection as the rules allow.
 //!
 //! # What no message carries
 //!
@@ -168,7 +168,7 @@ pub use config::{Config, ConfigError, RoleCounts};
 pub use game::{Directive, Game};
 pub use knowledge::{Death, Knowledge, Phased};
 pub use live::Text;
-pub use message::{Cause, Message, Narration, Outcome, Phase, Point, RequestKind, Round};
+pub use message::{Cause, Message, Narration, Outcome, Phase, RequestKind, Round, Select};
 pub use moderator::Moderator;
 pub use player::{Player, Seat};
 pub use policy::{Policy, RandomPolicy, View};

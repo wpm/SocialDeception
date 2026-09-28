@@ -74,9 +74,9 @@ pub enum Message {
     /// Moderator to chosen players: something they now observe.
     Narration(Narration),
     /// Player to the moderator and to whoever else may see it: a target
-    /// pointed at. A player may send more than one in the same session;
+    /// selected. A player may send more than one in the same session;
     /// its latest is its vote (ADR-0011).
-    Point(Point),
+    Select(Select),
 }
 
 /// A true statement from the moderator to the players it is addressed to.
@@ -119,7 +119,7 @@ pub enum Narration {
         cause: Cause,
     },
     /// To the living: the night ended with nobody dead. A save is never
-    /// announced as one, and neither is a pack that pointed nowhere.
+    /// announced as one, and neither is a pack that selected nowhere.
     NoDeath {
         /// The round whose night it was.
         round: Round,
@@ -193,30 +193,30 @@ impl RequestKind {
     }
 }
 
-/// A player pointing at a target.
+/// A player selecting a target.
 ///
-/// A member of an open session may point whenever it likes and as often as
-/// it likes; its most recent point is its vote (ADR-0011). Pointing nowhere
-/// is how a member abstains, and it is the absence of a point rather than a
-/// message, which is why there is no move that means "nobody".
+/// A member of an open session may select whenever it likes and as often as
+/// it likes; its most recent selection is its vote (ADR-0011). Selecting
+/// nowhere is how a member abstains, and it is the absence of a selection
+/// rather than a message, which is why there is no move that means "nobody".
 ///
-/// A point is addressed to the moderator and to nobody else. The other
+/// A selection is addressed to the moderator and to nobody else. The other
 /// players who should see it are named in `seen_by`, and the moderator
 /// forwards it to them if the session it names is still open. A player
 /// never sends another player anything directly, so there is no path by
-/// which a point can outlive its session in somebody else's queue.
+/// which a selection can outlive its session in somebody else's queue.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Point {
+pub struct Select {
     /// The round the session belongs to.
     pub round: Round,
-    /// Which of the phase's sessions this is: what the pointing is for.
+    /// Which of the phase's sessions this is: what the selection is for.
     pub kind: RequestKind,
-    /// The player pointed at.
+    /// The player selected.
     pub target: AgentId,
-    /// The other players who should see this point, for the moderator to
+    /// The other players who should see this selection, for the moderator to
     /// forward it to.
     ///
-    /// Empty for a point that is nobody else's business: the seer's
+    /// Empty for a selection that is nobody else's business: the seer's
     /// investigation and the doctor's protection are between that player
     /// and the moderator. A `Devour` names the rest of the pack and a
     /// `Nominate` the rest of the living, and in neither case does it name
@@ -294,13 +294,13 @@ mod tests {
             .map(|(narration, shape)| (Message::Narration(narration), json!({"Narration": shape})))
             .collect();
         messages.push((
-            Message::Point(Point {
+            Message::Select(Select {
                 round: Round::new(1),
                 kind: RequestKind::Devour,
                 target: AgentId::new("alice"),
                 seen_by: BTreeSet::new(),
             }),
-            json!({"Point": {"round": 1, "kind": "Devour", "target": "alice"}}),
+            json!({"Select": {"round": 1, "kind": "Devour", "target": "alice"}}),
         ));
         messages
     }
@@ -370,13 +370,13 @@ mod tests {
     }
 
     #[test]
-    fn a_point_names_its_session_and_a_bare_agent_id() {
+    fn a_selection_names_its_session_and_a_bare_agent_id() {
         // A target is an agent and nothing else: no move wraps it, and
         // nothing means "nobody" (ADR-0011). The session is the round and
         // the kind, which both sides derive rather than correlate by an
         // id the moderator mints (ADR-0014).
         assert_eq!(
-            json(&Point {
+            json(&Select {
                 round: Round::new(3),
                 kind: RequestKind::Nominate,
                 target: AgentId::new("alice"),

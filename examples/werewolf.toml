@@ -25,10 +25,10 @@ werewolves = 2
 seers = 1
 doctors = 1
 
-# The clocks the pointing sessions run on. Optional: every field has a
+# The clocks the selection sessions run on. Optional: every field has a
 # default, and the defaults suit a game played by language models.
 #
-# These values are short so that a game of random players, which point once
+# These values are short so that a game of random players, which select once
 # and never change their minds, finishes in a second or so. A game played by
 # models wants far longer ones — a pack needs time to argue — so start from
 # the defaults there: one second of quiet and twenty of limit for each night
@@ -38,7 +38,7 @@ doctors = 1
 # to everyone. Optional, default the number of players.
 day_cap = 7
 
-# A night session closes when every member has pointed and no point has
+# A night session closes when every member has selected and no selection has
 # changed for `quiet` seconds, or at `limit` seconds, whichever comes first.
 [timing.pack]
 quiet = 0.05

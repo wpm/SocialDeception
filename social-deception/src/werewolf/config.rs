@@ -65,7 +65,7 @@ pub struct Config {
     /// roster as the players, so no player may have this id.
     #[serde(default = "default_moderator")]
     pub moderator: AgentId,
-    /// The clocks the game's pointing sessions run on.
+    /// The clocks the game's selection sessions run on.
     #[serde(default)]
     pub timing: Timing,
 }
@@ -96,10 +96,10 @@ fn default_moderator() -> AgentId {
     AgentId::new(DEFAULT_MODERATOR)
 }
 
-/// The clocks a game's pointing sessions run on (ADR-0011).
+/// The clocks a game's selection sessions run on (ADR-0011).
 ///
 /// A phase is made of sessions, and a session closes on a clock rather than
-/// when the last member has pointed. Each night session has a quiet period
+/// when the last member has selected. Each night session has a quiet period
 /// and a hard limit of its own, so that a slow role cannot spend another
 /// role's time; the day has a hard limit only, since it closes on a
 /// majority rather than on quiet.
@@ -127,13 +127,13 @@ pub struct Timing {
 
 /// One night session's clock.
 ///
-/// The session closes when every member has pointed and no point has
+/// The session closes when every member has selected and no selection has
 /// changed for `quiet`, or at `limit`, whichever comes first. Any change of
 /// mind restarts the quiet period; a repeat of the same target does not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct NightTiming {
-    /// How long the members must leave their points alone before the
+    /// How long the members must leave their selections alone before the
     /// session closes.
     #[serde(with = "seconds")]
     pub quiet: Duration,
@@ -145,7 +145,7 @@ pub struct NightTiming {
 /// The day session's clock.
 ///
 /// The day has no quiet period: it closes the moment a majority of the
-/// living point at the same player, or at `limit` with nobody lynched.
+/// living select the same player, or at `limit` with nobody lynched.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct DayTiming {
@@ -205,7 +205,7 @@ impl Timing {
         ]
     }
 
-    /// Checks that every clock describes a session that can be pointed in.
+    /// Checks that every clock describes a session that can be selected in.
     ///
     /// Parsing has already rejected anything that is not a finite,
     /// non-negative number of seconds; what is left to check is that a
@@ -328,7 +328,7 @@ pub enum ConfigError {
     /// A player has the name of one of the seed streams that are not a
     /// player's, [`seed::RESERVED`], and would share its generator with it.
     ReservedPlayer(AgentId),
-    /// A timing duration is zero. A session with no time cannot be pointed
+    /// A timing duration is zero. A session with no time cannot be selected
     /// in.
     TimingNotPositive {
         /// The field, as it is written in the file, such as `timing.pack.quiet`.

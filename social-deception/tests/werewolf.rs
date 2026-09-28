@@ -16,7 +16,7 @@
 //! # Determinism, precisely
 //!
 //! For a fixed configuration and seed, the *logical transcript* (the role
-//! assignment, every point, elimination and the outcome)
+//! assignment, every selection, elimination and the outcome)
 //! is identical on every run. The *wall-clock timestamps* and the
 //! *interleaving of different agents' records* in the trajectory are not,
 //! and cannot be, because the agents are threads. So the determinism tests
@@ -63,30 +63,29 @@ const SEEDS: u64 = 120;
 /// A validated configuration for `players` with the given special roles,
 /// played from `seed`, writing no trajectory.
 /// Timing fast enough that a test does not spend real time waiting on a
-/// session's clock, and slow enough that a random player's one point
+/// session's clock, and slow enough that a random player's one selection
 /// always lands inside it.
 ///
-/// A game of random players points once and never changes its mind, so a
+/// A game of random players selects once and never changes its mind, so a
 /// night session closes a quiet period after its last member's only
-/// point, and a day runs to its limit unless a majority falls out of the
-/// deal. The outcome is reproducible only while every one of those points
+/// selection, and a day runs to its limit unless a majority falls out of the
+/// deal. The outcome is reproducible only while every one of those selections
 /// arrives before its session closes (ADR-0011), which is a claim about
 /// thread latency: the limits have to exceed however long the slowest
 /// player takes to be scheduled and answer.
 ///
 /// The two clocks are set for different reasons. A **hard limit** has to
-/// outlast the slowest player's one point, or a point misses its session
-/// and the game genuinely differs from run to run; at 50 ms these tests
-/// passed alone and failed a few times in ten with several suites at
-/// once, because seven agent threads on a loaded machine can outrun a
-/// margin that small. A **quiet period** costs real time on every night,
-/// since a night closes one quiet period after its members settle, so it
-/// stays short.
+/// outlast the slowest player's one selection, or a selection misses its
+/// session and the game genuinely differs from run to run; at 50 ms these
+/// tests passed alone and failed a few times in ten with several suites at
+/// once, because seven agent threads on a loaded machine can outrun a margin
+/// that small. A **quiet period** costs real time on every night, since a
+/// night closes one quiet period after its members settle, so it stays short.
 ///
 /// The day's limit is the expensive one — a random day rarely reaches a
 /// majority, so most days run it out — but it is also the one a slow
-/// point matters least for, because a day closes on a majority of the
-/// living and a point that misses cannot have made one. It is kept below
+/// selection matters least for, because a day closes on a majority of the
+/// living and a selection that misses cannot have made one. It is kept below
 /// the night's for that reason.
 const FAST: Timing = Timing {
     day_cap: None,
@@ -253,7 +252,7 @@ fn the_same_seed_plays_the_same_game() {
     // What is compared is the *verdicts*, not the whole transcript, and
     // certainly not the trajectory files. Under ADR-0011 a phase is a
     // timed session: every death, every finding and the winner are the
-    // same on every run of a seed, while the order points arrived in, and
+    // same on every run of a seed, while the order selections arrived in, and
     // which late ones landed before a session closed, are facts about
     // thread scheduling. The files differ for that reason and for their
     // wall-clock stamps. Comparing more than the verdicts would assert

@@ -1,5 +1,5 @@
 //! The decision boundary: a [`Policy`] is handed what an agent sees and
-//! returns the target to point at, or none.
+//! returns the target to select, or none.
 //!
 //! A policy is a conditional distribution over the action space given the
 //! state, in the vocabulary the [module](super) documentation states and
@@ -14,7 +14,7 @@
 //! two share a support, so the action space handed to a policy is never
 //! narrowed on its behalf, and `View` carries no strategy hints. Everything
 //! a policy might want to reason from, the role, the living set, the pack,
-//! the seer's findings and how every phase so far pointed, is already in
+//! the seer's findings and how every phase so far selected, is already in
 //! [`Knowledge`], and a policy computes whatever heuristic it wants from
 //! that. The action space arrives in a canonical order, so an index into it
 //! is a stable action label: the same on every run and in every episode
@@ -35,10 +35,10 @@
 //! to separate the two.
 //!
 //! The heuristic is deliberately no cleverer than it is. A seer that used its
-//! findings when nominating and a villager that read the phase's points would both
-//! play better, and both are left out on purpose: the uniform baseline leaves
-//! the seer's information unused, which is what makes its win rate a function
-//! of the role counts alone.
+//! findings when nominating and a villager that read the phase's selections
+//! would both play better, and both are left out on purpose: the uniform
+//! baseline leaves the seer's information unused, which is what makes its win
+//! rate a function of the role counts alone.
 //!
 //! # The path to a language model
 //!
@@ -93,11 +93,11 @@ use crate::event::AgentId;
 pub struct View<'a> {
     /// The agent's state: the fold of everything it has been told.
     pub knowledge: &'a Knowledge,
-    /// Which of the phase's sessions this is: what the pointing is for.
+    /// Which of the phase's sessions this is: what the selection is for.
     pub kind: RequestKind,
     /// Every target the rules permit, in canonical order: sorted agent
     /// order. May be empty, and a policy handed an empty one has nowhere to
-    /// point.
+    /// selection.
     pub action_space: &'a [AgentId],
 }
 
@@ -106,11 +106,11 @@ pub struct View<'a> {
 /// Implemented by the uniform random baseline, [`RandomPolicy`], and later
 /// by a language-model policy, which sees exactly the same [`View`].
 pub trait Policy {
-    /// Picks a target, or `None` to point nowhere for now. A `Some` must be
+    /// Picks a target, or `None` to select nowhere for now. A `Some` must be
     /// in `view.action_space`.
     ///
     /// `None` is how a member abstains (ADR-0011): nothing is sent, and a
-    /// member that never points is simply one nobody saw point. It is
+    /// member that never selects is simply one nobody saw select. It is
     /// also the only thing a policy can do with an empty action space.
     ///
     /// Infallible, and free to block; the [module documentation](self) says
@@ -156,9 +156,9 @@ impl Policy for RandomPolicy {
     /// deterministic: nothing about the draw depends on timing at all.
     fn choose(&mut self, view: View<'_>) -> Option<AgentId> {
         let candidates = candidates(&view);
-        // Nowhere to point: the doctor with nobody left it may protect.
+        // Nowhere to select: the doctor with nobody left it may protect.
         // Drawing from an empty list is the one thing sampling cannot do,
-        // and pointing nowhere is what the rules call for.
+        // and selecting nowhere is what the rules call for.
         if candidates.is_empty() {
             return None;
         }
@@ -287,7 +287,7 @@ mod tests {
         for (knowledge, kind) in cases {
             let space = base_action_space(knowledge, kind);
             for (seed, action) in first_choices(knowledge, kind) {
-                let action = action.expect("a non-empty action space is pointed into");
+                let action = action.expect("a non-empty action space is selected from");
                 assert!(
                     space.contains(&action),
                     "seed {seed}, {kind:?}: {action:?} outside {space:?}"
@@ -358,8 +358,8 @@ mod tests {
     }
 
     #[test]
-    fn a_policy_points_somewhere_whenever_it_can() {
-        // Pointing nowhere is for a member with nowhere to point. While the
+    fn a_policy_selects_somewhere_whenever_it_can() {
+        // Selecting nowhere is for a member with nowhere to select. While the
         // action space holds anybody at all, the baseline names somebody.
         let doctor = knowing(Role::Doctor, ["alice", "bob"]);
         let seer = seer_knowing(["alice", "bob"], []);
@@ -380,7 +380,7 @@ mod tests {
         for kind in [RequestKind::Devour, RequestKind::Nominate] {
             let space = base_action_space(&knowledge, kind);
             for (seed, action) in first_choices(&knowledge, kind) {
-                let action = action.expect("a non-empty action space is pointed into");
+                let action = action.expect("a non-empty action space is selected from");
                 assert!(space.contains(&action), "seed {seed}, {kind:?}: {action:?}");
             }
         }
@@ -389,20 +389,20 @@ mod tests {
     #[test]
     fn a_seer_that_has_investigated_everyone_living_looks_again() {
         // The heuristic would leave it nothing, and a policy handed a
-        // non-empty space still points: the space itself is the fallback,
+        // non-empty space still selects: the space itself is the fallback,
         // so it re-investigates rather than wasting its night.
         let knowledge = seer_knowing(["alice", "bob"], ["alice", "bob"]);
         let space = base_action_space(&knowledge, RequestKind::Investigate);
         for (seed, action) in first_choices(&knowledge, RequestKind::Investigate) {
-            let action = action.expect("a non-empty action space is pointed into");
+            let action = action.expect("a non-empty action space is selected from");
             assert!(space.contains(&action), "seed {seed}: {action:?}");
         }
     }
 
     #[test]
-    fn an_empty_action_space_points_nowhere() {
+    fn an_empty_action_space_selects_nowhere() {
         // The doctor with nobody left it may protect. Drawing from an empty
-        // list is the one thing sampling cannot do, and pointing nowhere is
+        // list is the one thing sampling cannot do, and selecting nowhere is
         // what the rules call for (ADR-0011).
         let knowledge = knowing(Role::Doctor, ["alice"]);
         for seed in SEEDS {

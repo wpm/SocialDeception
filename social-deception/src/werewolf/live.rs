@@ -25,16 +25,16 @@
 //! # The order is the writer's
 //!
 //! Lines appear in the order the writer received the records, which
-//! interleaves agents arbitrarily (see [`trajectory`](crate::trajectory)).
-//! A player's point can appear before the phase announcement that prompted
-//! it is rendered. That is expected of a live view of concurrent agents,
-//! and is the same interleaving the trajectory file records.
+//! interleaves agents arbitrarily (see [`trajectory`](crate::trajectory)). A
+//! player's selection can appear before the phase announcement that prompted
+//! it is rendered. That is expected of a live view of concurrent agents, and
+//! is the same interleaving the trajectory file records.
 
 use std::fmt;
 use std::io::{self, Write};
 
 use super::WerewolfDomain;
-use super::message::{Cause, Message, Narration, Phase, Point};
+use super::message::{Cause, Message, Narration, Phase, Select};
 use crate::event::AgentId;
 use crate::trajectory::{ActionRecord, LogRecord, Sink};
 
@@ -101,7 +101,7 @@ impl fmt::Display for Message {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Narration(narration) => narration.fmt(f),
-            Self::Point(point) => point.fmt(f),
+            Self::Select(selection) => selection.fmt(f),
         }
     }
 }
@@ -151,10 +151,10 @@ impl fmt::Display for Narration {
     }
 }
 
-impl fmt::Display for Point {
-    /// The session it points in and whom it points at.
+impl fmt::Display for Select {
+    /// The session it selects in and whom it selects.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Point({:?}: {})", self.kind, self.target)
+        write!(f, "Select({:?}: {})", self.kind, self.target)
     }
 }
 
@@ -401,18 +401,18 @@ mod tests {
     }
 
     #[test]
-    fn a_point_names_its_session_and_the_target() {
+    fn a_selection_names_its_session_and_the_target() {
         // Nothing renders a request any more: there is none to render.
-        // A point says for itself what it is for (ADR-0014), so the line
+        // A selection says for itself what it is for (ADR-0014), so the line
         // reads without a request to look the id up in.
         assert_eq!(
-            shown(Message::Point(Point {
+            shown(Message::Select(Select {
                 round: Round::new(1),
                 kind: RequestKind::Nominate,
                 target: id("frank"),
                 seen_by: BTreeSet::new(),
             })),
-            "Point(Nominate: frank)"
+            "Select(Nominate: frank)"
         );
     }
 
@@ -463,7 +463,7 @@ mod tests {
             "bob",
             ["moderator"],
             0,
-            Message::Point(Point {
+            Message::Select(Select {
                 round: Round::new(1),
                 kind: RequestKind::Devour,
                 target: id("alice"),
@@ -472,13 +472,13 @@ mod tests {
         );
         assert_eq!(
             line(&record, 9).unwrap(),
-            "0:00.000 bob        \u{2192} moderator  Point(Devour: alice)"
+            "0:00.000 bob        \u{2192} moderator  Select(Devour: alice)"
         );
         // An id wider than the column simply overflows it rather than being
         // cut: a name is worth more than an aligned column.
         assert_eq!(
             line(&record, 2).unwrap(),
-            "0:00.000 bob  \u{2192} moderator  Point(Devour: alice)"
+            "0:00.000 bob  \u{2192} moderator  Select(Devour: alice)"
         );
     }
 

@@ -22,11 +22,11 @@
 //!
 //! **It may be empty.** The doctor may protect neither itself nor last
 //! night's patient, which in a small enough game leaves nobody, and a
-//! member with nothing it may point at is not asked at all. That is what
+//! member with nothing it may select is not asked at all. That is what
 //! used to be an abstention (ADR-0011).
 //!
 //! The roles here compute their action spaces from what they know, and the
-//! [`Game`](super::Game) checks every point against the same function
+//! [`Game`](super::Game) checks every selection against the same function
 //! from what it knows, so the two cannot disagree about what the rules
 //! permit: a player that is not one of these types, a language-model agent
 //! or a test stub, is held to exactly the space these types compute.
@@ -42,7 +42,7 @@
 //! players living, the targets minus last night's can be empty.
 //!
 //! The action space is empty only where the rules really do leave a player
-//! nowhere to point, and such a player is not a member of the session at
+//! nowhere to select, and such a player is not a member of the session at
 //! all: `Nominate` and `Devour` open only while at least one valid target
 //! lives, since the game would be over otherwise, and `Protect` and
 //! `Investigate` always have `Abstain`.
@@ -67,9 +67,9 @@ use crate::event::AgentId;
 ///
 /// This is the whole of the rules about what a player may do, and the one
 /// place they are written: the roles below compute their action spaces with
-/// it from their knowledge, and the game checks every point against it
+/// it from their knowledge, and the game checks every selection against it
 /// from its own state. `last_protected` is whom the doctor protected the
-/// night before, or `None` for anyone else, for a doctor that pointed
+/// night before, or `None` for anyone else, for a doctor that selected
 /// nowhere, and for a doctor on the first night.
 ///
 /// The result may be empty, and a player whose action space is empty is not
@@ -268,7 +268,7 @@ mod tests {
         with(Doctor::new(id(ME)), knowing(Role::Doctor, others))
     }
 
-    /// Points at `target` for a `Protect`, the way a seat would.
+    /// Selects `target` for a `Protect`, the way a seat would.
     fn protected(doctor: &mut Doctor, target: &AgentId) {
         doctor.knowledge_mut().acted(RequestKind::Protect, target);
     }
