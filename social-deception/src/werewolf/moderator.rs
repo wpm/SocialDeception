@@ -293,12 +293,7 @@ mod tests {
     /// it. The creation time plays no part in the fold, so one stand-in
     /// serves every test here.
     fn from_player(who: &str, payload: Message) -> Observation<WerewolfDomain> {
-        observed(Event::new(
-            who,
-            [MODERATOR],
-            crate::clock::Timestamp::default(),
-            payload,
-        ))
+        observed(Event::new(who, [MODERATOR], Timestamp::default(), payload))
     }
 
     fn response(

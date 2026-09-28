@@ -7,7 +7,7 @@
 //! `--seed` means the file is no longer the sole determinant of the run.
 //!
 //! The narration is a line per thing that happens, rendered by
-//! [`social_deception::werewolf::live`], and `--quiet`
+//! [`werewolf::live`], and `--quiet`
 //! leaves it out. It is written by an optional sink, so a reader that closes
 //! the pipe costs the narration alone; the summary below it is printed from
 //! the outcome the run returns, not by a sink.
