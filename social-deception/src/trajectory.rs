@@ -992,6 +992,11 @@ mod tests {
             if self.fails_from.is_some_and(|n| seen.len() >= n) {
                 return Err(io::Error::new(io::ErrorKind::BrokenPipe, "no reader"));
             }
+            // A panic, not a `?`: a `LogRecord` cannot fail to serialize, so
+            // a failure here is a bug in the fixture. Converting it to an
+            // `io::Error` would hand the writer the one signal this spy
+            // exists to control, and a fixture bug would arrive disguised
+            // as the sink failure these tests are built to tell apart.
             seen.push(serde_json::to_string(record).unwrap());
             Ok(())
         }
