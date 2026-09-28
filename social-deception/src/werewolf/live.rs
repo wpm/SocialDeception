@@ -124,7 +124,7 @@ impl fmt::Display for Narration {
             } => write!(
                 f,
                 "PhaseBegan({phase} {}; {} living)",
-                round.0,
+                round.number(),
                 living.len()
             ),
             Self::Investigated { target, faction } => {
@@ -133,8 +133,8 @@ impl fmt::Display for Narration {
             Self::Eliminated {
                 who, role, cause, ..
             } => write!(f, "Eliminated({who}, {role}, {cause})"),
-            Self::NoDeath { round } => write!(f, "NoDeath(Night {})", round.0),
-            Self::NoLynch { round } => write!(f, "NoLynch(Day {})", round.0),
+            Self::NoDeath { round } => write!(f, "NoDeath(Night {})", round.number()),
+            Self::NoLynch { round } => write!(f, "NoLynch(Day {})", round.number()),
             Self::Outcome(outcome) => {
                 let ended = match outcome.winner {
                     Some(winner) => format!("{winner} win"),
@@ -143,7 +143,7 @@ impl fmt::Display for Narration {
                 write!(
                     f,
                     "Outcome({ended} after {} rounds; survivors: {})",
-                    outcome.rounds.0,
+                    outcome.rounds.number(),
                     listed(&outcome.living),
                 )
             }
@@ -316,7 +316,7 @@ mod tests {
     fn a_phase_names_its_round_and_how_many_are_left() {
         assert_eq!(
             shown(Message::Narration(Narration::PhaseBegan {
-                round: Round(1),
+                round: Round::new(1),
                 phase: Phase::Night,
                 living: ids(["alice", "bob", "carol", "dave", "erin", "frank", "grace"]),
             })),
@@ -324,7 +324,7 @@ mod tests {
         );
         assert_eq!(
             shown(Message::Narration(Narration::PhaseBegan {
-                round: Round(2),
+                round: Round::new(2),
                 phase: Phase::Day,
                 living: ids(["alice"]),
             })),
@@ -349,7 +349,7 @@ mod tests {
             shown(Message::Narration(Narration::Eliminated {
                 who: id("alice"),
                 role: Role::Villager,
-                round: Round(1),
+                round: Round::new(1),
                 cause: Cause::Lynched,
             })),
             "Eliminated(alice, Villager, lynched)"
@@ -358,7 +358,7 @@ mod tests {
             shown(Message::Narration(Narration::Eliminated {
                 who: id("bob"),
                 role: Role::Seer,
-                round: Round(2),
+                round: Round::new(2),
                 cause: Cause::Devoured,
             })),
             "Eliminated(bob, Seer, devoured)"
@@ -368,7 +368,9 @@ mod tests {
     #[test]
     fn a_quiet_night_names_its_round() {
         assert_eq!(
-            shown(Message::Narration(Narration::NoDeath { round: Round(2) })),
+            shown(Message::Narration(Narration::NoDeath {
+                round: Round::new(2)
+            })),
             "NoDeath(Night 2)"
         );
     }
@@ -379,7 +381,9 @@ mod tests {
         // narration, told from a night nobody died in by the phase it
         // names (ADR-0011).
         assert_eq!(
-            shown(Message::Narration(Narration::NoLynch { round: Round(3) })),
+            shown(Message::Narration(Narration::NoLynch {
+                round: Round::new(3)
+            })),
             "NoLynch(Day 3)"
         );
     }
@@ -389,7 +393,7 @@ mod tests {
         assert_eq!(
             shown(Message::Narration(Narration::Outcome(Outcome {
                 winner: Some(Faction::Werewolves),
-                rounds: Round(2),
+                rounds: Round::new(2),
                 living: ids(["bob", "dave"]),
             }))),
             "Outcome(Werewolves win after 2 rounds; survivors: bob, dave)"
@@ -403,7 +407,7 @@ mod tests {
         // reads without a request to look the id up in.
         assert_eq!(
             shown(Message::Point(Point {
-                round: Round(1),
+                round: Round::new(1),
                 kind: RequestKind::Nominate,
                 target: id("frank"),
                 seen_by: BTreeSet::new(),
@@ -423,7 +427,9 @@ mod tests {
                 "a",
                 ["b"],
                 nanos,
-                Message::Narration(Narration::NoDeath { round: Round(1) }),
+                Message::Narration(Narration::NoDeath {
+                    round: Round::new(1),
+                }),
             );
             let rendered = line(&record, 0).unwrap();
             assert!(
@@ -439,7 +445,9 @@ mod tests {
             "moderator",
             ["bob", "alice"],
             1_250_000_000,
-            Message::Narration(Narration::NoDeath { round: Round(3) }),
+            Message::Narration(Narration::NoDeath {
+                round: Round::new(3),
+            }),
         );
         // The recipients are sorted and comma-separated, whatever order
         // they were given in.
@@ -456,7 +464,7 @@ mod tests {
             ["moderator"],
             0,
             Message::Point(Point {
-                round: Round(1),
+                round: Round::new(1),
                 kind: RequestKind::Devour,
                 target: id("alice"),
                 seen_by: BTreeSet::new(),
@@ -480,7 +488,9 @@ mod tests {
             "moderator",
             ["alice"],
             at(0),
-            Message::Narration(Narration::NoDeath { round: Round(1) }),
+            Message::Narration(Narration::NoDeath {
+                round: Round::new(1),
+            }),
         );
         let records: Vec<LogRecord<WerewolfDomain>> = vec![
             ObservationRecord {
@@ -533,7 +543,9 @@ mod tests {
             "moderator",
             ["alice"],
             0,
-            Message::Narration(Narration::NoDeath { round: Round(1) }),
+            Message::Narration(Narration::NoDeath {
+                round: Round::new(1),
+            }),
         );
         let cycle: LogRecord<WerewolfDomain> = CycleRecord {
             agent: id("alice"),
@@ -563,7 +575,9 @@ mod tests {
             "a",
             ["b"],
             0,
-            Message::Narration(Narration::NoDeath { round: Round(1) }),
+            Message::Narration(Narration::NoDeath {
+                round: Round::new(1),
+            }),
         ))
         .unwrap();
         assert_eq!(

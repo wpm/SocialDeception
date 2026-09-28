@@ -285,7 +285,7 @@ impl Game {
         Self {
             assignment,
             living,
-            round: Round(1),
+            round: Round::FIRST,
             phase: Phase::Night,
             ties: ChaCha8Rng::seed_from_u64(seed_for(seed, TIES)),
             begun: false,
@@ -734,7 +734,7 @@ impl Game {
         // stalemate: it has run out of days, and going on would let a
         // village that keeps running out the clock play forever
         // (ADR-0011).
-        if self.phase == Phase::Day && self.round.0 >= self.day_cap() {
+        if self.phase == Phase::Day && self.round.number() >= self.day_cap() {
             return vec![self.end(None)];
         }
         self.next_phase(now)
@@ -752,7 +752,7 @@ impl Game {
         match self.phase {
             Phase::Night => self.phase = Phase::Day,
             Phase::Day => {
-                self.round = Round(self.round.0 + 1);
+                self.round = self.round.next();
                 self.phase = Phase::Night;
             }
         }
@@ -981,7 +981,7 @@ mod tests {
         narrate(
             living,
             Narration::PhaseBegan {
-                round: Round(round),
+                round: Round::new(round),
                 phase,
                 living: ids(living),
             },
@@ -1012,7 +1012,7 @@ mod tests {
             narration: Narration::Eliminated {
                 who: id(who),
                 role,
-                round: Round(round),
+                round: Round::new(round),
                 cause,
             },
         }
@@ -1025,7 +1025,7 @@ mod tests {
             living,
             Narration::Outcome(Outcome {
                 winner: Some(winner),
-                rounds: Round(rounds),
+                rounds: Round::new(rounds),
                 living: ids(living),
             }),
         )
@@ -1064,7 +1064,7 @@ mod tests {
         target: AgentId,
     ) -> Vec<Directive> {
         let point = Point {
-            round: Round(round),
+            round: Round::new(round),
             kind,
             target,
             seen_by: BTreeSet::new(),
@@ -1089,7 +1089,7 @@ mod tests {
     ) -> Vec<Directive> {
         let (created, at) = when;
         let point = Point {
-            round: Round(round),
+            round: Round::new(round),
             kind,
             target: id(target),
             seen_by: ids(seen_by),
@@ -1125,11 +1125,11 @@ mod tests {
         // the night closes with nobody dead, the day with nobody lynched,
         // and round 2's night is the session now open.
         let mut now = at(0);
-        while game.round == Round(1) {
+        while game.round == Round::new(1) {
             now = game.next_deadline().expect("an open phase has a clock");
             game.expire(now);
         }
-        assert_eq!(game.round, Round(2), "the game moved on");
+        assert_eq!(game.round, Round::new(2), "the game moved on");
         let late = points_seen_by(
             &mut game,
             "bob",
@@ -1186,7 +1186,7 @@ mod tests {
             )),
             "the script ends the game"
         );
-        let round = game.round.0;
+        let round = game.round.number();
         let straggler = points_seen_by(
             &mut game,
             "erin",
@@ -1391,12 +1391,14 @@ mod tests {
             Some(&id("carol")),
             "the accepted point is the vote"
         );
-        // A point for a round that has passed changes nothing and is told
-        // to nobody, so no observer can believe otherwise.
+        // A point for a round that is not the open one changes nothing and
+        // is told to nobody, so no observer can believe otherwise. Rounds
+        // are counted from 1, so the round that is not this one is the
+        // next; the game rejects it by the same inequality either way.
         let stale = points_seen_by(
             &mut game,
             "bob",
-            0,
+            2,
             RequestKind::Devour,
             "erin",
             ["alice"],
@@ -1537,7 +1539,7 @@ mod tests {
             game.outcome(),
             Some(&Outcome {
                 winner: Some(Faction::Village),
-                rounds: Round(1),
+                rounds: Round::new(1),
                 living: ids(["carol", "dave", "erin"]),
             })
         );
@@ -1775,7 +1777,7 @@ mod tests {
 
         let outcome = game.outcome().expect("the cap ended the game");
         assert_eq!(outcome.winner, None, "a stalemate has no winner");
-        assert_eq!(outcome.rounds, Round(2), "it ended on the cap's day");
+        assert_eq!(outcome.rounds, Round::new(2), "it ended on the cap's day");
         assert_eq!(outcome.living.len(), 7, "nobody died");
         assert!(
             directives.contains(&narrate(
@@ -1825,7 +1827,7 @@ mod tests {
         play(&mut game, &village_wins());
         let outcome = game.outcome().expect("the game ended");
         assert_eq!(outcome.winner, Some(Faction::Village));
-        assert_eq!(outcome.rounds, Round(1));
+        assert_eq!(outcome.rounds, Round::new(1));
         for (who, value) in game.rewards().unwrap() {
             let expected = if game.role(&who).faction() == Faction::Village {
                 1
@@ -1854,7 +1856,7 @@ mod tests {
             for seed in 0..200 {
                 let (outcome, living) = play_out(assignment.clone(), seed);
                 assert!(
-                    outcome.rounds.0 as usize <= players * 2,
+                    outcome.rounds.number() as usize <= players * 2,
                     "{players} players, seed {seed}: {outcome:?}"
                 );
                 assert!(
@@ -2039,7 +2041,12 @@ mod tests {
             [
                 // The seer looked at bob and found the pack.
                 investigated("carol", "bob", Faction::Werewolves),
-                narrate(everyone, Narration::NoDeath { round: Round(1) }),
+                narrate(
+                    everyone,
+                    Narration::NoDeath {
+                        round: Round::new(1)
+                    }
+                ),
                 phase_began(1, Phase::Day, everyone),
             ]
         );
@@ -2131,7 +2138,7 @@ mod tests {
         );
         assert!(!game.living().contains(&id("dave")), "dave is dead");
         assert_eq!(game.phase, Phase::Night);
-        assert_eq!(game.round, Round(2));
+        assert_eq!(game.round, Round::new(2));
         // Two sessions where the first night had three, and dave is in
         // neither of them.
         assert_eq!(
@@ -2378,7 +2385,7 @@ mod tests {
                 ]),
             ],
         );
-        assert_eq!(game.round, Round(2), "the second night is under way");
+        assert_eq!(game.round, Round::new(2), "the second night is under way");
         assert!(
             respond_in(&mut game, "bob", 1, RequestKind::Devour, target("erin")).is_empty(),
             "a point from round one causes nothing in round two"
@@ -2485,7 +2492,7 @@ mod tests {
                 *game.living(),
                 ids(["bob", "carol", "dave", "erin", "frank"])
             );
-            assert_eq!(game.round, Round(3), "the third night is under way");
+            assert_eq!(game.round, Round::new(3), "the third night is under way");
             assert_eq!(asks(&game).len(), 4, "four members point tonight");
             let permitted = roles::action_space(
                 &id("dave"),

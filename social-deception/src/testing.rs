@@ -202,7 +202,7 @@ pub(crate) fn phase_began(
     living: BTreeSet<AgentId>,
 ) -> Event<WerewolfDomain> {
     narrated(Narration::PhaseBegan {
-        round: Round(round),
+        round: Round::new(round),
         phase,
         living,
     })

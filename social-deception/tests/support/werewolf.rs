@@ -443,9 +443,10 @@ impl<'a> Play<'a> {
         round: Round,
         living: &BTreeSet<AgentId>,
     ) -> Vec<AgentId> {
-        let last_protected = (kind == RequestKind::Protect && round.0 > 1)
-            .then(|| self.protections_in(Round(round.0 - 1)))
-            .and_then(|protections| protections.get(who).cloned());
+        let last_protected = round
+            .previous()
+            .filter(|_| kind == RequestKind::Protect)
+            .and_then(|before| self.protections_in(before).get(who).cloned());
         roles::action_space(who, living, kind, last_protected.as_ref())
     }
 
@@ -567,17 +568,18 @@ impl<'a> Play<'a> {
         // action-space check below would otherwise swallow it and
         // report it as an anonymous "outside the space".
         for (round, phase, _) in &self.phases {
-            if *phase != Phase::Night || round.0 == 1 {
+            let Some(previous) = round.previous().filter(|_| *phase == Phase::Night) else {
                 continue;
-            }
-            let before = self.protections_in(Round(round.0 - 1));
+            };
+            let before = self.protections_in(previous);
             for (doctor, chosen) in self.protections_in(*round) {
                 if let Some(last) = before.get(&doctor) {
                     assert_ne!(
-                        *last, chosen,
+                        *last,
+                        chosen,
                         "the doctor never protects the same player two nights running: \
                          {doctor} protected {chosen} in round {}",
-                        round.0
+                        round.number()
                     );
                 }
             }
@@ -819,7 +821,7 @@ impl<'a> Play<'a> {
             "the winner is what the parity rule says of the survivors: {outcome:?}"
         );
         assert!(
-            outcome.rounds.0 as usize <= self.config.players.len(),
+            outcome.rounds.number() as usize <= self.config.players.len(),
             "the game ends within as many rounds as there are players: {outcome:?}"
         );
     }
@@ -1121,9 +1123,9 @@ impl<'p, 'a> Phases<'p, 'a> {
         self.counts.close(self.current);
         self.counts = PhaseCounts::default();
         let expected = match self.current {
-            None => (Round(1), Phase::Night),
+            None => (Round::FIRST, Phase::Night),
             Some((round, Phase::Night, _)) => (round, Phase::Day),
-            Some((Round(round), Phase::Day, _)) => (Round(round + 1), Phase::Night),
+            Some((round, Phase::Day, _)) => (round.next(), Phase::Night),
         };
         assert_eq!(
             (round, phase),

@@ -1,9 +1,9 @@
 //! Everything said in a Werewolf episode: the [`Message`] payload and the
 //! vocabulary of rounds, phases, sessions and targets it is built from.
 
-use std::collections::BTreeSet;
-
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
+use std::num::NonZero;
 
 use super::role::{Faction, Role};
 use crate::event::AgentId;
@@ -13,7 +13,47 @@ use crate::event::AgentId;
 /// Serializes as a bare integer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct Round(pub u32);
+pub struct Round(pub NonZero<u32>);
+
+impl Round {
+    /// The round a game starts in.
+    pub const FIRST: Self = Self(NonZero::<u32>::MIN);
+
+    /// The round numbered `number`.
+    ///
+    /// # Panics
+    ///
+    /// If `number` is zero: rounds are counted from 1, and there is no
+    /// round before the first.
+    #[must_use]
+    pub const fn new(number: u32) -> Self {
+        match NonZero::new(number) {
+            Some(number) => Self(number),
+            None => panic!("a round is counted from 1"),
+        }
+    }
+
+    /// Which round this is, counted from 1.
+    #[must_use]
+    pub const fn number(self) -> u32 {
+        self.0.get()
+    }
+
+    /// The round after this one.
+    #[must_use]
+    pub const fn next(self) -> Self {
+        Self::new(self.number() + 1)
+    }
+
+    /// The round before this one, or `None` for the first.
+    #[must_use]
+    pub const fn previous(self) -> Option<Self> {
+        match NonZero::new(self.number() - 1) {
+            Some(number) => Some(Self(number)),
+            None => None,
+        }
+    }
+}
 
 /// Half of a round.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -205,7 +245,7 @@ mod tests {
             ),
             (
                 Narration::PhaseBegan {
-                    round: Round(1),
+                    round: Round::new(1),
                     phase: Phase::Night,
                     living: ["alice", "bob"].map(AgentId::new).into(),
                 },
@@ -222,19 +262,21 @@ mod tests {
                 Narration::Eliminated {
                     who: AgentId::new("bob"),
                     role: Role::Seer,
-                    round: Round(2),
+                    round: Round::new(2),
                     cause: Cause::Lynched,
                 },
                 json!({"Eliminated": {"who": "bob", "role": "Seer", "round": 2, "cause": "Lynched"}}),
             ),
             (
-                Narration::NoDeath { round: Round(3) },
+                Narration::NoDeath {
+                    round: Round::new(3),
+                },
                 json!({"NoDeath": {"round": 3}}),
             ),
             (
                 Narration::Outcome(Outcome {
                     winner: Some(Faction::Werewolves),
-                    rounds: Round(3),
+                    rounds: Round::new(3),
                     living: ["wanda"].map(AgentId::new).into(),
                 }),
                 json!({"Outcome": {"winner": "Werewolves", "rounds": 3, "living": ["wanda"]}}),
@@ -253,7 +295,7 @@ mod tests {
             .collect();
         messages.push((
             Message::Point(Point {
-                round: Round(1),
+                round: Round::new(1),
                 kind: RequestKind::Devour,
                 target: AgentId::new("alice"),
                 seen_by: BTreeSet::new(),
@@ -298,9 +340,33 @@ mod tests {
 
     #[test]
     fn a_round_is_a_bare_integer() {
-        assert_eq!(json(&Round(4)), json!(4));
+        assert_eq!(json(&Round::new(4)), json!(4));
         let round: Round = serde_json::from_value(json!(4)).unwrap();
-        assert_eq!(round, Round(4));
+        assert_eq!(round, Round::new(4));
+    }
+
+    #[test]
+    fn a_game_starts_at_round_one() {
+        assert_eq!(Round::FIRST, Round::new(1));
+        assert_eq!(Round::FIRST.number(), 1);
+    }
+
+    #[test]
+    fn a_round_is_followed_by_the_next_one() {
+        assert_eq!(Round::FIRST.next(), Round::new(2));
+        assert_eq!(Round::new(7).next(), Round::new(8));
+    }
+
+    #[test]
+    fn a_round_knows_the_one_before_it_unless_it_is_the_first() {
+        assert_eq!(Round::new(2).previous(), Some(Round::FIRST));
+        assert_eq!(Round::FIRST.previous(), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "a round is counted from 1")]
+    fn there_is_no_round_zero() {
+        let _ = Round::new(0);
     }
 
     #[test]
@@ -311,7 +377,7 @@ mod tests {
         // id the moderator mints (ADR-0014).
         assert_eq!(
             json(&Point {
-                round: Round(3),
+                round: Round::new(3),
                 kind: RequestKind::Nominate,
                 target: AgentId::new("alice"),
                 seen_by: BTreeSet::new(),
