@@ -7,6 +7,10 @@
 [ADR-0005](0005-policy-separates-decisions-from-rules.md),
 [ADR-0007](0007-reinforcement-learning-vocabulary.md),
 [ADR-0011](0011-werewolf-phases-are-timed-pointing-sessions.md)
+**Amended by:**
+[ADR-0015](0015-an-environment-does-not-summarize-what-agents-observed.md),
+which withdraws the tally from every session rather than only from a
+session of one
 
 ## Context
 

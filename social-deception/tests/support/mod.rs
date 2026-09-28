@@ -610,7 +610,8 @@ fn check_the_join(lines: &[Value]) {
             // before routing its events, so an event created earlier in
             // the batch than the stop is still dropped for the agent the
             // batch stopped. Werewolf does exactly this when a night's
-            // last tally and the death that follows it fall in one cycle.
+            // last point and the death that follows it fall in one
+            // cycle.
             let dropped =
                 stopped.contains_key(who) && created > last_observed.get(who).copied().unwrap_or(0);
             assert!(

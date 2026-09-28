@@ -28,7 +28,7 @@
 //! - **hidden information**: the realized observations stay inside each
 //!   role's observation space. Every message goes to exactly the players
 //!   the rules address it to: the pack is named only to werewolves, a
-//!   night's tally goes to the werewolves who cast it, a finding goes to the
+//!   devour is passed on to the living pack alone, a finding goes to the
 //!   seer alone, and a narration to the living goes to exactly the living.
 //!   Routing is the whole of the hidden-information mechanism, so these are
 //!   what the design exists to guarantee;
@@ -50,7 +50,8 @@
 //!   game, so there is nothing its behavior could be worth;
 //! - **game shape**: the phases alternate from the first night, each
 //!   eliminates at most one player and each day exactly one, the player
-//!   eliminated is one the phase's tally names most often, a night with no
+//!   eliminated is one the phase's counted points name most often, a
+//!   night with no
 //!   death is one on which the doctor protected such a player and only
 //!   then, the living set strictly shrinks every round, the game ends
 //!   within as many rounds as there are players, the winner is what the
@@ -83,6 +84,20 @@ struct Heard<'a> {
     line: &'a Value,
 }
 
+/// A point the moderator passed on: one it accepted.
+///
+/// The moderator forwards only a point whose session was still open
+/// (ADR-0014), so a forward is the trajectory's record that a point was
+/// counted. Since nothing summarizes a session any more (ADR-0015), it is
+/// also the only such record: what a session decided is read off these.
+struct Forwarded<'a> {
+    seq: u64,
+    from: AgentId,
+    to: BTreeSet<AgentId>,
+    point: Point,
+    line: &'a Value,
+}
+
 /// A game as its moderator recorded it, with the facts every check needs
 /// read out once: who holds which role, where each phase began, when each
 /// player was eliminated, and how it ended.
@@ -92,6 +107,9 @@ struct Play<'a> {
     said: Vec<Said<'a>>,
     /// Every point the moderator heard, in sequence order.
     heard: Vec<Heard<'a>>,
+    /// Every point the moderator passed on, in sequence order: the points
+    /// it accepted.
+    forwarded: Vec<Forwarded<'a>>,
     /// Each phase, in the order it began: its round, its phase, and the
     /// sequence number of the narration that announced it.
     ///
@@ -127,6 +145,7 @@ pub fn check(lines: &[Value], config: &Config) {
     play.check_points();
     play.check_action_spaces();
     play.check_recipients();
+    play.check_forwards();
     play.check_hidden_information();
     play.check_outcome();
     play.check_players(lines);
@@ -197,6 +216,38 @@ fn records_of<'a>(
         .filter(move |line| line["type"] == kind && super::agent(line) == agent.as_str())
 }
 
+/// The points the moderator passed on for a player: those among its
+/// actions stamped with that player as sender (ADR-0014).
+///
+/// A forward is what says the moderator accepted the point, so the checks
+/// read what a session decided off these (ADR-0015).
+fn forwards_of<'a>(
+    lines: &'a [Value],
+    config: &'a Config,
+    players: &BTreeSet<&AgentId>,
+) -> Vec<Forwarded<'a>> {
+    records_of(lines, &config.moderator, "action")
+        .filter(|line| line["event"]["sender"] != config.moderator.as_str())
+        .map(|line| {
+            let Message::Point(point) = message(line) else {
+                panic!("the moderator passes on only points: {line}");
+            };
+            let from = AgentId::deserialize(&line["event"]["sender"]).unwrap();
+            assert!(
+                players.contains(&from),
+                "the moderator passes on a point of a player's: {line}"
+            );
+            Forwarded {
+                seq: super::seq(line),
+                from,
+                to: recipients(line),
+                point,
+                line,
+            }
+        })
+        .collect()
+}
+
 /// The one recipient of a message addressed to a single player.
 fn only<'a>(to: &'a BTreeSet<AgentId>, line: &Value) -> &'a AgentId {
     assert_eq!(to.len(), 1, "addressed to one player: {line}");
@@ -211,9 +262,9 @@ fn outcome(message: &Message) -> Option<&Outcome> {
     }
 }
 
-/// The players a tally names most often: the ones the elimination is
-/// drawn from. A member that never pointed is absent from the tally and
-/// names nobody.
+/// The players a session's points name most often: the ones the
+/// elimination is drawn from. A member whose point was never counted is
+/// absent and names nobody.
 fn leaders(votes: &BTreeMap<AgentId, AgentId>) -> BTreeSet<AgentId> {
     let mut counts: BTreeMap<&AgentId, usize> = BTreeMap::new();
     for who in votes.values() {
@@ -237,11 +288,11 @@ impl<'a> Play<'a> {
     /// eliminated twice, or a game without an outcome.
     fn read(lines: &'a [Value], config: &'a Config) -> Self {
         let players: BTreeSet<&AgentId> = config.players.iter().collect();
+        let forwarded = forwards_of(lines, config, &players);
         let said: Vec<Said> = records_of(lines, &config.moderator, "action")
-            // What the moderator says for itself. A point among its
-            // actions is one it passed on for a player, stamped with that
-            // player as sender (ADR-0014); it is that player's action, and
-            // it is read below from the moderator's observation of it.
+            // What the moderator says for itself, which is every narration
+            // and nothing else: the forwards above are the players'
+            // actions, read from the same records.
             .filter(|line| line["event"]["sender"] == config.moderator.as_str())
             .map(|line| {
                 let message = message(line);
@@ -327,6 +378,7 @@ impl<'a> Play<'a> {
             config,
             said,
             heard,
+            forwarded,
             phases,
             assignment,
             eliminated,
@@ -363,20 +415,6 @@ impl<'a> Play<'a> {
             .filter(|who| !self.dead_at(who, seq))
             .cloned()
             .collect()
-    }
-
-    /// The phase a record numbered `seq` falls in: the latest phase
-    /// announced before it.
-    ///
-    /// A phase narration is the only record that a phase's sessions
-    /// opened (ADR-0014), so this is what places everything the
-    /// moderator said or heard within the game.
-    fn phase_at(&self, seq: u64) -> Option<(Round, Phase)> {
-        self.phases
-            .iter()
-            .take_while(|(_, _, began)| *began < seq)
-            .last()
-            .map(|(round, phase, _)| (*round, *phase))
     }
 
     /// Whom each doctor protected in `round`, from the points it made.
@@ -420,7 +458,8 @@ impl<'a> Play<'a> {
     /// moderator each derive it: from the roles. The non-empty action
     /// space matters — a doctor the rules leave nobody it may protect is
     /// not a member, and its session does not open — so a check that
-    /// went by role alone would expect a tally that never comes.
+    /// went by role alone would hold a player to a session it was never
+    /// in.
     fn members_of(
         &self,
         kind: RequestKind,
@@ -433,16 +472,6 @@ impl<'a> Play<'a> {
             .filter(|who| !self.action_space(who, kind, round, living).is_empty())
             .cloned()
             .collect()
-    }
-
-    /// The members of a night session of `kind` at the record numbered
-    /// `seq`, which is who its closing tally is addressed to.
-    fn night_members(&self, kind: RequestKind, seq: u64) -> BTreeSet<AgentId> {
-        let living = self.living_at(seq);
-        let (round, _) = self
-            .phase_at(seq)
-            .expect("a night tally falls within a phase");
-        self.members_of(kind, round, &living)
     }
 
     /// The record that began the phase a point names, if the game ever
@@ -472,8 +501,8 @@ impl<'a> Play<'a> {
     /// of mistaking it for a point in the phase that has since opened.
     ///
     /// Nothing here claims a member points. A session closes on its
-    /// clock, so a member that never pointed is simply absent from its
-    /// tally, which is how it abstains (ADR-0011).
+    /// clock, so a member that never pointed is simply one nobody saw
+    /// point, which is how it abstains (ADR-0011).
     fn check_points(&self) {
         for heard in &self.heard {
             let line = heard.line;
@@ -568,10 +597,11 @@ impl<'a> Play<'a> {
     }
 
     /// Every message goes to exactly the players the rules address it to.
-    /// A request and a role assignment go to one player, which `read`
-    /// checked. A finding goes to the seer alone; a night tally to the
-    /// werewolves who cast it; and a phase, a day tally, a death, a quiet
-    /// night and the outcome to the living.
+    /// A role assignment goes to one player, which `read` checked. A
+    /// finding goes to the seer alone; and a phase, a death, a quiet
+    /// night, a quiet day and the outcome to the living. Where each
+    /// forwarded point goes is checked in
+    /// [`check_forwards`](Self::check_forwards).
     ///
     /// The outcome is in the last group, not a group of its own: the
     /// broadcast exception ADR-0004 made for it is withdrawn, so it is a
@@ -587,25 +617,6 @@ impl<'a> Play<'a> {
                 Message::Narration(Narration::Investigated { .. }) => {
                     assert_eq!(said.to, seers, "a finding goes to the seer alone: {line}");
                 }
-                // A night session's tally marks its close, and goes to
-                // its own members: the pack sees the pack's, and the seer
-                // and the doctor each see only their own (ADR-0011).
-                Message::Narration(Narration::Tally {
-                    phase: Phase::Night,
-                    kind,
-                    votes,
-                    ..
-                }) => {
-                    let members = self.night_members(*kind, said.seq);
-                    assert_eq!(
-                        said.to, members,
-                        "a night tally goes to its session's members: {line}"
-                    );
-                    assert!(
-                        votes.keys().all(|who| members.contains(who)),
-                        "a night tally names only its session's members: {line}"
-                    );
-                }
                 // A death is announced to the living *after* it: the
                 // victim is not told, because it is stopped in the same
                 // cycle and there is nobody left to tell (ADR-0012).
@@ -618,8 +629,7 @@ impl<'a> Play<'a> {
                     );
                 }
                 Message::Narration(
-                    Narration::Tally { .. }
-                    | Narration::PhaseBegan { .. }
+                    Narration::PhaseBegan { .. }
                     | Narration::NoDeath { .. }
                     | Narration::NoLynch { .. },
                 ) => assert_eq!(
@@ -635,65 +645,100 @@ impl<'a> Play<'a> {
                     );
                     outcomes += 1;
                 }
-                Message::Point(_) => unreachable!("the moderator sends no points"),
+                Message::Point(_) => {
+                    unreachable!("a forwarded point is not among the moderator's own words")
+                }
             }
         }
         assert_eq!(outcomes, 1, "the outcome is announced once");
     }
 
+    /// Every point the moderator passed on went to exactly the players the
+    /// rules let see it, and to living players only.
+    ///
+    /// Since ADR-0015 nothing summarizes a session, so a forward is the
+    /// only thing the moderator says about one point of one member, and
+    /// where each goes is the
+    /// whole of the hidden information a session leaks: a `Devour` to the
+    /// rest of the living pack, a `Nominate` to the rest of the living,
+    /// and nothing at all for the seer's and the doctor's, which are
+    /// between that player and the moderator and so are never forwarded.
+    fn check_forwards(&self) {
+        for forwarded in &self.forwarded {
+            let line = forwarded.line;
+            let living = self.living_at(forwarded.seq);
+            assert!(
+                forwarded.to.iter().all(|who| living.contains(who)),
+                "a point is passed on to living players only: {line}"
+            );
+            assert!(
+                !forwarded.to.contains(&forwarded.from),
+                "a point is not passed back to the player that made it: {line}"
+            );
+            let mut others = living.clone();
+            others.remove(&forwarded.from);
+            match forwarded.point.kind {
+                // The pack sees where the pack is pointing, and nobody
+                // else sees a devour at all.
+                RequestKind::Devour => {
+                    let pack: BTreeSet<AgentId> = others
+                        .into_iter()
+                        .filter(|who| self.role(who) == Role::Werewolf)
+                        .collect();
+                    assert_eq!(
+                        forwarded.to, pack,
+                        "a devour goes to the rest of the living pack: {line}"
+                    );
+                    assert_eq!(
+                        self.role(&forwarded.from),
+                        Role::Werewolf,
+                        "only a werewolf devours: {line}"
+                    );
+                }
+                // The day's vote is public among the living.
+                RequestKind::Nominate => assert_eq!(
+                    forwarded.to, others,
+                    "a nomination goes to the rest of the living: {line}"
+                ),
+                RequestKind::Investigate | RequestKind::Protect => panic!(
+                    "a {:?} point is nobody else's business and is never passed on: {line}",
+                    forwarded.point.kind
+                ),
+            }
+        }
+    }
+
     /// What the addressed messages say stays inside the recipient's
     /// observation space: a werewolf is told the pack and nobody else is
-    /// told anything of it, and a night tally is the werewolves' votes.
+    /// told anything of it.
     fn check_hidden_information(&self) {
         for said in &self.said {
             let line = said.line;
-            match &said.message {
-                Message::Narration(Narration::Assigned { role, pack }) => {
-                    if *role == Role::Werewolf {
-                        assert_eq!(
-                            pack,
-                            self.assignment.pack(),
-                            "a werewolf is told its pack: {line}"
-                        );
-                    } else {
-                        assert!(
-                            pack.is_empty(),
-                            "no message naming the pack is addressed to a non-werewolf: {line}"
-                        );
-                    }
-                }
-                // A night session's tally names its own members, and only
-                // the pack's is the werewolves' (ADR-0011).
-                Message::Narration(Narration::Tally {
-                    phase: Phase::Night,
-                    kind,
-                    votes,
-                    ..
-                }) => {
-                    let role = match kind {
-                        RequestKind::Devour => Role::Werewolf,
-                        RequestKind::Investigate => Role::Seer,
-                        RequestKind::Protect => Role::Doctor,
-                        RequestKind::Nominate => unreachable!("nobody nominates at night"),
-                    };
+            if let Message::Narration(Narration::Assigned { role, pack }) = &said.message {
+                if *role == Role::Werewolf {
+                    assert_eq!(
+                        pack,
+                        self.assignment.pack(),
+                        "a werewolf is told its pack: {line}"
+                    );
+                } else {
                     assert!(
-                        votes.keys().all(|who| self.role(who) == role),
-                        "a {kind:?} tally is the {role}s' votes: {line}"
+                        pack.is_empty(),
+                        "no message naming the pack is addressed to a non-werewolf: {line}"
                     );
                 }
-                _ => {}
             }
         }
     }
 
     /// The phases run Night 1, Day 1, Night 2, Day 2, ... from the first
     /// night; each begins with the living as they are and asks only during
-    /// itself; a night has one tally and then one death or one `NoDeath`; a
-    /// day has one tally and then one death; the player eliminated is one
-    /// the tally names most, unprotected at night, and a quiet night is one
-    /// on which the doctor protected such a player; a death reveals the
-    /// role and names the phase's cause; and the living strictly shrink
-    /// from one round to the next.
+    /// itself; a night ends in one death or one `NoDeath`; a day ends in
+    /// one lynching or one `NoLynch`; the player eliminated is one the
+    /// phase's counted points name most, unprotected at night, and a
+    /// quiet night is one on which the doctor protected such a player; a
+    /// death reveals the role and names the phase's cause; and the living
+    /// strictly shrink from one round to the next.
     fn check_phases(&self) {
         // Straight off the points: each says which round and which
         // session it was made in (ADR-0014), so there is nothing to join
@@ -1006,25 +1051,39 @@ impl<'p, 'a> Phases<'p, 'a> {
     /// The players the session that decides a death named most often:
     /// the pack's at night, the day's by day.
     ///
-    /// Read from the points the moderator observed rather than from the
-    /// tally it narrated. A point is the primary record — an action a
-    /// player took, naming for itself the session it was made in
-    /// (ADR-0014) — and it is there whether or not anybody was told a
-    /// tally. A tally is a message to the members of a session, and a
-    /// session of one is sent none, because a lone seer, doctor or wolf
-    /// would be told only what it has just said.
+    /// Read from the points the moderator *passed on*, which are the
+    /// points it accepted. Nothing summarizes a session any more
+    /// (ADR-0015), so a forward is the trajectory's record that a point
+    /// counted: a point the moderator merely heard may have lost a race
+    /// with its session's clock, and counting it would hold the
+    /// moderator to a vote it never took.
+    ///
+    /// A point with nobody to see it is the exception. A lone werewolf's
+    /// `Devour` names no audience, so there is nothing for the moderator
+    /// to pass on and no forward is written however the race went. For
+    /// those the check falls back to the points the moderator heard,
+    /// which is as much as the trajectory says: a pack of one cannot
+    /// split, so the fallback can only ever name the one player the
+    /// session had a point for.
     fn leaders_of(&self, round: Round, phase: Phase) -> BTreeSet<AgentId> {
         let deciding = match phase {
             Phase::Night => RequestKind::Devour,
             Phase::Day => RequestKind::Nominate,
         };
-        let votes: BTreeMap<AgentId, AgentId> = self
+        let counted = self
+            .play
+            .forwarded
+            .iter()
+            .filter(|point| point.point.round == round && point.point.kind == deciding)
+            .map(|point| (point.from.clone(), point.point.target.clone()));
+        let unseen = self
             .play
             .heard
             .iter()
             .filter(|heard| heard.point.round == round && heard.point.kind == deciding)
-            .map(|heard| (heard.from.clone(), heard.point.target.clone()))
-            .collect();
+            .filter(|heard| heard.point.seen_by.is_empty())
+            .map(|heard| (heard.from.clone(), heard.point.target.clone()));
+        let votes: BTreeMap<AgentId, AgentId> = counted.chain(unseen).collect();
         leaders(&votes)
     }
 
@@ -1136,7 +1195,6 @@ impl<'p, 'a> Phases<'p, 'a> {
 /// What has been narrated so far in one phase.
 #[derive(Default)]
 struct PhaseCounts {
-    tallies: usize,
     eliminated: usize,
     no_death: usize,
 }
@@ -1146,16 +1204,6 @@ impl PhaseCounts {
     /// belongs to that phase.
     fn count(&mut self, narration: &Narration, round: Round, phase: Phase, line: &Value) {
         match narration {
-            Narration::Tally {
-                round: r, phase: p, ..
-            } => {
-                assert_eq!(
-                    (*r, *p),
-                    (round, phase),
-                    "a tally belongs to its phase: {line}"
-                );
-                self.tallies += 1;
-            }
             Narration::Eliminated { round: r, .. } => {
                 assert_eq!(*r, round, "a death belongs to its round: {line}");
                 self.eliminated += 1;
@@ -1186,35 +1234,23 @@ impl PhaseCounts {
         let Some((_, phase, line)) = phase else {
             return;
         };
-        // A tally goes only to a session of more than one member, since
-        // a session of one would be told what it alone said, so how many
-        // a phase has is a fact about the roster rather than about the
-        // rules: a night of three lone roles has none, a seven-player
-        // day has one. What each arm checks is the part that does not
-        // depend on who is left alive.
+        // How a phase came out, which is the whole of what a phase
+        // narrates about its sessions since ADR-0015: the sessions
+        // themselves close silently, so there is nothing to count but
+        // the outcome.
         match phase {
-            // At most three: the pack, the seer and the doctor.
-            Phase::Night => {
-                assert!(
-                    self.tallies <= 3,
-                    "a night has at most a tally per session: {line}"
-                );
-                assert_eq!(
-                    self.eliminated + self.no_death,
-                    1,
-                    "a night has one death or one NoDeath, never both or neither: {line}"
-                );
-            }
-            // A day is one session, and it may end without a lynch now
-            // that it closes on a majority rather than a plurality.
-            Phase::Day => {
-                assert!(self.tallies <= 1, "a day is one session: {line}");
-                assert_eq!(
-                    self.eliminated + self.no_death,
-                    1,
-                    "a day lynches exactly one or nobody, never both: {line}"
-                );
-            }
+            Phase::Night => assert_eq!(
+                self.eliminated + self.no_death,
+                1,
+                "a night has one death or one NoDeath, never both or neither: {line}"
+            ),
+            // A day may end without a lynch now that it closes on a
+            // majority rather than a plurality.
+            Phase::Day => assert_eq!(
+                self.eliminated + self.no_death,
+                1,
+                "a day lynches exactly one or nobody, never both: {line}"
+            ),
         }
     }
 }
@@ -1292,11 +1328,11 @@ mod tests {
         }
     }
 
-    /// The tally of the given phase.
-    fn tally(round: u32, phase: &str) -> impl Fn(&Value) -> bool + '_ {
+    /// A point of the given round and session kind.
+    fn point_in(round: u32, kind: &str) -> impl Fn(&Value) -> bool + '_ {
         move |payload| {
-            let tally = &payload["Narration"]["Tally"];
-            tally["round"] == round && tally["phase"] == phase
+            let point = &payload["Point"];
+            point["round"] == round && point["kind"] == kind
         }
     }
 
@@ -1543,7 +1579,7 @@ mod tests {
     #[test]
     fn a_member_may_never_point_at_all() {
         // A session closes on its clock, so a member that never pointed
-        // is simply absent from its tally (ADR-0011). Nothing claims a
+        // is simply one nobody saw point (ADR-0011). Nothing claims a
         // member points, so removing a point is a game, not a forgery.
         let mut lines = fixture();
         let index = find_record(
@@ -1614,11 +1650,16 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "a night tally goes to its session's members")]
-    fn a_night_tally_sent_to_a_villager_is_caught() {
-        let lines = said(tally(1, "Night"), |line| {
-            recipients(line, &["alice", "dave", "erin"]);
-        });
+    #[should_panic(expected = "a devour goes to the rest of the living pack")]
+    fn a_devour_passed_on_to_a_villager_is_caught() {
+        // What a night session leaks is where its points go, and since
+        // ADR-0015 a forward is the only thing the moderator says about
+        // one. dave and erin are the pack; alice is a villager, and a
+        // devour passed on to her tells her both that somebody is being
+        // eaten and, by who sent it, that dave is a wolf.
+        let mut lines = fixture();
+        let index = find(&lines, "moderator", "action", point_in(1, "Devour"));
+        recipients(&mut lines[index], &["alice", "erin"]);
         check(&lines, &config());
     }
 
@@ -1685,12 +1726,16 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "a night tally goes to its session's members")]
-    fn a_night_tally_with_a_villager_in_it_is_caught() {
-        let lines = said(tally(1, "Night"), |line| {
-            line["event"]["payload"]["Narration"]["Tally"]["votes"]["carol"] = json!("alice");
-            recipients(line, &["carol", "dave", "erin"]);
-        });
+    #[should_panic(expected = "only a werewolf devours")]
+    fn a_devour_passed_on_for_a_villager_is_caught() {
+        // A devour the moderator accepted from somebody the rules never
+        // put in the pack's session. The recipients are made the rest of
+        // the living pack, so that it is who made the point that trips
+        // the check rather than where it went.
+        let mut lines = fixture();
+        let index = find(&lines, "moderator", "action", point_in(1, "Devour"));
+        sender(&mut lines[index], "alice");
+        recipients(&mut lines[index], &["dave", "erin"]);
         check(&lines, &config());
     }
 
@@ -1753,10 +1798,11 @@ mod tests {
         // outcome is corrected to match, so that whom the pack pointed at
         // is what the check trips on rather than the survivors.
         //
-        // What it is checked against is the pack's *points*, which the
-        // moderator observed, and not a tally it narrated: a tally is a
-        // message to a session's members and says nothing a point did
-        // not, so forging one would not make this death legitimate.
+        // What it is checked against is the pack's *points*, the ones
+        // the moderator passed on. Nothing summarizes a session
+        // (ADR-0015), so there is no summary to forge alongside the
+        // death: the points are the whole record of what the pack
+        // decided.
         let mut lines = fixture();
         let death = find(&lines, "moderator", "action", eliminated("alice"));
         lines[death]["event"]["payload"]["Narration"]["Eliminated"] =
@@ -1798,9 +1844,6 @@ mod tests {
             point_of("carol", 2, "Protect"),
         );
         target(&mut lines[protect], "bob");
-        let tally = find(&lines, "moderator", "action", tally(2, "Night"));
-        lines[tally]["event"]["payload"]["Narration"]["Tally"]["votes"] =
-            json!({"dave": "bob", "erin": "bob"});
         let death = find(&lines, "moderator", "action", eliminated("carol"));
         swap(&mut lines[death..], "carol", "bob");
         // A swap exchanges the names, not the role the death reveals.
@@ -1906,7 +1949,7 @@ mod tests {
         // has to put the leak after that moment rather than after an
         // announcement carol never received.
         let mut lines = fixture();
-        let mut leaked = lines[find(&lines, "bob", "observation", tally(2, "Day"))].clone();
+        let mut leaked = lines[find(&lines, "bob", "observation", point_in(2, "Nominate"))].clone();
         leaked["agent"] = json!("carol");
         let stop = lines
             .iter()

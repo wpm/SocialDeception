@@ -166,7 +166,7 @@ impl Domain for WerewolfDomain {
 pub use assignment::Assignment;
 pub use config::{Config, ConfigError, RoleCounts};
 pub use game::{Directive, Game};
-pub use knowledge::{Death, Heard, Knowledge};
+pub use knowledge::{Death, Knowledge, Phased};
 pub use live::Text;
 pub use message::{Cause, Message, Narration, Outcome, Phase, Point, RequestKind, Round};
 pub use moderator::Moderator;

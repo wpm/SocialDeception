@@ -16,7 +16,7 @@
 //! # Determinism, precisely
 //!
 //! For a fixed configuration and seed, the *logical transcript* (the role
-//! assignment, every request, response, tally, elimination and the outcome)
+//! assignment, every point, elimination and the outcome)
 //! is identical on every run. The *wall-clock timestamps* and the
 //! *interleaving of different agents' records* in the trajectory are not,
 //! and cannot be, because the agents are threads. So the determinism tests

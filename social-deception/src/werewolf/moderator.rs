@@ -241,8 +241,10 @@ impl Environment<WerewolfDomain> for Moderator {
     ///
     /// The moderator is the only agent in the tree that keeps clocks. It
     /// wakes on the earliest of them and asks the game what that instant
-    /// finished; a session that closed is a tally to its members, and the
-    /// last of a night's sessions resolves the night.
+    /// finished. A session's close is the moderator's own business and is
+    /// narrated to nobody (ADR-0015); what its members hear is what the
+    /// phase came to, and the last of a night's sessions resolves the
+    /// night.
     fn timeout(&mut self, now: Timestamp) -> Vec<Effect<WerewolfDomain>> {
         if self.game.outcome().is_some() {
             return Vec::new();

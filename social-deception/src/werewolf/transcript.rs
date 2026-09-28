@@ -47,8 +47,8 @@
 //! # No game logic
 //!
 //! Nothing here decides anything. The reader records what the moderator
-//! said, in the order it said it, and nothing more: it does not tally votes,
-//! check a win condition or infer a save. If reconstructing the game ever
+//! said and passed on, in the order it did so, and nothing more: it does not
+//! count votes, check a win condition or infer a save. If reconstructing the game ever
 //! needed a rule, the moderator would not be recording enough, and the fix
 //! would belong with the moderator.
 
@@ -576,6 +576,17 @@ fn only(
 struct Reader {
     assignment: BTreeMap<AgentId, Role>,
     rounds: Vec<RoundRecord>,
+    /// The player that made the latest nomination the moderator passed
+    /// on, and which is therefore still a candidate for the hammer.
+    ///
+    /// The moderator forwards each nomination it accepts as it accepts
+    /// it, and the point that completes a majority is forwarded before
+    /// the lynching it causes is narrated. So the sender of the last
+    /// forward before an `Eliminated { cause: Lynched }` is the player
+    /// whose point ended the day, and no narration has to say so
+    /// (ADR-0015). Cleared when a phase begins, so that a lynching can
+    /// never take its hammer from the day before.
+    latest_nomination: Option<AgentId>,
     /// How the game ended, once the moderator has announced it. `None`
     /// until then, and still `None` at the end of a truncated transcript,
     /// which is [`TranscriptError::NoOutcome`].
@@ -600,8 +611,15 @@ impl Reader {
             // players who should see it (ADR-0014). It is stamped with the
             // player that made it, so it is the same point this reader
             // already folded when the moderator received it, and folding
-            // it twice would count one vote as two.
-            (Direction::Sent, Message::Point(_)) => Ok(()),
+            // it twice would count one vote as two. What it does say, and
+            // the received point does not, is that the moderator accepted
+            // it: that is where the hammer comes from (ADR-0015).
+            (Direction::Sent, Message::Point(point)) => {
+                if point.kind == RequestKind::Nominate {
+                    self.latest_nomination = Some(sender);
+                }
+                Ok(())
+            }
             _ => Err(TranscriptError::Misdirected { line }),
         }
     }
@@ -622,21 +640,27 @@ impl Reader {
                 round,
                 phase: Phase::Night,
                 living,
-            } => self.rounds.push(RoundRecord {
-                round,
-                night: PhaseRecord::begun(living),
-                day: None,
-            }),
+            } => {
+                self.latest_nomination = None;
+                self.rounds.push(RoundRecord {
+                    round,
+                    night: PhaseRecord::begun(living),
+                    day: None,
+                });
+            }
             Narration::PhaseBegan {
                 round,
                 phase: Phase::Day,
                 living,
-            } => match self.rounds.last_mut() {
-                Some(latest) if latest.round == round && latest.day.is_none() => {
-                    latest.day = Some(PhaseRecord::begun(living));
+            } => {
+                self.latest_nomination = None;
+                match self.rounds.last_mut() {
+                    Some(latest) if latest.round == round && latest.day.is_none() => {
+                        latest.day = Some(PhaseRecord::begun(living));
+                    }
+                    _ => return Err(TranscriptError::NoPhase { line }),
                 }
-                _ => return Err(TranscriptError::NoPhase { line }),
-            },
+            }
             Narration::Investigated { target, faction } => {
                 let seer = only(line, recipients, "a finding is addressed to one seer")?;
                 self.current(line)?
@@ -645,15 +669,18 @@ impl Reader {
             }
             Narration::Eliminated {
                 who, role, cause, ..
-            } => self.current(line)?.eliminated = Some((who, role, cause)),
-            Narration::NoLynch { .. } => self.current(line)?.no_lynch = true,
-            Narration::Tally { hammer, .. } => {
-                if let Some(hammer) = hammer {
-                    self.current(line)?.hammer = Some(hammer);
-                }
+            } => {
+                // The nomination that lynched somebody is the last one
+                // the moderator passed on before saying so (ADR-0015).
+                let hammer = (cause == Cause::Lynched)
+                    .then(|| self.latest_nomination.clone())
+                    .flatten();
+                let phase = self.current(line)?;
+                phase.eliminated = Some((who, role, cause));
+                phase.hammer = hammer;
             }
-            // A tally otherwise repeats points already recorded, and a
-            // night without a death is one without an elimination.
+            Narration::NoLynch { .. } => self.current(line)?.no_lynch = true,
+            // A night without a death is one without an elimination.
             Narration::NoDeath { .. } => {}
             Narration::Outcome(outcome) => self.outcome = Some(outcome),
         }
@@ -703,7 +730,7 @@ impl Reader {
     }
 }
 
-/// How many cells a roster or a tally lays out per line.
+/// How many cells a roster or a phase's moves lay out per line.
 const COLUMNS: usize = 4;
 
 impl fmt::Display for Transcript {
