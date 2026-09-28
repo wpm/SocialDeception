@@ -35,14 +35,17 @@
 //! told its finding when its own session closes, so a seer devoured that
 //! same night still learns what it learned.
 //!
-//! A session of **more than one member** closes with a tally of its
-//! members' latest points, to those members. That is what lets a pack see
-//! where it has converged. A session of one is sent none: it would tell a
-//! lone seer, doctor or wolf the one thing it already knows, having just
-//! said it. Everything the moderator sends a player is something that
-//! player observes for its own sake; what the moderator needs to remember
-//! it keeps, and a reader of the trajectory reconstructs a session from
-//! the points the moderator observed, which are the primary record.
+//! **A session closes silently.** Its members are told nothing of its
+//! close, because there is nothing left to tell them: each point the
+//! moderator accepted was forwarded as it arrived, so a member has
+//! already watched the session converge point by point, and a summary of
+//! where it landed would only repeat what that member observed
+//! (ADR-0015). What the moderator needs to remember about a session it
+//! keeps — it is the moderator that drops a point arriving after the
+//! close — and a reader of the trajectory reconstructs a session from
+//! the points, which are the primary record. What a member learns is the
+//! session's *outcome*, and that is announced anyway: the death, the
+//! finding, or the night that passed quietly.
 //!
 //! The night resolves once every session has closed: the victim is the
 //! plurality of the pack's latest points, and no wolf pointing means
@@ -418,7 +421,7 @@ impl Game {
         if kind == RequestKind::Nominate && self.majority().is_some() {
             // This point is the one that completed the majority, so the
             // player who made it is the hammer.
-            directives.extend(self.close_day(Some(from.clone()), at));
+            directives.extend(self.close_day(Some(from), at));
         }
         directives
     }
@@ -615,39 +618,18 @@ impl Game {
         }
     }
 
-    /// Closes one night session: its tally to its observers, and the
-    /// seer's finding if it looked at anybody.
+    /// Closes one night session: the seer's finding if it looked at
+    /// anybody, and nothing else.
     ///
-    /// The tally marks the close, which is how the session's members and
-    /// the transcript know that a point arriving later is late. The seer
-    /// is told what it found here rather than at the end of the night, so
-    /// that its own session's clock is the only one it waits on; a seer
-    /// devoured the same night still learns what it learned.
+    /// Nobody is told the session closed. Its members watched it converge
+    /// through the forwards, so a summary would repeat what they already
+    /// observed, and whether a point arrived too late is the moderator's
+    /// own bookkeeping rather than anything a player acts on (ADR-0015).
+    /// The seer is told what it found here rather than at the end of the
+    /// night, so that its own session's clock is the only one it waits
+    /// on; a seer devoured the same night still learns what it learned.
     fn close_night_session(&mut self, session: &Session) -> Vec<Directive> {
-        // To its members, and to nobody else; the moderator is not a
-        // recipient of its own narrations.
-        //
-        // A session of one is not told its own tally. The point of a
-        // tally is that a member sees where the *others* landed, which
-        // is what lets a pack converge; told to a lone seer or doctor it
-        // repeats the one thing that player already knows, having just
-        // said it. The seer's close is marked by the finding below,
-        // which says something it did not know; the doctor's is marked
-        // by nothing, which is of a piece with a protection being
-        // announced to nobody.
         let mut directives = Vec::new();
-        if session.members.len() > 1 {
-            directives.push(Directive::Narrate {
-                to: session.members.clone(),
-                narration: Narration::Tally {
-                    round: self.round,
-                    phase: Phase::Night,
-                    kind: session.kind,
-                    votes: session.points.clone(),
-                    hammer: None,
-                },
-            });
-        }
         for (who, target) in &session.points {
             match session.kind {
                 RequestKind::Protect => {
@@ -697,22 +679,19 @@ impl Game {
         directives
     }
 
-    /// Closes the day: the tally to the living, then the lynching that a
-    /// majority called for, or `NoLynch` when the limit passed without one.
-    fn close_day(&mut self, hammer: Option<AgentId>, now: Timestamp) -> Vec<Directive> {
+    /// Closes the day: the lynching a majority called for, or `NoLynch`
+    /// when the limit passed without one.
+    ///
+    /// The hammer is the moderator's own: it is what names the player who
+    /// dies, and it is never narrated. A reader recovers it from the
+    /// trajectory as the last point forwarded before the lynching, and a
+    /// player that saw that point saw the same thing (ADR-0015).
+    fn close_day(&mut self, hammer: Option<&AgentId>, now: Timestamp) -> Vec<Directive> {
         let session = self.sessions.remove(0);
         // The hammer is the point that made the majority, and the target
         // of that majority is who dies for it.
-        let lynched = hammer
-            .as_ref()
-            .and_then(|who| session.points.get(who).cloned());
-        let mut directives = vec![self.narrate_living(Narration::Tally {
-            round: self.round,
-            phase: Phase::Day,
-            kind: RequestKind::Nominate,
-            votes: session.points,
-            hammer,
-        })];
+        let lynched = hammer.and_then(|who| session.points.get(who).cloned());
+        let mut directives = Vec::new();
         if let Some(who) = lynched {
             directives.extend(self.eliminate(&who, Cause::Lynched));
             directives.extend(self.advance(now));
@@ -1005,50 +984,6 @@ mod tests {
                 round: Round(round),
                 phase,
                 living: ids(living),
-            },
-        )
-    }
-
-    /// The closing tally of one session, to the members it goes to.
-    fn tally<const N: usize>(
-        to: [&str; N],
-        round: u32,
-        kind: RequestKind,
-        votes: &[(&'static str, &str)],
-    ) -> Directive {
-        narrate(
-            to,
-            Narration::Tally {
-                round: Round(round),
-                phase: kind.phase(),
-                kind,
-                hammer: None,
-                votes: answers(votes)
-                    .into_iter()
-                    .map(|(who, action)| (id(who), action))
-                    .collect(),
-            },
-        )
-    }
-
-    /// A day's closing tally, naming the hammer that ended it.
-    fn day_tally<const N: usize>(
-        to: [&str; N],
-        round: u32,
-        hammer: Option<&str>,
-        votes: &[(&'static str, &str)],
-    ) -> Directive {
-        narrate(
-            to,
-            Narration::Tally {
-                round: Round(round),
-                phase: Phase::Day,
-                kind: RequestKind::Nominate,
-                hammer: hammer.map(id),
-                votes: answers(votes)
-                    .into_iter()
-                    .map(|(who, action)| (id(who), action))
-                    .collect(),
             },
         )
     }
@@ -1421,8 +1356,12 @@ mod tests {
             "both points are forwarded, in the order they were accepted"
         );
         // And the vote the game counts is the later of the two.
-        let tally = game.sessions[0].points.get(&voter);
-        assert_eq!(tally, Some(&living[2]), "the most recent point is the vote");
+        let counted = game.sessions[0].points.get(&voter);
+        assert_eq!(
+            counted,
+            Some(&living[2]),
+            "the most recent point is the vote"
+        );
     }
 
     #[test]
@@ -1585,17 +1524,10 @@ mod tests {
                 eliminated(everyone, "alice", Villager, 1, Cause::Devoured),
                 stopped("alice"),
                 phase_began(1, Phase::Day, survivors),
-                day_tally(
-                    survivors,
-                    1,
-                    Some("erin"),
-                    &[
-                        ("bob", "carol"),
-                        ("carol", "bob"),
-                        ("dave", "bob"),
-                        ("erin", "bob")
-                    ],
-                ),
+                // Nothing stands between the phase and the lynching it
+                // came to. The points that made the majority went to the
+                // living as they arrived, so a close has nothing left to
+                // tell them (ADR-0015).
                 eliminated(survivors, "bob", Werewolf, 1, Cause::Lynched),
                 stopped("bob"),
                 outcome(Faction::Village, 1, ["carol", "dave", "erin"]),
@@ -1636,13 +1568,9 @@ mod tests {
                 stopped("carol"),
                 phase_began(1, Phase::Day, ["alice", "bob", "dave", "erin"]),
                 // dave's point is the third of four living, a majority,
-                // so it is the hammer and erin never points at all.
-                day_tally(
-                    ["alice", "bob", "dave", "erin"],
-                    1,
-                    Some("dave"),
-                    &[("alice", "erin"), ("bob", "erin"), ("dave", "erin")],
-                ),
+                // so it is the hammer and erin never points at all. The
+                // hammer is not narrated: a reader takes it from the
+                // last point the moderator passed on (ADR-0015).
                 eliminated(
                     ["alice", "bob", "dave", "erin"],
                     "erin",
@@ -1959,20 +1887,10 @@ mod tests {
         let deadline = game.next_deadline().expect("the sessions are open");
         assert_eq!(deadline, at(0) + fast().pack.quiet);
         let caused = game.expire(deadline);
-        // The village's pack is one wolf, so there is no tally to send:
-        // a session of one is not told what it alone said. What the
-        // close does produce is the seer's finding, then the death.
+        // Closing a session says nothing to its members (ADR-0015).
+        // What the close does produce is the seer's finding, then the
+        // death.
         assert_eq!(caused[0], investigated("carol", "bob", Faction::Werewolves));
-        assert!(
-            !caused.iter().any(|directive| matches!(
-                directive,
-                Directive::Narrate {
-                    narration: Narration::Tally { .. },
-                    ..
-                }
-            )),
-            "no session of this night had two members: {caused:?}"
-        );
     }
 
     #[test]
@@ -2055,12 +1973,6 @@ mod tests {
         assert_eq!(
             directives[8..],
             [
-                tally(
-                    ["alice", "bob", "carol"],
-                    1,
-                    RequestKind::Devour,
-                    &[("alice", "dave"), ("bob", "erin"), ("carol", "frank")],
-                ),
                 eliminated(everyone, "dave", Villager, 1, Cause::Devoured),
                 stopped("dave"),
                 outcome(
@@ -2108,9 +2020,10 @@ mod tests {
 
     #[test]
     fn a_plurality_of_nothing_is_nobody() {
-        // A member that never pointed is absent from the tally rather than
-        // present with an abstention, so an empty tally is the only way a
-        // plurality comes back empty (ADR-0011).
+        // A member that never pointed is absent from its session's
+        // points rather than present with an abstention, so a session
+        // nobody pointed in is the only way a plurality comes back empty
+        // (ADR-0011).
         let mut ties = ChaCha8Rng::seed_from_u64(1);
         assert_eq!(plurality(&[], &mut ties), None);
         assert_eq!(plurality(&[target("bob")], &mut ties), Some(id("bob")));
@@ -2131,22 +2044,16 @@ mod tests {
             ]
         );
         assert_eq!(*game.living(), ids(everyone));
-        // A save is never announced as one. What the doctor alone hears is
-        // its deal and the tally that closes its own session; that it
-        // protected the victim is told to nobody, so the village cannot
-        // tell a save from a pack that pointed nowhere.
+        // A save is never announced as one. The only thing the doctor
+        // hears that the village does not is its own deal: its session
+        // closes silently (ADR-0015), and that it protected the victim
+        // is told to nobody, so the village cannot tell a save from a
+        // pack that pointed nowhere.
         for directive in &directives {
             if let Directive::Narrate { to, narration } = directive {
                 if to.contains(&id("dave")) && to.len() < everyone.len() {
                     assert!(
-                        matches!(
-                            narration,
-                            Narration::Assigned { .. }
-                                | Narration::Tally {
-                                    kind: RequestKind::Protect,
-                                    ..
-                                }
-                        ),
+                        matches!(narration, Narration::Assigned { .. }),
                         "the doctor alone was told {narration:?}"
                     );
                 }
@@ -2318,30 +2225,6 @@ mod tests {
                             } else {
                                 assert!(pack.is_empty(), "{who} is told the pack {pack:?}");
                             }
-                        }
-                    }
-                    // A night session's tally closes that session and goes
-                    // to its own members, so who may hear one depends on
-                    // which session it is (ADR-0011).
-                    Narration::Tally {
-                        phase: Phase::Night,
-                        kind,
-                        ..
-                    } => {
-                        let role = match kind {
-                            RequestKind::Devour => Werewolf,
-                            RequestKind::Investigate => Seer,
-                            RequestKind::Protect => Doctor,
-                            RequestKind::Nominate => {
-                                unreachable!("nobody nominates at night")
-                            }
-                        };
-                        for who in to {
-                            assert_eq!(
-                                assignment.role(who),
-                                Some(role),
-                                "{who} hears a {kind:?} tally"
-                            );
                         }
                     }
                     Narration::Investigated { .. } => {

@@ -47,8 +47,8 @@
 //! # No game logic
 //!
 //! Nothing here decides anything. The reader records what the moderator
-//! said, in the order it said it, and nothing more: it does not tally votes,
-//! check a win condition or infer a save. If reconstructing the game ever
+//! said and passed on, in the order it did so, and nothing more: it does not
+//! count votes, check a win condition or infer a save. If reconstructing the game ever
 //! needed a rule, the moderator would not be recording enough, and the fix
 //! would belong with the moderator.
 
@@ -576,6 +576,17 @@ fn only(
 struct Reader {
     assignment: BTreeMap<AgentId, Role>,
     rounds: Vec<RoundRecord>,
+    /// The player that made the latest nomination the moderator passed
+    /// on, and which is therefore still a candidate for the hammer.
+    ///
+    /// The moderator forwards each nomination it accepts as it accepts
+    /// it, and the point that completes a majority is forwarded before
+    /// the lynching it causes is narrated. So the sender of the last
+    /// forward before an `Eliminated { cause: Lynched }` is the player
+    /// whose point ended the day, and no narration has to say so
+    /// (ADR-0015). Cleared when a phase begins, so that a lynching can
+    /// never take its hammer from the day before.
+    latest_nomination: Option<AgentId>,
     /// How the game ended, once the moderator has announced it. `None`
     /// until then, and still `None` at the end of a truncated transcript,
     /// which is [`TranscriptError::NoOutcome`].
@@ -600,8 +611,15 @@ impl Reader {
             // players who should see it (ADR-0014). It is stamped with the
             // player that made it, so it is the same point this reader
             // already folded when the moderator received it, and folding
-            // it twice would count one vote as two.
-            (Direction::Sent, Message::Point(_)) => Ok(()),
+            // it twice would count one vote as two. What it does say, and
+            // the received point does not, is that the moderator accepted
+            // it: that is where the hammer comes from (ADR-0015).
+            (Direction::Sent, Message::Point(point)) => {
+                if point.kind == RequestKind::Nominate {
+                    self.latest_nomination = Some(sender);
+                }
+                Ok(())
+            }
             _ => Err(TranscriptError::Misdirected { line }),
         }
     }
@@ -622,21 +640,27 @@ impl Reader {
                 round,
                 phase: Phase::Night,
                 living,
-            } => self.rounds.push(RoundRecord {
-                round,
-                night: PhaseRecord::begun(living),
-                day: None,
-            }),
+            } => {
+                self.latest_nomination = None;
+                self.rounds.push(RoundRecord {
+                    round,
+                    night: PhaseRecord::begun(living),
+                    day: None,
+                });
+            }
             Narration::PhaseBegan {
                 round,
                 phase: Phase::Day,
                 living,
-            } => match self.rounds.last_mut() {
-                Some(latest) if latest.round == round && latest.day.is_none() => {
-                    latest.day = Some(PhaseRecord::begun(living));
+            } => {
+                self.latest_nomination = None;
+                match self.rounds.last_mut() {
+                    Some(latest) if latest.round == round && latest.day.is_none() => {
+                        latest.day = Some(PhaseRecord::begun(living));
+                    }
+                    _ => return Err(TranscriptError::NoPhase { line }),
                 }
-                _ => return Err(TranscriptError::NoPhase { line }),
-            },
+            }
             Narration::Investigated { target, faction } => {
                 let seer = only(line, recipients, "a finding is addressed to one seer")?;
                 self.current(line)?
@@ -645,15 +669,18 @@ impl Reader {
             }
             Narration::Eliminated {
                 who, role, cause, ..
-            } => self.current(line)?.eliminated = Some((who, role, cause)),
-            Narration::NoLynch { .. } => self.current(line)?.no_lynch = true,
-            Narration::Tally { hammer, .. } => {
-                if let Some(hammer) = hammer {
-                    self.current(line)?.hammer = Some(hammer);
-                }
+            } => {
+                // The nomination that lynched somebody is the last one
+                // the moderator passed on before saying so (ADR-0015).
+                let hammer = (cause == Cause::Lynched)
+                    .then(|| self.latest_nomination.clone())
+                    .flatten();
+                let phase = self.current(line)?;
+                phase.eliminated = Some((who, role, cause));
+                phase.hammer = hammer;
             }
-            // A tally otherwise repeats points already recorded, and a
-            // night without a death is one without an elimination.
+            Narration::NoLynch { .. } => self.current(line)?.no_lynch = true,
+            // A night without a death is one without an elimination.
             Narration::NoDeath { .. } => {}
             Narration::Outcome(outcome) => self.outcome = Some(outcome),
         }
@@ -703,7 +730,7 @@ impl Reader {
     }
 }
 
-/// How many cells a roster or a tally lays out per line.
+/// How many cells a roster or a phase's moves lay out per line.
 const COLUMNS: usize = 4;
 
 impl fmt::Display for Transcript {
@@ -1857,6 +1884,93 @@ mod tests {
             rendered.ends_with("Werewolves win after 2 rounds.  Survivors: bob, dave\n"),
             "{rendered}"
         );
+    }
+
+    #[test]
+    fn the_hammer_is_the_last_nomination_passed_on_before_the_lynching() {
+        // Nothing narrates the hammer any more (ADR-0015). It is read
+        // from the moderator's own actions: a nomination it passed on is
+        // one it accepted, and the last such before it announced the
+        // lynching is the point that completed the majority.
+        let lines = scripted(
+            village(),
+            &[
+                answers([("bob", "carol"), ("carol", "bob"), ("dave", "alice")]),
+                // alice, then bob, then dave, all at erin. dave's is the
+                // third of four living, so it makes the majority and ends
+                // the day; erin is never asked.
+                answers([("alice", "erin"), ("bob", "erin"), ("dave", "erin")]),
+                answers([("bob", "alice"), ("dave", "bob")]),
+            ],
+        );
+        let day = read(&lines).unwrap().rounds[0]
+            .day
+            .clone()
+            .expect("the game had a day");
+        assert_eq!(
+            day.eliminated,
+            Some((id("erin"), Villager, Cause::Lynched)),
+            "erin is lynched"
+        );
+        assert_eq!(day.hammer, Some(id("dave")), "dave's point made it");
+
+        // And nothing said so: the day's narrations are the lynching and
+        // what follows it, with no summary of the session that decided.
+        let narrated: Vec<String> = lines
+            .iter()
+            .filter(|line| line["type"] == "action" && line["event"]["sender"] == "moderator")
+            .filter_map(|line| line["event"]["payload"]["Narration"].as_object())
+            .flat_map(|narration| narration.keys().cloned())
+            .collect();
+        assert!(
+            narrated
+                .iter()
+                .all(|name| name != "Tally" && !name.contains("Hammer")),
+            "the hammer is derived, never narrated: {narrated:?}"
+        );
+    }
+
+    #[test]
+    fn a_hammer_never_carries_over_from_an_earlier_day() {
+        // A day that runs out of time has no hammer, and must not
+        // inherit one from a day that had it. Day 1 is lynched on dave's
+        // point; day 2 is left to the clock.
+        let lines = scripted(
+            Assignment::new([
+                ("alice", Werewolf),
+                ("bob", Villager),
+                ("carol", Villager),
+                ("dave", Villager),
+                ("erin", Villager),
+                ("frank", Villager),
+                ("grace", Villager),
+            ]),
+            &[
+                answers([("alice", "bob")]),
+                // Four of six living at frank: the fourth is the hammer.
+                answers([
+                    ("alice", "frank"),
+                    ("carol", "frank"),
+                    ("dave", "frank"),
+                    ("erin", "frank"),
+                ]),
+                answers([("alice", "carol")]),
+                // Two of four living: never a majority, so the day runs
+                // out and nobody is lynched.
+                answers([("alice", "dave"), ("dave", "alice")]),
+                // The pack takes dave, leaving alice with erin and
+                // grace; then a majority of three lynches alice and the
+                // village wins.
+                answers([("alice", "dave")]),
+                answers([("alice", "erin"), ("erin", "alice"), ("grace", "alice")]),
+            ],
+        );
+        let rounds = read(&lines).unwrap().rounds;
+        let first = rounds[0].day.clone().expect("day 1");
+        assert_eq!(first.hammer, Some(id("erin")), "day 1 ended on a point");
+        let second = rounds[1].day.clone().expect("day 2");
+        assert!(second.no_lynch, "day 2 ran out of time");
+        assert_eq!(second.hammer, None, "a day that ran out has no hammer");
     }
 
     #[test]

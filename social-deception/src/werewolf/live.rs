@@ -130,24 +130,6 @@ impl fmt::Display for Narration {
             Self::Investigated { target, faction } => {
                 write!(f, "Investigated({target}: {faction})")
             }
-            Self::Tally {
-                round,
-                phase,
-                kind,
-                votes,
-                hammer: _,
-            } => {
-                let votes: Vec<String> = votes
-                    .iter()
-                    .map(|(who, chosen)| format!("{who}\u{2192}{chosen}"))
-                    .collect();
-                write!(
-                    f,
-                    "Tally({phase} {} {kind:?}: {})",
-                    round.0,
-                    votes.join(", ")
-                )
-            }
             Self::Eliminated {
                 who, role, cause, ..
             } => write!(f, "Eliminated({who}, {role}, {cause})"),
@@ -258,7 +240,7 @@ impl<W: Write + Send> Sink<WerewolfDomain> for Text<W> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeSet;
     use std::time::Duration;
 
     use super::*;
@@ -358,20 +340,6 @@ mod tests {
                 faction: Faction::Werewolves,
             })),
             "Investigated(grace: Werewolves)"
-        );
-    }
-
-    #[test]
-    fn a_tally_lists_every_vote_in_order() {
-        assert_eq!(
-            shown(Message::Narration(Narration::Tally {
-                round: Round(1),
-                phase: Phase::Day,
-                kind: RequestKind::Nominate,
-                votes: BTreeMap::from([(id("alice"), id("frank")), (id("bob"), id("carol")),]),
-                hammer: None,
-            })),
-            "Tally(Day 1 Nominate: alice\u{2192}frank, bob\u{2192}carol)"
         );
     }
 

@@ -14,7 +14,7 @@
 //! two share a support, so the action space handed to a policy is never
 //! narrowed on its behalf, and `View` carries no strategy hints. Everything
 //! a policy might want to reason from, the role, the living set, the pack,
-//! the seer's findings and every tally the agent heard, is already in
+//! the seer's findings and how every phase so far pointed, is already in
 //! [`Knowledge`], and a policy computes whatever heuristic it wants from
 //! that. The action space arrives in a canonical order, so an index into it
 //! is a stable action label: the same on every run and in every episode
@@ -35,7 +35,7 @@
 //! to separate the two.
 //!
 //! The heuristic is deliberately no cleverer than it is. A seer that used its
-//! findings when nominating and a villager that read the tallies would both
+//! findings when nominating and a villager that read the phase's points would both
 //! play better, and both are left out on purpose: the uniform baseline leaves
 //! the seer's information unused, which is what makes its win rate a function
 //! of the role counts alone.
@@ -110,7 +110,7 @@ pub trait Policy {
     /// in `view.action_space`.
     ///
     /// `None` is how a member abstains (ADR-0011): nothing is sent, and a
-    /// member that never points is absent from its session's tally. It is
+    /// member that never points is simply one nobody saw point. It is
     /// also the only thing a policy can do with an empty action space.
     ///
     /// Infallible, and free to block; the [module documentation](self) says

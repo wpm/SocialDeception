@@ -1,7 +1,7 @@
 //! Everything said in a Werewolf episode: the [`Message`] payload and the
 //! vocabulary of rounds, phases, sessions and targets it is built from.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
@@ -65,28 +65,6 @@ pub enum Narration {
         target: AgentId,
         /// The side that player is on.
         faction: Faction,
-    },
-    /// How a session's members pointed when it closed, addressed to the
-    /// session's observers: the day's to the living, a night session's to
-    /// its own members and the moderator.
-    ///
-    /// A tally marks the close of the session it belongs to, which is how
-    /// its members and the transcript know a point arriving later is late.
-    Tally {
-        /// The round the tally belongs to.
-        round: Round,
-        /// Which half of the round.
-        phase: Phase,
-        /// Which session closed, since a night has three.
-        kind: RequestKind,
-        /// Each member's latest target, in canonical order. A member that
-        /// never pointed is absent.
-        votes: BTreeMap<AgentId, AgentId>,
-        /// The member whose point completed the majority that ended the
-        /// day: the *hammer*. `None` for a night session and for a day
-        /// that reached its limit without one.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        hammer: Option<AgentId>,
     },
     /// To the living, and to the eliminated player itself: someone is out
     /// of the game, and their role is revealed.
@@ -241,25 +219,6 @@ mod tests {
                 json!({"Investigated": {"target": "bob", "faction": "Village"}}),
             ),
             (
-                Narration::Tally {
-                    round: Round(2),
-                    phase: Phase::Day,
-                    kind: RequestKind::Nominate,
-                    votes: BTreeMap::from([
-                        (AgentId::new("alice"), AgentId::new("bob")),
-                        (AgentId::new("bob"), AgentId::new("carol")),
-                    ]),
-                    hammer: Some(AgentId::new("bob")),
-                },
-                json!({"Tally": {
-                    "round": 2,
-                    "phase": "Day",
-                    "kind": "Nominate",
-                    "votes": {"alice": "bob", "bob": "carol"},
-                    "hammer": "bob",
-                }}),
-            ),
-            (
                 Narration::Eliminated {
                     who: AgentId::new("bob"),
                     role: Role::Seer,
@@ -358,26 +317,6 @@ mod tests {
                 seen_by: BTreeSet::new(),
             }),
             json!({"round": 3, "kind": "Nominate", "target": "alice"})
-        );
-    }
-
-    #[test]
-    fn a_tally_serializes_its_voters_in_sorted_order() {
-        let tally = Narration::Tally {
-            round: Round(1),
-            phase: Phase::Night,
-            kind: RequestKind::Devour,
-            votes: ["carol", "alice", "bob"]
-                .into_iter()
-                .map(|who| (AgentId::new(who), AgentId::new("dave")))
-                .collect(),
-            hammer: None,
-        };
-        // A `serde_json::Value` object sorts its own keys, so the order has
-        // to be checked on the text.
-        assert_eq!(
-            serde_json::to_string(&tally).unwrap(),
-            r#"{"Tally":{"round":1,"phase":"Night","kind":"Devour","votes":{"alice":"dave","bob":"dave","carol":"dave"}}}"#
         );
     }
 
