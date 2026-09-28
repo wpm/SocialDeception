@@ -1887,6 +1887,93 @@ mod tests {
     }
 
     #[test]
+    fn the_hammer_is_the_last_nomination_passed_on_before_the_lynching() {
+        // Nothing narrates the hammer any more (ADR-0015). It is read
+        // from the moderator's own actions: a nomination it passed on is
+        // one it accepted, and the last such before it announced the
+        // lynching is the point that completed the majority.
+        let lines = scripted(
+            village(),
+            &[
+                answers([("bob", "carol"), ("carol", "bob"), ("dave", "alice")]),
+                // alice, then bob, then dave, all at erin. dave's is the
+                // third of four living, so it makes the majority and ends
+                // the day; erin is never asked.
+                answers([("alice", "erin"), ("bob", "erin"), ("dave", "erin")]),
+                answers([("bob", "alice"), ("dave", "bob")]),
+            ],
+        );
+        let day = read(&lines).unwrap().rounds[0]
+            .day
+            .clone()
+            .expect("the game had a day");
+        assert_eq!(
+            day.eliminated,
+            Some((id("erin"), Villager, Cause::Lynched)),
+            "erin is lynched"
+        );
+        assert_eq!(day.hammer, Some(id("dave")), "dave's point made it");
+
+        // And nothing said so: the day's narrations are the lynching and
+        // what follows it, with no summary of the session that decided.
+        let narrated: Vec<String> = lines
+            .iter()
+            .filter(|line| line["type"] == "action" && line["event"]["sender"] == "moderator")
+            .filter_map(|line| line["event"]["payload"]["Narration"].as_object())
+            .flat_map(|narration| narration.keys().cloned())
+            .collect();
+        assert!(
+            narrated
+                .iter()
+                .all(|name| name != "Tally" && !name.contains("Hammer")),
+            "the hammer is derived, never narrated: {narrated:?}"
+        );
+    }
+
+    #[test]
+    fn a_hammer_never_carries_over_from_an_earlier_day() {
+        // A day that runs out of time has no hammer, and must not
+        // inherit one from a day that had it. Day 1 is lynched on dave's
+        // point; day 2 is left to the clock.
+        let lines = scripted(
+            Assignment::new([
+                ("alice", Werewolf),
+                ("bob", Villager),
+                ("carol", Villager),
+                ("dave", Villager),
+                ("erin", Villager),
+                ("frank", Villager),
+                ("grace", Villager),
+            ]),
+            &[
+                answers([("alice", "bob")]),
+                // Four of six living at frank: the fourth is the hammer.
+                answers([
+                    ("alice", "frank"),
+                    ("carol", "frank"),
+                    ("dave", "frank"),
+                    ("erin", "frank"),
+                ]),
+                answers([("alice", "carol")]),
+                // Two of four living: never a majority, so the day runs
+                // out and nobody is lynched.
+                answers([("alice", "dave"), ("dave", "alice")]),
+                // The pack takes dave, leaving alice with erin and
+                // grace; then a majority of three lynches alice and the
+                // village wins.
+                answers([("alice", "dave")]),
+                answers([("alice", "erin"), ("erin", "alice"), ("grace", "alice")]),
+            ],
+        );
+        let rounds = read(&lines).unwrap().rounds;
+        let first = rounds[0].day.clone().expect("day 1");
+        assert_eq!(first.hammer, Some(id("erin")), "day 1 ended on a point");
+        let second = rounds[1].day.clone().expect("day 2");
+        assert!(second.no_lynch, "day 2 ran out of time");
+        assert_eq!(second.hammer, None, "a day that ran out has no hammer");
+    }
+
+    #[test]
     fn a_game_with_no_seer_has_no_investigations() {
         let assignment = Assignment::new([
             ("alice", Werewolf),

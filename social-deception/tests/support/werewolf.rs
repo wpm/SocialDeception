@@ -483,6 +483,17 @@ impl<'a> Play<'a> {
             .map(|(_, _, seq)| *seq)
     }
 
+    /// The record that began the phase *after* the given one, which is
+    /// the first record after that phase had certainly ended. `None` for
+    /// the last phase of the game, which nothing follows.
+    fn ended(&self, round: Round, phase: Phase) -> Option<u64> {
+        let index = self
+            .phases
+            .iter()
+            .position(|(had, was, _)| *had == round && *was == phase)?;
+        self.phases.get(index + 1).map(|(_, _, seq)| *seq)
+    }
+
     /// Every point names a session the game really opened, with its
     /// sender a member of it.
     ///
@@ -675,16 +686,16 @@ impl<'a> Play<'a> {
                 !forwarded.to.contains(&forwarded.from),
                 "a point is not passed back to the player that made it: {line}"
             );
-            let mut others = living.clone();
-            others.remove(&forwarded.from);
+            let round = forwarded.point.round;
             match forwarded.point.kind {
                 // The pack sees where the pack is pointing, and nobody
-                // else sees a devour at all.
+                // else sees a devour at all. Who the pack is comes from
+                // `members_of`, the one place this file works out who a
+                // session's members are, so the audience a forward is
+                // held to is the session the rules opened.
                 RequestKind::Devour => {
-                    let pack: BTreeSet<AgentId> = others
-                        .into_iter()
-                        .filter(|who| self.role(who) == Role::Werewolf)
-                        .collect();
+                    let mut pack = self.members_of(RequestKind::Devour, round, &living);
+                    pack.remove(&forwarded.from);
                     assert_eq!(
                         forwarded.to, pack,
                         "a devour goes to the rest of the living pack: {line}"
@@ -695,11 +706,16 @@ impl<'a> Play<'a> {
                         "only a werewolf devours: {line}"
                     );
                 }
-                // The day's vote is public among the living.
-                RequestKind::Nominate => assert_eq!(
-                    forwarded.to, others,
-                    "a nomination goes to the rest of the living: {line}"
-                ),
+                // The day's vote is public among the living, whether or
+                // not the rules leave each of them somewhere to point.
+                RequestKind::Nominate => {
+                    let mut others = living;
+                    others.remove(&forwarded.from);
+                    assert_eq!(
+                        forwarded.to, others,
+                        "a nomination goes to the rest of the living: {line}"
+                    );
+                }
                 RequestKind::Investigate | RequestKind::Protect => panic!(
                     "a {:?} point is nobody else's business and is never passed on: {line}",
                     forwarded.point.kind
@@ -1060,28 +1076,33 @@ impl<'p, 'a> Phases<'p, 'a> {
     ///
     /// A point with nobody to see it is the exception. A lone werewolf's
     /// `Devour` names no audience, so there is nothing for the moderator
-    /// to pass on and no forward is written however the race went. For
-    /// those the check falls back to the points the moderator heard,
-    /// which is as much as the trajectory says: a pack of one cannot
-    /// split, so the fallback can only ever name the one player the
-    /// session had a point for.
+    /// to pass on and no forward is written however the race went; the
+    /// trajectory simply does not say whether that point was accepted.
+    /// For those the check falls back to the points the moderator heard
+    /// *while the phase was still running*, which is as much as the
+    /// trajectory does say. Bounding it by the phase matters: an
+    /// unforwarded point heard after the phase ended certainly lost its
+    /// race, and counting it would credit the session with a vote it
+    /// never took.
     fn leaders_of(&self, round: Round, phase: Phase) -> BTreeSet<AgentId> {
         let deciding = match phase {
             Phase::Night => RequestKind::Devour,
             Phase::Day => RequestKind::Nominate,
         };
+        let mine = |point: &Point| point.round == round && point.kind == deciding;
         let counted = self
             .play
             .forwarded
             .iter()
-            .filter(|point| point.point.round == round && point.point.kind == deciding)
-            .map(|point| (point.from.clone(), point.point.target.clone()));
+            .filter(|forwarded| mine(&forwarded.point))
+            .map(|forwarded| (forwarded.from.clone(), forwarded.point.target.clone()));
+        let ended = self.play.ended(round, phase).unwrap_or(u64::MAX);
         let unseen = self
             .play
             .heard
             .iter()
-            .filter(|heard| heard.point.round == round && heard.point.kind == deciding)
-            .filter(|heard| heard.point.seen_by.is_empty())
+            .filter(|heard| mine(&heard.point) && heard.point.seen_by.is_empty())
+            .filter(|heard| heard.seq < ended)
             .map(|heard| (heard.from.clone(), heard.point.target.clone()));
         let votes: BTreeMap<AgentId, AgentId> = counted.chain(unseen).collect();
         leaders(&votes)
@@ -1237,21 +1258,19 @@ impl PhaseCounts {
         // How a phase came out, which is the whole of what a phase
         // narrates about its sessions since ADR-0015: the sessions
         // themselves close silently, so there is nothing to count but
-        // the outcome.
-        match phase {
-            Phase::Night => assert_eq!(
-                self.eliminated + self.no_death,
-                1,
-                "a night has one death or one NoDeath, never both or neither: {line}"
-            ),
-            // A day may end without a lynch now that it closes on a
-            // majority rather than a plurality.
-            Phase::Day => assert_eq!(
-                self.eliminated + self.no_death,
-                1,
-                "a day lynches exactly one or nobody, never both: {line}"
-            ),
-        }
+        // the outcome. The rule is one for both halves of a round: a
+        // night ends in a death or a `NoDeath`, and a day in a lynching
+        // or a `NoLynch`, now that a day may close on its limit without
+        // a majority.
+        let outcome = match phase {
+            Phase::Night => "a death or one NoDeath",
+            Phase::Day => "a lynching or one NoLynch",
+        };
+        assert_eq!(
+            self.eliminated + self.no_death,
+            1,
+            "a {phase:?} ends in one {outcome}, never both or neither: {line}"
+        );
     }
 }
 
@@ -1765,7 +1784,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "a night has one death or one NoDeath")]
+    #[should_panic(expected = "a Night ends in one a death or one NoDeath")]
     fn a_night_that_says_nothing_of_deaths_is_caught() {
         check(
             &without("moderator", "action", narration("NoDeath")),
@@ -1774,7 +1793,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "a day lynches exactly one or nobody, never both")]
+    #[should_panic(expected = "a Day ends in one a lynching or one NoLynch")]
     fn a_day_that_neither_lynches_nor_says_so_is_caught() {
         // A day may end with nobody lynched, but it says so with a
         // `NoLynch`. Every day of this fixture ends that way, so the

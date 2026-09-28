@@ -133,6 +133,12 @@ pub struct Phased {
     /// The latest target of each player whose point this agent saw,
     /// including its own. A player whose points it never saw is absent,
     /// and so is one that never pointed.
+    ///
+    /// Another player's entry is a point the moderator accepted, since
+    /// that is the only kind it forwards. This agent's own entry is the
+    /// point it *sent*, which may have lost its race with the session's
+    /// clock: whether a last-second point counted is the moderator's
+    /// bookkeeping and no agent is told it (ADR-0015).
     pub points: BTreeMap<AgentId, AgentId>,
 }
 
