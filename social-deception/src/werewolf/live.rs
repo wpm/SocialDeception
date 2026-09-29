@@ -33,7 +33,7 @@ use std::fmt;
 use std::io::{self, Write};
 
 use super::message::{Cause, Message, Narration, Phase, Select};
-use crate::log::{ActionRecord, Record, Sink};
+use crate::log::{ActionRecord, Elapsed, Record, Sink};
 use crate::message::ActorId;
 
 /// How wide the time column is, so that the columns line up for any game
@@ -46,14 +46,14 @@ const TIME_WIDTH: usize = 8;
 /// actor id in the game, so that the columns line up. [`Text`] takes it
 /// from the roster it is built with.
 ///
-/// The line has four columns: the time since the episode's clock started,
-/// the sender, the recipients, and the payload. It carries no trailing
+/// The line has four columns: the time since the episode's origin, the
+/// sender, the recipients, and the payload. It carries no trailing
 /// newline; [`Text`] adds one.
 ///
 /// Only an action produces a line. Everything else is [`None`]; see the
 /// module documentation for why.
 #[must_use]
-pub fn line(record: &Record<Message>, senders: usize) -> Option<String> {
+pub fn line(record: &Record<Message, Elapsed>, senders: usize) -> Option<String> {
     let Record::Action(action) = record else {
         return None;
     };
@@ -61,31 +61,30 @@ pub fn line(record: &Record<Message>, senders: usize) -> Option<String> {
 }
 
 /// One action record as its four columns.
-fn rendered(action: &ActionRecord<Message>, senders: usize) -> String {
+fn rendered(action: &ActionRecord<Message, Elapsed>, senders: usize) -> String {
     // The sender goes in as `&str`, not as the `ActorId` it is: `ActorId`'s
     // `Display` writes straight through and so ignores the width, which is
     // the whole point of the column.
     format!(
         "{:>TIME_WIDTH$} {:<senders$}  \u{2192} {}  {}",
-        Elapsed(action.created.nanos()),
+        Clock(action.t),
         action.agent.as_str(),
         listed(&action.message.recipients),
         action.message.payload,
     )
 }
 
-/// A duration since the episode's clock started, in nanoseconds, rendered
-/// as `m:ss.mmm`.
+/// A time since the episode's origin, rendered as `m:ss.mmm`.
 ///
 /// Minutes are not padded, so a game runs from `0:00.000` and a long one
 /// widens rather than wrapping. Sub-millisecond precision is dropped: a
 /// reader watching a game wants to see the shape of the timing, and the
 /// log keeps the nanoseconds for anyone who wants them.
-struct Elapsed(u64);
+struct Clock(Elapsed);
 
-impl fmt::Display for Elapsed {
+impl fmt::Display for Clock {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let millis = self.0 / 1_000_000;
+        let millis = self.0.nanos() / 1_000_000;
         let (minutes, rest) = (millis / 60_000, millis % 60_000);
         write!(f, "{minutes}:{:02}.{:03}", rest / 1000, rest % 1000)
     }
@@ -223,7 +222,7 @@ impl<W: Write> Text<W> {
 }
 
 impl<W: Write + Send> Sink<Message> for Text<W> {
-    fn record(&mut self, record: &Record<Message>) -> io::Result<()> {
+    fn record(&mut self, record: &Record<Message, Elapsed>) -> io::Result<()> {
         let Some(line) = line(record, self.senders) else {
             return Ok(());
         };
@@ -242,36 +241,37 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::clock::Timestamp;
-    use crate::log::{ControlRecord, CycleRecord, ObservationRecord, RewardRecord, Seq, Woken};
+    use crate::log::{ControlRecord, CycleRecord, Key, ObservationRecord, RewardRecord, Woken};
     use crate::message::Control;
     use crate::testing::{Shared, id, ids};
     use crate::werewolf::message::{Outcome, Round, SessionKind};
     use crate::werewolf::role::{Faction, Role};
 
-    fn at(nanos: u64) -> Timestamp {
-        Timestamp::from(Duration::from_nanos(nanos))
+    /// `nanos` into the episode, as the log writes a time.
+    fn at(nanos: u64) -> Elapsed {
+        Elapsed::from(Duration::from_nanos(nanos))
     }
 
-    /// An action of `sender` to `recipients` carrying `payload`, created
+    /// An action of `sender` to `recipients` carrying `payload`, sent
     /// `nanos` into the episode.
     fn action<const N: usize>(
         sender: &str,
         recipients: [&str; N],
         nanos: u64,
         payload: Message,
-    ) -> Record<Message> {
+    ) -> Record<Message, Elapsed> {
+        let message = crate::Message::new(sender, recipients, 0, payload);
         ActionRecord {
             agent: id(sender),
-            seq: Seq(0),
-            created: at(nanos),
-            message: crate::Message::new(sender, recipients, at(nanos), payload),
+            t: at(nanos),
+            key: Key::of(&message),
+            message,
         }
         .into()
     }
 
     /// The payload column of the one line `record` renders to.
-    fn payload(record: &Record<Message>) -> String {
+    fn payload(record: &Record<Message, Elapsed>) -> String {
         let rendered = line(record, 0).unwrap();
         rendered
             .split_once("\u{2192} ")
@@ -483,25 +483,22 @@ mod tests {
         let message = crate::Message::new(
             "moderator",
             ["alice"],
-            at(0),
+            0,
             Message::Narration(Narration::NoDeath {
                 round: Round::new(1),
             }),
         );
-        let records: Vec<Record<Message>> = vec![
+        let records: Vec<Record<Message, Elapsed>> = vec![
             ObservationRecord {
                 agent: id("alice"),
-                seq: Seq(0),
-                created: at(0),
-                received: at(1),
+                t: at(1),
+                key: Key::of(&message),
                 message,
             }
             .into(),
             ControlRecord {
                 agent: id("alice"),
-                seq: Seq(1),
-                created: at(0),
-                received: at(1),
+                t: at(1),
                 control: Control::Start,
             }
             .into(),
@@ -510,16 +507,16 @@ mod tests {
                 t_start: at(0),
                 t_stop: at(1),
                 woken: Woken::Queue,
-                inputs: vec![Seq(0)],
-                outputs: vec![],
+                observed: None,
             }
             .into(),
             RewardRecord {
                 agent: id("alice"),
-                created: at(2),
+                t: at(2),
                 value: serde_json::json!(1),
             }
             .into(),
+            crate::EpisodeRecord::of(crate::Clock::start()).into(),
         ];
         for record in &records {
             assert_eq!(line(record, 8), None, "{record:?}");
@@ -543,13 +540,12 @@ mod tests {
                 round: Round::new(1),
             }),
         );
-        let cycle: Record<Message> = CycleRecord {
+        let cycle: Record<Message, Elapsed> = CycleRecord {
             agent: id("alice"),
             t_start: at(0),
             t_stop: at(1),
             woken: Woken::Queue,
-            inputs: vec![],
-            outputs: vec![],
+            observed: None,
         }
         .into();
         text.record(&narration).unwrap();

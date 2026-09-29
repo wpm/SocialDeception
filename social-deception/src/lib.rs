@@ -11,7 +11,7 @@
 //!
 //! | Term | Is |
 //! |---|---|
-//! | [`Message`] | in-domain data on the wire: sender, recipients, creation time and a payload |
+//! | [`Message`] | in-domain data on the wire: sender, recipients, a per-sender sequence number and a payload |
 //! | [`Control`] | out-of-domain data on the wire: start and stop |
 //! | [`Delivery`] | either of the two, which is what an agent's one queue carries |
 //! | [`Observation`] | a [`Message`] popped off an agent's queue |
@@ -21,9 +21,9 @@
 //!
 //! [`Observation`] and [`Action`] are relative to an agent; on the wire
 //! there are only messages and controls. The same [`Message`] is the sent
-//! action of its sender and an observation of each of its recipients, which
-//! is what lets the log be joined across agents, and a trajectory built
-//! from it.
+//! action of its sender and an observation of each of its recipients, joined
+//! across agents by its sender and its sequence number, which is what lets a
+//! trajectory be built from the log.
 //!
 //! The runtime is generic over one parameter, the [`Payload`] a game's
 //! messages carry. A game's reward type is a second parameter, but it
@@ -33,9 +33,8 @@
 //!
 //! # The modules, from the bottom up
 //!
-//! - [`clock`]: the episode [`Clock`] everything is timestamped with, and
-//!   the [`Created`] and [`Received`] traits that say what is known about
-//!   a thing's time;
+//! - [`clock`]: the episode [`Clock`], the one origin the log's offsets are
+//!   measured from;
 //! - [`message`]: the [`Payload`] a game's messages carry, the [`Message`]
 //!   and [`Control`] that travel on the wire, and the [`Delivery`] that
 //!   carries either of them to an agent;
@@ -78,7 +77,7 @@ pub mod timer;
 pub mod werewolf;
 
 pub use agent::{Action, Agent, CycleDispatch, Error, Handler, Instruction, Observation, Wiring};
-pub use clock::{Clock, Created, Received, Timestamp};
+pub use clock::Clock;
 pub use environment::{Effect, Environment, Refusal};
 pub use episode::{Episode, EpisodeError, Failure};
 pub use message::{ActorId, Control, Delivery, Message, Payload};
@@ -90,6 +89,6 @@ pub use timer::{ManualTimer, ManualTimerControl, TimerSource};
 // the sink it belongs to, where `log::Policy::Required` says what it means
 // and collides with nothing.
 pub use log::{
-    ActionRecord, ControlRecord, CycleRecord, JsonLines, ObservationRecord, Record, RewardRecord,
-    Seq, Sink, Woken, Writer,
+    ActionRecord, ControlRecord, CycleRecord, Elapsed, EpisodeRecord, JsonLines, Key,
+    ObservationRecord, Record, RewardRecord, Sink, Woken, Writer,
 };

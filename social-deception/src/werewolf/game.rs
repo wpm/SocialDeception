@@ -116,12 +116,11 @@
 //! night, as the doctor does.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 
-use crate::clock::Timestamp;
 use crate::message::ActorId;
 use crate::werewolf::assignment::Assignment;
 use crate::werewolf::config::Timing;
@@ -153,8 +152,9 @@ pub enum Directive {
     ///
     /// The moderator is the only agent a player addresses, so this is how
     /// a selection reaches anybody else (ADR-0014). The forwarded message
-    /// names the player that selected and the instant it selected, so a
-    /// recipient cannot tell the selection came by way of the moderator; see
+    /// carries the player's own name and sequence number, so a recipient
+    /// cannot tell the selection came by way of the moderator and the
+    /// forward joins back to the player's own action record; see
     /// [`Action::relay`](crate::agent::Action::relay).
     ///
     /// Only a selection the game accepted is forwarded. One whose session has
@@ -164,8 +164,8 @@ pub enum Directive {
     Forward {
         /// The player whose selection it is.
         from: ActorId,
-        /// When that player made it.
-        created: Timestamp,
+        /// Which of that player's messages it was.
+        seq: u64,
         /// The other players who should see it, never empty.
         to: BTreeSet<ActorId>,
         /// The selection itself, exactly as it was sent.
@@ -203,11 +203,11 @@ struct Session {
     /// The quiet period, for a night session; `None` for the day.
     quiet: Option<Duration>,
     /// The instant the session closes however its members behave.
-    limit: Timestamp,
+    limit: Instant,
     /// When a member's target last changed, which is what the quiet period
     /// is measured from. The session's opening counts as the first change,
     /// so a session nobody selects in still has somewhere to measure from.
-    last_change: Timestamp,
+    last_change: Instant,
 }
 
 impl Session {
@@ -215,7 +215,7 @@ impl Session {
     ///
     /// A repeat of the same target is not a change and does not restart
     /// the quiet period; a change of mind is and does.
-    fn select(&mut self, from: &ActorId, target: &ActorId, at: Timestamp) -> bool {
+    fn select(&mut self, from: &ActorId, target: &ActorId, at: Instant) -> bool {
         let changed = self.selections.get(from) != Some(target);
         self.selections.insert(from.clone(), target.clone());
         if changed {
@@ -231,7 +231,7 @@ impl Session {
 
     /// The earliest instant this session could close: its hard limit, or
     /// the end of its quiet period once every member has selected.
-    fn deadline(&self) -> Timestamp {
+    fn deadline(&self) -> Instant {
         match self.quiet {
             Some(quiet) if self.settled() => self.limit.min(self.last_change + quiet),
             _ => self.limit,
@@ -239,7 +239,7 @@ impl Session {
     }
 
     /// Whether the session's time is up at `now`.
-    fn expired(&self, now: Timestamp) -> bool {
+    fn expired(&self, now: Instant) -> bool {
         now >= self.deadline()
     }
 }
@@ -311,7 +311,7 @@ impl Game {
     /// # Panics
     ///
     /// If called more than once.
-    pub fn begin(&mut self, now: Timestamp) -> Vec<Directive> {
+    pub fn begin(&mut self, now: Instant) -> Vec<Directive> {
         assert!(!self.begun, "the game has already begun");
         self.begun = true;
         let mut directives: Vec<Directive> = self
@@ -361,8 +361,8 @@ impl Game {
         &mut self,
         from: &ActorId,
         selection: &Select,
-        created: Timestamp,
-        at: Timestamp,
+        seq: u64,
+        at: Instant,
     ) -> Vec<Directive> {
         let kind = selection.kind;
         // A selection names the session it was made in, so a selection from a
@@ -409,7 +409,7 @@ impl Game {
         if !selection.seen_by.is_empty() {
             directives.push(Directive::Forward {
                 from: from.clone(),
-                created,
+                seq,
                 to: selection.seen_by.clone(),
                 selection: selection.clone(),
             });
@@ -436,7 +436,7 @@ impl Game {
     /// The moderator calls this whenever it wakes, and after every selection,
     /// because a deadline that passed while an observation waited joins
     /// that observation's cycle (ADR-0008).
-    pub fn expire(&mut self, now: Timestamp) -> Vec<Directive> {
+    pub fn expire(&mut self, now: Instant) -> Vec<Directive> {
         if self.outcome.is_some() {
             return Vec::new();
         }
@@ -472,7 +472,7 @@ impl Game {
     /// open sessions of each one's hard limit and, for a night session whose
     /// members have all selected, the end of its quiet period.
     #[must_use]
-    pub fn next_deadline(&self) -> Option<Timestamp> {
+    pub fn next_deadline(&self) -> Option<Instant> {
         if self.outcome.is_some() {
             return None;
         }
@@ -576,7 +576,7 @@ impl Game {
     /// Announces the current phase to the living and opens the sessions it
     /// calls for. Nobody is asked to act: a player works that out from its
     /// own role (ADR-0014).
-    fn begin_phase(&mut self, now: Timestamp) -> Vec<Directive> {
+    fn begin_phase(&mut self, now: Instant) -> Vec<Directive> {
         let directives = vec![self.narrate_living(Narration::PhaseBegan {
             round: self.round,
             phase: self.phase,
@@ -657,7 +657,7 @@ impl Game {
     /// Resolves the night once every session has closed: the victim is the
     /// plurality of the pack's latest selections, unless the doctor's
     /// protection reached them first.
-    fn resolve_night(&mut self, now: Timestamp) -> Vec<Directive> {
+    fn resolve_night(&mut self, now: Instant) -> Vec<Directive> {
         let mut votes = BTreeMap::new();
         let mut protected = BTreeSet::new();
         for (kind, selections) in std::mem::take(&mut self.resolved) {
@@ -691,7 +691,7 @@ impl Game {
     /// dies, and it is never narrated. A reader recovers it from the
     /// log as the last selection forwarded before the lynching, and a
     /// player that saw that selection saw the same thing (ADR-0015).
-    fn close_day(&mut self, hammer: Option<&ActorId>, now: Timestamp) -> Vec<Directive> {
+    fn close_day(&mut self, hammer: Option<&ActorId>, now: Instant) -> Vec<Directive> {
         let session = self.sessions.remove(0);
         // The hammer is the selection that made the majority, and the target
         // of that majority is who dies for it.
@@ -731,7 +731,7 @@ impl Game {
 
     /// After an elimination: the outcome if a side has won, and otherwise
     /// the next phase.
-    fn advance(&mut self, now: Timestamp) -> Vec<Directive> {
+    fn advance(&mut self, now: Instant) -> Vec<Directive> {
         if let Some(winner) = self.winner() {
             return vec![self.end(Some(winner))];
         }
@@ -753,7 +753,7 @@ impl Game {
 
     /// Begins the phase after this one: the day of the same round, or the
     /// night of the next.
-    fn next_phase(&mut self, now: Timestamp) -> Vec<Directive> {
+    fn next_phase(&mut self, now: Instant) -> Vec<Directive> {
         match self.phase {
             Phase::Night => self.phase = Phase::Day,
             Phase::Day => {
@@ -876,12 +876,9 @@ mod tests {
         Game::new(assignment, SEED, fast())
     }
 
-    /// An instant, in milliseconds from the start of the episode. The
-    /// scripted games below never let a clock decide anything, so their
-    /// instants only have to be ordered.
-    fn at(millis: u64) -> Timestamp {
-        Timestamp::from(Duration::from_millis(millis))
-    }
+    /// The instants these tests name, offset from the one fixed base every
+    /// test module in the crate shares; see [`testing::BASE`](crate::testing).
+    use crate::testing::at_millis as at;
 
     /// Long after any session opened in these tests could still be open:
     /// [`fast`]'s longest limit is 50 ms, so this closes everything.
@@ -913,7 +910,7 @@ mod tests {
     /// the expiry that follows finds nothing left to close; a night always
     /// closes on its clocks. Either way the phase is over when this
     /// returns, which is what lets a script name one phase per entry.
-    fn answer(game: &mut Game, answers: &Answers, at: Timestamp) -> Vec<Directive> {
+    fn answer(game: &mut Game, answers: &Answers, at: Instant) -> Vec<Directive> {
         let asks = asks(game);
         assert_eq!(
             asks.keys().cloned().collect::<BTreeSet<_>>(),
@@ -934,7 +931,10 @@ mod tests {
                 target: chosen.clone(),
                 seen_by: BTreeSet::new(),
             };
-            caused.extend(game.select(&who, &selection, at, at));
+            // Every selection of one script gets number zero: what a
+            // forward carries is checked where forwarding is, and nothing
+            // in this pass reads it.
+            caused.extend(game.select(&who, &selection, 0, at));
         }
         // Close this phase and no more. If selecting already closed it,
         // there is nothing to run: running the clocks anyway would close
@@ -1057,7 +1057,7 @@ mod tests {
             target,
             seen_by: BTreeSet::new(),
         };
-        game.select(&id(from), &selection, at(0), at(0))
+        game.select(&id(from), &selection, 0, at(0))
     }
 
     /// The same, for a selection naming a round of the caller's choosing.
@@ -1074,15 +1074,15 @@ mod tests {
             target,
             seen_by: BTreeSet::new(),
         };
-        game.select(&id(from), &selection, at(0), at(0))
+        game.select(&id(from), &selection, 0, at(0))
     }
 
     /// Selections as a player really would, naming the audience the moderator
     /// should forward to, at the instants a caller chooses.
     ///
-    /// `created` is when the player selected and `at` when the moderator
-    /// received it: the two instants a forward turns on, and the reason
-    /// this takes both.
+    /// `when` is the player's sequence number for the selection and the
+    /// instant the moderator received it: the two a forward turns on, and
+    /// the reason this takes both.
     fn selections_seen_by<const N: usize>(
         game: &mut Game,
         from: &str,
@@ -1090,16 +1090,16 @@ mod tests {
         kind: SessionKind,
         target: &str,
         seen_by: [&str; N],
-        when: (Timestamp, Timestamp),
+        when: (u64, Instant),
     ) -> Vec<Directive> {
-        let (created, at) = when;
+        let (seq, at) = when;
         let selection = Select {
             round: Round::new(round),
             kind,
             target: id(target),
             seen_by: ids(seen_by),
         };
-        game.select(&id(from), &selection, created, at)
+        game.select(&id(from), &selection, seq, at)
     }
 
     /// The forwards among some directives: who is told of whose selection.
@@ -1145,7 +1145,7 @@ mod tests {
             SessionKind::Devour,
             "carol",
             ["alice"],
-            (at(1), now + Duration::from_millis(1)),
+            (0, now + Duration::from_millis(1)),
         );
         assert!(
             !forwarded_anything(&late),
@@ -1168,7 +1168,7 @@ mod tests {
             SessionKind::Devour,
             "carol",
             ["alice"],
-            (at(1), deadline + Duration::from_millis(1)),
+            (0, deadline + Duration::from_millis(1)),
         );
         assert!(
             !forwarded_anything(&late),
@@ -1202,7 +1202,7 @@ mod tests {
             SessionKind::Nominate,
             "carol",
             ["carol", "dave"],
-            (at(1), at(10 * LATER)),
+            (0, at(10 * LATER)),
         );
         assert!(
             !forwarded_anything(&straggler),
@@ -1224,7 +1224,7 @@ mod tests {
             SessionKind::Devour,
             "carol",
             ["alice", "erin"],
-            (at(1), at(2)),
+            (0, at(2)),
         );
         let seen = forwards(&forwarded);
         let [(from, to, selection)] = seen.as_slice() else {
@@ -1263,7 +1263,10 @@ mod tests {
                 target: target.clone(),
                 seen_by: seen_by.iter().map(|who| id(who)).collect(),
             };
-            closing = game.select(who, &selection, at_instant, at_instant);
+            // The number the selection was sent under is not what this test
+            // reads; what it reads is that the forward and the close come
+            // out in the right order.
+            closing = game.select(who, &selection, index as u64, at_instant);
         }
         // The last of the three completed the majority, so its cycle both
         // forwards its selection and closes the day.
@@ -1299,7 +1302,7 @@ mod tests {
             SessionKind::Devour,
             "carol",
             ["alice"],
-            (at(1), deadline),
+            (0, deadline),
         );
         assert!(
             forwarded_anything(&on_time),
@@ -1314,7 +1317,7 @@ mod tests {
             SessionKind::Devour,
             "erin",
             ["alice"],
-            (at(2), deadline + Duration::from_millis(1)),
+            (0, deadline + Duration::from_millis(1)),
         );
         assert!(
             !forwarded_anything(&too_late),
@@ -1348,7 +1351,7 @@ mod tests {
                 target: target.clone(),
                 seen_by: seen_by.iter().map(|who| id(who)).collect(),
             };
-            let directives = game.select(&voter, &selection, at_instant, at_instant);
+            let directives = game.select(&voter, &selection, index as u64, at_instant);
             let seen = forwards(&directives);
             let [(from, to, forwarded)] = seen.as_slice() else {
                 panic!("each selection is forwarded once: {directives:?}");
@@ -1386,7 +1389,7 @@ mod tests {
             SessionKind::Devour,
             "carol",
             ["alice"],
-            (at(1), at(2)),
+            (0, at(2)),
         );
         assert!(forwarded_anything(&accepted));
         let counted = game
@@ -1410,7 +1413,7 @@ mod tests {
             SessionKind::Devour,
             "erin",
             ["alice"],
-            (at(3), at(4)),
+            (0, at(4)),
         );
         assert!(!forwarded_anything(&stale), "{stale:?}");
         let counted = game
@@ -1435,8 +1438,7 @@ mod tests {
             ("carol", SessionKind::Investigate),
             ("dave", SessionKind::Protect),
         ] {
-            let directives =
-                selections_seen_by(&mut game, who, 1, kind, "alice", [], (at(1), at(2)));
+            let directives = selections_seen_by(&mut game, who, 1, kind, "alice", [], (0, at(2)));
             assert!(
                 !forwarded_anything(&directives),
                 "{who}'s {kind:?} is nobody else's business: {directives:?}"
@@ -1661,7 +1663,7 @@ mod tests {
                     target: pick(&mut moves, &space).clone(),
                     seen_by: BTreeSet::new(),
                 };
-                game.select(&who, &selection, now, now);
+                game.select(&who, &selection, 0, now);
             }
             // Every player selects once and never changes its mind, so
             // running the clock out is what closes the phase.

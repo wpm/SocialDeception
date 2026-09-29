@@ -1,110 +1,46 @@
-//! The episode clock.
+//! The episode clock: one origin, shared by everything in an episode.
 //!
-//! A [`Clock`] fixes an origin, the moment it was started, and hands out
-//! [`Timestamp`]s: whole nanoseconds since that origin, read from the
-//! process's monotonic clock.
+//! Times in the runtime are [`Instant`]s. An actor reads `Instant::now()` at
+//! the moment something happens and puts that instant on the log record
+//! unconverted; the log writer is the one thing that converts, and it
+//! converts by measuring from the origin a [`Clock`] holds (ADR-0017).
 //!
-//! # What is known about a thing's time
+//! That is all a clock is. There is no timestamp type, because an `Instant`
+//! already is one, and a clock never appears on a message: a message carries
+//! a sequence number and no time.
 //!
-//! Two traits say what a stamped thing knows about itself, and every type
-//! the runtime stamps implements one of them. [`Created`] is the instant
-//! something came into being: for a message, the instant its sender sent it.
-//! [`Received`] adds the instant it reached whoever holds it, and with it a
-//! [`latency`](Received::latency), the delay that holder actually suffered.
+//! # Why an origin at all
 //!
-//! The split is not decoration. A message on the wire was created and not yet
-//! received; the same message, popped off a queue as an observation, is both.
-//! Keeping them apart in the types means a value that cannot say when it was
-//! received cannot be asked.
+//! Rust's `Instant` is monotonic and has no epoch, so it can only be written
+//! down as an offset from another `Instant`. The one time that can be written
+//! absolutely, `SystemTime`, is the wall clock, which can be adjusted in the
+//! middle of an episode and can go backwards. So the log measures monotonic
+//! offsets within the episode from a single origin, and anchors the whole
+//! episode to the wall clock exactly once, in its header record.
+//!
+//! That anchor is the origin's own, which is why the clock reads both clocks
+//! at once. Taking the wall-clock reading anywhere else would anchor the log
+//! to a moment that is not offset zero, and the one thing the header is for —
+//! lining an episode up against another log — would be wrong by however long
+//! the two readings were apart.
 
-use std::ops::{Add, Sub};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use serde::Serialize;
-
-/// A moment in an episode, as whole nanoseconds since the episode's [`Clock`]
-/// was started.
+/// The episode's origin: the instant it started, and the only thing the log's
+/// offsets are measured from.
 ///
-/// Serializes as a bare integer. Two timestamps are comparable only when they
-/// came from the same clock. The default is the clock's origin, which is
-/// what a caller that does not care when something happened wants.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
-#[serde(transparent)]
-pub struct Timestamp(u64);
-
-impl Timestamp {
-    /// Nanoseconds since the clock was started.
-    #[must_use]
-    pub const fn nanos(self) -> u64 {
-        self.0
-    }
-}
-
-impl Add<Duration> for Timestamp {
-    type Output = Self;
-
-    /// The timestamp `rhs` later. Saturates rather than wrapping.
-    fn add(self, rhs: Duration) -> Self {
-        Self(u64::try_from(u128::from(self.0) + rhs.as_nanos()).unwrap_or(u64::MAX))
-    }
-}
-
-impl Sub for Timestamp {
-    type Output = Duration;
-
-    /// How long `rhs` was before this timestamp. Saturates at zero rather
-    /// than wrapping, so subtracting a later timestamp from an earlier one
-    /// is no time at all rather than an enormous one.
-    fn sub(self, rhs: Self) -> Duration {
-        Duration::from_nanos(self.0.saturating_sub(rhs.0))
-    }
-}
-
-impl From<Duration> for Timestamp {
-    /// Converts a duration since the clock's origin. A duration too long to fit
-    /// in 64 bits of nanoseconds saturates.
-    fn from(since_start: Duration) -> Self {
-        Self(u64::try_from(since_start.as_nanos()).unwrap_or(u64::MAX))
-    }
-}
-
-/// Something that knows when it came into being.
+/// It is `Copy`. The [`Writer`](crate::log::Writer) and every actor hold a
+/// copy of the same clock, so everything either of them measures from the
+/// start of the episode is on one timeline.
 ///
-/// For everything the runtime stamps, that is the instant the sender sent
-/// it. An [`Action`](crate::Action) a handler returns is deliberately not
-/// one of these: it has no creation time until the loop sends it, and the
-/// handler cannot know that instant.
-pub trait Created {
-    /// When it was created.
-    fn created(&self) -> Timestamp;
-}
-
-/// Something that knows both when it was created and when it reached the
-/// agent holding it.
-///
-/// An observation and a popped control are the two: each was created by
-/// somebody else and has since arrived here. The gap between the two is the
-/// [`latency`](Received::latency).
-pub trait Received: Created {
-    /// When it was received: the instant the agent popped it off its queue.
-    fn received(&self) -> Timestamp;
-
-    /// How stale it was when the agent saw it: routing, plus however long it
-    /// waited in the queue. That is the whole delay the agent suffered, and
-    /// it is the reason `received` is the pop and not the enqueue, which
-    /// ADR-0002 argues is send time plus scheduler jitter in one process.
-    fn latency(&self) -> Duration {
-        self.received() - self.created()
-    }
-}
-
-/// A monotonic clock with a fixed origin, shared by every agent in an episode.
-///
-/// It is `Copy`; every copy reads the same origin and produces comparable
-/// timestamps.
+/// It holds one moment read off both of the process's clocks: the monotonic
+/// one, which every offset is measured from, and the wall clock, which the
+/// log's header carries so that an episode can be lined up against another
+/// log. They are the same moment by construction.
 #[derive(Debug, Clone, Copy)]
 pub struct Clock {
     origin: Instant,
+    start_unix_ns: u64,
 }
 
 impl Clock {
@@ -113,94 +49,119 @@ impl Clock {
     pub fn start() -> Self {
         Self {
             origin: Instant::now(),
+            start_unix_ns: unix_nanos(SystemTime::now()),
         }
     }
 
-    /// The current time, measured from this clock's origin.
+    /// The episode's origin.
     #[must_use]
-    pub fn now(self) -> Timestamp {
-        Timestamp::from(self.origin.elapsed())
+    pub const fn origin(self) -> Instant {
+        self.origin
     }
 
-    /// The process instant a timestamp from this clock refers to, or `None`
-    /// if the process clock cannot represent it.
-    pub(crate) fn instant_of(self, stamp: Timestamp) -> Option<Instant> {
-        self.origin.checked_add(Duration::from_nanos(stamp.nanos()))
+    /// The origin on the wall clock, as Unix nanoseconds: the one wall-clock
+    /// time the log carries, and the moment offset zero refers to.
+    #[must_use]
+    pub const fn start_unix_ns(self) -> u64 {
+        self.start_unix_ns
     }
+
+    /// How long after the origin `at` is, or no time at all if it is
+    /// earlier.
+    ///
+    /// An instant before the origin is not an error to report: it is a
+    /// record stamped in the moment between a clock being started and the
+    /// thing it times being wired up, and a log whose time ran backwards
+    /// would be worse than one whose first record sits at zero.
+    #[must_use]
+    pub fn offset(self, at: Instant) -> Duration {
+        at.saturating_duration_since(self.origin)
+    }
+}
+
+/// A system time as whole nanoseconds since the Unix epoch.
+///
+/// A clock set before 1970, or further than 584 years after it, saturates
+/// rather than failing: the anchor is for lining logs up, and a log worth
+/// nothing to an archaeologist is better than no log.
+fn unix_nanos(at: SystemTime) -> u64 {
+    let since_epoch = at.duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO);
+    u64::try_from(since_epoch.as_nanos()).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn at(nanos: u64) -> Timestamp {
-        Timestamp::from(Duration::from_nanos(nanos))
+    /// A second before `at`, which every platform this runs on can
+    /// represent: a `Clock` started now has a monotonic clock behind it that
+    /// has been running since boot.
+    fn before(at: Instant) -> Instant {
+        at.checked_sub(Duration::from_secs(1))
+            .expect("the process has been running for a second")
     }
 
     #[test]
-    fn timestamps_are_monotonic() {
+    fn the_origin_is_where_offsets_are_measured_from() {
         let clock = Clock::start();
-        let first = clock.now();
-        let second = clock.now();
-        assert!(first <= second);
-    }
-
-    #[test]
-    fn timestamp_is_nanoseconds() {
-        let stamp = Timestamp::from(Duration::new(1, 500));
-        assert_eq!(stamp.nanos(), 1_000_000_500);
-        assert_eq!(serde_json::to_string(&stamp).unwrap(), "1000000500");
-    }
-
-    #[test]
-    fn overlong_duration_saturates() {
-        assert_eq!(Timestamp::from(Duration::MAX).nanos(), u64::MAX);
-    }
-
-    #[test]
-    fn adding_a_duration_moves_a_timestamp_later() {
-        let stamp = Timestamp::from(Duration::from_nanos(5)) + Duration::from_nanos(7);
-        assert_eq!(stamp.nanos(), 12);
+        assert_eq!(clock.offset(clock.origin()), Duration::ZERO);
         assert_eq!(
-            (Timestamp::from(Duration::MAX) + Duration::MAX).nanos(),
-            u64::MAX
+            clock.offset(clock.origin() + Duration::from_nanos(7)),
+            Duration::from_nanos(7)
         );
     }
 
     #[test]
-    fn subtracting_timestamps_gives_the_duration_between_them() {
-        let (earlier, later) = (at(5), at(12));
-        assert_eq!(later - earlier, Duration::from_nanos(7));
-        assert_eq!(earlier - earlier, Duration::ZERO);
-        // Backwards is no time at all, never a wrapped enormity.
-        assert_eq!(earlier - later, Duration::ZERO);
-    }
-
-    /// Something created at 40 and received at 55.
-    struct Late;
-
-    impl Created for Late {
-        fn created(&self) -> Timestamp {
-            at(40)
-        }
-    }
-
-    impl Received for Late {
-        fn received(&self) -> Timestamp {
-            at(55)
-        }
-    }
-
-    #[test]
-    fn latency_is_the_gap_between_creation_and_receipt() {
-        assert_eq!(Late.latency(), Duration::from_nanos(15));
-    }
-
-    #[test]
-    fn instant_of_inverts_now() {
+    fn an_instant_before_the_origin_is_no_time_at_all() {
         let clock = Clock::start();
-        let stamp = clock.now();
-        let instant = clock.instant_of(stamp).unwrap();
-        assert_eq!(instant, clock.origin + Duration::from_nanos(stamp.nanos()));
+        assert_eq!(clock.offset(before(clock.origin())), Duration::ZERO);
+    }
+
+    #[test]
+    fn a_copy_of_a_clock_reads_the_same_origin() {
+        let clock = Clock::start();
+        let copy = clock;
+        assert_eq!(copy.origin(), clock.origin());
+    }
+
+    #[test]
+    fn a_clock_anchors_its_origin_to_the_wall_clock() {
+        // Both readings are of one moment, so the anchor is the moment
+        // offset zero refers to and not some later one. Checked against the
+        // wall clock either side of the reading, which is the most a
+        // monotonic origin can be compared with.
+        let before = unix_nanos(SystemTime::now());
+        let clock = Clock::start();
+        let after = unix_nanos(SystemTime::now());
+        assert!(
+            before <= clock.start_unix_ns() && clock.start_unix_ns() <= after,
+            "the anchor is read when the origin is: {} is not in {before}..={after}",
+            clock.start_unix_ns()
+        );
+        // And it is carried, not re-read: a copy reports the same anchor.
+        assert_eq!(clock.start_unix_ns(), { clock }.start_unix_ns());
+    }
+
+    #[test]
+    fn an_impossible_wall_clock_saturates_rather_than_failing() {
+        assert_eq!(unix_nanos(UNIX_EPOCH), 0);
+        assert_eq!(
+            unix_nanos(UNIX_EPOCH - Duration::from_secs(1)),
+            0,
+            "a clock set before the epoch anchors at zero"
+        );
+        // 584 years after the epoch is the last moment 64 bits of
+        // nanoseconds can name; anything past it saturates there rather than
+        // wrapping to an anchor in the past.
+        let overflowing = UNIX_EPOCH + Duration::from_secs(600 * 365 * 24 * 60 * 60);
+        assert_eq!(unix_nanos(overflowing), u64::MAX);
+    }
+
+    #[test]
+    fn an_offset_grows_with_real_time() {
+        let clock = Clock::start();
+        let first = clock.offset(Instant::now());
+        let second = clock.offset(Instant::now());
+        assert!(first <= second);
     }
 }

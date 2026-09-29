@@ -11,7 +11,7 @@ pub mod collatz;
 mod temp;
 pub mod werewolf;
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use serde_json::Value;
 pub use temp::TempDir;
@@ -32,101 +32,107 @@ pub fn parse(bytes: &[u8]) -> Vec<Value> {
 
 /// Asserts the invariants every log satisfies:
 ///
-/// - every observation and control was received at or after it was created,
-///   and at exactly the `t_start` of the cycle that lists it, with no
-///   exception: everything a cycle pops, it pops at its start (ADR-0009);
-/// - every action was created within the window of the cycle that lists it;
-/// - a cycle's inputs followed by its outputs are exactly the records its
-///   agent wrote since its previous cycle, and every record belongs to some
-///   cycle;
-/// - per-agent sequence numbers are contiguous and strictly increasing from
-///   zero, in file order;
-/// - a cycle lists **at most one** observation among its inputs, and a
-///   cycle woken by the queue has at least one input;
+/// - the **first line** is the `episode` header, carrying a wall-clock start
+///   and nothing else, and no other line is one;
+/// - every other record's `t` is a nonnegative offset from the episode's
+///   origin, and everything a cycle popped was popped at exactly its
+///   `t_start`, with no exception: everything a cycle pops, it pops at its
+///   start (ADR-0009);
+/// - every action was sent within the window of the cycle it belongs to;
+/// - **sequence numbers are a message's, not a record's**: each sender's are
+///   contiguous from zero over the messages it sent, and nothing but a
+///   message record carries one;
+/// - a cycle names at most one observation, and a cycle woken by the queue
+///   popped something;
 /// - no message has its sender among its recipients; an observation lists the
-///   agent that recorded it among the recipients, and an action names it as
-///   the sender;
+///   agent that recorded it among the recipients, and its `from` is the
+///   message's sender;
 /// - nothing follows an agent's `Stop` in its records but the end of the
 ///   cycle that popped it;
-/// - a `reward` names an agent and a value, carries no sequence number and
-///   no receipt, and belongs to no cycle;
-/// - every observation joins exactly one action, by sender and creation
-///   time, and every action has one matching observation per recipient.
+/// - a `reward` names an agent and a value, carries no sequence number and no
+///   message, and belongs to no cycle;
+/// - every observation joins exactly one action **by `(from, seq)`**, and
+///   every action has one matching observation per recipient.
 ///
 /// A reward is outside almost all of it, and deliberately. It belongs to
 /// the agent it names and was written by the environment, so it is in no
-/// cycle of that agent's, has no sequence number to be contiguous with, and
-/// arrives in the file wherever the writer took it. What is left to check
-/// is its shape, which is what the reward clause above says, and the one
-/// ordering that does hold: it is logged before the episode's last `Stop`,
-/// since a reward assigned after the run had finished for everybody would
-/// be scoring an episode that no longer existed. It need not precede the
-/// stop of its *own* agent: an agent stopped mid-episode, as a dead
-/// Werewolf player is (ADR-0012), is paid at the end like everybody else,
-/// which a logged reward allows and a sent one would not.
+/// cycle of that agent's and arrives in the file wherever the writer took
+/// it. What is left to check is its shape, which is what the reward clause
+/// above says, and the one ordering that does hold: it is logged before the
+/// episode's last `Stop`, since a reward assigned after the run had finished
+/// for everybody would be scoring an episode that no longer existed. It need
+/// not precede the stop of its *own* agent: an agent stopped mid-episode, as
+/// a dead Werewolf player is (ADR-0012), is paid at the end like everybody
+/// else, which a logged reward allows and a sent one would not.
 ///
 /// The last is the one that makes the log a single object rather than a
 /// pile of per-agent logs: an observation and the action that produced it are
-/// the same message seen from its two ends, and nothing but the sender and
-/// the creation time links them. Every action a handler returns is sent, so
-/// every action record has an other side and none is exempt from the join.
+/// the same message seen from its two ends, and `(from, seq)` is what links
+/// them (ADR-0017). One send to five recipients is one message and one
+/// number, so one action joins to all of its observations at once. Every
+/// action a handler returns is sent, so every action record has an other
+/// side and none is exempt from the join.
 ///
 /// # Panics
 ///
 /// On the first invariant that does not hold, naming the record.
 pub fn check(lines: &[Value]) {
-    let records = records(lines);
-    // Each cycle's run: the sequence numbers its agent wrote since its
-    // previous cycle. `check_grouping` proves the run is exactly the
-    // cycle's inputs followed by its outputs.
-    let mut runs: HashMap<&str, Vec<u64>> = HashMap::new();
+    check_the_header(lines);
+    let lines = &lines[1..];
     for line in lines {
         match line["type"].as_str() {
-            Some(kind @ ("observation" | "action" | "control")) => {
-                check_record(line, kind);
-                runs.entry(agent(line)).or_default().push(seq(line));
-            }
-            // A reward is in no cycle and in no run: it was written by the
-            // environment, about somebody else, outside that agent's loop
-            // entirely.
+            Some(kind @ ("observation" | "action" | "control")) => check_record(line, kind),
+            // A reward is in no cycle: it was written by the environment,
+            // about somebody else, outside that agent's loop entirely.
             Some("reward") => check_reward(line),
-            Some("cycle") => {
-                // The run is taken so that it does not outlive its cycle;
-                // `check_grouping` is what proves the two agree.
-                runs.remove(agent(line));
-                check_cycle(line, &records);
-            }
+            Some("cycle") => check_cycle(line),
             other => panic!("unknown record type {other:?} in {line}"),
         }
     }
     check_sequence_numbers(lines);
-    check_grouping(lines);
+    check_cycles_bracket_their_records(lines);
     check_nothing_follows_a_stop(lines);
     check_rewards_precede_their_stop(lines);
     check_the_join(lines);
 }
 
-/// A reward names the agent it belongs to, says when it was logged and what
-/// it is worth, and carries neither a sequence number nor a receipt.
+/// The log opens with the `episode` header and never mentions it again.
 ///
-/// The two absences are the point. A reward has no `seq` because sequence
-/// numbers are the agent loop's to assign and this record was not written by
-/// that loop, and no `received` because a reward is logged and never sent,
-/// so nobody ever received it.
+/// The header's `start_unix_ns` is the one wall-clock time anywhere in the
+/// log, so it is checked for its presence and its type and never for its
+/// value: it is different on every run by construction (ADR-0017).
+fn check_the_header(lines: &[Value]) {
+    let header = lines.first().expect("a log has at least its header");
+    assert_eq!(header["type"], "episode", "the first line is the header");
+    assert!(
+        header["start_unix_ns"].is_u64(),
+        "the header anchors the episode to the wall clock: {header}"
+    );
+    assert!(
+        header["agent"].is_null(),
+        "the header is nobody's record: {header}"
+    );
+    for line in &lines[1..] {
+        assert_ne!(line["type"], "episode", "one header per log: {line}");
+    }
+}
+
+/// A reward names the agent it belongs to, says when it was logged and what
+/// it is worth, and carries neither a sequence number nor a message.
+///
+/// The two absences are the point. A reward has no `seq` because a sequence
+/// number is a message's and a reward is not a message, and no message
+/// because it is logged rather than said.
 fn check_reward(line: &Value) {
     agent(line);
-    time(line, "created");
+    time(line, "t");
     assert!(
         line["value"].is_number(),
         "a reward says what it is worth: {line}"
     );
     assert!(
         line["seq"].is_null(),
-        "a reward carries no sequence number: {line}"
-    );
-    assert!(
-        line["received"].is_null(),
-        "a reward is logged, never sent, so nobody received it: {line}"
+        "a reward is not a message and carries no sequence number: {line}"
     );
     assert!(
         line["message"].is_null(),
@@ -148,41 +154,79 @@ fn check_reward(line: &Value) {
 ///
 /// What still holds is the outer bound. A reward logged after the last stop
 /// would be scoring a run that had finished for everybody, with no episode
-/// left to have produced it. The check is on the `created` stamps and not
-/// on file order, because a reward is written by the environment's thread
-/// and its line lands wherever the writer took it.
+/// left to have produced it. The check is on the times and not on file
+/// order, because a reward is written by the environment's thread and its
+/// line lands wherever the writer took it.
 fn check_rewards_precede_their_stop(lines: &[Value]) {
     let Some(end) = lines
         .iter()
         .filter(|line| line["type"] == "control" && line["control"] == "stop")
-        .map(|line| time(line, "created"))
+        .map(|line| time(line, "t"))
         .max()
     else {
         return;
     };
     for line in lines.iter().filter(|line| line["type"] == "reward") {
         assert!(
-            time(line, "created") <= end,
+            time(line, "t") <= end,
             "a reward is logged before the episode's last stop: {line}"
         );
     }
 }
 
-/// The numbered records of `lines`, by agent and sequence number: every
-/// record but a cycle, which has no number, and a reward, which has none
-/// either and belongs to an agent other than the one that wrote it.
-pub fn records(lines: &[Value]) -> HashMap<(&str, u64), &Value> {
-    lines
-        .iter()
-        .filter(|line| numbered(line))
-        .map(|line| ((agent(line), seq(line)), line))
-        .collect()
+/// The `episode` header every log opens with, as a hand-written log needs
+/// one.
+///
+/// The anchor is a fixed moment no check reads: it is the one wall-clock time
+/// in a log, and what it is worth is that post-processing can line episodes
+/// up by it, which no test here does.
+#[must_use]
+pub fn header() -> Value {
+    serde_json::json!({"type": "episode", "start_unix_ns": 1_790_630_400_000_000_000u64})
 }
 
-/// Whether a record carries a sequence number: everything its agent's own
-/// loop wrote, which is everything but a cycle and a reward.
-pub fn numbered(line: &Value) -> bool {
-    line["type"] != "cycle" && line["type"] != "reward"
+/// Every cycle in `lines`, paired with the records of its agent's that it
+/// closes, in the order they were written.
+///
+/// Line order carries no meaning across agents (ADR-0017), but one agent's
+/// records still reach the writer in the order it wrote them, and a cycle
+/// record is written after every record of that cycle. So the records of one
+/// agent between two of its cycle records belong to the later one, and that
+/// is the grouping a reader recovers. The cycle's window is what confirms it,
+/// and `check` asserts that.
+///
+/// A reward is in nobody's cycle: it was written by the environment, about
+/// another agent, so it is left out. So is the header, which is nobody's
+/// record at all.
+///
+/// # Panics
+///
+/// If any agent's records run past its last cycle. Every record an agent
+/// writes belongs to some cycle of its own — everything it popped or sent,
+/// since everything a handler returns is sent (ADR-0009) — so a leftover is a
+/// record no cycle closed, and the grouping this returns would be missing it
+/// rather than merely ordering it oddly.
+pub fn cycles(lines: &[Value]) -> Vec<(&Value, Vec<&Value>)> {
+    let mut pending: HashMap<&str, Vec<&Value>> = HashMap::new();
+    let mut grouped = Vec::new();
+    for line in lines {
+        if line["type"] == "reward" || line["type"] == "episode" {
+            continue;
+        }
+        let run = pending.entry(agent(line)).or_default();
+        if line["type"] == "cycle" {
+            grouped.push((line, std::mem::take(run)));
+        } else {
+            run.push(line);
+        }
+    }
+    for (agent, run) in pending {
+        assert!(
+            run.is_empty(),
+            "every record belongs to a cycle, but {agent} left {run:?} after its last"
+        );
+    }
+    grouped
 }
 
 /// The agent a record belongs to.
@@ -192,31 +236,28 @@ pub fn agent(line: &Value) -> &str {
         .expect("every record names its agent")
 }
 
-/// A record's sequence number.
+/// A message record's sequence number.
 pub fn seq(line: &Value) -> u64 {
     line["seq"]
         .as_u64()
-        .expect("every non-cycle record has a sequence number")
+        .expect("every message record has a sequence number")
 }
 
-/// The sequence numbers a cycle record lists under `key`.
-pub fn seqs<'a>(cycle: &'a Value, key: &str) -> impl Iterator<Item = u64> + 'a {
-    cycle[key]
-        .as_array()
-        .expect("a cycle lists its inputs and outputs")
-        .iter()
-        .map(|seq| seq.as_u64().expect("a sequence number is an integer"))
-}
-
-fn time(line: &Value, key: &str) -> u64 {
+/// The time a record carries under `key`, as nanoseconds since the episode's
+/// origin.
+///
+/// # Panics
+///
+/// If the record has no such time.
+pub fn time(line: &Value, key: &str) -> u64 {
     line[key]
         .as_u64()
         .unwrap_or_else(|| panic!("{line} has no {key}"))
 }
 
 /// What a record says about the message it carries: its sender, its
-/// recipients and its payload, which together with the creation time are
-/// what an observation and its action must agree on.
+/// recipients and its payload, which together with the key are what an
+/// observation and its action must agree on.
 fn message(line: &Value) -> (&str, Vec<&Value>, &Value) {
     let message = &line["message"];
     let sender = message["sender"]
@@ -231,18 +272,20 @@ fn message(line: &Value) -> (&str, Vec<&Value>, &Value) {
 }
 
 fn check_record(line: &Value, kind: &str) {
-    // Everything that was popped says when, and nothing is popped before it
-    // was created. An action is the exception: it was never received.
-    if line["received"].is_null() {
-        assert_eq!(kind, "action", "only an action records no receipt: {line}");
-    } else {
-        assert!(
-            time(line, "created") <= time(line, "received"),
-            "nothing is received before it was created: {line}"
-        );
-    }
+    // Every record says when the thing it describes happened, as an offset
+    // from the episode's origin, and no record carries a second time: the
+    // sender's clock reading is not something a message travels with
+    // (ADR-0017).
+    time(line, "t");
+    assert!(
+        line["created"].is_null() && line["received"].is_null(),
+        "a record carries one time, and it is `t`: {line}"
+    );
     match kind {
-        "control" => {}
+        "control" => assert!(
+            line["seq"].is_null(),
+            "a control is not a message and carries no sequence number: {line}"
+        ),
         "observation" => {
             let (sender, recipients, _) = message(line);
             check_recipients(line, sender, &recipients);
@@ -255,27 +298,35 @@ fn check_record(line: &Value, kind: &str) {
                 agent(line),
                 "an agent does not observe what it sent: {line}"
             );
+            assert_eq!(
+                line["from"],
+                Value::from(sender),
+                "an observation's `from` is the message's sender: {line}"
+            );
         }
         "action" => {
-            // An action has no `received`: its sender knows only when it
-            // sent it, and when each recipient got it is in that
-            // recipient's own observation record. The check above says so.
+            // An action records only when it was sent. When each recipient
+            // got it is in that recipient's own observation record.
             let (sender, recipients, _) = message(line);
             check_recipients(line, sender, &recipients);
             if sender == agent(line) {
+                assert!(
+                    line["from"].is_null(),
+                    "an action's agent is its sender, so it needs no `from`: {line}"
+                );
                 return;
             }
-            // Otherwise this agent is passing on somebody else's action.
-            // The message keeps the original sender, so a recipient cannot
-            // tell the difference and the relay costs latency and nothing
-            // else (ADR-0014). Which agents may relay, and what, is the
-            // domain's rule and is checked there; what holds everywhere is
-            // that passing an action on does not address it to the agent
+            // Otherwise this agent is relaying somebody else's message. It
+            // keeps the original `(sender, seq)`, so a recipient cannot tell
+            // the difference and the relay joins back to the message it
+            // passes on (ADR-0014). Which agents may relay, and what, is
+            // the domain's rule and is checked there; what holds everywhere
+            // is that passing a message on does not address it to the agent
             // doing the passing, which would be that agent observing what
             // it had just sent.
             assert!(
                 !recipients.contains(&&Value::from(agent(line))),
-                "an agent does not forward an action to itself: {line}"
+                "an agent does not forward a message to itself: {line}"
             );
         }
         // `check` matched the kind before calling; there is no other.
@@ -291,7 +342,7 @@ fn check_recipients(line: &Value, sender: &str, recipients: &[&Value]) {
     );
 }
 
-fn check_cycle(cycle: &Value, records: &HashMap<(&str, u64), &Value>) {
+fn check_cycle(cycle: &Value) {
     let (t_start, t_stop) = (time(cycle, "t_start"), time(cycle, "t_stop"));
     assert!(
         t_start <= t_stop,
@@ -302,123 +353,103 @@ fn check_cycle(cycle: &Value, records: &HashMap<(&str, u64), &Value>) {
         woken == "queue" || woken == "timeout",
         "a cycle is woken by the queue or the timeout: {cycle}"
     );
-    let record = |seq: u64| {
-        records
-            .get(&(agent(cycle), seq))
-            .unwrap_or_else(|| panic!("{cycle} lists seq {seq}, which has no record"))
-    };
-
-    let inputs: Vec<&Value> = seqs(cycle, "inputs").map(|seq| *record(seq)).collect();
-    let observations = inputs
-        .iter()
-        .filter(|input| input["type"] == "observation")
-        .count();
-    // A cycle is one decision, so it observed one thing or nothing at all
-    // (ADR-0008). This is what makes `t_start` and `t_stop` bracket a single
-    // decision rather than the time to work through an arbitrary pile, and
-    // so what lets a reader take the gap between them for deliberation.
-    //
-    // It is asserted of every cycle, whatever woke it. `timeout` says the
-    // deadline had passed when the cycle began, not that the cycle observed
-    // nothing: a deadline that passes while a message is waiting joins that
-    // message's cycle. What no cycle does is observe twice.
     assert!(
-        observations <= 1,
-        "a cycle handles at most one observation, but this one lists \
-         {observations}: {cycle}"
+        cycle["t"].is_null(),
+        "a cycle is a window, not an instant: {cycle}"
     );
-    if woken == "queue" {
-        assert!(
-            !inputs.is_empty(),
-            "a cycle woken by the queue popped something: {cycle}"
-        );
-    }
-    // Everything a cycle popped, it popped at the cycle's start: the
-    // controls and the observation alike, with no exception (ADR-0009).
-    // That is what makes the gap between an input's `received` and an
-    // output's `created` the agent's deliberation.
-    for input in inputs {
-        assert_ne!(
-            input["type"], "action",
-            "an input is something popped, not an output: {input} in {cycle}"
-        );
-        assert_eq!(
-            time(input, "received"),
-            t_start,
-            "everything a cycle popped was popped at its start: {input} in {cycle}"
-        );
-    }
-    for record in seqs(cycle, "outputs").map(record) {
-        assert_eq!(
-            record["type"], "action",
-            "an output is an action: {record} in {cycle}"
-        );
-        let created = time(record, "created");
-        // An action an agent passed on for somebody else keeps the instant
-        // that somebody made it, which is necessarily before the cycle
-        // that forwarded it: that gap is the latency the relay costs, and
-        // it is the only trace the relay leaves (ADR-0014).
-        if record["message"]["sender"] != agent(record) {
-            assert!(
-                created < t_start,
-                "a forwarded action was created before the cycle that \
-                 passed it on: {record} in {cycle}"
-            );
-            continue;
-        }
-        assert!(
-            t_start <= created && created <= t_stop,
-            "an action is created within its cycle's window: {record} in {cycle}"
-        );
+    // A cycle names at most one observation because there is one field to
+    // name it in, so the shape of the record is the invariant: what is left
+    // to check is that a cycle that names one names it whole.
+    match (cycle["from"].as_str(), cycle["seq"].as_u64()) {
+        (Some(_), Some(_)) | (None, None) => {}
+        _ => panic!("a cycle names its observation by sender and number or not at all: {cycle}"),
     }
 }
 
+/// A cycle's own records lie inside it: everything it popped at exactly its
+/// `t_start`, and everything it sent between `t_start` and `t_stop`.
+///
+/// This is the grouping a reader of the log relies on, and it is now a
+/// property of the times rather than of lists the cycle carries. [`cycles`]
+/// recovers the grouping from file order; the windows here are what confirm
+/// it, so the two together are the claim that a cycle's records are its own.
+///
+/// A relayed action is sent inside the cycle that sent it like any other,
+/// even though the message is not the relaying agent's, so the window holds
+/// for it too.
+fn check_cycles_bracket_their_records(lines: &[Value]) {
+    for (cycle, records) in cycles(lines) {
+        let (t_start, t_stop) = (time(cycle, "t_start"), time(cycle, "t_stop"));
+        let mut observations = 0;
+        for record in &records {
+            if record["type"] == "action" {
+                assert!(
+                    t_start <= time(record, "t") && time(record, "t") <= t_stop,
+                    "an action is sent within its cycle's window: {record} in {cycle}"
+                );
+                continue;
+            }
+            if record["type"] == "observation" {
+                observations += 1;
+            }
+            assert_eq!(
+                time(record, "t"),
+                t_start,
+                "everything a cycle popped was popped at its start: {record} in {cycle}"
+            );
+        }
+        // A cycle is one decision, so it observed one thing or nothing at
+        // all (ADR-0008). This is what makes `t_start` and `t_stop` bracket
+        // a single decision rather than the time to work through an
+        // arbitrary pile, and so what lets a reader take the gap between
+        // them for deliberation.
+        //
+        // It is asserted of every cycle, whatever woke it. `timeout` says
+        // the deadline had passed when the cycle began, not that the cycle
+        // observed nothing: a deadline that passes while a message is
+        // waiting joins that message's cycle. What no cycle does is observe
+        // twice.
+        assert!(
+            observations <= 1,
+            "a cycle handles at most one observation, but this one wrote \
+             {observations}: {cycle}"
+        );
+        assert_eq!(
+            observations == 1,
+            !cycle["from"].is_null(),
+            "a cycle names the observation it was called with, and only that: {cycle}"
+        );
+        if cycle["woken"] == "queue" {
+            assert!(
+                !records.is_empty(),
+                "a cycle woken by the queue popped something: {cycle}"
+            );
+        }
+    }
+}
+
+/// Each sender's messages are numbered contiguously from zero, in the order
+/// it sent them.
+///
+/// The numbers are **the messages'**, so this counts each sender's own
+/// action records and nothing else: a control, a reward and a cycle carry
+/// none, and an observation carries its *sender's* number, which that
+/// sender's own records are where the counting happens. A relayed action is
+/// skipped too, since its number is the original sender's.
 fn check_sequence_numbers(lines: &[Value]) {
     let mut next: HashMap<&str, u64> = HashMap::new();
-    for line in lines.iter().filter(|line| numbered(line)) {
-        let expected = next.entry(agent(line)).or_insert(0);
+    for line in lines.iter().filter(|line| line["type"] == "action") {
+        let (sender, _, _) = message(line);
+        if sender != agent(line) {
+            continue;
+        }
+        let expected = next.entry(sender).or_insert(0);
         assert_eq!(
             seq(line),
             *expected,
-            "sequence numbers are contiguous from zero: {line}"
+            "a sender's messages are numbered contiguously from zero: {line}"
         );
         *expected += 1;
-    }
-}
-
-/// A cycle's inputs followed by its outputs are exactly the records its
-/// agent wrote since its previous cycle.
-///
-/// Exactly, with nothing taken out: every record an agent writes within a
-/// cycle is either something it popped or something it sent, since
-/// everything a handler returns is sent (ADR-0009). That is the grouping
-/// every reader of the log relies on.
-fn check_grouping(lines: &[Value]) {
-    let mut pending: HashMap<&str, Vec<u64>> = HashMap::new();
-    for line in lines {
-        // A reward belongs to no cycle of the agent it names: the
-        // environment wrote it, outside that agent's loop entirely.
-        if line["type"] == "reward" {
-            continue;
-        }
-        let agent = agent(line);
-        let pending = pending.entry(agent).or_default();
-        if line["type"] == "cycle" {
-            let listed: Vec<u64> = seqs(line, "inputs").chain(seqs(line, "outputs")).collect();
-            let written: Vec<u64> = std::mem::take(pending);
-            assert_eq!(
-                listed, written,
-                "a cycle lists exactly the records since its agent's previous cycle: {line}"
-            );
-        } else {
-            pending.push(seq(line));
-        }
-    }
-    for (agent, pending) in pending {
-        assert!(
-            pending.is_empty(),
-            "every record belongs to a cycle, but {agent} left {pending:?} after its last"
-        );
     }
 }
 
@@ -437,7 +468,7 @@ fn check_nothing_follows_a_stop(lines: &[Value]) {
         // order: the environment writes it on its own thread, so it can
         // land after the agent's last cycle. That it was *logged* before
         // the stop is `check_rewards_precede_their_stop`'s business, on the
-        // stamps, which is where the claim can actually be made.
+        // times, which is where the claim can actually be made.
         if line["type"] == "reward" {
             continue;
         }
@@ -456,10 +487,9 @@ fn check_nothing_follows_a_stop(lines: &[Value]) {
     }
 }
 
-/// Every observation is somebody's action, and every action is observed by
-/// each of its recipients that was still running. The join is on the sender
-/// and the creation time, which is all a reader has: nothing carries an
-/// identifier for a message.
+/// Every observation is somebody's message, and every message is observed by
+/// each of its recipients that was still running. The join is on `(from,
+/// seq)` and on nothing else (ADR-0017).
 ///
 /// The join is no longer total on the recipient side, and ADR-0012 is why.
 /// An environment may stop one agent while the rest run on, and a message
@@ -474,54 +504,82 @@ fn check_nothing_follows_a_stop(lines: &[Value]) {
 /// What cannot be allowed is using that as a blanket excuse, because then
 /// the check would pass for a delivery that was simply lost. A missing
 /// observation is accepted only for a recipient this run actually stopped,
-/// and only for a message created after the last message that recipient did
+/// and only for a message sent after the last message that recipient did
 /// observe. Up to that instant the agent was demonstrably taking delivery,
 /// so a gap there is a real failure and still fails here.
+/// Every relay passes on a message somebody really sent, and carries what
+/// was sent; returns which recipients each relayed message reached.
+///
+/// The original is in the relaying agent's own records under the same key,
+/// because a relay keeps the original `(sender, seq)`: that is what makes it
+/// the same message rather than a second one (ADR-0017). Without this an
+/// action misfiled under another agent would read as a relay of a message
+/// nobody sent.
+///
+/// The recipients come back separately because a relay delivers the message
+/// to agents its original was never addressed to, so the original's list
+/// cannot account for them. Whether each of them observed it is
+/// [`check_the_join`]'s to say, under the same ADR-0012 allowance it makes for
+/// a direct send: an agent that was stopped may miss what came after.
+fn check_the_relays<'a>(
+    relayed: &[&'a Value],
+    actions: &BTreeMap<(&'a str, u64), &'a Value>,
+) -> BTreeMap<(&'a str, u64), BTreeSet<&'a str>> {
+    let mut relayed_to: BTreeMap<(&str, u64), BTreeSet<&str>> = BTreeMap::new();
+    for line in relayed {
+        let (sender, recipients, payload) = message(line);
+        let at = (sender, seq(line));
+        let original = actions.get(&at).unwrap_or_else(|| {
+            panic!(
+                "a relayed message passes on one its sender really sent, \
+                 but none names the agent that sent it as its sender: {line}"
+            )
+        });
+        let (_, _, sent) = message(original);
+        assert_eq!(
+            payload, sent,
+            "a relayed message carries what was sent: {line} against {original}"
+        );
+        let to = relayed_to.entry(at).or_default();
+        for who in recipients {
+            to.insert(who.as_str().expect("a recipient is an actor id"));
+        }
+    }
+    relayed_to
+}
+
 fn check_the_join(lines: &[Value]) {
-    // The earliest instant from which each stopped agent may legitimately
-    // miss a message.
-    //
-    // An agent stopped while the run continued was stopped by some
-    // cycle's batch of effects, and the whole of that batch shares one
-    // fate: the episode applies a batch's controls before routing its
-    // messages, so a message created earlier in the batch than the stop is
-    // dropped for the agent that batch stopped. The bound is therefore
-    // the start of that cycle, not the stop's own stamp — the router
-    // stamps a control when it queues it, which is after the cycle
-    // returned, so the stamp sits outside the batch it belongs to.
-    //
-    // The bound cannot be read off the stop's own stamp. A control is
-    // stamped when the router queues it, which is after the cycle that
-    // asked for it has returned, so the stamp falls between cycles and
-    // may fall after cycles later than the batch it came from. What the
-    // log does show without guesswork is the last message the agent
-    // actually observed: the batch that stopped it produced nothing it
-    // took in, so every message it missed was created after that instant.
-    //
-    // Being stopped is what licenses the gap, and the instant is what
-    // bounds it. Together they are narrow: an agent that was never
-    // stopped may miss nothing, and a stopped agent may miss only what
-    // came after the last thing it did observe. A delivery lost while
-    // the agent was still taking others in falls inside the bound and
-    // still fails.
-    let stopped: HashMap<&str, u64> = lines
+    // Which agents were stopped at all: being stopped is what licenses a
+    // missing observation.
+    let stopped: HashSet<&str> = lines
         .iter()
         .filter(|line| line["type"] == "control" && line["control"] == "stop")
-        .map(|line| (agent(line), time(line, "created")))
+        .map(agent)
         .collect();
-    // The creation stamp of the last message each agent observed.
+    // When each agent last observed anything, which bounds what it may
+    // legitimately have missed.
+    //
+    // The bound cannot be read off the stop's own time. A stop and the
+    // messages around it are one cycle's work: the environment returns a
+    // batch of effects together and the episode applies that batch's
+    // controls before routing its messages, so a message sent earlier in
+    // the batch than the stop is still dropped for the agent the batch
+    // stopped. What the log does show without guesswork is the last message
+    // the agent actually observed, and every message it missed reached it
+    // after that.
     let mut last_observed: HashMap<&str, u64> = HashMap::new();
     for line in lines.iter().filter(|line| line["type"] == "observation") {
-        let at = time(line, "created");
+        let at = time(line, "t");
         last_observed
             .entry(agent(line))
             .and_modify(|latest| *latest = (*latest).max(at))
             .or_insert(at);
     }
-    // Keyed by who *acted* and when, which is what an observation names.
-    // A forwarded action is the same message as the one it passes on, so it
-    // is not a second action under this key: it is skipped here and joined
-    // through the original below (ADR-0014).
+    // Keyed by the message: who sent it and which of theirs it is, which is
+    // exactly what an observation names. A relayed action is the same
+    // message as the one it passes on, so it is not a second action under
+    // this key: it is collected separately and joined through the original
+    // below (ADR-0014).
     let mut actions: BTreeMap<(&str, u64), &Value> = BTreeMap::new();
     let mut relayed: Vec<&Value> = Vec::new();
     for line in lines.iter().filter(|line| line["type"] == "action") {
@@ -530,38 +588,20 @@ fn check_the_join(lines: &[Value]) {
             relayed.push(line);
             continue;
         }
-        let key = (sender, time(line, "created"));
+        let at = (sender, seq(line));
         assert!(
-            actions.insert(key, line).is_none(),
-            "an agent takes at most one action per instant, or no observation could \
+            actions.insert(at, line).is_none(),
+            "a sender numbers each of its messages once, or no observation could \
              name which: {line}"
         );
     }
-    // A relay passes on an action somebody really took, so the original is
-    // in that agent's own records, at the same instant and carrying the
-    // same payload. Without this an action misfiled under another agent
-    // would read as a forward of an action nobody made.
-    for line in &relayed {
-        let (sender, _, payload) = message(line);
-        let key = (sender, time(line, "created"));
-        let original = actions.get(&key).unwrap_or_else(|| {
-            panic!(
-                "a forwarded action passes on one its sender really took, \
-                 but none names the agent that took it as its sender: {line}"
-            )
-        });
-        let (_, _, made) = message(original);
-        assert_eq!(
-            payload, made,
-            "a forwarded action carries what was made: {line} against {original}"
-        );
-    }
+    let relayed_to = check_the_relays(&relayed, &actions);
     let mut observed: HashSet<((&str, u64), &str)> = HashSet::new();
     for line in lines.iter().filter(|line| line["type"] == "observation") {
         let (sender, recipients, payload) = message(line);
-        let key = (sender, time(line, "created"));
-        let action = actions.get(&key).unwrap_or_else(|| {
-            panic!("every observation joins an action by sender and creation time: {line}")
+        let at = (sender, seq(line));
+        let action = actions.get(&at).unwrap_or_else(|| {
+            panic!("every observation joins an action by sender and sequence number: {line}")
         });
         let (_, sent_to, sent) = message(action);
         assert_eq!(
@@ -569,20 +609,19 @@ fn check_the_join(lines: &[Value]) {
             "an observation and its action are the same message: {line} against {action}"
         );
         // The join above is what ties an observation to the agent that
-        // really acted: it is keyed on the sender and the instant, against
-        // the actions each agent took, so an observation naming a sender
-        // that took no such action panics there. That holds for a relayed
-        // message too, because it keeps the original sender and instant.
+        // really sent it: it is keyed on the sender and the number, against
+        // the messages each agent sent, so an observation naming a sender
+        // that sent no such message panics there. That holds for a relayed
+        // message too, because it keeps the original key.
         //
         // What does not carry over is the recipient list, and it should
         // not. Two sends carried one message: the actor addressed the
-        // moderator, and the moderator addressed the players it forwarded
+        // moderator, and the moderator addressed the players it relayed
         // to. Requiring the lists to match would be requiring the relay
         // not to happen. Who observed the message is checked on the
         // observation's own recipients, for every observation and with no
         // exception for a relay — that it was addressed to its observer
-        // (`check_record`) and that every recipient observed it
-        // (`check_deliveries`).
+        // (`check_record`) and that every recipient observed it (below).
         if sent_to.contains(&&Value::from(agent(line))) {
             assert_eq!(
                 recipients, sent_to,
@@ -591,37 +630,38 @@ fn check_the_join(lines: &[Value]) {
             );
         }
         assert!(
-            observed.insert((key, agent(line))),
+            observed.insert((at, agent(line))),
             "an agent observes a message once: {line}"
         );
     }
-    for (key, action) in &actions {
+    for (at, action) in &actions {
         let (_, recipients, _) = message(action);
-        let (_, created) = *key;
+        let sent = time(action, "t");
         for who in recipients {
             let who = who.as_str().expect("a recipient is an actor id");
-            if observed.contains(&(*key, who)) {
+            if observed.contains(&(*at, who)) {
                 continue;
             }
             // Unobserved: allowed only from the sender's cycle that
             // stopped this recipient onward, which is the one way a
             // message legitimately reaches nobody (ADR-0012).
-            //
-            // The bound is the sender's cycle and not the stop's own
-            // stamp because a stop and the messages around it are one
-            // cycle's work. The environment returns a batch of effects
-            // together, and the episode applies that batch's controls
-            // before routing its messages, so a message created earlier in
-            // the batch than the stop is still dropped for the agent the
-            // batch stopped. Werewolf does exactly this when a night's
-            // last selection and the death that follows it fall in one
-            // cycle.
             let dropped =
-                stopped.contains_key(who) && created > last_observed.get(who).copied().unwrap_or(0);
+                stopped.contains(who) && sent > last_observed.get(who).copied().unwrap_or(0);
             assert!(
                 dropped,
-                "every recipient of an action observes it unless it had stopped, but {who} \
+                "every recipient of a message observes it unless it had stopped, but {who} \
                  did not: {action}"
+            );
+        }
+    }
+    // And the same for a relay's own recipients, which the original never
+    // named.
+    for (at, to) in &relayed_to {
+        for who in to {
+            assert!(
+                observed.contains(&(*at, who)) || stopped.contains(who),
+                "every recipient of a relayed message observes it unless it had \
+                 stopped, but {who} did not: {at:?}"
             );
         }
     }
@@ -639,78 +679,71 @@ mod tests {
     /// agents and cannot be checked from one alone.
     fn good() -> Vec<Value> {
         vec![
-            json!({"type": "control", "agent": "a", "seq": 0, "created": 10, "received": 30,
-                   "control": "start"}),
-            json!({"type": "observation", "agent": "a", "seq": 1, "created": 20, "received": 30,
+            header(),
+            json!({"type": "control", "agent": "a", "t": 30, "control": "start"}),
+            json!({"type": "observation", "agent": "a", "t": 30, "from": "b", "seq": 0,
                    "message": {"sender": "b", "recipients": ["a"], "payload": {"Step": 6}}}),
-            json!({"type": "action", "agent": "a", "seq": 2, "created": 40,
+            json!({"type": "action", "agent": "a", "t": 40, "seq": 0,
                    "message": {"sender": "a", "recipients": ["b"], "payload": {"Step": 7}}}),
             json!({"type": "cycle", "agent": "a", "t_start": 30, "t_stop": 50, "woken": "queue",
-                   "inputs": [0, 1], "outputs": [2]}),
+                   "from": "b", "seq": 0}),
             json!({"type": "cycle", "agent": "a", "t_start": 60, "t_stop": 70,
-                   "woken": "timeout", "inputs": [], "outputs": []}),
-            json!({"type": "control", "agent": "a", "seq": 3, "created": 75, "received": 80,
-                   "control": "stop"}),
-            json!({"type": "cycle", "agent": "a", "t_start": 80, "t_stop": 81, "woken": "queue",
-                   "inputs": [3], "outputs": []}),
-            json!({"type": "action", "agent": "b", "seq": 0, "created": 20,
+                   "woken": "timeout"}),
+            json!({"type": "control", "agent": "a", "t": 80, "control": "stop"}),
+            json!({"type": "cycle", "agent": "a", "t_start": 80, "t_stop": 81,
+                   "woken": "queue"}),
+            json!({"type": "action", "agent": "b", "t": 20, "seq": 0,
                    "message": {"sender": "b", "recipients": ["a"], "payload": {"Step": 6}}}),
-            json!({"type": "cycle", "agent": "b", "t_start": 15, "t_stop": 25, "woken": "timeout",
-                   "inputs": [], "outputs": [0]}),
-            json!({"type": "observation", "agent": "b", "seq": 1, "created": 40, "received": 45,
+            json!({"type": "cycle", "agent": "b", "t_start": 15, "t_stop": 25,
+                   "woken": "timeout"}),
+            json!({"type": "observation", "agent": "b", "t": 45, "from": "a", "seq": 0,
                    "message": {"sender": "a", "recipients": ["b"], "payload": {"Step": 7}}}),
             json!({"type": "cycle", "agent": "b", "t_start": 45, "t_stop": 46, "woken": "queue",
-                   "inputs": [1], "outputs": []}),
+                   "from": "a", "seq": 0}),
         ]
     }
 
-    /// A log in which `r` relays `b`'s action to `c`.
+    /// A log in which `r` relays `b`'s message to `c`.
     ///
-    /// `b` addresses `r` alone; `r` passes the message on, keeping `b` as the
-    /// sender and `b`'s creation instant, so `c` observes what `b` would
-    /// have sent it directly (ADR-0014). The relay shows up only as the gap
-    /// between `created` and `c`'s `received`.
+    /// `b` addresses `r` alone; `r` passes the message on, keeping `b`'s name
+    /// and `b`'s number, so `c` observes what `b` would have sent it directly
+    /// and the message joins back to `b`'s own action (ADR-0014).
     fn relayed() -> Vec<Value> {
         vec![
-            json!({"type": "control", "agent": "b", "seq": 0, "created": 5, "received": 10,
-                   "control": "start"}),
-            json!({"type": "action", "agent": "b", "seq": 1, "created": 20,
+            header(),
+            json!({"type": "control", "agent": "b", "t": 10, "control": "start"}),
+            json!({"type": "action", "agent": "b", "t": 20, "seq": 0,
                    "message": {"sender": "b", "recipients": ["r"], "payload": {"Step": 6}}}),
-            json!({"type": "cycle", "agent": "b", "t_start": 10, "t_stop": 25, "woken": "queue",
-                   "inputs": [0], "outputs": [1]}),
+            json!({"type": "cycle", "agent": "b", "t_start": 10, "t_stop": 25,
+                   "woken": "queue"}),
             json!({"type": "cycle", "agent": "b", "t_start": 26, "t_stop": 27,
-                   "woken": "timeout", "inputs": [], "outputs": []}),
-            json!({"type": "control", "agent": "b", "seq": 2, "created": 90, "received": 95,
-                   "control": "stop"}),
-            json!({"type": "cycle", "agent": "b", "t_start": 95, "t_stop": 96, "woken": "queue",
-                   "inputs": [2], "outputs": []}),
-            json!({"type": "control", "agent": "r", "seq": 0, "created": 5, "received": 10,
-                   "control": "start"}),
-            json!({"type": "cycle", "agent": "r", "t_start": 10, "t_stop": 11, "woken": "queue",
-                   "inputs": [0], "outputs": []}),
-            json!({"type": "observation", "agent": "r", "seq": 1, "created": 20, "received": 30,
+                   "woken": "timeout"}),
+            json!({"type": "control", "agent": "b", "t": 95, "control": "stop"}),
+            json!({"type": "cycle", "agent": "b", "t_start": 95, "t_stop": 96,
+                   "woken": "queue"}),
+            json!({"type": "control", "agent": "r", "t": 10, "control": "start"}),
+            json!({"type": "cycle", "agent": "r", "t_start": 10, "t_stop": 11,
+                   "woken": "queue"}),
+            json!({"type": "observation", "agent": "r", "t": 30, "from": "b", "seq": 0,
                    "message": {"sender": "b", "recipients": ["r"], "payload": {"Step": 6}}}),
-            // The forward: `r`'s own record, carrying `b`'s name and stamp.
-            json!({"type": "action", "agent": "r", "seq": 2, "created": 20,
+            // The relay: `r`'s own record, carrying `b`'s name and number.
+            json!({"type": "action", "agent": "r", "t": 35, "seq": 0,
                    "message": {"sender": "b", "recipients": ["c"], "payload": {"Step": 6}}}),
             json!({"type": "cycle", "agent": "r", "t_start": 30, "t_stop": 50, "woken": "queue",
-                   "inputs": [1], "outputs": [2]}),
-            json!({"type": "control", "agent": "r", "seq": 3, "created": 90, "received": 95,
-                   "control": "stop"}),
-            json!({"type": "cycle", "agent": "r", "t_start": 95, "t_stop": 96, "woken": "queue",
-                   "inputs": [3], "outputs": []}),
-            json!({"type": "control", "agent": "c", "seq": 0, "created": 5, "received": 10,
-                   "control": "start"}),
-            json!({"type": "cycle", "agent": "c", "t_start": 10, "t_stop": 11, "woken": "queue",
-                   "inputs": [0], "outputs": []}),
-            json!({"type": "observation", "agent": "c", "seq": 1, "created": 20, "received": 60,
+                   "from": "b", "seq": 0}),
+            json!({"type": "control", "agent": "r", "t": 95, "control": "stop"}),
+            json!({"type": "cycle", "agent": "r", "t_start": 95, "t_stop": 96,
+                   "woken": "queue"}),
+            json!({"type": "control", "agent": "c", "t": 10, "control": "start"}),
+            json!({"type": "cycle", "agent": "c", "t_start": 10, "t_stop": 11,
+                   "woken": "queue"}),
+            json!({"type": "observation", "agent": "c", "t": 60, "from": "b", "seq": 0,
                    "message": {"sender": "b", "recipients": ["c"], "payload": {"Step": 6}}}),
             json!({"type": "cycle", "agent": "c", "t_start": 60, "t_stop": 61, "woken": "queue",
-                   "inputs": [1], "outputs": []}),
-            json!({"type": "control", "agent": "c", "seq": 2, "created": 90, "received": 95,
-                   "control": "stop"}),
-            json!({"type": "cycle", "agent": "c", "t_start": 95, "t_stop": 96, "woken": "queue",
-                   "inputs": [2], "outputs": []}),
+                   "from": "b", "seq": 0}),
+            json!({"type": "control", "agent": "c", "t": 95, "control": "stop"}),
+            json!({"type": "cycle", "agent": "c", "t_start": 95, "t_stop": 96,
+                   "woken": "queue"}),
         ]
     }
 
@@ -731,28 +764,27 @@ mod tests {
     /// queue.
     fn stopped_behind_a_message() -> Vec<Value> {
         vec![
-            json!({"type": "control", "agent": "a", "seq": 0, "created": 10, "received": 30,
-                   "control": "start"}),
-            json!({"type": "cycle", "agent": "a", "t_start": 30, "t_stop": 31, "woken": "queue",
-                   "inputs": [0], "outputs": []}),
-            json!({"type": "observation", "agent": "a", "seq": 1, "created": 40, "received": 45,
+            header(),
+            json!({"type": "control", "agent": "a", "t": 30, "control": "start"}),
+            json!({"type": "cycle", "agent": "a", "t_start": 30, "t_stop": 31,
+                   "woken": "queue"}),
+            json!({"type": "observation", "agent": "a", "t": 45, "from": "b", "seq": 0,
                    "message": {"sender": "b", "recipients": ["a"], "payload": {"Step": 6}}}),
-            json!({"type": "action", "agent": "a", "seq": 2, "created": 70,
+            json!({"type": "action", "agent": "a", "t": 70, "seq": 0,
                    "message": {"sender": "a", "recipients": ["b"], "payload": {"Step": 7}}}),
             json!({"type": "cycle", "agent": "a", "t_start": 45, "t_stop": 72, "woken": "queue",
-                   "inputs": [1], "outputs": [2]}),
-            json!({"type": "control", "agent": "a", "seq": 3, "created": 60, "received": 80,
-                   "control": "stop"}),
-            json!({"type": "cycle", "agent": "a", "t_start": 80, "t_stop": 81, "woken": "queue",
-                   "inputs": [3], "outputs": []}),
-            json!({"type": "action", "agent": "b", "seq": 0, "created": 40,
+                   "from": "b", "seq": 0}),
+            json!({"type": "control", "agent": "a", "t": 80, "control": "stop"}),
+            json!({"type": "cycle", "agent": "a", "t_start": 80, "t_stop": 81,
+                   "woken": "queue"}),
+            json!({"type": "action", "agent": "b", "t": 40, "seq": 0,
                    "message": {"sender": "b", "recipients": ["a"], "payload": {"Step": 6}}}),
             json!({"type": "cycle", "agent": "b", "t_start": 35, "t_stop": 41,
-                   "woken": "timeout", "inputs": [], "outputs": [0]}),
-            json!({"type": "observation", "agent": "b", "seq": 1, "created": 70, "received": 75,
+                   "woken": "timeout"}),
+            json!({"type": "observation", "agent": "b", "t": 75, "from": "a", "seq": 0,
                    "message": {"sender": "a", "recipients": ["b"], "payload": {"Step": 7}}}),
             json!({"type": "cycle", "agent": "b", "t_start": 75, "t_stop": 76, "woken": "queue",
-                   "inputs": [1], "outputs": []}),
+                   "from": "a", "seq": 0}),
         ]
     }
 
@@ -773,14 +805,14 @@ mod tests {
         // later than `t_start` is simply an input that was not popped when
         // it claims to have been.
         let mut lines = stopped_behind_a_message();
-        lines[5]["received"] = json!(81);
+        lines[6]["t"] = json!(81);
         check(&lines);
     }
 
     #[test]
     #[should_panic(expected = "popped at its start")]
     fn an_ordinary_control_popped_late_is_still_caught() {
-        check(&edited(0, |line| line["received"] = json!(31)));
+        check(&edited(1, |line| line["t"] = json!(31)));
     }
 
     #[test]
@@ -790,9 +822,9 @@ mod tests {
         // running after it was told to stop.
         let mut lines = stopped_behind_a_message();
         lines.insert(
-            7,
+            8,
             json!({"type": "cycle", "agent": "a", "t_start": 90, "t_stop": 91,
-                   "woken": "timeout", "inputs": [], "outputs": []}),
+                   "woken": "timeout"}),
         );
         check(&lines);
     }
@@ -805,14 +837,12 @@ mod tests {
         // that the check has left to catch. The rest of the log is
         // dropped, since a log that ends at the stop is what the
         // other check already asserts.
-        let mut lines = stopped_behind_a_message()[..2].to_vec();
-        lines[0]["control"] = json!("stop");
+        let mut lines = stopped_behind_a_message()[..3].to_vec();
+        lines[1]["control"] = json!("stop");
         lines.insert(
-            1,
-            json!({"type": "control", "agent": "a", "seq": 1, "created": 11, "received": 30,
-                   "control": "stop"}),
+            2,
+            json!({"type": "control", "agent": "a", "t": 30, "control": "stop"}),
         );
-        lines[2]["inputs"] = json!([0, 1]);
         check(&lines);
     }
 
@@ -820,7 +850,7 @@ mod tests {
     /// as an environment would have written it.
     fn rewarded() -> Vec<Value> {
         let mut lines = good();
-        lines.push(json!({"type": "reward", "agent": "a", "created": 74, "value": 1}));
+        lines.push(json!({"type": "reward", "agent": "a", "t": 74, "value": 1}));
         lines
     }
 
@@ -842,15 +872,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "nobody received it")]
-    fn a_reward_that_claims_to_have_been_received_is_caught() {
-        let mut lines = rewarded();
-        let last = lines.len() - 1;
-        lines[last]["received"] = json!(75);
-        check(&lines);
-    }
-
-    #[test]
     #[should_panic(expected = "says what it is worth")]
     fn a_reward_without_a_value_is_caught() {
         let mut lines = rewarded();
@@ -862,11 +883,11 @@ mod tests {
     #[test]
     #[should_panic(expected = "before the episode's last stop")]
     fn a_reward_logged_after_the_episode_is_caught() {
-        // The only stop in `good()` is `a`'s, at 75, so that is where the
-        // episode ends and 76 is past it.
+        // The only stop in `good()` is `a`'s, at 80, so that is where the
+        // episode ends and 81 is past it.
         let mut lines = rewarded();
         let last = lines.len() - 1;
-        lines[last]["created"] = json!(76);
+        lines[last]["t"] = json!(81);
         check(&lines);
     }
 
@@ -879,17 +900,14 @@ mod tests {
         // (ADR-0007), so the agent need not be there to take it.
         //
         // `b` is never stopped in `good()`, so `a` may be paid after its
-        // own stop at 75 while the episode is still going.
+        // own stop at 80 while the episode is still going.
         let mut lines = good();
-        lines.push(
-            json!({"type": "control", "agent": "b", "seq": 2, "created": 90,
-                          "received": 95, "control": "stop"}),
-        );
+        lines.push(json!({"type": "control", "agent": "b", "t": 95, "control": "stop"}));
         lines.push(
             json!({"type": "cycle", "agent": "b", "t_start": 95, "t_stop": 96,
-                          "woken": "queue", "inputs": [2], "outputs": []}),
+                          "woken": "queue"}),
         );
-        lines.push(json!({"type": "reward", "agent": "a", "created": 85, "value": 1}));
+        lines.push(json!({"type": "reward", "agent": "a", "t": 85, "value": 1}));
         check(&lines);
     }
 
@@ -903,25 +921,49 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "received before it was created")]
-    fn an_observation_received_before_it_was_sent_is_caught() {
-        check(&edited(1, |line| line["created"] = json!(31)));
+    #[should_panic(expected = "the first line is the header")]
+    fn a_log_without_its_header_is_caught() {
+        check(&good()[1..]);
     }
 
     #[test]
-    #[should_panic(expected = "popped at its start")]
-    fn an_input_received_at_other_than_its_cycles_start_is_caught() {
+    #[should_panic(expected = "one header per log")]
+    fn a_second_header_is_caught() {
         let mut lines = good();
-        lines[0]["received"] = json!(29);
-        lines[1]["received"] = json!(29);
-        lines[3]["t_start"] = json!(30);
+        lines.push(header());
         check(&lines);
     }
 
     #[test]
-    #[should_panic(expected = "created within its cycle's window")]
-    fn an_action_created_outside_its_cycle_is_caught() {
-        check(&edited(2, |line| line["created"] = json!(51)));
+    #[should_panic(expected = "anchors the episode to the wall clock")]
+    fn a_header_without_a_wall_clock_start_is_caught() {
+        let mut lines = good();
+        lines[0].as_object_mut().unwrap().remove("start_unix_ns");
+        check(&lines);
+    }
+
+    #[test]
+    #[should_panic(expected = "one time, and it is `t`")]
+    fn a_record_that_keeps_a_creation_time_is_caught() {
+        // No message carries when its sender sent it (ADR-0017), so a
+        // record with a second time is a record from the old format.
+        check(&edited(2, |line| line["created"] = json!(20)));
+    }
+
+    #[test]
+    #[should_panic(expected = "popped at its start")]
+    fn an_input_popped_at_other_than_its_cycles_start_is_caught() {
+        let mut lines = good();
+        lines[1]["t"] = json!(29);
+        lines[2]["t"] = json!(29);
+        lines[4]["t_start"] = json!(30);
+        check(&lines);
+    }
+
+    #[test]
+    #[should_panic(expected = "sent within its cycle's window")]
+    fn an_action_sent_outside_its_cycle_is_caught() {
+        check(&edited(3, |line| line["t"] = json!(51)));
     }
 
     #[test]
@@ -932,7 +974,7 @@ mod tests {
         // calls `handle` like any other, so this is a shape the loop really
         // produces and the checker must accept.
         let mut lines = good();
-        lines[10]["woken"] = json!("timeout");
+        lines[11]["woken"] = json!("timeout");
         check(&lines);
     }
 
@@ -945,141 +987,137 @@ mod tests {
         // work through a pile.
         let mut lines = good();
         lines.insert(
-            2,
-            json!({"type": "observation", "agent": "a", "seq": 2, "created": 20, "received": 30,
+            3,
+            json!({"type": "observation", "agent": "a", "t": 30, "from": "b", "seq": 1,
                    "message": {"sender": "b", "recipients": ["a"], "payload": {"Step": 8}}}),
         );
-        // Renumber the rest of `a`'s records around the extra one.
-        lines[3]["seq"] = json!(3);
-        lines[4]["inputs"] = json!([0, 1, 2]);
-        lines[4]["outputs"] = json!([3]);
-        lines[6]["seq"] = json!(4);
-        lines[7]["inputs"] = json!([4]);
+        // And `b` really sent it, so the join is not what catches this.
+        lines.push(json!({"type": "action", "agent": "b", "t": 21, "seq": 1,
+               "message": {"sender": "b", "recipients": ["a"], "payload": {"Step": 8}}}));
+        lines.push(
+            json!({"type": "cycle", "agent": "b", "t_start": 21, "t_stop": 22,
+                          "woken": "timeout"}),
+        );
         check(&lines);
     }
 
     #[test]
     #[should_panic(expected = "woken by the queue popped something")]
     fn a_queue_cycle_that_popped_nothing_is_caught() {
-        check(&edited(4, |line| line["woken"] = json!("queue")));
+        check(&edited(5, |line| line["woken"] = json!("queue")));
     }
 
     #[test]
     #[should_panic(expected = "woken by the queue or the timeout")]
     fn a_cycle_woken_by_something_else_is_caught() {
-        check(&edited(4, |line| line["woken"] = json!("thinking")));
+        check(&edited(5, |line| line["woken"] = json!("thinking")));
     }
 
     #[test]
-    #[should_panic(expected = "contiguous from zero")]
-    fn a_gap_in_sequence_numbers_is_caught() {
+    #[should_panic(expected = "numbered contiguously from zero")]
+    fn a_gap_in_a_senders_sequence_numbers_is_caught() {
+        // Two messages of one sender carry consecutive numbers, so a jump is
+        // a missing message. `b`'s only action is numbered zero.
         let mut lines = good();
-        lines[5]["seq"] = json!(4);
-        lines[6]["inputs"] = json!([4]);
+        lines[8]["seq"] = json!(1);
+        lines[2]["seq"] = json!(1);
+        lines[4]["seq"] = json!(1);
         check(&lines);
     }
 
     #[test]
     #[should_panic(expected = "observed only by its recipients")]
     fn a_message_delivered_to_a_non_recipient_is_caught() {
-        check(&edited(1, |line| {
+        check(&edited(2, |line| {
             line["message"]["recipients"] = json!(["c"]);
-        }));
-    }
-
-    #[test]
-    #[should_panic(expected = "not an output")]
-    fn a_cycle_that_lists_an_output_as_an_input_is_caught() {
-        check(&edited(3, |line| {
-            line["inputs"] = json!([0, 1, 2]);
-            line["outputs"] = json!([]);
         }));
     }
 
     #[test]
     #[should_panic(expected = "sender among its recipients")]
     fn a_loopback_is_caught() {
-        check(&edited(2, |line| {
+        check(&edited(3, |line| {
             line["message"]["recipients"] = json!(["a", "b"]);
         }));
     }
 
     #[test]
-    #[should_panic(expected = "which has no record")]
+    #[should_panic(expected = "every record belongs to a cycle")]
     fn an_action_recorded_by_somebody_other_than_its_sender_is_caught() {
-        // Moving `a`'s action into `c`'s records. Since an agent may
-        // pass on somebody else's action, a record whose sender is not its
-        // agent is no longer wrong on its face; what still catches this is
-        // that `a`'s cycle claimed an output it no longer has.
-        check(&edited(2, |line| line["agent"] = json!("c")));
+        // Moving `a`'s action into `c`'s records, where no cycle of `c`'s
+        // closes it. An agent may relay somebody else's message, so a record
+        // whose sender is not its agent is no longer wrong on its face; a
+        // record no cycle of its agent's closes still is.
+        check(&edited(3, |line| line["agent"] = json!("c")));
     }
 
     #[test]
-    #[should_panic(expected = "but none names the agent that took it as its sender")]
-    fn a_forward_of_an_action_nobody_took_is_caught() {
+    #[should_panic(expected = "but none names the agent that sent it as its sender")]
+    fn a_relay_of_a_message_nobody_sent_is_caught() {
         // A relay must pass on something real. Here `r` forwards a message
-        // stamped with an agent and instant at which nobody acted, which is
-        // what a misattributed action would otherwise look like.
+        // under a key at which nobody sent anything, which is what a
+        // misattributed message would otherwise look like.
         let mut lines = relayed();
-        let forward = lines
+        let relay = lines
             .iter()
             .position(|line| line["type"] == "action" && line["agent"] == "r")
-            .expect("the fixture has the forward");
-        lines[forward]["created"] = json!(21);
-        lines[forward]["message"]["created"] = json!(21);
+            .expect("the fixture has the relay");
+        lines[relay]["seq"] = json!(1);
+        lines[16]["seq"] = json!(1);
+        lines[17]["seq"] = json!(1);
         check(&lines);
-    }
-
-    #[test]
-    #[should_panic(expected = "records since its agent's previous cycle")]
-    fn a_cycle_that_skips_a_record_is_caught() {
-        check(&edited(3, |line| line["inputs"] = json!([0])));
     }
 
     #[test]
     #[should_panic(expected = "every record belongs to a cycle")]
     fn a_record_after_the_last_cycle_is_caught() {
         let mut lines = good();
-        lines.remove(6);
+        lines.remove(7);
         check(&lines);
     }
 
     #[test]
-    #[should_panic(expected = "joins an action by sender and creation time")]
+    #[should_panic(expected = "joins an action by sender and sequence number")]
     fn an_observation_of_something_nobody_sent_is_caught() {
-        check(&edited(1, |line| line["created"] = json!(21)));
+        let mut lines = good();
+        lines[2]["seq"] = json!(1);
+        lines[4]["seq"] = json!(1);
+        check(&lines);
     }
 
     #[test]
     #[should_panic(expected = "the same message")]
     fn an_observation_that_disagrees_with_its_action_is_caught() {
-        check(&edited(1, |line| {
+        check(&edited(2, |line| {
             line["message"]["payload"] = json!({"Step": 99});
         }));
     }
 
     #[test]
-    fn a_relayed_action_reads_as_the_action_of_whoever_made_it() {
+    fn a_relayed_message_reads_as_the_message_of_whoever_sent_it() {
         // `c` observes `b`'s step although `r` was what sent it. Nothing
         // records that the relay happened: `c`'s observation names `b` and
-        // carries `b`'s instant, and the only trace is that it was received
-        // at 60 rather than at 20.
+        // carries `b`'s number, and the only trace is that it arrived at 60
+        // rather than at 30.
         check(&relayed());
     }
 
     #[test]
-    #[should_panic(expected = "but none names the agent that took it as its sender")]
-    fn an_observation_naming_a_sender_that_never_acted_is_caught() {
-        // Nothing may claim to carry an action its supposed author never
-        // took. Relabeling both the forward and `c`'s observation of it as
+    #[should_panic(expected = "but none names the agent that sent it as its sender")]
+    fn an_observation_naming_a_sender_that_never_sent_is_caught() {
+        // Nothing may claim to carry a message its supposed author never
+        // sent. Relabeling both the relay and `c`'s observation of it as
         // `a`'s is caught where the relay is held to a real original: `a`
-        // never acted at instant 20.
+        // sent no message zero.
         let mut lines = relayed();
         for line in &mut lines {
             let relabel = (line["type"] == "action" && line["agent"] == "r")
                 || (line["type"] == "observation" && line["agent"] == "c");
             if relabel {
                 line["message"]["sender"] = json!("a");
+                if line["type"] == "observation" {
+                    line["from"] = json!("a");
+                }
             }
         }
         check(&lines);
@@ -1088,28 +1126,29 @@ mod tests {
     #[test]
     #[should_panic(expected = "no message has its sender among its recipients")]
     fn a_relay_back_to_its_own_author_is_caught() {
-        // Forwarding somebody's action to that same somebody: it would be
-        // an agent observing what it did, which no relay may manufacture.
-        // The forward keeps `b` as the sender, so naming `b` a recipient
+        // Relaying somebody's message to that same somebody: it would be
+        // an agent observing what it sent, which no relay may manufacture.
+        // The relay keeps `b` as the sender, so naming `b` a recipient
         // makes the message its own author's.
         let mut lines = relayed();
-        let forward = lines
+        let relay = lines
             .iter()
             .position(|line| line["type"] == "action" && line["agent"] == "r")
-            .expect("the fixture has the forward");
-        lines[forward]["message"]["recipients"] = json!(["b"]);
+            .expect("the fixture has the relay");
+        lines[relay]["message"]["recipients"] = json!(["b"]);
         check(&lines);
     }
 
     #[test]
-    #[should_panic(expected = "every recipient of an action observes it")]
-    fn an_action_nobody_received_is_caught() {
+    #[should_panic(expected = "every recipient of a message observes it")]
+    fn a_message_nobody_received_is_caught() {
         let mut lines = good();
         // `a`'s reply never reaches `b`, whose last cycle then popped
         // nothing at all.
-        lines.remove(9);
-        lines[9]["inputs"] = json!([]);
-        lines[9]["woken"] = json!("timeout");
+        lines.remove(10);
+        lines[10].as_object_mut().unwrap().remove("from");
+        lines[10].as_object_mut().unwrap().remove("seq");
+        lines[10]["woken"] = json!("timeout");
         check(&lines);
     }
 }

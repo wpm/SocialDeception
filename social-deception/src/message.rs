@@ -27,8 +27,6 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::clock::{Created, Timestamp};
-
 /// What the runtime requires of a game's message payload:
 /// `Serialize`, `Send`, `Clone` and `'static`.
 ///
@@ -116,17 +114,26 @@ pub enum Control {
     Stop,
 }
 
-/// In-domain data on the wire: what one agent said to others.
+/// In-domain data on the wire: what one agent said to others, and which of
+/// its sender's messages it is.
 ///
 /// The same value is an [`Action`](crate::Action) of its sender and an
 /// [`Observation`](crate::Observation) of each of its recipients; on the
-/// wire it is only a message. The sender and the creation time are stamped by
-/// the loop as it sends, never by the handler, which is why the value a
+/// wire it is only a message. The sender and the sequence number are stamped
+/// by the loop as it sends, never by the handler, which is why the value a
 /// handler returns is an `Action` and not this.
 ///
-/// It has no `Serialize` of its own: a message goes into the log
-/// through the record that carries it, which writes it without the
-/// `created` that record already carries at the top level.
+/// **A message carries no time** (ADR-0017). The times are in the log: an
+/// observation record says when this agent received it and the sender's
+/// action record says when it was sent, and `(sender, seq)` is what joins
+/// the two. What an agent perceives of latency is when its observations
+/// arrived relative to each other, which is what its own records hold; when
+/// somebody else's clock read is a fact about that clock and not about the
+/// message.
+///
+/// It has no `Serialize` of its own: a message goes into the log through the
+/// record that carries it, which writes it without the `seq` that record
+/// already carries at the top level.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Message<P: Payload> {
     /// The agent that sent it.
@@ -135,20 +142,23 @@ pub struct Message<P: Payload> {
     ///
     /// The set never contains the sender; the router enforces that.
     pub recipients: BTreeSet<ActorId>,
-    /// The instant the sender sent it.
-    pub created: Timestamp,
+    /// Which of its sender's messages this is, counting from zero.
+    ///
+    /// The number is the sender's, so it means nothing without
+    /// [`sender`](Self::sender): two agents both have a message 0. **One
+    /// send to five recipients is one message and one number**, so the
+    /// sender's action record and each recipient's observation record carry
+    /// the same pair and one action joins to all of its observations
+    /// (ADR-0017).
+    pub seq: u64,
     /// What was said. Its meaning belongs to the game.
     pub payload: P,
 }
 
 impl<P: Payload> Message<P> {
-    /// A message from `sender` to `recipients`, created at `created`.
-    pub fn new<I, A>(
-        sender: impl Into<ActorId>,
-        recipients: I,
-        created: Timestamp,
-        payload: P,
-    ) -> Self
+    /// A message from `sender` to `recipients`, the `seq`th that sender
+    /// sent.
+    pub fn new<I, A>(sender: impl Into<ActorId>, recipients: I, seq: u64, payload: P) -> Self
     where
         I: IntoIterator<Item = A>,
         A: Into<ActorId>,
@@ -156,15 +166,9 @@ impl<P: Payload> Message<P> {
         Self {
             sender: sender.into(),
             recipients: recipients.into_iter().map(Into::into).collect(),
-            created,
+            seq,
             payload,
         }
-    }
-}
-
-impl<P: Payload> Created for Message<P> {
-    fn created(&self) -> Timestamp {
-        self.created
     }
 }
 
@@ -188,9 +192,9 @@ impl<P: Payload> Created for Message<P> {
 /// left is a FIFO whose order is the order things were sent, which is the
 /// order an agent handles them in.
 ///
-/// A control carries its `created` here because nothing else does: a
-/// [`Message`] has a field for the instant its sender made it and a
-/// [`Control`] is a bare two-variant enum, so the stamp travels beside it.
+/// Neither variant carries a time. Nothing on the wire does (ADR-0017): a
+/// control's record says when the agent popped it, which is the one instant
+/// about it that agent knows.
 ///
 /// [`Observation`]: crate::Observation
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -199,37 +203,17 @@ pub enum Delivery<P: Payload> {
     ///
     /// [`Observation`]: crate::Observation
     Message(Message<P>),
-    /// An out-of-domain instruction, and the instant the sender sent it.
-    Control {
-        /// What the agent is told.
-        control: Control,
-        /// When whoever sent it sent it. A [`Message`] carries its own; a
-        /// [`Control`] has nowhere to put one, so it is here.
-        created: Timestamp,
-    },
-}
-
-impl<P: Payload> Delivery<P> {
-    /// A control delivery stamped with `created`.
-    #[must_use]
-    pub const fn control(control: Control, created: Timestamp) -> Self {
-        Self::Control { control, created }
-    }
+    /// An out-of-domain instruction about the episode.
+    Control(Control),
 }
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use super::*;
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
     enum TestPayload {
         Step(u64),
-    }
-
-    fn at(nanos: u64) -> Timestamp {
-        Timestamp::from(Duration::from_nanos(nanos))
     }
 
     fn json<T: Serialize>(value: &T) -> serde_json::Value {
@@ -241,22 +225,30 @@ mod tests {
         // A message is written to the log by `log::Envelope`,
         // which is the only wire shape it has, so what is asserted here is
         // the set itself: the order the envelope will write.
-        let message = Message::<TestPayload>::new("a", ["c", "b"], at(40), TestPayload::Step(7));
+        let message = Message::<TestPayload>::new("a", ["c", "b"], 0, TestPayload::Step(7));
         let recipients: Vec<&str> = message.recipients.iter().map(ActorId::as_str).collect();
         assert_eq!(recipients, ["b", "c"]);
     }
 
     #[test]
-    fn a_message_knows_when_it_was_created() {
-        let message = Message::<TestPayload>::new("a", ["b"], at(40), TestPayload::Step(7));
-        assert_eq!(Created::created(&message), at(40));
+    fn a_message_knows_which_of_its_sender_s_it_is_and_no_time() {
+        // The number is the sender's own, and it is the only thing besides
+        // the sender that tells one of its messages from another: a message
+        // carries no time at all (ADR-0017).
+        let message = Message::<TestPayload>::new("a", ["b"], 7, TestPayload::Step(7));
+        assert_eq!(message.seq, 7);
+        assert_ne!(
+            message,
+            Message::new("a", ["b"], 8, TestPayload::Step(7)),
+            "two messages of one sender differ by their sequence number"
+        );
     }
 
     #[test]
     fn a_delivery_is_one_kind_or_the_other_and_says_which() {
         // The whole point of the enum: one queue carries both, and what
         // came off it is still unambiguously a message or a control.
-        let message = Message::<TestPayload>::new("a", ["b"], at(40), TestPayload::Step(7));
+        let message = Message::<TestPayload>::new("a", ["b"], 0, TestPayload::Step(7));
         let carried = Delivery::Message(message.clone());
         let Delivery::Message(back) = &carried else {
             panic!("a message delivery is a message: {carried:?}");
@@ -264,16 +256,16 @@ mod tests {
         assert_eq!(back, &message);
         assert_eq!(carried, Delivery::Message(message));
 
-        // A control has nowhere of its own to keep the instant it was sent,
-        // so the delivery keeps it.
-        let stop = Delivery::<TestPayload>::control(Control::Stop, at(10));
-        let Delivery::Control { control, created } = stop else {
+        // A control is itself and nothing beside it: nothing on the wire
+        // carries a time.
+        let stop = Delivery::<TestPayload>::Control(Control::Stop);
+        let Delivery::Control(control) = stop else {
             panic!("a control delivery is a control: {stop:?}");
         };
-        assert_eq!((control, created), (Control::Stop, at(10)));
+        assert_eq!(control, Control::Stop);
         assert_ne!(
-            Delivery::<TestPayload>::control(Control::Stop, at(10)),
-            Delivery::control(Control::Start, at(10))
+            Delivery::<TestPayload>::Control(Control::Stop),
+            Delivery::Control(Control::Start)
         );
     }
 

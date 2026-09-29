@@ -18,9 +18,9 @@
 
 use std::time::Instant;
 
-use crossbeam_channel::{Receiver, SendError, Sender, at, never, unbounded};
+use crossbeam_channel::{Receiver, SendError, Sender, at, unbounded};
 
-use crate::clock::{Clock, Timestamp};
+use crate::clock::Clock;
 
 /// A source of wake channels.
 ///
@@ -29,15 +29,19 @@ use crate::clock::{Clock, Timestamp};
 /// the agent may still be waiting on it.
 pub trait TimerSource {
     /// A channel that delivers one message once `deadline` has passed.
-    fn wake_at(&mut self, deadline: Timestamp) -> Receiver<Instant>;
+    fn wake_at(&mut self, deadline: Instant) -> Receiver<Instant>;
 }
 
 impl TimerSource for Clock {
     /// A channel driven by real elapsed time. A deadline already in the past
-    /// fires immediately; one too far in the future for the process clock to
-    /// represent never fires.
-    fn wake_at(&mut self, deadline: Timestamp) -> Receiver<Instant> {
-        self.instant_of(deadline).map_or_else(never, at)
+    /// fires immediately.
+    ///
+    /// A deadline is an [`Instant`] on the process's monotonic clock, which
+    /// is the clock `crossbeam` waits on, so the episode's origin plays no
+    /// part here. The [`Clock`] is the production timer source because it is
+    /// what every actor already holds, not because it converts anything.
+    fn wake_at(&mut self, deadline: Instant) -> Receiver<Instant> {
+        at(deadline)
     }
 }
 
@@ -50,7 +54,7 @@ impl TimerSource for Clock {
 /// deadline value plays no part in when a fire is delivered.
 #[derive(Debug)]
 pub struct ManualTimer {
-    requests: Sender<Timestamp>,
+    requests: Sender<Instant>,
     wake: Receiver<Instant>,
 }
 
@@ -60,7 +64,7 @@ pub struct ManualTimer {
 /// as an error rather than a wake-up.
 #[derive(Debug)]
 pub struct ManualTimerControl {
-    requests: Receiver<Timestamp>,
+    requests: Receiver<Instant>,
     fire: Sender<Instant>,
 }
 
@@ -81,7 +85,7 @@ impl ManualTimer {
 }
 
 impl TimerSource for ManualTimer {
-    fn wake_at(&mut self, deadline: Timestamp) -> Receiver<Instant> {
+    fn wake_at(&mut self, deadline: Instant) -> Receiver<Instant> {
         // A control that has stopped listening for requests is not an error:
         // the test may only care about firing.
         let _ = self.requests.send(deadline);
@@ -92,7 +96,7 @@ impl TimerSource for ManualTimer {
 impl ManualTimerControl {
     /// The deadlines the agent has asked for, in the order it asked.
     #[must_use]
-    pub fn requests(&self) -> &Receiver<Timestamp> {
+    pub fn requests(&self) -> &Receiver<Instant> {
         &self.requests
     }
 
@@ -118,29 +122,28 @@ mod tests {
     #[test]
     fn clock_wakes_no_earlier_than_the_deadline() {
         let mut clock = Clock::start();
-        let deadline = clock.now() + Duration::from_millis(2);
+        let deadline = Instant::now() + Duration::from_millis(2);
         clock.wake_at(deadline).recv().unwrap();
-        assert!(clock.now() >= deadline);
+        assert!(Instant::now() >= deadline);
     }
 
     #[test]
     fn clock_wakes_immediately_for_a_deadline_that_has_passed() {
         let mut clock = Clock::start();
-        let deadline = clock.now();
-        assert!(clock.wake_at(deadline).recv().is_ok());
+        assert!(clock.wake_at(Instant::now()).recv().is_ok());
     }
 
     #[test]
     fn clock_does_not_wake_early_for_a_far_deadline() {
         let mut clock = Clock::start();
-        let wake = clock.wake_at(Timestamp::from(Duration::MAX));
+        let wake = clock.wake_at(Instant::now() + Duration::from_secs(3600));
         assert_eq!(wake.try_recv(), Err(TryRecvError::Empty));
     }
 
     #[test]
     fn manual_timer_reports_requests_and_fires_on_command() {
         let (mut timer, control) = ManualTimer::new();
-        let deadline = Timestamp::from(Duration::from_secs(1));
+        let deadline = Instant::now() + Duration::from_secs(1);
         let wake = timer.wake_at(deadline);
         assert_eq!(control.requests().try_recv(), Ok(deadline));
         assert_eq!(wake.try_recv(), Err(TryRecvError::Empty));
@@ -153,14 +156,14 @@ mod tests {
     fn manual_timer_keeps_an_early_fire_for_the_next_wait() {
         let (mut timer, control) = ManualTimer::new();
         control.fire().unwrap();
-        let wake = timer.wake_at(Timestamp::from(Duration::ZERO));
+        let wake = timer.wake_at(Instant::now());
         assert!(wake.try_recv().is_ok());
     }
 
     #[test]
     fn dropping_the_control_disconnects_the_wake_channel() {
         let (mut timer, control) = ManualTimer::new();
-        let wake = timer.wake_at(Timestamp::from(Duration::ZERO));
+        let wake = timer.wake_at(Instant::now());
         drop(control);
         assert_eq!(wake.try_recv(), Err(TryRecvError::Disconnected));
     }

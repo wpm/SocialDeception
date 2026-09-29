@@ -11,9 +11,9 @@
 //! 3. records each of them, stamped with the instant of the pop;
 //! 4. hands the observation to the game's [`Handler`] and gets back the
 //!    [`Action`]s to send;
-//! 5. stamps each action with the agent's id and the instant of the send,
-//!    records it, and sends the cycle's actions to the router as one
-//!    [`CycleDispatch`];
+//! 5. stamps each action with the agent's id and the next number in the
+//!    agent's message sequence, records it with the instant of the send,
+//!    and sends the cycle's actions to the router as one [`CycleDispatch`];
 //! 6. records the cycle.
 //!
 //! **A cycle handles one observation** (ADR-0008). An agent with a full queue
@@ -28,11 +28,11 @@
 //! reaches it before the things said to it first.
 //!
 //! Everything a cycle pops is stamped with one instant, so its observation
-//! and every control it popped have the same `received`: the cycle's
-//! `t_start`. There is no exception. That is what makes an agent's
-//! deliberation recoverable from the log without a stamp for it, as ADR-0007
-//! sets out: it is a sent action's `created` minus the `received` of the
-//! observation in the same cycle, and the cycle record groups them.
+//! and every control it popped have the same `t`: the cycle's `t_start`.
+//! There is no exception. That is what makes an agent's deliberation
+//! recoverable from the log without a stamp for it: it is a sent action's
+//! `t` minus the `t` of the observation in the same cycle, and the cycle
+//! record's window brackets both.
 //!
 //! The handler returns what to send rather than sending it, so the loop sees
 //! everything that goes out and the log it records is authoritative.
@@ -132,7 +132,7 @@
 //! not `timeout`: it has an observation, and an observation is what a
 //! handler decides from. The record still says the deadline woke it. A
 //! handler that keeps its own deadlines therefore checks them in `handle`
-//! too, against the observation's `received`.
+//! too, against the observation's `at`.
 //!
 //! # Termination
 //!
@@ -170,6 +170,7 @@
 //!     }
 //! }
 //!
+//! // One clock for the episode, captured before the writer or the agent.
 //! let clock = Clock::start();
 //! let (to_agent, queue) = unbounded();
 //! let (dispatches, from_agent) = unbounded();
@@ -177,18 +178,19 @@
 //! // can read back; a run writes one over a file instead.
 //! let log = Arc::new(Mutex::new(Vec::new()));
 //! let sink: Box<dyn Sink<Chat>> = Box::new(JsonLines::new(Recorded(log.clone())));
-//! let (records, writer) = Writer::spawn(vec![(sink, Policy::Required)]);
+//! let (records, writer) = Writer::spawn(vec![(sink, Policy::Required)], clock);
 //! let wiring =
 //!     Wiring { id: "echo".into(), clock, queue, dispatches, records, timeout: None };
 //! let agent = Agent::spawn(wiring, Echo, clock);
 //!
-//! let hello = Message::<Chat>::new("caller", ["echo"], clock.now(), String::from("hello"));
+//! // The caller's first message, so sequence number zero.
+//! let hello = Message::<Chat>::new("caller", ["echo"], 0, String::from("hello"));
 //! // One queue, so everything is said in the order it is to be handled: the
 //! // start, the message, and then the stop the agent reaches after
 //! // answering it.
-//! to_agent.send(Delivery::control(Control::Start, clock.now())).unwrap();
+//! to_agent.send(Delivery::Control(Control::Start)).unwrap();
 //! to_agent.send(Delivery::Message(hello)).unwrap();
-//! to_agent.send(Delivery::control(Control::Stop, clock.now())).unwrap();
+//! to_agent.send(Delivery::Control(Control::Stop)).unwrap();
 //!
 //! let echoed: CycleDispatch<Chat> = from_agent.iter().find(|r| !r.sent.is_empty()).unwrap();
 //! agent.join().unwrap();
@@ -220,71 +222,43 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError, never, select};
 
-use crate::clock::{Clock, Created, Received, Timestamp};
-use crate::log::{ActionRecord, ControlRecord, CycleRecord, ObservationRecord, Record, Seq, Woken};
+use crate::clock::Clock;
+use crate::log::{ActionRecord, ControlRecord, CycleRecord, Key, ObservationRecord, Record, Woken};
 use crate::message::{ActorId, Control, Delivery, Message, Payload};
 use crate::timer::TimerSource;
 
-/// A message this agent has popped off its queue: what it observed, and when.
+/// A message this agent has popped off its queue: what it observed, and when
+/// it arrived.
 ///
-/// The message carries the instant its sender created it; this adds the
-/// instant this agent received it. The gap between the two is the
-/// observation's [`latency`](Received::latency), the whole staleness of
-/// what the agent is looking at.
+/// The arrival is the one time an agent has about a message, and the one it
+/// needs: what latency an agent perceives is when its observations arrived
+/// relative to each other and to itself (ADR-0017). When the sender's clock
+/// read as it sent is a fact about that clock, and no message carries it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Observation<P: Payload> {
     /// The message.
     pub message: Message<P>,
     /// When this agent popped it: its cycle's `t_start`.
-    pub received: Timestamp,
-}
-
-impl<P: Payload> Created for Observation<P> {
-    fn created(&self) -> Timestamp {
-        self.message.created
-    }
-}
-
-impl<P: Payload> Received for Observation<P> {
-    fn received(&self) -> Timestamp {
-        self.received
-    }
+    pub at: Instant,
 }
 
 /// A control this agent has popped off its queue, and when.
 ///
-/// Logged by the loop and never handed to a handler; it implements
-/// [`Received`] for the same reason an observation does, so that a control
-/// that waited behind whatever was queued ahead of it says so.
+/// Logged by the loop and never handed to a handler.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Instruction {
     /// The control.
     pub control: Control,
-    /// When the episode sent it.
-    pub created: Timestamp,
     /// When this agent popped it: its cycle's `t_start`.
-    pub received: Timestamp,
-}
-
-impl Created for Instruction {
-    fn created(&self) -> Timestamp {
-        self.created
-    }
-}
-
-impl Received for Instruction {
-    fn received(&self) -> Timestamp {
-        self.received
-    }
+    pub at: Instant,
 }
 
 /// What an agent sends: to whom, and what.
 ///
-/// No sender and no creation time, unless the action is a relay. An action
-/// has no creation time until it is sent, and the handler cannot know that
-/// instant, so the loop stamps both as it hands the action to the router;
-/// the stamped value is the [`Message`] on the wire and what the `action`
-/// record logs.
+/// No sender and no sequence number, unless the action is a relay. An action
+/// is not numbered until it is sent, and the handler cannot know its number,
+/// so the loop stamps both as it hands the action to the router; the stamped
+/// value is the [`Message`] on the wire and what the `action` record logs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Action<P: Payload> {
     /// The agents to send it to, possibly none. The set never contains the
@@ -292,29 +266,15 @@ pub struct Action<P: Payload> {
     pub recipients: BTreeSet<ActorId>,
     /// What to say.
     pub payload: P,
-    /// Who really said it, and when, when this action is one agent
-    /// passing on another's.
+    /// Which message this one passes on, when this action is one agent
+    /// relaying another's.
     ///
-    /// `None` for the ordinary case: the action is the sender's own and
-    /// the loop stamps it with the sender's own name and clock. `Some` is
-    /// a **relay**, and the stamp keeps what is here instead, so the
+    /// `None` for the ordinary case: the action is the sender's own and the
+    /// loop stamps it with the sender's own name and next number. `Some` is
+    /// a **relay**, and the stamp keeps the key that is here instead, so the
     /// recipient sees the message the original actor would have sent it
     /// directly. See [`Action::relay`].
-    pub origin: Option<Origin>,
-}
-
-/// Who first sent a relayed action, and when.
-///
-/// An agent that passes on another's action does not put its own name on
-/// it. The pair here is what [`Message::sender`] and [`Message::created`]
-/// become, so a relayed message is indistinguishable from a direct one and
-/// the relay shows up only as the extra latency it costs.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Origin {
-    /// The agent whose action this is.
-    pub sender: ActorId,
-    /// The instant that agent created it.
-    pub created: Timestamp,
+    pub origin: Option<Key>,
 }
 
 impl<P: Payload> Action<P> {
@@ -331,25 +291,17 @@ impl<P: Payload> Action<P> {
         }
     }
 
-    /// One agent passing on another's action, addressed to `recipients`.
+    /// One agent passing on another's message, addressed to `recipients`.
     ///
-    /// The message the recipients observe names `sender` and is stamped
-    /// `created`, not the relaying agent and not the instant of the relay.
-    /// What a recipient sees is therefore exactly what it would have seen
-    /// had the original actor addressed it directly; the only trace of the
-    /// relay is that the message arrives later than it was created.
+    /// The message the recipients observe carries the original `(sender,
+    /// seq)`, not the relaying agent's name and not a number of the relaying
+    /// agent's. What a recipient sees is therefore exactly what it would
+    /// have seen had the original actor addressed it directly, and it joins
+    /// to the original actor's action record like any other observation.
     ///
-    /// The relaying agent's own numbering is untouched: the strictly
-    /// increasing stamp [`Handler`] actions get is per sender, and this
-    /// action is not the relaying agent's to number. Two actions are told
-    /// apart by their sender and creation time (ADR-0002), and both of
-    /// those belong to the original actor here.
-    pub fn relay<I, A>(
-        sender: impl Into<ActorId>,
-        created: Timestamp,
-        recipients: I,
-        payload: P,
-    ) -> Self
+    /// The relaying agent's own numbering is untouched: a sequence number is
+    /// per sender, and this message is not the relaying agent's to number.
+    pub fn relay<I, A>(sender: impl Into<ActorId>, seq: u64, recipients: I, payload: P) -> Self
     where
         I: IntoIterator<Item = A>,
         A: Into<ActorId>,
@@ -357,9 +309,9 @@ impl<P: Payload> Action<P> {
         Self {
             recipients: recipients.into_iter().map(Into::into).collect(),
             payload,
-            origin: Some(Origin {
-                sender: sender.into(),
-                created,
+            origin: Some(Key {
+                from: sender.into(),
+                seq,
             }),
         }
     }
@@ -380,7 +332,7 @@ pub trait Handler<P: Payload> {
     /// Opening actions are the agent's own, decided from nothing; a handler
     /// with work to do before it can name them has state to fold and belongs
     /// in `handle`.
-    fn start(&mut self, _now: Timestamp) -> Vec<Action<P>> {
+    fn start(&mut self, _now: Instant) -> Vec<Action<P>> {
         Vec::new()
     }
 
@@ -408,7 +360,7 @@ pub trait Handler<P: Payload> {
     /// would have had to unwrap its way back out of it (ADR-0008). The
     /// default does nothing, which is what an agent without a timeout wants
     /// and what every agent in the tree wants today.
-    fn timeout(&mut self, _now: Timestamp) -> Vec<Action<P>> {
+    fn timeout(&mut self, _now: Instant) -> Vec<Action<P>> {
         Vec::new()
     }
 
@@ -421,10 +373,10 @@ pub trait Handler<P: Payload> {
     /// its schedule completely, and one that returns `None` throughout
     /// behaves exactly as it did before there was a deadline to set.
     ///
-    /// The instant is absolute and on the agent's clock, the same clock the
-    /// `now` of [`start`](Handler::start) and [`timeout`](Handler::timeout)
-    /// and an observation's `received` are read from, so a handler may
-    /// compare them directly.
+    /// The instant is absolute and off the process's monotonic clock, the
+    /// same clock the `now` of [`start`](Handler::start) and
+    /// [`timeout`](Handler::timeout) and an observation's `at` are read from,
+    /// so a handler may compare them directly.
     ///
     /// **A deadline already in the past fires at once**, which is how a
     /// handler asks for the next cycle whatever else happens. A handler that
@@ -435,8 +387,8 @@ pub trait Handler<P: Payload> {
     /// **Check the deadline in `handle` too.** A deadline that passes while
     /// a message is waiting joins that message's cycle, which calls `handle`
     /// rather than `timeout` (ADR-0008), so a handler that keeps deadlines
-    /// compares them against `observation.received` as well. A due deadline
-    /// is a fact about the time, not about which method is running.
+    /// compares them against `observation.at` as well. A due deadline is a
+    /// fact about the time, not about which method is running.
     ///
     /// **`None` withdraws a deadline** for a handler whose agent was wired
     /// with no interval, which is every agent an [`Episode`] runs. Owning a
@@ -447,7 +399,7 @@ pub trait Handler<P: Payload> {
     /// rather than "no deadline".
     ///
     /// [`Episode`]: crate::Episode
-    fn deadline(&self) -> Option<Timestamp> {
+    fn deadline(&self) -> Option<Instant> {
         None
     }
 }
@@ -487,7 +439,12 @@ pub struct Wiring<P: Payload> {
     /// The agent's id: the sender on everything it emits and the `agent` on
     /// every record it writes.
     pub id: ActorId,
-    /// The episode clock.
+    /// The episode clock: the shared origin the log's offsets are measured
+    /// from.
+    ///
+    /// The agent does not convert anything with it — the
+    /// [`Writer`](crate::log::Writer) does that — and holds it only to pass
+    /// on, until feature #106 hands it to the handler's `start` hook instead.
     pub clock: Clock,
     /// The agent's queue: messages, which become [`Observation`]s when
     /// popped, and controls, which the loop acts on itself, in the order
@@ -565,7 +522,6 @@ impl<H> Agent<H> {
             handler,
             timer,
             next_seq: 0,
-            last_created: None,
             started: false,
             closed: false,
             pending: None,
@@ -650,13 +606,12 @@ struct Loop<P: Payload, H, T> {
     wiring: Wiring<P>,
     handler: H,
     timer: T,
-    /// The next sequence number to assign.
+    /// The next number in this agent's message sequence.
+    ///
+    /// One per message sent, so the numbers are dense in the messages this
+    /// agent sent and mean nothing for anything else it logs. A relayed
+    /// message takes none: it is not this agent's to number.
     next_seq: u64,
-    /// The last `created` this agent stamped onto an action. Per agent, not
-    /// per cycle: the join an observation makes is on the sender and the
-    /// instant over the whole log, so two actions of one agent may
-    /// not share an instant even across a cycle boundary.
-    last_created: Option<Timestamp>,
 
     /// Whether the agent has been started. A second `Start` is a bug in
     /// whoever sent it; see [`cycle`](Self::cycle).
@@ -670,7 +625,7 @@ struct Loop<P: Payload, H, T> {
 
     /// The earliest deadline and the wake channel asked for it, kept across
     /// cycles until it fires.
-    pending: Option<(Timestamp, Receiver<Instant>)>,
+    pending: Option<(Instant, Receiver<Instant>)>,
 }
 
 impl<P, H, T> Loop<P, H, T>
@@ -689,7 +644,7 @@ where
             };
             // Everything popped shares one instant, so the cycle's start is
             // taken before the pop rather than after it.
-            let t_start = self.wiring.clock.now();
+            let t_start = Instant::now();
             let popped = self.drain(woke_with, t_start);
             if popped.is_empty() && !woken_by_deadline {
                 // The queue closed and brought nothing with it. There is no
@@ -757,7 +712,7 @@ where
     /// already have taken ahead of a `Stop` cannot arise — the wake-up
     /// takes one thing and the pass stops at the stop it then finds — so
     /// the only thing forgotten is what was never taken.
-    fn drain(&mut self, woke_with: Wake<P>, t_start: Timestamp) -> Popped<P> {
+    fn drain(&mut self, woke_with: Wake<P>, t_start: Instant) -> Popped<P> {
         let (mut controls, mut message, mut deliveries) = (Vec::new(), None, 0);
         let mut in_hand = match woke_with {
             Wake::Delivered(delivery) => Some(delivery),
@@ -784,11 +739,10 @@ where
             };
             deliveries += 1;
             match delivery {
-                Delivery::Control { control, created } => {
+                Delivery::Control(control) => {
                     controls.push(Instruction {
                         control,
-                        created,
-                        received: t_start,
+                        at: t_start,
                     });
                     if control == Control::Stop {
                         break;
@@ -842,7 +796,7 @@ where
     /// pending either; an interval runs from the start, not from whatever
     /// the agent was doing beforehand. In between, the deadline stays where
     /// it is, so being spoken to never pushes it back.
-    fn arm(&mut self, from: Timestamp, due: bool) {
+    fn arm(&mut self, from: Instant, due: bool) {
         match (self.handler.deadline(), self.wiring.timeout) {
             // The handler named one. Re-armed only where it moved to, so a
             // handler that keeps naming the same instant waits on the
@@ -878,7 +832,7 @@ where
     /// go nowhere.
     fn cycle(
         &mut self,
-        t_start: Timestamp,
+        t_start: Instant,
         popped: Popped<P>,
         timed_out: bool,
     ) -> Result<bool, Error> {
@@ -887,7 +841,7 @@ where
             message,
             deliveries,
         } = popped;
-        let (mut inputs, mut started, mut stopped) = (Vec::new(), false, false);
+        let (mut started, mut stopped) = (false, false);
         // Controls first, and in one pass, so that a `Start` at the head of
         // the queue has run the start hook before the message behind it is
         // observed.
@@ -906,14 +860,17 @@ where
                 }
                 Control::Stop => stopped = true,
             }
-            inputs.push(self.record_control(instruction)?);
+            self.record_control(instruction)?;
         }
         let observation = message.map(|message| Observation {
             message,
-            received: t_start,
+            at: t_start,
         });
+        let observed = observation
+            .as_ref()
+            .map(|observation| Key::of(&observation.message));
         if let Some(observation) = &observation {
-            inputs.push(self.record_observation(observation)?);
+            self.record_observation(observation)?;
         }
         // A start is the loop's own business: it calls the start hook, whose
         // opening actions go out ahead of whatever the cycle's observation
@@ -934,10 +891,10 @@ where
             actions.extend(self.handler.timeout(t_start));
         }
 
-        let (mut sent, mut outputs) = (Vec::new(), Vec::new());
+        let mut sent = Vec::new();
         for action in actions {
             let message = self.stamp(action);
-            outputs.push(self.record_action(&message)?);
+            self.record_action(&message)?;
             sent.push(message);
         }
 
@@ -965,14 +922,13 @@ where
         let cycle = CycleRecord {
             agent: self.wiring.id.clone(),
             t_start,
-            t_stop: self.wiring.clock.now(),
+            t_stop: Instant::now(),
             woken: if timed_out {
                 Woken::Timeout
             } else {
                 Woken::Queue
             },
-            inputs,
-            outputs,
+            observed,
         };
         self.wiring
             .records
@@ -981,107 +937,83 @@ where
         Ok(stopped)
     }
 
-    /// Stamps one action with this agent as sender and the instant of the
-    /// stamp.
+    /// Stamps one action with this agent as sender and the next number in
+    /// this agent's message sequence.
     ///
-    /// The stamp is the action's `created` on the wire, and every action a
-    /// handler returns is sent, so there is no other case.
+    /// The number is what tells one of an agent's messages from another, and
+    /// what the sender's action record and every recipient's observation
+    /// record join on (ADR-0017). **One send to five recipients is one
+    /// message and one number**: the action is stamped once, here, and the
+    /// router copies the stamped message to each recipient.
     ///
-    /// The stamp is always strictly later than the last one this agent handed
-    /// out. That is not cosmetic. An observation names the action it came
-    /// from by the sender and the creation time and by nothing else, since no
-    /// message carries an identifier (ADR-0002), so two of an agent's actions
-    /// sharing an instant would be two actions no observation could tell
-    /// apart. A cycle that returns several actions stamps them within a few
-    /// hundred nanoseconds of each other, which the clock's resolution does
-    /// not always separate, and two cycles can run that close together too,
-    /// so the guarantee is the agent's and not one cycle's.
+    /// That is why there is nothing to guard against two actions sharing an
+    /// instant. Numbers are the join, so two actions a cycle sends a few
+    /// hundred nanoseconds apart are already distinct, whatever the clock's
+    /// resolution says.
     ///
-    /// # A relay is stamped with whose action it is
+    /// # A relay is stamped with whose message it is
     ///
-    /// An action carrying an [`Origin`] is one agent passing on another's,
-    /// and it keeps the original sender and creation time
-    /// ([`Action::relay`]). This agent's own numbering is left alone: the
-    /// increasing-stamp guarantee is per sender, and a relayed action is
-    /// not this agent's to number. Advancing `last_created` for one would
-    /// push this agent's next real action past an instant it never used.
+    /// An action carrying an origin is one agent passing on another's
+    /// message, and it keeps the original sender and sequence number
+    /// ([`Action::relay`]). This agent's own numbering is left alone: a
+    /// sequence number is per sender, and a relayed message is not this
+    /// agent's to number. Taking one for it would leave a gap in the numbers
+    /// of the messages this agent really sent.
     fn stamp(&mut self, action: Action<P>) -> Message<P> {
         let Action {
             recipients,
             payload,
             origin,
         } = action;
-        if let Some(Origin { sender, created }) = origin {
-            return Message {
-                sender,
-                recipients,
-                created,
-                payload,
-            };
-        }
-        let now = self.wiring.clock.now();
-        let created = match self.last_created {
-            Some(previous) if now <= previous => previous + Duration::from_nanos(1),
-            _ => now,
-        };
-        self.last_created = Some(created);
+        let Key { from, seq } = origin.unwrap_or_else(|| {
+            let seq = self.next_seq;
+            self.next_seq += 1;
+            Key {
+                from: self.wiring.id.clone(),
+                seq,
+            }
+        });
         Message {
-            sender: self.wiring.id.clone(),
+            sender: from,
             recipients,
-            created,
+            seq,
             payload,
         }
     }
 
-    /// Takes the next sequence number.
-    fn next_seq(&mut self) -> Seq {
-        let seq = Seq(self.next_seq);
-        self.next_seq += 1;
-        seq
-    }
-
-    fn record_observation(&mut self, observation: &Observation<P>) -> Result<Seq, Error> {
-        let seq = self.next_seq();
+    fn record_observation(&self, observation: &Observation<P>) -> Result<(), Error> {
         self.send_record(
             ObservationRecord {
                 agent: self.wiring.id.clone(),
-                seq,
-                created: observation.message.created,
-                received: observation.received,
+                t: observation.at,
+                key: Key::of(&observation.message),
                 message: observation.message.clone(),
             }
             .into(),
-        )?;
-        Ok(seq)
+        )
     }
 
-    fn record_action(&mut self, message: &Message<P>) -> Result<Seq, Error> {
-        let seq = self.next_seq();
+    fn record_action(&self, message: &Message<P>) -> Result<(), Error> {
         self.send_record(
             ActionRecord {
                 agent: self.wiring.id.clone(),
-                seq,
-                created: message.created,
+                t: Instant::now(),
+                key: Key::of(message),
                 message: message.clone(),
             }
             .into(),
-        )?;
-        Ok(seq)
+        )
     }
 
-    fn record_control(&mut self, instruction: &Instruction) -> Result<Seq, Error> {
-        let seq = self.next_seq();
+    fn record_control(&self, instruction: &Instruction) -> Result<(), Error> {
         self.send_record(
             ControlRecord {
                 agent: self.wiring.id.clone(),
-                seq,
-                created: instruction.created(),
-                received: instruction.received(),
+                t: instruction.at,
                 control: instruction.control,
             }
             .into(),
-        )?;
-        Ok(seq)
+        )
     }
 
     fn send_record(&self, record: Record<P>) -> Result<(), Error> {
@@ -1114,17 +1046,17 @@ mod tests {
 
     type TestMessage = Message<TestPayload>;
 
-    fn at(nanos: u64) -> Timestamp {
-        Timestamp::from(Duration::from_nanos(nanos))
-    }
+    /// The instants these tests name, offset from the one fixed base every
+    /// test module in the crate shares; see [`testing::BASE`](crate::testing).
+    use crate::testing::at_nanos as at;
 
-    /// A step from `sender` to `a`, created at `created`.
-    fn step_at(sender: &str, n: u64, created: Timestamp) -> TestMessage {
-        Message::new(sender, ["a"], created, TestPayload::Step(n))
+    /// A step from `sender` to `a`, its `seq`th message.
+    fn step_at(sender: &str, n: u64, seq: u64) -> TestMessage {
+        Message::new(sender, ["a"], seq, TestPayload::Step(n))
     }
 
     fn step(sender: &str, n: u64) -> TestMessage {
-        step_at(sender, n, Timestamp::default())
+        step_at(sender, n, 0)
     }
 
     fn recv<T>(receiver: &Receiver<T>) -> T {
@@ -1147,11 +1079,11 @@ mod tests {
         seen: Vec<TestPayload>,
         /// The `now` of every start and timeout, in order, so that a test
         /// can check the hooks are told the cycle's `t_start`.
-        clock_readings: Vec<Timestamp>,
+        clock_readings: Vec<Instant>,
     }
 
     impl Handler<TestPayload> for Recorder {
-        fn start(&mut self, now: Timestamp) -> Vec<Action<TestPayload>> {
+        fn start(&mut self, now: Instant) -> Vec<Action<TestPayload>> {
             self.started += 1;
             self.clock_readings.push(now);
             Vec::new()
@@ -1166,7 +1098,7 @@ mod tests {
             )]
         }
 
-        fn timeout(&mut self, now: Timestamp) -> Vec<Action<TestPayload>> {
+        fn timeout(&mut self, now: Instant) -> Vec<Action<TestPayload>> {
             self.timeouts += 1;
             self.clock_readings.push(now);
             Vec::new()
@@ -1186,12 +1118,12 @@ mod tests {
     #[derive(Debug)]
     struct Punctual {
         inner: Recorder,
-        deadline: Arc<Mutex<Option<Timestamp>>>,
+        deadline: Arc<Mutex<Option<Instant>>>,
     }
 
     impl Punctual {
         /// The handler and the test's handle on its deadline.
-        fn new(deadline: Option<Timestamp>) -> (Self, Arc<Mutex<Option<Timestamp>>>) {
+        fn new(deadline: Option<Instant>) -> (Self, Arc<Mutex<Option<Instant>>>) {
             let deadline = Arc::new(Mutex::new(deadline));
             (
                 Self {
@@ -1204,7 +1136,7 @@ mod tests {
     }
 
     impl Handler<TestPayload> for Punctual {
-        fn start(&mut self, now: Timestamp) -> Vec<Action<TestPayload>> {
+        fn start(&mut self, now: Instant) -> Vec<Action<TestPayload>> {
             self.inner.start(now)
         }
 
@@ -1212,11 +1144,11 @@ mod tests {
             self.inner.handle(observation)
         }
 
-        fn timeout(&mut self, now: Timestamp) -> Vec<Action<TestPayload>> {
+        fn timeout(&mut self, now: Instant) -> Vec<Action<TestPayload>> {
             self.inner.timeout(now)
         }
 
-        fn deadline(&self) -> Option<Timestamp> {
+        fn deadline(&self) -> Option<Instant> {
             *self.deadline.lock().unwrap()
         }
     }
@@ -1238,7 +1170,7 @@ mod tests {
     }
 
     impl<H: Handler<TestPayload>> Handler<TestPayload> for Gated<H> {
-        fn start(&mut self, now: Timestamp) -> Vec<Action<TestPayload>> {
+        fn start(&mut self, now: Instant) -> Vec<Action<TestPayload>> {
             self.inner.start(now)
         }
 
@@ -1248,13 +1180,13 @@ mod tests {
             self.inner.handle(observation)
         }
 
-        fn timeout(&mut self, now: Timestamp) -> Vec<Action<TestPayload>> {
+        fn timeout(&mut self, now: Instant) -> Vec<Action<TestPayload>> {
             self.entered.send(()).unwrap();
             self.release.recv().unwrap();
             self.inner.timeout(now)
         }
 
-        fn deadline(&self) -> Option<Timestamp> {
+        fn deadline(&self) -> Option<Instant> {
             self.inner.deadline()
         }
     }
@@ -1263,11 +1195,11 @@ mod tests {
     /// so that a past deadline runs exactly one cycle instead of spinning.
     struct Once {
         inner: Punctual,
-        deadline: Arc<Mutex<Option<Timestamp>>>,
+        deadline: Arc<Mutex<Option<Instant>>>,
     }
 
     impl Handler<TestPayload> for Once {
-        fn start(&mut self, now: Timestamp) -> Vec<Action<TestPayload>> {
+        fn start(&mut self, now: Instant) -> Vec<Action<TestPayload>> {
             self.inner.start(now)
         }
 
@@ -1275,12 +1207,12 @@ mod tests {
             self.inner.handle(observation)
         }
 
-        fn timeout(&mut self, now: Timestamp) -> Vec<Action<TestPayload>> {
+        fn timeout(&mut self, now: Instant) -> Vec<Action<TestPayload>> {
             *self.deadline.lock().unwrap() = None;
             self.inner.timeout(now)
         }
 
-        fn deadline(&self) -> Option<Timestamp> {
+        fn deadline(&self) -> Option<Instant> {
             self.inner.deadline()
         }
     }
@@ -1293,7 +1225,7 @@ mod tests {
     struct Town(&'static [&'static str]);
 
     impl Handler<TestPayload> for Town {
-        fn start(&mut self, _now: Timestamp) -> Vec<Action<TestPayload>> {
+        fn start(&mut self, _now: Instant) -> Vec<Action<TestPayload>> {
             vec![Action::to(self.0.iter().copied(), TestPayload::Step(0))]
         }
 
@@ -1313,7 +1245,7 @@ mod tests {
         fn handle(&mut self, observation: &Observation<TestPayload>) -> Vec<Action<TestPayload>> {
             vec![Action::relay(
                 observation.message.sender.clone(),
-                observation.message.created,
+                observation.message.seq,
                 [self.0],
                 observation.message.payload.clone(),
             )]
@@ -1328,7 +1260,7 @@ mod tests {
             vec![
                 Action::relay(
                     observation.message.sender.clone(),
-                    observation.message.created,
+                    observation.message.seq,
                     [self.0],
                     observation.message.payload.clone(),
                 ),
@@ -1345,7 +1277,7 @@ mod tests {
             panic!("handler bug");
         }
 
-        fn timeout(&mut self, _now: Timestamp) -> Vec<Action<TestPayload>> {
+        fn timeout(&mut self, _now: Instant) -> Vec<Action<TestPayload>> {
             panic!("handler bug");
         }
     }
@@ -1353,7 +1285,6 @@ mod tests {
     /// An agent and the test's end of every channel it is wired to.
     struct Rig<H> {
         agent: Agent<H>,
-        clock: Clock,
         queue: Sender<Delivery<TestPayload>>,
         dispatches: Receiver<CycleDispatch<TestPayload>>,
         records: Receiver<Record<TestPayload>>,
@@ -1370,9 +1301,7 @@ mod tests {
 
     impl Wires {
         fn control(&self, control: Control) {
-            self.queue
-                .send(Delivery::control(control, self.wiring.clock.now()))
-                .unwrap();
+            self.queue.send(Delivery::Control(control)).unwrap();
         }
 
         fn send(&self, message: TestMessage) {
@@ -1406,10 +1335,8 @@ mod tests {
     ) -> Rig<H> {
         let wires = wires(timeout);
         let (timer, control) = ManualTimer::new();
-        let clock = wires.wiring.clock;
         Rig {
             agent: Agent::spawn(wires.wiring, handler, timer),
-            clock,
             queue: wires.queue,
             dispatches: wires.dispatches,
             records: wires.records,
@@ -1423,9 +1350,7 @@ mod tests {
         }
 
         fn control(&self, control: Control) {
-            self.queue
-                .send(Delivery::control(control, self.clock.now()))
-                .unwrap();
+            self.queue.send(Delivery::Control(control)).unwrap();
         }
 
         fn start(&self) {
@@ -1482,6 +1407,9 @@ mod tests {
     /// of the kinds rather than their contents.
     fn kind(record: &Record<TestPayload>) -> &'static str {
         match record {
+            // Only the writer writes one, and it never reaches a test that
+            // reads an agent's records off the channel.
+            Record::Episode(_) => "episode",
             Record::Observation(_) => "observation",
             Record::Action(_) => "action",
             Record::Control(_) => "control",
@@ -1667,7 +1595,10 @@ mod tests {
             "a timeout cycle records nothing it popped: {records:?}"
         );
         assert_eq!(timed_out.woken, Woken::Timeout);
-        assert!(timed_out.inputs.is_empty() && timed_out.outputs.is_empty());
+        assert!(
+            timed_out.observed.is_none(),
+            "a timeout cycle observed nothing: {timed_out:?}"
+        );
 
         // The message did not move the deadline: the only request between
         // the first and the one made after the timeout is none at all.
@@ -1845,7 +1776,7 @@ mod tests {
         // so exactly one past-deadline cycle runs however the threads are
         // scheduled. Clearing it from the test instead would race the
         // agent, which spins until it sees the retraction.
-        let (handler, deadline) = Punctual::new(Some(Timestamp::default()));
+        let (handler, deadline) = Punctual::new(Some(Instant::now()));
         let once = Once {
             inner: handler,
             deadline: deadline.clone(),
@@ -1854,17 +1785,13 @@ mod tests {
         let clock = wires.wiring.clock;
         let (queue, dispatches, records) = (wires.queue, wires.dispatches, wires.records);
         let agent = Agent::spawn(wires.wiring, once, clock);
-        queue
-            .send(Delivery::control(Control::Start, clock.now()))
-            .unwrap();
+        queue.send(Delivery::Control(Control::Start)).unwrap();
         // The start cycle, then the cycle the past deadline woke, with
         // nothing having been said to the agent in between.
         assert_eq!(recv(&dispatches).deliveries, 1, "the start");
         assert_eq!(recv(&dispatches).deliveries, 0, "the deadline");
 
-        queue
-            .send(Delivery::control(Control::Stop, clock.now()))
-            .unwrap();
+        queue.send(Delivery::Control(Control::Stop)).unwrap();
         drop(queue);
         let handler = agent.join().unwrap();
         drop(records);
@@ -2016,134 +1943,189 @@ mod tests {
     }
 
     #[test]
-    fn a_cycle_is_recorded_as_its_inputs_then_its_outputs_then_the_cycle() {
+    fn a_cycle_is_recorded_as_what_it_popped_then_what_it_sent_then_the_cycle() {
         let mut wires = wires(None);
-        let (records, writer, bytes) = recording();
-        wires.wiring.records = records;
-        wires
-            .queue
-            .send(Delivery::control(Control::Start, at(10)))
-            .unwrap();
-        wires.send(step_at("b", 6, at(20)));
         let clock = wires.wiring.clock;
+        let (records, writer, bytes) = recording(clock);
+        wires.wiring.records = records;
+        wires.queue.send(Delivery::Control(Control::Start)).unwrap();
+        wires.send(step_at("b", 6, 4));
         let agent = Agent::spawn(wires.wiring, Recorder::default(), clock);
         drop(wires.queue);
         agent.join().unwrap();
         let lines = parse_lines(&joined(writer, &bytes));
 
-        assert_eq!(lines.len(), 4);
-        let t_start = lines[3]["t_start"].as_u64().unwrap();
-        let t_stop = lines[3]["t_stop"].as_u64().unwrap();
-        assert_eq!(
-            lines[0],
-            json!({"type": "control", "agent": "a", "seq": 0, "created": 10,
-                   "received": t_start, "control": "start"})
-        );
+        // The header, then the cycle's three records and its own.
+        assert_eq!(lines.len(), 5);
+        assert_eq!(lines[0]["type"], "episode");
+        let t_start = lines[4]["t_start"].as_u64().unwrap();
+        let t_stop = lines[4]["t_stop"].as_u64().unwrap();
         assert_eq!(
             lines[1],
-            json!({"type": "observation", "agent": "a", "seq": 1, "created": 20,
-                   "received": t_start,
-                   "message": {"sender": "b", "recipients": ["a"], "payload": {"Step": 6}}})
+            json!({"type": "control", "agent": "a", "t": t_start, "control": "start"})
         );
-        let created = lines[2]["created"].as_u64().unwrap();
         assert_eq!(
             lines[2],
-            json!({"type": "action", "agent": "a", "seq": 2, "created": created,
+            json!({"type": "observation", "agent": "a", "t": t_start, "from": "b", "seq": 4,
+                   "message": {"sender": "b", "recipients": ["a"], "payload": {"Step": 6}}})
+        );
+        let sent = lines[3]["t"].as_u64().unwrap();
+        assert_eq!(
+            lines[3],
+            json!({"type": "action", "agent": "a", "t": sent, "seq": 0,
                    "message": {"sender": "a", "recipients": ["b"], "payload": {"Step": 7}}})
         );
         assert_eq!(
-            lines[3],
+            lines[4],
             json!({"type": "cycle", "agent": "a", "t_start": t_start, "t_stop": t_stop,
-                   "woken": "queue", "inputs": [0, 1], "outputs": [2]})
+                   "woken": "queue", "from": "b", "seq": 4})
         );
         // Everything popped was popped at the start of the cycle, and
         // everything sent was sent within its window.
-        assert!(20 < t_start);
-        assert!(t_start <= created && created <= t_stop);
+        assert!(t_start <= sent && sent <= t_stop);
     }
 
     #[test]
-    fn an_observation_carries_the_senders_creation_time_and_this_agents_receipt() {
+    fn an_observation_carries_its_key_and_the_instant_it_arrived() {
         let rig = rig(Recorder::default(), None);
         rig.start();
         rig.cycle();
-        rig.send(step_at("b", 1, at(7)));
+        rig.send(step_at("b", 1, 7));
         let (records, cycle) = rig.cycle();
         let Record::Observation(observation) = &records[0] else {
             panic!("the first record of the cycle is the observation: {records:?}");
         };
-        assert_eq!(observation.created, at(7), "the sender's stamp is carried");
         assert_eq!(
-            observation.received, cycle.t_start,
-            "and the receipt is the pop, which is the cycle's start"
+            observation.key,
+            Key {
+                from: ActorId::new("b"),
+                seq: 7
+            },
+            "the message it is: who sent it and which of theirs"
+        );
+        assert_eq!(
+            observation.t, cycle.t_start,
+            "and the arrival is the pop, which is the cycle's start"
         );
         rig.stop();
         rig.agent.join().unwrap();
     }
 
     #[test]
-    fn sequence_numbers_run_on_across_cycles_and_cover_every_kind() {
+    fn a_cycle_names_the_observation_it_was_called_with_and_nothing_else() {
         let rig = rig(Recorder::default(), None);
         rig.start();
         let (first, cycle) = rig.cycle();
         assert!(matches!(first.as_slice(), [Record::Control(_)]));
-        assert_eq!((cycle.inputs, cycle.outputs), (vec![Seq(0)], vec![]));
-        rig.send(step("b", 1));
+        assert!(
+            cycle.observed.is_none(),
+            "a cycle that popped only a control observed nothing: {cycle:?}"
+        );
+        rig.send(step_at("b", 1, 3));
         let (second, cycle) = rig.cycle();
         assert!(matches!(
             second.as_slice(),
             [Record::Observation(_), Record::Action(_)]
         ));
-        assert_eq!((cycle.inputs, cycle.outputs), (vec![Seq(1)], vec![Seq(2)]));
+        assert_eq!(
+            cycle.observed,
+            Some(Key {
+                from: ActorId::new("b"),
+                seq: 3
+            })
+        );
         rig.stop();
         rig.agent.join().unwrap();
     }
 
     #[test]
-    fn a_relayed_action_keeps_the_original_sender_and_creation_time() {
+    fn an_agent_numbers_its_own_messages_consecutively_from_zero() {
+        // Two messages sent by one agent carry consecutive numbers, across
+        // cycles as well as within one: the sequence is the agent's.
+        let rig = rig(Recorder::default(), None);
+        rig.start();
+        rig.cycle();
+        rig.dispatch();
+        for (n, expected) in [(1, 0), (2, 1), (3, 2)] {
+            rig.send(step("b", n));
+            let dispatch = rig.dispatch();
+            let [sent] = dispatch.sent.as_slice() else {
+                panic!("one reply per observation: {:?}", dispatch.sent);
+            };
+            assert_eq!(sent.sender, ActorId::new("a"));
+            assert_eq!(sent.seq, expected);
+            rig.cycle();
+        }
+        rig.stop();
+        rig.agent.join().unwrap();
+    }
+
+    #[test]
+    fn one_send_to_three_recipients_is_one_message_and_one_number() {
+        // The whole point of numbering a message rather than a record: the
+        // sender's one action record and each recipient's observation
+        // record carry the same key, so one action joins to all three.
+        let rig = rig(Town(&["b", "c", "d"]), None);
+        rig.start();
+        let dispatch = rig.dispatch();
+        let [sent] = dispatch.sent.as_slice() else {
+            panic!("one send, whatever its recipients: {:?}", dispatch.sent);
+        };
+        assert_eq!(sent.recipients, ["b", "c", "d"].map(ActorId::new).into());
+        assert_eq!(sent.seq, 0);
+        let (records, _) = rig.cycle();
+        let actions: Vec<&ActionRecord<TestPayload>> = records
+            .iter()
+            .filter_map(|record| match record {
+                Record::Action(action) => Some(action),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(actions.len(), 1, "one action record: {records:?}");
+        assert_eq!(actions[0].key, Key::of(sent));
+        rig.stop();
+        rig.agent.join().unwrap();
+    }
+
+    #[test]
+    fn a_relayed_action_keeps_the_original_senders_key() {
         // What `c` observes must be indistinguishable from what `b` would
-        // have sent it directly: the relay costs latency and shows up
-        // nowhere else.
+        // have sent it directly, and it joins back to `b`'s own action
+        // record by `(b, seq)`.
         let rig = rig(Relays("c"), None);
         rig.start();
         rig.cycle();
         rig.dispatch();
-        rig.send(step_at("b", 1, at(7)));
+        rig.send(step_at("b", 1, 7));
         let dispatch = rig.dispatch();
         assert_eq!(dispatch.sent.len(), 1);
         let sent = &dispatch.sent[0];
-        assert_eq!(sent.sender, ActorId::new("b"), "whose action it is");
-        assert_eq!(sent.created, at(7), "and when that agent made it");
+        assert_eq!(sent.sender, ActorId::new("b"), "whose message it is");
+        assert_eq!(sent.seq, 7, "and which of that agent's");
         assert_eq!(sent.recipients, ["c"].map(ActorId::new).into());
         rig.stop();
         rig.agent.join().unwrap();
     }
 
     #[test]
-    fn relaying_does_not_advance_the_relaying_agents_own_stamps() {
-        // The increasing-stamp guarantee is per sender. A relayed action
-        // is not this agent's to number, so its own next action is stamped
-        // from its clock and not pushed past an instant it never used.
+    fn relaying_does_not_advance_the_relaying_agents_own_numbering() {
+        // A sequence number is per sender. A relayed message is not this
+        // agent's to number, so taking one for it would leave a gap in the
+        // numbers of the messages this agent really sent.
         let rig = rig(RelaysThenSpeaks("c"), None);
         rig.start();
         rig.cycle();
         rig.dispatch();
-        // Far enough ahead that the agent's own clock cannot have reached
-        // it: if relaying advanced `last_created`, the agent's own action
-        // would be dragged past this instant.
-        let far = at(60_000_000_000);
-        rig.send(step_at("b", 1, far));
+        rig.send(step_at("b", 1, 99));
         let dispatch = rig.dispatch();
         let [relayed, own] = dispatch.sent.as_slice() else {
             panic!("the cycle relays and then speaks: {:?}", dispatch.sent);
         };
-        assert_eq!(relayed.sender, ActorId::new("b"));
-        assert_eq!(relayed.created, far);
-        assert_eq!(own.sender, ActorId::new("a"), "its own action is its own");
-        assert!(
-            own.created < far,
-            "and is stamped from its own clock, not dragged past the relay: {:?}",
-            own.created
+        assert_eq!((relayed.sender.as_str(), relayed.seq), ("b", 99));
+        assert_eq!(
+            (own.sender.as_str(), own.seq),
+            ("a", 0),
+            "its own first message is its own number zero"
         );
         rig.stop();
         rig.agent.join().unwrap();
@@ -2164,7 +2146,7 @@ mod tests {
             action.message.recipients,
             ["b", "c"].map(ActorId::new).into()
         );
-        assert_eq!(cycle.outputs, [Seq(1)]);
+        assert_eq!(cycle.observed, None, "the start observed nothing");
         rig.stop();
         rig.agent.join().unwrap();
     }
@@ -2185,13 +2167,15 @@ mod tests {
             action.message.recipients.is_empty(),
             "and is logged as addressed to nobody"
         );
-        assert_eq!(cycle.outputs, [Seq(1)]);
+        assert_eq!(action.key, Key::of(&sent[0]));
+        assert_eq!(cycle.observed, None, "the start observed nothing");
         rig.stop();
         rig.agent.join().unwrap();
     }
 
     /// Answers one observation with many actions at once, which is where
-    /// two of an agent's stamps could collide.
+    /// two of an agent's messages could collide if they were told apart by
+    /// anything but their numbers.
     struct Chatters(usize);
 
     impl Handler<TestPayload> for Chatters {
@@ -2203,35 +2187,32 @@ mod tests {
     }
 
     #[test]
-    fn an_agents_actions_never_share_an_instant() {
-        // An observation names the action it came from by the sender and
-        // the creation time alone, so two of one agent's actions at one
-        // instant would be two an observation could not tell apart. A cycle
-        // that returns a hundred actions returns them far faster than the
-        // clock's resolution.
+    fn a_cycles_actions_are_numbered_in_order_and_sent_within_its_window() {
+        // A cycle that returns a hundred actions returns them far faster
+        // than the clock's resolution, which is exactly why a message is
+        // told apart by its number and not by its instant.
         let rig = rig(Chatters(100), None);
         rig.start();
         rig.cycle();
         rig.send(step("b", 1));
         let (records, cycle) = rig.cycle();
-        let created: Vec<Timestamp> = records
+        let actions: Vec<&ActionRecord<TestPayload>> = records
             .iter()
             .filter_map(|record| match record {
-                Record::Action(record) => Some(record.created),
+                Record::Action(record) => Some(record),
                 _ => None,
             })
             .collect();
-        assert_eq!(created.len(), 100);
+        assert_eq!(actions.len(), 100);
+        let seqs: Vec<u64> = actions.iter().map(|record| record.key.seq).collect();
+        assert_eq!(seqs, (0..100).collect::<Vec<_>>());
+        // And every one was sent inside the cycle's window, which is what
+        // the log checker asserts of an action.
         assert!(
-            created.windows(2).all(|pair| pair[0] < pair[1]),
-            "every action of a cycle is stamped later than the one before it: {created:?}"
-        );
-        // And the stamps still lie inside the cycle's window, which is what
-        // the log checker asserts of an output.
-        assert!(
-            created
+            actions
                 .iter()
-                .all(|at| cycle.t_start <= *at && *at <= cycle.t_stop)
+                .all(|record| cycle.t_start <= record.t && record.t <= cycle.t_stop),
+            "every action of a cycle is sent inside its window: {cycle:?}"
         );
         rig.stop();
         rig.agent.join().unwrap();
@@ -2299,21 +2280,22 @@ mod tests {
     }
 
     #[test]
-    fn an_observation_and_a_control_know_their_own_latency() {
+    fn an_observation_and_a_control_know_only_when_they_arrived() {
+        // One time each, and it is the arrival. What an agent can perceive
+        // of latency is when its own observations arrived, so there is
+        // nothing to subtract a sender's clock reading from (ADR-0017).
         let observation = Observation::<TestPayload> {
-            message: step_at("b", 1, at(40)),
-            received: at(55),
+            message: step_at("b", 1, 40),
+            at: at(55),
         };
-        assert_eq!(observation.created(), at(40));
-        assert_eq!(observation.received(), at(55));
-        assert_eq!(observation.latency(), Duration::from_nanos(15));
+        assert_eq!(observation.at, at(55));
+        assert_eq!(observation.message.seq, 40);
 
         let instruction = Instruction {
             control: Control::Start,
-            created: at(10),
-            received: at(12),
+            at: at(12),
         };
-        assert_eq!(instruction.latency(), Duration::from_nanos(2));
+        assert_eq!(instruction.at, at(12));
     }
 
     #[test]
@@ -2466,7 +2448,14 @@ mod tests {
             steps([2]),
             "the answer was sent, not withheld: {records:?}"
         );
-        assert_eq!(cycle.outputs.len(), 1, "and it is an output: {cycle:?}");
+        assert_eq!(
+            cycle.observed,
+            Some(Key {
+                from: ActorId::new("b"),
+                seq: 0
+            }),
+            "and the cycle names what it answered: {cycle:?}"
+        );
         let dispatch = rig
             .dispatches
             .iter()
@@ -2479,9 +2468,9 @@ mod tests {
     #[test]
     fn everything_a_cycle_pops_shares_its_start() {
         // There is no longer any exception. A control is popped at the top
-        // of the cycle like the observation beside it, so every input's
-        // `received` is the cycle's `t_start` and a reader needs no special
-        // case for one of them.
+        // of the cycle like the observation beside it, so every popped
+        // record's `t` is the cycle's `t_start` and a reader needs no
+        // special case for one of them.
         let rig = rig(Recorder::default(), None);
         rig.start();
         rig.send(step("b", 1));
@@ -2490,11 +2479,11 @@ mod tests {
 
         let records: Vec<Record<TestPayload>> = rig.records.try_iter().collect();
         let mut cycles = 0;
-        let mut received: Vec<Timestamp> = Vec::new();
+        let mut received: Vec<Instant> = Vec::new();
         for record in &records {
             match record {
-                Record::Control(record) => received.push(record.received),
-                Record::Observation(record) => received.push(record.received),
+                Record::Control(record) => received.push(record.t),
+                Record::Observation(record) => received.push(record.t),
                 Record::Cycle(cycle) => {
                     cycles += 1;
                     assert!(

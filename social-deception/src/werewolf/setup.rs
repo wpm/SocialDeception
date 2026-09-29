@@ -54,6 +54,7 @@ use super::player::Player;
 use super::role::Role;
 use super::strategy::RandomStrategy;
 use crate::agent::Handler;
+use crate::clock::Clock;
 use crate::episode::{Episode, EpisodeError};
 use crate::log::{JsonLines, Policy, Record, Sink, Writer};
 use crate::message::ActorId;
@@ -121,6 +122,9 @@ impl From<EpisodeError> for RunError {
 /// seeded for it alone; and the moderator runs a [`Game`] over that same
 /// deal. The log goes to `records`.
 ///
+/// `clock` is the episode's origin, which must be the one the writer behind
+/// `records` was given; see [`Episode::new`].
+///
 /// # Panics
 ///
 /// If the configuration would not pass [`Config::validate`], which rules
@@ -129,9 +133,10 @@ impl From<EpisodeError> for RunError {
 pub fn episode(
     config: &Config,
     records: Sender<Record<Message>>,
+    clock: Clock,
 ) -> (Episode<i32, Message>, Receiver<Outcome>) {
     let assignment = Assignment::deal(config);
-    let (mut episode, outcomes) = moderate(config, assignment.clone(), records);
+    let (mut episode, outcomes) = moderate(config, assignment.clone(), records, clock);
     for (who, role) in assignment.players() {
         seat(&mut episode, config, who, role);
     }
@@ -145,6 +150,7 @@ fn moderate(
     config: &Config,
     assignment: Assignment,
     records: Sender<Record<Message>>,
+    clock: Clock,
 ) -> (Episode<i32, Message>, Receiver<Outcome>) {
     let (outcome, outcomes) = unbounded();
     let game = Game::new(assignment, config.seed, config.timing);
@@ -152,6 +158,7 @@ fn moderate(
         records,
         config.moderator.clone(),
         Moderator::new(game, outcome),
+        clock,
     );
     (episode, outcomes)
 }
@@ -233,8 +240,12 @@ pub fn run(config: &Config, live: Option<Box<dyn Write + Send>>) -> Result<Outco
         let roster = config.players.iter().chain([&config.moderator]);
         sinks.push((Box::new(Text::new(live, roster)), Policy::Optional));
     }
-    let (records, writer) = Writer::spawn(sinks);
-    let (episode, outcomes) = episode(config, records);
+    // One clock for the run, captured before the writer or any actor, so the
+    // log's offsets and everything an actor measures are on one timeline
+    // (ADR-0017).
+    let clock = Clock::start();
+    let (records, writer) = Writer::spawn(sinks, clock);
+    let (episode, outcomes) = episode(config, records, clock);
     play(episode, &outcomes, writer, log)
 }
 
@@ -334,8 +345,9 @@ mod tests {
 
     #[test]
     fn the_roster_is_every_player_and_the_moderator() {
-        let (records, _writer) = Writer::spawn(Vec::new());
-        let (episode, _outcomes) = episode(&town(), records);
+        let clock = Clock::start();
+        let (records, _writer) = Writer::spawn(Vec::new(), clock);
+        let (episode, _outcomes) = episode(&town(), records, clock);
         let roster: BTreeSet<ActorId> = episode.ids().cloned().collect();
         assert_eq!(
             roster,
@@ -446,8 +458,9 @@ mod tests {
         let config = config(["alice", "bob", "carol"], 1, 0, 0);
         let assignment = Assignment::deal(&config);
         let silent = assignment.pack().iter().next().unwrap().clone();
-        let (records, writer) = Writer::spawn(Vec::new());
-        let (mut episode, outcomes) = moderate(&config, assignment.clone(), records);
+        let clock = Clock::start();
+        let (records, writer) = Writer::spawn(Vec::new(), clock);
+        let (mut episode, outcomes) = moderate(&config, assignment.clone(), records, clock);
         for (who, role) in assignment.players() {
             if *who == silent {
                 add(&mut episode, who, Silent);

@@ -11,8 +11,11 @@ use crossbeam_channel::Sender;
 use serde::Serialize;
 use serde_json::Value;
 
+use std::sync::LazyLock;
+use std::time::{Duration, Instant};
+
 use crate::agent::Observation;
-use crate::clock::Timestamp;
+use crate::clock::Clock;
 use crate::log::{JsonLines, Policy, Record, Sink, Writer};
 use crate::message::{ActorId, Message, Payload};
 use crate::werewolf::{self, Assignment, Faction, Knowledge, Narration, Phase, Role, Round};
@@ -72,10 +75,10 @@ impl Write for Shared {
 
 /// A writer whose one required [`JsonLines`] sink writes to a buffer the
 /// test keeps, which is what a test that reads its log back wants.
-pub(crate) fn recording<P: Payload>() -> (Sender<Record<P>>, Writer, Shared) {
+pub(crate) fn recording<P: Payload>(clock: Clock) -> (Sender<Record<P>>, Writer, Shared) {
     let bytes = Shared::new();
     let sink: Box<dyn Sink<P>> = Box::new(JsonLines::new(bytes.clone()));
-    let (sender, writer) = Writer::spawn(vec![(sink, Policy::Required)]);
+    let (sender, writer) = Writer::spawn(vec![(sink, Policy::Required)], clock);
     (sender, writer, bytes)
 }
 
@@ -102,6 +105,51 @@ pub(crate) fn parse_lines(bytes: &[u8]) -> Vec<Value> {
     text.lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect()
+}
+
+/// Asserts that `line` is the `episode` header a log opens with, and returns
+/// the wall-clock anchor it carries.
+///
+/// The anchor is the one wall-clock time in a log and so differs on every
+/// run; a caller that wants to check *which* moment it is compares it with
+/// the [`Clock`] the log was written from.
+///
+/// # Panics
+///
+/// If the line is not a header, or carries no anchor.
+pub(crate) fn header_anchor(line: &Value) -> u64 {
+    assert_eq!(
+        line["type"], "episode",
+        "the first line is the header: {line}"
+    );
+    assert!(
+        line["agent"].is_null(),
+        "the header is nobody's record: {line}"
+    );
+    line["start_unix_ns"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("the header anchors the episode to the wall clock: {line}"))
+}
+
+/// A fixed base for the instants a test names, so that `at(0)`, `at(1)` and
+/// so on are one comparable series.
+///
+/// An `Instant` has no epoch to build one from, so a test that wants
+/// arbitrary times offsets one reading taken once for the whole run. It is
+/// far enough in the future that a deadline named from it never fires on a
+/// real clock; a test that wants one to fire uses a
+/// [`ManualTimer`](crate::ManualTimer).
+pub(crate) static BASE: LazyLock<Instant> =
+    LazyLock::new(|| Instant::now() + Duration::from_secs(3600));
+
+/// `nanos` after [`BASE`].
+pub(crate) fn at_nanos(nanos: u64) -> Instant {
+    *BASE + Duration::from_nanos(nanos)
+}
+
+/// `millis` after [`BASE`].
+pub(crate) fn at_millis(millis: u64) -> Instant {
+    *BASE + Duration::from_millis(millis)
 }
 
 /// Serializes a value to a JSON value, for asserting on its shape.
@@ -160,21 +208,21 @@ pub(crate) fn fast() -> crate::werewolf::config::Timing {
     }
 }
 
-/// A message from `sender` to [`ME`], created at a time no test reads.
+/// A message from `sender` to [`ME`], numbered as no test reads.
 ///
 /// Every werewolf unit test is a fold over what arrives, and the fold is a
-/// pure function of the payloads; the instant each message was created plays
-/// no part in it, so one stand-in time serves them all.
+/// pure function of the payloads; which of its sender's messages each one is
+/// plays no part in it, so one stand-in number serves them all.
 pub(crate) fn from(sender: &str, payload: werewolf::Message) -> Message<werewolf::Message> {
-    Message::new(sender, [ME], Timestamp::default(), payload)
+    Message::new(sender, [ME], 0, payload)
 }
 
-/// A message as [`ME`] observes it, received at a time no test reads. Like
-/// the creation time in [`from`], it plays no part in any fold.
+/// A message as [`ME`] observes it, arriving at a time no test reads. Like
+/// the sequence number in [`from`], it plays no part in any fold.
 pub(crate) fn observed(message: Message<werewolf::Message>) -> Observation<werewolf::Message> {
     Observation {
         message,
-        received: Timestamp::default(),
+        at: Instant::now(),
     }
 }
 
