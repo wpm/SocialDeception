@@ -75,6 +75,7 @@ actions; an environment implements `step`, from an observation to effects.**
 | `Context` | Runtime-internal: the per-actor plumbing (id, router, log sender, sequence counter). No application code sees it. |
 | `Router` | The shared, fixed-roster map from actor id to inbox sender, as ADR-0001 describes. |
 | `Episode` | The owner of one run: wiring, threads, the log writer, a time limit, joining. |
+| `Clock` | The episode's one origin, chosen before any actor starts and shared by every actor and the log writer (ADR-0017). |
 
 The runtime layer takes its names from the actor model so that the RL names
 stay exact at the layer above: an agent chooses actions, an environment
@@ -98,12 +99,12 @@ pub enum Effect<W, P> {
 }
 
 pub trait Policy<P> {
-    fn start(&mut self) -> impl IntoIterator<Item = Action<P>> { [] }
+    fn start(&mut self, clock: Clock) -> impl IntoIterator<Item = Action<P>> { [] }
     fn policy(&mut self, observation: Observation<P>) -> impl IntoIterator<Item = Action<P>>;
 }
 
 pub trait Step<W, P> {
-    fn start(&mut self) -> impl IntoIterator<Item = Effect<W, P>> { [] }
+    fn start(&mut self, clock: Clock) -> impl IntoIterator<Item = Effect<W, P>> { [] }
     fn step(&mut self, observation: Observation<P>) -> impl IntoIterator<Item = Effect<W, P>>;
 }
 
@@ -131,16 +132,20 @@ router's check that only the environment sends controls stays as a backstop.
 arrives, so something must speak first — the moderator opening night one, the
 first sender in a Collatz ring — and the framework cannot construct a game's
 payload to prompt it. `start` is called once, when the actor receives
-`Start`, and defaults to doing nothing.
+`Start`, and defaults to doing nothing. It is given the episode's `Clock`
+([ADR-0017](0017-messages-carry-a-sequence-number-and-the-log-keeps-the-time.md)):
+the one origin the episode chose before any actor started, shared by every
+actor and the log writer, so that a handler measuring time from the start of
+the game is on the log's timeline.
 
 ### Actions are sent as they are yielded
 
 The handler thread sends each action as the iterator yields it, not after the
 handler returns. A policy that returns a `Vec` sends everything at the end;
 one that returns a lazy iterator can yield an action, do slow work inside
-`next()`, and yield another. An LLM player can yield `TypingStarted`, make
-its model call, then yield `Say`, and its listeners see typing begin while
-the model is still working. The iterator borrows the handler, so the traits
+`next()`, and yield another. An LLM player streaming its model's response
+can yield each piece of speech as it arrives, and its listeners hear the
+utterance while the model is still generating it. The iterator borrows the handler, so the traits
 are not usable as `dyn`; `Actor<R, H>` is generic over the handler, so
 nothing needs them to be.
 
@@ -156,8 +161,8 @@ player that should make one model call for five messages rather than five —
 does it with its own state. The usual shape is to wait for a lull: fold each
 observation into its state, set a reminder a short interval ahead, and
 decide when a reminder arrives with nothing newer folded since it was set.
-Werewolf's pointing sessions already close this way, on a quiet period that
-any new point restarts. How an agent batches, and whether it does at all, is
+Werewolf's selection sessions already close this way, on a quiet period that
+any new selection restarts. How an agent batches, and whether it does at all, is
 its own business; the framework offers no mechanism for it.
 
 ### Recipients
@@ -272,14 +277,15 @@ the reward is logged, and everything else is generic over the payload type
 
 ### Wiring and the episode
 
-An episode builds every inbox first, then the `Router` from their senders,
-then the log writer, and only then starts any actor. `Wiring` has nothing
+An episode captures its `Clock` first, then builds every inbox, then the
+`Router` from their senders, then the log writer with a copy of the clock,
+and only then starts any actor, each with a copy of the same clock. `Wiring` has nothing
 left to hold:
 
 | `Wiring` field | Where it goes |
 |---|---|
 | `id` | the `Actor` and its `Context` |
-| `clock` | nowhere; see ADR-0017 |
+| `clock` | the episode's `Clock`, now only an origin, given to each actor's `start` hook; see ADR-0017 |
 | `queue` | the actor's inbox |
 | `dispatches` | nowhere; only the quiescence count read it |
 | `records` | the `Context`'s log sender |
@@ -350,7 +356,7 @@ handler returns.
 **Received times mean what they say.** A message is observed and logged when
 it arrives, not when its agent next looks up from a model call, and the
 handler is told that instant in `observation.at`. A handler that applies
-time-sensitive rules — a point that must land before a phase's limit —
+time-sensitive rules — a selection that must land before a phase's limit —
 compares against `at`, not against the time it happens to be running.
 
 **Handlers decide after every observation, in order.** That is what keeps

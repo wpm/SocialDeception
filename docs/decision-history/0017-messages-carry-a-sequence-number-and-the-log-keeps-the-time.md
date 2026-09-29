@@ -89,10 +89,33 @@ An actor reads `Instant::now()` at the moment something happens — a message
 arriving, a message sent, a reminder coming due, a policy call starting or
 ending — and puts that `Instant` on the log record. It does not convert it.
 
-The **log writer** owns the one origin: an `Instant` captured when the writer
-is created, before any actor starts. When it writes a record, it writes the
-record's instant as whole nanoseconds since that origin. An instant earlier
-than the origin (which wiring order rules out) would saturate to zero.
+**The episode has one clock.** Before it creates the log writer or starts any
+actor, the `Episode` captures a single `Instant`, the episode's origin, and
+wraps it in a `Clock`:
+
+```rust
+#[derive(Clone, Copy)]
+pub struct Clock { origin: Instant }
+
+impl Clock {
+    pub fn origin(self) -> Instant;
+    pub fn offset(self, at: Instant) -> Duration;   // since the origin; zero if earlier
+}
+```
+
+Every actor and the log writer get a copy of the same `Clock`. The writer
+writes each record's instant as `clock.offset(t)` in whole nanoseconds. An
+actor gets its copy through its `start` hook
+([ADR-0016](0016-actors-perceive-on-one-thread-and-decide-on-another.md)),
+so anything it measures from the origin, such as the `[m:ss]` stamps in a
+language-model player's prompt, is on the same timeline as the log, and a
+prompt line can be matched to its log record by time. Actors are started by
+the environment's `Start` command, so their `start` hooks run a little after
+the origin; that does not matter, because every offset is measured from the
+shared origin and not from when a hook ran.
+
+`Clock` is only the origin. Times are `Instant`s everywhere; there is no
+timestamp type, and a clock never appears on a message.
 
 The origin is not a convenience for reading. Rust's `Instant` is monotonic
 and has no epoch, so it can only be written as an offset from another
@@ -141,18 +164,19 @@ given by `t`, and by `seq` within a sender.
 trajectory, in the reinforcement learning sense, is one agent's observations
 and actions paired up, which is what a parser builds from the log; the
 runtime writes a record of what happened and builds nothing. The writer,
-its `Sink`s and `JsonLines` stay as they are, apart from the writer owning
-the origin: it converts each record's instant to an offset before handing
-the record to its sinks, so a live view and the file show the same numbers.
+its `Sink`s and `JsonLines` stay as they are, apart from the writer holding
+the episode's `Clock`: it converts each record's instant to an offset before
+handing the record to its sinks, so a live view and the file show the same numbers.
 The `Woken` mark on cycle records goes, since there are no timeouts to
 record.
 
 ### What is removed
 
-`clock.rs`: `Clock`, `Timestamp`, `Created`, `Received` and `latency()`; the
-`created` and `received` fields on messages, observations and controls; and
-every place a clock is passed, which is most of why `Wiring` and `Adapter`
-held one.
+From `clock.rs`: `Timestamp`, `Created`, `Received`, `latency()` and
+`Episode::with_clock`; and the `created` and `received` fields on messages,
+observations and controls. `Clock` stays, reduced to the episode's origin and
+an `offset` from it, and is passed only to the log writer and to each
+actor's `start` hook.
 
 ## Consequences
 
@@ -188,7 +212,11 @@ arriving worth knowing about.
 No origin, nothing to convert. Rejected because the wall clock is not
 monotonic, and a record of what happened must not have time run backwards.
 
-### Keep `Clock` and pass it to every actor
+### Let the writer capture its own origin
 
-Rejected because only the writer needs an origin. Actors need `Instant::now()`,
-which the standard library already provides.
+The first draft of this record: the writer captured an `Instant` when it was
+created, and actors read `Instant::now()` with no origin of their own.
+Rejected because actors need the origin too. A language-model player stamps
+its prompt with times since the start of the game, and if each player
+measured from its own start those stamps would be offset from one another,
+and from the log, by each actor's start latency.

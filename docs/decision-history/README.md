@@ -45,9 +45,11 @@ from the earlier attempt at the project are not part of its history.
 | [0010](0010-a-handler-sets-its-own-deadline.md) | A handler sets its own deadline | Accepted |
 | [0011](0011-werewolf-phases-are-timed-pointing-sessions.md) | Werewolf phases are timed pointing sessions | Accepted |
 | [0012](0012-a-dead-player-stops.md) | A dead player stops | Accepted |
-| [0013](0013-speech-typing-and-a-scheduler-for-when-to-speak.md) | Speech and typing are events, and a scheduler decides when to speak | Accepted |
+| [0013](0013-speech-typing-and-a-scheduler-for-when-to-speak.md) | Speech and typing are events, and a scheduler decides when to speak | Superseded by [0019](0019-speech-streams-and-nobody-announces-typing.md) |
 | [0014](0014-events-carry-information-controls-carry-instruction.md) | Events carry information, controls carry instruction | Accepted |
 | [0015](0015-an-environment-does-not-summarize-what-agents-observed.md) | An environment does not summarize what its agents already observed | Accepted |
 | [0016](0016-actors-perceive-on-one-thread-and-decide-on-another.md) | Actors perceive on one thread and decide on another | Accepted |
 | [0017](0017-messages-carry-a-sequence-number-and-the-log-keeps-the-time.md) | Messages carry a sequence number, and the log keeps the time | Accepted |
 | [0018](0018-werewolf-speech-goes-through-the-moderator.md) | In Werewolf, all speech goes through the moderator | Accepted |
+| [0019](0019-speech-streams-and-nobody-announces-typing.md) | Speech streams as it is generated, and nobody announces typing | Accepted |
+| [0020](0020-a-selection-is-discrete-and-a-model-makes-one-with-a-tool-call.md) | A selection is discrete, and a model makes one with a tool call | Accepted |
