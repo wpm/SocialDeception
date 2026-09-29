@@ -1,0 +1,447 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Perceive and Decide</title>
+</head>
+<body style="margin:0">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+  :root {
+    --ground: #f2f4f7;
+    --panel: #ffffff;
+    --panel-2: #e9edf2;
+    --line: #cfd6df;
+    --ink: #1b2430;
+    --ink-2: #4f5c6b;
+    --ink-3: #7d8896;
+    --ctl: #5b6b7f;
+    --ctl-bg: #e3e8ee;
+    --msg: #3f6ab0;
+    --msg-bg: #e1e9f7;
+    --out: #0f8b8d;
+    --out-bg: #d9f0f0;
+    --log: #6f4fa6;
+    --log-bg: #ece5f7;
+    --rem: #b8741a;
+    --rem-bg: #f6e8d2;
+    --lost: #a3322a;
+    --lost-bg: #f5ddda;
+    --focus: #0f8b8d;
+    --sans: "IBM Plex Sans", "Helvetica Neue", Arial, sans-serif;
+    --mono: "IBM Plex Mono", "SFMono-Regular", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground: #141a21; --panel: #1d242d; --panel-2: #262f3a; --line: #38434f;
+      --ink: #e6ebf0; --ink-2: #aab5c1; --ink-3: #7f8b98;
+      --ctl: #a9b6c6; --ctl-bg: #2c3641;
+      --msg: #8fb0e6; --msg-bg: #24344d;
+      --out: #4fc3c5; --out-bg: #163a3b;
+      --log: #b79ce6; --log-bg: #302543;
+      --rem: #e3a24c; --rem-bg: #3a2e1c;
+      --lost: #e26b61; --lost-bg: #3b2220;
+      --focus: #4fc3c5;
+    }
+  }
+  :root[data-theme="dark"] {
+    --ground: #141a21; --panel: #1d242d; --panel-2: #262f3a; --line: #38434f;
+    --ink: #e6ebf0; --ink-2: #aab5c1; --ink-3: #7f8b98;
+    --ctl: #a9b6c6; --ctl-bg: #2c3641;
+    --msg: #8fb0e6; --msg-bg: #24344d;
+    --out: #4fc3c5; --out-bg: #163a3b;
+    --log: #b79ce6; --log-bg: #302543;
+    --rem: #e3a24c; --rem-bg: #3a2e1c;
+    --lost: #e26b61; --lost-bg: #3b2220;
+    --focus: #4fc3c5;
+  }
+  * { box-sizing: border-box; }
+  body { background: var(--ground); color: var(--ink); font-family: var(--sans); font-size: 15px; line-height: 1.5; }
+  .wrap { max-width: 1240px; margin: 0 auto; padding-block: 28px 48px; padding-inline: 20px; }
+  header h1 { font-size: 30px; font-weight: 600; letter-spacing: -0.01em; margin: 0 0 6px; text-wrap: balance; }
+  header p { margin: 0; color: var(--ink-2); max-width: 70ch; }
+  header p + p { margin-top: 8px; }
+  .mono { font-family: var(--mono); font-size: 0.92em; }
+
+  .stage { display: grid; grid-template-columns: 1fr 1.05fr 1.55fr; gap: 16px; margin-top: 24px; align-items: start; }
+  .col { display: grid; gap: 12px; }
+  .box { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
+  .boxhead { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-weight: 600; font-size: 13px; letter-spacing: 0.04em; text-transform: uppercase; color: var(--ink-2); margin-bottom: 8px; }
+  .boxhead b { font-weight: 600; color: var(--ink); text-transform: none; letter-spacing: 0; font-family: var(--mono); font-size: 13px; }
+  .box p { margin: 0; color: var(--ink-2); font-size: 13.5px; }
+
+  .lane { background: var(--panel-2); border: 1px dashed var(--line); border-radius: 10px; padding: 10px 12px; }
+  .lane.control { border-color: var(--ctl); }
+  .lanehead { font-size: 12px; letter-spacing: 0.04em; text-transform: uppercase; color: var(--ink-3); margin-bottom: 6px; display: flex; justify-content: space-between; gap: 8px; }
+  .lanehead .mono { text-transform: none; letter-spacing: 0; }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; min-height: 28px; }
+  .chips:empty::before { content: "empty"; color: var(--ink-3); font-size: 12px; font-family: var(--mono); padding: 4px 0; }
+  .chip { font-family: var(--mono); font-size: 12.5px; padding: 4px 9px; border-radius: 999px; border: 1px solid transparent; white-space: nowrap; transition: transform 240ms ease, opacity 240ms ease; }
+  .chip.ctl { background: var(--ctl-bg); color: var(--ctl); }
+  .chip.msg { background: var(--msg-bg); color: var(--msg); }
+  .chip.out { background: var(--out-bg); color: var(--out); }
+  .chip.rem { background: var(--rem-bg); color: var(--rem); }
+  .chip.lost { background: var(--lost-bg); color: var(--lost); text-decoration: line-through; }
+  .chip.enter { animation: enter 320ms ease; }
+  @keyframes enter { from { transform: translateY(-6px); opacity: 0; } to { transform: none; opacity: 1; } }
+
+  .threadbox { border-width: 2px; }
+  .threadbox.perceive { border-color: var(--msg); }
+  .threadbox.decide { border-color: var(--out); }
+  .pill { font-family: var(--mono); font-size: 12px; text-transform: none; letter-spacing: 0; padding: 2px 9px; border-radius: 999px; background: var(--panel-2); color: var(--ink-2); }
+  .pill.busy { background: var(--out-bg); color: var(--out); }
+  .pill.wait { background: var(--panel-2); color: var(--ink-3); }
+  .pill.done { background: var(--ctl-bg); color: var(--ctl); }
+  .pill.stopped { background: var(--lost-bg); color: var(--lost); }
+  .row { display: grid; grid-template-columns: 72px 1fr; gap: 10px; align-items: start; padding: 8px 0; border-top: 1px solid var(--line); }
+  .row .lbl { font-size: 12px; letter-spacing: 0.04em; text-transform: uppercase; color: var(--ink-3); padding-top: 5px; }
+  .handler { font-family: var(--mono); font-size: 12.5px; color: var(--ink-2); min-height: 28px; padding-top: 4px; overflow-wrap: anywhere; }
+  .handler.busy { color: var(--out); }
+  .meta { display: flex; justify-content: space-between; gap: 12px; font-size: 13px; color: var(--ink-2); font-variant-numeric: tabular-nums; }
+  .meta b { font-family: var(--mono); font-weight: 500; color: var(--ink); }
+
+  .rendezvous { text-align: center; font-family: var(--mono); font-size: 11.5px; color: var(--ink-3); padding: 2px 0; }
+
+  .log { list-style: none; margin: 0; padding: 0; font-family: var(--mono); font-size: 11.5px; line-height: 1.45; display: grid; gap: 3px; max-height: 460px; overflow: auto; }
+  .log:empty::before { content: "nothing written yet"; color: var(--ink-3); }
+  .log li { padding: 3px 8px; border-radius: 6px; background: var(--panel-2); color: var(--ink-2); white-space: nowrap; overflow-x: auto; }
+  .log li.cycle { color: var(--log); background: var(--log-bg); }
+  .log li.reward { color: var(--out); background: var(--out-bg); }
+  .log li.lost { color: var(--lost); background: var(--lost-bg); }
+  .log li.new { outline: 1px solid var(--log); animation: enter 320ms ease; }
+
+  .caption { margin-top: 20px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 18px; display: grid; grid-template-columns: auto 1fr; gap: 6px 16px; align-items: baseline; }
+  .stepno { font-family: var(--mono); font-size: 12px; color: var(--ink-3); grid-row: 1 / span 2; padding-top: 4px; font-variant-numeric: tabular-nums; }
+  .caption h2 { margin: 0; font-size: 17px; font-weight: 600; }
+  .caption p { margin: 0; color: var(--ink-2); max-width: 78ch; }
+
+  .controls { margin-top: 12px; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+  button { font: inherit; font-weight: 500; font-size: 14px; padding: 7px 14px; border-radius: 8px; border: 1px solid var(--line); background: var(--panel); color: var(--ink); cursor: pointer; }
+  button.primary { background: var(--out); border-color: var(--out); color: #fff; }
+  button:focus-visible, select:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+  button:disabled { opacity: 0.45; cursor: default; }
+  select { font: inherit; font-size: 14px; padding: 7px 10px; border-radius: 8px; border: 1px solid var(--line); background: var(--panel); color: var(--ink); }
+  .progress { flex: 1 1 160px; height: 6px; background: var(--panel-2); border-radius: 999px; overflow: hidden; min-width: 120px; }
+  .progress i { display: block; height: 100%; background: var(--out); width: 0; transition: width 240ms ease; }
+
+  .legend { margin-top: 22px; display: flex; flex-wrap: wrap; gap: 8px 18px; font-size: 13px; color: var(--ink-2); }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .sw { width: 12px; height: 12px; border-radius: 3px; }
+
+  @media (max-width: 1000px) { .stage { grid-template-columns: 1fr 1fr; } .stage .writer { grid-column: 1 / -1; } }
+  @media (max-width: 640px) { .stage { grid-template-columns: 1fr; } .stage .writer { grid-column: auto; } header h1 { font-size: 24px; } .caption { grid-template-columns: 1fr; } .stepno { grid-row: auto; } }
+  @media (prefers-reduced-motion: reduce) { .chip, .progress i { transition: none; } .chip.enter, .log li.new { animation: none; } }
+</style>
+
+<main class="wrap">
+  <header>
+    <h1>Perceive and Decide</h1>
+    <p>One actor, step by step: what arrives on its inbox, its control channel and its reminder timer; what its perception thread stamps and logs; what its handler thread decides; and the lines both write to the log. Play it through, or step with the arrow keys.</p>
+    <p>An actor is <strong>two threads</strong>. The point of the second one is that <strong>perceiving never waits on deciding</strong>: a handler busy in a model call cannot delay the stamp on what arrives while it thinks.</p>
+  </header>
+
+  <section class="stage" aria-live="polite">
+    <div class="col">
+      <div class="box">
+        <div class="boxhead">Router</div>
+        <p>A fixed roster from actor id to that actor's inbox and control channel. A handler thread sends straight to its recipients' inboxes — there is no central loop in the middle, and nothing counts deliveries in flight. Senders are unbounded, so a send never blocks.</p>
+      </div>
+      <div class="lane control">
+        <div class="lanehead"><span>control channel</span><span class="mono">checked first</span></div>
+        <div id="control" class="chips"></div>
+      </div>
+      <div class="lane">
+        <div class="lanehead"><span>inbox</span><span class="mono">Receiver&lt;Message&gt;</span></div>
+        <div id="inbox" class="chips"></div>
+      </div>
+      <div class="lane">
+        <div class="lanehead"><span>reminder timer</span><span class="mono">held, by deadline</span></div>
+        <div id="timer" class="chips"></div>
+      </div>
+    </div>
+
+    <div class="col">
+      <div class="box threadbox perceive">
+        <div class="boxhead"><span>perception <b>a</b></span><span id="pstate" class="pill wait">waiting</span></div>
+        <div class="row"><span class="lbl">stamped</span><div id="stamped" class="chips"></div></div>
+        <div class="row meta"><span>now <b id="clock">0</b></span></div>
+      </div>
+      <div class="rendezvous">↓ bounded(0) &mdash; a rendezvous, so nothing buffers here</div>
+      <div class="box threadbox decide">
+        <div class="boxhead"><span>handler <b>a</b></span><span id="hstate" class="pill wait">idle</span></div>
+        <div class="row"><span class="lbl">observing</span><div id="observing" class="chips"></div></div>
+        <div class="row"><span class="lbl">call</span><div id="handler" class="handler"></div></div>
+        <div class="row"><span class="lbl">yielded</span><div id="yielded" class="chips"></div></div>
+        <div class="row meta"><span>next seq <b id="seq">0</b></span></div>
+      </div>
+    </div>
+
+    <div class="col writer">
+      <div class="box">
+        <div class="boxhead"><span>Writer</span><span class="mono">werewolf.jsonl</span></div>
+        <ol id="log" class="log"></ol>
+      </div>
+    </div>
+  </section>
+
+  <section class="caption">
+    <div class="stepno" id="stepno">1 / 1</div>
+    <h2 id="ctitle"></h2>
+    <p id="cbody"></p>
+  </section>
+
+  <div class="controls">
+    <button id="reset" type="button">Reset</button>
+    <button id="prev" type="button">← Back</button>
+    <button id="play" type="button" class="primary">Play</button>
+    <button id="next" type="button">Step →</button>
+    <label for="speed" class="mono" style="color:var(--ink-3);font-size:12px">speed</label>
+    <select id="speed"><option value="4200">slow</option><option value="2600" selected>normal</option><option value="1400">fast</option></select>
+    <div class="progress"><i id="bar"></i></div>
+  </div>
+
+  <div class="legend">
+    <span><i class="sw" style="background:var(--ctl)"></i>control: start or stop</span>
+    <span><i class="sw" style="background:var(--msg)"></i>message from another actor</span>
+    <span><i class="sw" style="background:var(--rem)"></i>reminder, the actor's own</span>
+    <span><i class="sw" style="background:var(--out)"></i>action the handler yields</span>
+    <span><i class="sw" style="background:var(--log)"></i>cycle record</span>
+    <span><i class="sw" style="background:var(--lost)"></i>undelivered or unsent</span>
+    <span class="mono">times are clock units</span>
+  </div>
+</main>
+
+<script>
+(function () {
+  // ---- Chip builders -------------------------------------------------
+  const ctl = (name) => ({ k: 'ctl', text: name });
+  const msg = (from, n) => ({ k: 'msg', text: from + '→a Step(' + n + ')' });
+  const rem = (payload, at) => ({ k: 'rem', text: 'Remind(' + payload + ') · due ' + at });
+  const out = (to, n) => ({ k: 'out', text: 'a→' + to + ' Step(' + n + ')' });
+  const lost = (text) => ({ k: 'lost', text });
+
+  // ---- Record lines, exactly as the writer serializes them -----------
+  //
+  // Every record carries one time, `t`, in nanoseconds from the episode's
+  // origin (ADR-0017). Nothing on the wire carries a time, so there is no
+  // `created`: a message's sender and its sequence number are the whole of
+  // the join, and the log keeps the times.
+  const body = (s, r, n) => '{"sender":"' + s + '","recipients":[' + r + '],"payload":{"Step":' + n + '}}';
+  const one = (r) => '"' + r + '"';
+
+  const obsLine = (t, from, seq, msgJson) => ({ cls: 'obs', text: '{"type":"observation","agent":"a","t":' + t + ',"from":"' + from + '","seq":' + seq + ',"message":' + msgJson + '}' });
+  const actLine = (t, seq, msgJson) => ({ cls: 'act', text: '{"type":"action","agent":"a","t":' + t + ',"seq":' + seq + ',"message":' + msgJson + '}' });
+  const ctlLine = (t, c) => ({ cls: 'ctl', text: '{"type":"control","agent":"a","t":' + t + ',"control":"' + c + '"}' });
+  const rwdLine = (t, v) => ({ cls: 'reward', text: '{"type":"reward","agent":"a","t":' + t + ',"value":' + v + '}' });
+  const undLine = (t, from, seq, msgJson) => ({ cls: 'lost', text: '{"type":"undelivered","agent":"a","t":' + t + ',"from":"' + from + '","seq":' + seq + ',"message":' + msgJson + '}' });
+  const unsLine = (t, seq, msgJson) => ({ cls: 'lost', text: '{"type":"unsent","agent":"a","t":' + t + ',"seq":' + seq + ',"message":' + msgJson + '}' });
+  // A cycle is one handler call: a window, and the observation it was called
+  // with, if any. It says nothing about what woke it, and carries no list of
+  // what it sent — an action belongs to the call whose window contains it.
+  const cyLine = (ts, te, from, seq) => ({
+    cls: 'cycle',
+    text: '{"type":"cycle","agent":"a","t_start":' + ts + ',"t_stop":' + te +
+      (from === null ? '' : ',"from":"' + from + '","seq":' + seq) + '}'
+  });
+
+  // ---- Scenario ------------------------------------------------------
+  const base = {
+    control: [], inbox: [], timer: [], stamped: [], observing: [],
+    pstate: 'waiting', hstate: 'idle', handler: '', yielded: [],
+    log: [], seq: 0, clock: 0
+  };
+  const frames = [];
+  let cur = base;
+  function frame(title, body, patch) {
+    const next = JSON.parse(JSON.stringify(cur));
+    patch(next);
+    next.title = title; next.body = body;
+    frames.push(next); cur = next;
+  }
+
+  frame('Two threads, at rest',
+    'Actor a is two threads. The perception thread waits on several channels at once: its control channel, its inbox, its reminder timer, and requests from its own handler thread to hold a new reminder. The handler thread waits on one — the observations the perception thread forwards. Neither can run until something arrives, which is why something has to speak first.',
+    s => {});
+
+  frame('Start arrives on its own channel',
+    'The environment starts the agents. A control travels on a channel of its own rather than in the inbox, and the perception thread checks that channel before every select, so a control always goes first. crossbeam picks at random among ready channels, and this check is what keeps that from mattering.',
+    s => { s.control = [ctl('Start')]; s.clock = 10; });
+
+  frame('The start hook runs',
+    'Start calls the handler\'s start hook, and the perception thread logs the control at the instant it saw it: t 10, and no second time, because nothing on the wire carries one. The hook is given the episode\'s Clock — the one origin every actor and the log writer share — so a handler measuring from the start of the game is on the log\'s timeline. This agent opens with nothing to say.',
+    s => { s.control = []; s.pstate = 'stamping'; s.hstate = 'calling'; s.handler = 'start(clock) → []'; s.log.push(ctlLine(10, 'start')); });
+
+  frame('A start call is a cycle with no observation',
+    'The call returns, and the cycle record closes it: a window, and no from or seq, because there was no observation to be called with. That is the only shape a cycle has — the window and at most one observation. It says nothing about what woke it, because there is nothing to say.',
+    s => { s.pstate = 'waiting'; s.hstate = 'idle'; s.handler = ''; s.clock = 12; s.log.push(cyLine(10, 12, null)); });
+
+  frame('A message arrives',
+    'Agent b sends Step(6) to a. It lands in the inbox, and the router refused nothing: a has b in its roster, and b is not addressing itself.',
+    s => { s.inbox = [msg('b', 6)]; s.clock = 20; });
+
+  frame('Stamp it the moment it arrives',
+    'The perception thread does only fast work: receive, stamp with Instant::now(), log, forward. The stamp is t 20 — when the message arrived, not when anything decides about it. An actor\'s sense of time is the times at which its observations arrive, and this is the thread that keeps that honest.',
+    s => { s.inbox = []; s.stamped = [msg('b', 6)]; s.pstate = 'stamping'; s.clock = 20; s.log.push(obsLine(20, 'b', 0, body('b', one('a'), 6))); });
+
+  frame('Hand it over, and it is taken',
+    'The channel between the two threads is bounded(0) — a rendezvous, so the send completes only when the handler receives. Nothing buffers here, deliberately: a buffer would let a slow handler\'s backlog drain into a place the stop path never looks, and the log would say a message was delivered when nobody ever observed it.',
+    s => { s.stamped = []; s.observing = [msg('b', 6)]; s.pstate = 'waiting'; s.hstate = 'calling'; });
+
+  frame('One call, one observation',
+    'The handler is called once per observation, in arrival order. It takes the observation by value and returns actions: recipients and a payload, nothing more. It cannot name a sender or a time — the runtime supplies those. An agent cannot command or reward either, because Action has no variant for either; the compiler says so.',
+    s => { s.handler = 'policy(Observation { at: 20, … }) → [to b: Step(3)]'; s.yielded = [out('b', 3)]; });
+
+  frame('Actions are sent as they are yielded',
+    'Each action goes out as the iterator produces it, not after the call returns. The handler thread sends through the router itself and logs the action with the instant it sent it and the message\'s own seq, which is this actor\'s first: seq 0. A policy that streams its model\'s response can yield each piece of speech while the model is still generating it.',
+    s => { s.clock = 24; s.log.push(actLine(24, 0, body('a', one('b'), 3))); s.seq = 1; });
+
+  frame('The cycle record closes the call',
+    'Window 20 to 24, and the observation it was called with, named by sender and sequence number. Note what t_start is: the instant the message arrived, which here is also when the call began, because the handler was idle. That is not true in general — and the next few steps are why.',
+    s => { s.observing = []; s.yielded = []; s.handler = ''; s.hstate = 'idle'; s.log.push(cyLine(20, 24, 'b', 0)); });
+
+  frame('A slow call begins',
+    'Agent c sends Step(40). It is stamped at t 30 and handed over, and this time the handler is slow — the way a model call is slow.',
+    s => { s.clock = 30; s.observing = [msg('c', 40)]; s.hstate = 'calling'; s.handler = 'policy(Observation { at: 30, … }) … still deciding'; s.log.push(obsLine(30, 'c', 0, body('c', one('a'), 40))); });
+
+  frame('Perceiving does not wait',
+    'Two more messages land, and they are stamped at t 60 and t 80 — the instants they actually arrived. This is the whole point of the second thread. Under one thread these would both have been observed when the slow call returned, at nearly the same instant, and the spacing of the conversation would have been erased exactly where it mattered most.',
+    s => { s.stamped = [msg('b', 2), msg('c', 9)]; s.pstate = 'stamping'; s.clock = 80; s.log.push(obsLine(60, 'b', 1, body('b', one('a'), 2))); s.log.push(obsLine(80, 'c', 1, body('c', one('a'), 9))); });
+
+  frame('The slow call returns',
+    'At last. The action is logged at t 130, and the cycle\'s window is 30 to 130: a hundred units of deliberation, readable straight off the record. One actor has one call in flight at a time, so the two stamped messages have been waiting at the rendezvous.',
+    s => { s.handler = 'policy(Observation { at: 30, … }) → [to c: Step(20)]'; s.yielded = [out('c', 20)]; s.clock = 130; s.log.push(actLine(130, 1, body('a', one('c'), 20))); s.seq = 2; s.log.push(cyLine(30, 130, 'c', 0)); });
+
+  frame('Windows can overlap',
+    'The next call begins, on the message that arrived at t 60. Its cycle record says t_start 60 — the arrival — so this window starts long before the previous one ended. A reader that groups records by window has to allow for that, and must never binary-search the windows as though they were ordered. What the windows still give a reader is which call an action belongs to.',
+    s => { s.observing = [msg('b', 2)]; s.stamped = [msg('c', 9)]; s.yielded = []; s.handler = 'policy(Observation { at: 60, … }) → [to b: Step(1)]'; s.clock = 133; s.log.push(actLine(132, 2, body('a', one('b'), 1))); s.seq = 3; s.log.push(cyLine(60, 133, 'b', 1)); });
+
+  frame('An action addressed to nobody',
+    'The handler for the third message yields a send with an empty recipient set. That is not a bug: an action need not be directed at anyone, and one addressed to nobody is still logged. A reader sees the actor spoke and sees that nobody heard it.',
+    s => { s.observing = [msg('c', 9)]; s.stamped = []; s.handler = 'policy(Observation { at: 80, … }) → [to nobody: Step(0)]'; s.yielded = [out('nobody', 0)]; s.clock = 136; s.log.push(actLine(135, 3, body('a', '', 0))); s.seq = 4; s.log.push(cyLine(80, 136, 'c', 1)); });
+
+  frame('A reminder: the actor\'s own message to itself',
+    'The handler yields Remind, and the request goes over a channel to its own perception thread, which holds it on its timer. A reminder is always self-directed and has no recipients — another actor cannot decide when you think. It is the one way a message reaches the actor that sent it, which is why the router\'s no-loopback rule is not broken by it.',
+    s => { s.observing = []; s.yielded = [rem('Wake', 160)]; s.handler = 'policy(…) → [Remind(Wake) due 160]'; s.timer = [rem('Wake', 160)]; s.clock = 140; s.hstate = 'idle'; });
+
+  frame('And it comes back as an ordinary message',
+    'At its deadline the payload is delivered back as a message from the actor to itself, with the sequence number it was given when it was set — seq 4 here, because a reminder consumes one like any other thing a handler yields, and the numbers are dense over all of them. It is observed like anything else. The payload says why it was set, so there is no wake-up type and no question of what to do with one. Reminders accumulate and each fires once; nothing is cancelled, so a handler that has changed its mind simply ignores a stale one.',
+    s => { s.timer = []; s.handler = ''; s.yielded = []; s.observing = [rem('Wake', 160)]; s.hstate = 'calling'; s.clock = 160; s.log.push(obsLine(160, 'a', 4, '{"sender":"a","recipients":["a"],"payload":{"Reminder":"Wake"}}')); s.log.push(cyLine(160, 162, 'a', 4)); });
+
+  frame('The environment settles up, and calls it',
+    'Agent b sends Step(1) and c sends Step(7); a is mid-call on the first. Meanwhile the environment has decided the game is over. It pays what the episode was worth and then stops everybody — in that order, because a reward logged after the last stop would be scoring a run that had finished for everybody, with no episode left to have assigned it.',
+    s => { s.observing = [msg('b', 1)]; s.handler = 'policy(Observation { at: 170, … }) … still deciding'; s.hstate = 'calling'; s.inbox = [msg('c', 7)]; s.control = [ctl('Stop')]; s.clock = 175; s.log.push(obsLine(170, 'b', 2, body('b', one('a'), 5))); s.log.push(rwdLine(175, 1)); });
+
+  frame('Stop preempts everything',
+    'The perception thread sees the Stop ahead of anything in the inbox, because it checks that channel first. This reverses the old rule that a control waited its turn. Immediacy is what is wanted — and it costs something, which the next step is about.',
+    s => { s.control = []; s.pstate = 'stopping'; s.clock = 180; s.log.push(ctlLine(180, 'stop')); });
+
+  frame('What it preempted is logged as undelivered',
+    'The message still in the inbox, and every reminder the timer was holding, are logged undelivered and forwarded nowhere. An undelivered record carries the same fields as the observation it would have been, so a reader following a message from its sender finds the ones that went nowhere on the same (from, seq) join. Nothing vanishes silently: the log says the actor was stopped before it could hear this.',
+    s => { s.inbox = []; s.stamped = [lost('c→a Step(7)')]; s.log.push(undLine(180, 'c', 2, body('c', one('a'), 7))); });
+
+  frame('The call in progress is not interrupted',
+    'The perception thread sets the stopped flag and drops its end of the rendezvous, so the handler thread will end once this call returns — but it does not cut the call short. Joining an actor can therefore wait for one model call, bounded by the HTTP client\'s timeout. Cancelling a call in progress is not something this design does.',
+    s => { s.pstate = 'stopped'; s.stamped = []; });
+
+  frame('And what it yields now is unsent',
+    'The slow call returns and yields an action, but its actor has been stopped. The handler thread logs it unsent and carries it nowhere. So a final message can be lost to a stop, and the log says so — which is why an environment that wants a last word heard sets a reminder and stops everybody when it arrives, rather than saying "narrate the outcome, then stop" in one breath.',
+    s => { s.handler = 'policy(Observation { at: 170, … }) → [to b: Step(2)]'; s.yielded = [lost('a→b Step(2)')]; s.clock = 190; s.log.push(unsLine(190, 5, body('a', one('b'), 2))); s.log.push(cyLine(170, 190, 'b', 2)); });
+
+  frame('Both threads end',
+    'The handler thread ends with its call, the perception thread has already stopped, and the actor reports on the episode\'s completion channel. The episode joins it. There is no quiescence count anywhere in this: the episode does not see what is in flight, so it cannot tell a quiet roster from a busy one. What it can do is refuse to run forever, and an episode past its time limit fails with a timeout rather than hanging.',
+    s => { s.hstate = 'ended'; s.handler = ''; s.yielded = []; });
+
+  frame('The reward, written by somebody else',
+    'One line in this actor\'s records was not written by this actor — the reward, back at t 175. A reward is what the environment decided the agent\'s behavior was worth. Nothing in a running episode reads it, so it is never sent: the environment writes it straight to the log, naming the agent paid. It has no seq, because a sequence number is a message\'s, and no message, because it was logged rather than said. It need not precede the stop of its own agent — a player stopped mid-game is paid at the end like everybody else, which a logged reward allows and a sent one would not — but it does precede the last stop in the run.',
+    s => {});
+
+  frame('What always holds',
+    'A cycle is one handler call: a window, and at most one observation, named by sender and sequence number. An action lies in the window of the call that yielded it — though a lazy iterator\'s actions may reach the writer before the cycle record that closes it, and one actor\'s windows can overlap, because t_start is an arrival and not a call\'s beginning. Only a reminder has its sender among its recipients. Recipients may be empty. Every action\'s recipient either observed it or has it undelivered. Each sender\'s sequence numbers are dense from zero over the messages it sent, and one send to five recipients is one message and one number — which is the whole of the join, and what lets a trajectory be built from the log.',
+    s => {});
+
+  // ---- Rendering -----------------------------------------------------
+  const $ = (id) => document.getElementById(id);
+  const el = {
+    control: $('control'), inbox: $('inbox'), timer: $('timer'), stamped: $('stamped'),
+    observing: $('observing'), pstate: $('pstate'), hstate: $('hstate'), handler: $('handler'),
+    yielded: $('yielded'), seq: $('seq'), clock: $('clock'), log: $('log'), stepno: $('stepno'),
+    ctitle: $('ctitle'), cbody: $('cbody'), bar: $('bar'), play: $('play'), prev: $('prev'),
+    next: $('next'), reset: $('reset'), speed: $('speed')
+  };
+  let i = 0, timer = null, lastLog = 0;
+
+  function chips(container, list, animate) {
+    container.innerHTML = '';
+    for (const c of list) {
+      const d = document.createElement('span');
+      d.className = 'chip ' + c.k + (animate ? ' enter' : '');
+      d.textContent = c.text;
+      container.appendChild(d);
+    }
+  }
+
+  const PILL = { waiting: 'wait', idle: 'wait', stopped: 'stopped', ended: 'done' };
+
+  function render(idx, direction) {
+    const s = frames[idx];
+    chips(el.control, s.control, direction > 0);
+    chips(el.inbox, s.inbox, direction > 0);
+    chips(el.timer, s.timer, direction > 0);
+    chips(el.stamped, s.stamped, direction > 0);
+    chips(el.observing, s.observing, direction > 0);
+    chips(el.yielded, s.yielded, direction > 0);
+
+    el.pstate.textContent = s.pstate;
+    el.pstate.className = 'pill ' + (PILL[s.pstate] || 'busy');
+    el.hstate.textContent = s.hstate;
+    el.hstate.className = 'pill ' + (PILL[s.hstate] || 'busy');
+    el.handler.textContent = s.handler || (s.hstate === 'ended' ? 'returned to join()' : 'idle');
+    el.handler.className = 'handler' + (s.handler ? ' busy' : '');
+    el.seq.textContent = s.seq;
+    el.clock.textContent = s.clock;
+
+    el.log.innerHTML = '';
+    s.log.forEach((line, n) => {
+      const li = document.createElement('li');
+      li.className = line.cls + (direction > 0 && n >= lastLog ? ' new' : '');
+      li.textContent = line.text;
+      el.log.appendChild(li);
+    });
+    lastLog = s.log.length;
+    el.log.scrollTop = el.log.scrollHeight;
+
+    el.stepno.textContent = (idx + 1) + ' / ' + frames.length;
+    el.ctitle.textContent = s.title;
+    el.cbody.textContent = s.body;
+    el.bar.style.width = ((idx + 1) / frames.length * 100) + '%';
+    el.prev.disabled = idx === 0;
+    el.next.disabled = idx === frames.length - 1;
+    if (idx === frames.length - 1) stop();
+  }
+
+  function go(n) { const d = n - i; i = Math.max(0, Math.min(frames.length - 1, n)); render(i, d); }
+  function stop() { if (timer) { clearInterval(timer); timer = null; } el.play.textContent = 'Play'; }
+  function start() {
+    if (i === frames.length - 1) { lastLog = 0; go(0); }
+    timer = setInterval(() => go(i + 1), Number(el.speed.value));
+    el.play.textContent = 'Pause';
+  }
+  el.play.addEventListener('click', () => timer ? stop() : start());
+  el.next.addEventListener('click', () => { stop(); go(i + 1); });
+  el.prev.addEventListener('click', () => { stop(); go(i - 1); });
+  el.reset.addEventListener('click', () => { stop(); lastLog = 0; go(0); });
+  el.speed.addEventListener('change', () => { if (timer) { stop(); start(); } });
+  document.addEventListener('keydown', (e) => {
+    if (e.target.tagName === 'SELECT') return;
+    if (e.key === 'ArrowRight') { stop(); go(i + 1); }
+    else if (e.key === 'ArrowLeft') { stop(); go(i - 1); }
+    else if (e.key === ' ') { e.preventDefault(); timer ? stop() : start(); }
+  });
+
+  render(0, 0);
+})();
+</script>
+
+</body>
+</html>
