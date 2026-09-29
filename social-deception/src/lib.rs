@@ -16,7 +16,6 @@
 //! | [`Delivery`] | either of the two, which is what an agent's one queue carries |
 //! | [`Observation`] | a [`Message`] popped off an agent's queue |
 //! | [`Action`] | what a handler returns for the loop to send |
-//! | [`Domain`] | the types one game contributes: its payload and its reward |
 //! | cycle | one turn of an agent's loop: pop one observation, hand it to the handler, send |
 //! | [`Environment`] | the one agent per episode that starts and stops the others |
 //!
@@ -25,17 +24,20 @@
 //! action of its sender and an observation of each of its recipients, which
 //! is what lets a trajectory be joined across agents.
 //!
-//! The runtime is generic over one parameter, a [`Domain`], rather than over
-//! each of a game's types separately.
+//! The runtime is generic over one parameter, the [`Payload`] a game's
+//! messages carry. A game's reward type is a second parameter, but it
+//! appears only where rewards are assigned — on [`Environment`] and
+//! [`Effect`] — because a reward is logged and never sent, so no message,
+//! agent or router ever holds one (ADR-0016).
 //!
 //! # The modules, from the bottom up
 //!
 //! - [`clock`]: the episode [`Clock`] everything is timestamped with, and
 //!   the [`Created`] and [`Received`] traits that say what is known about
 //!   a thing's time;
-//! - [`message`]: the [`Domain`] a game names its types with, the
-//!   [`Message`] and [`Control`] that travel on the wire, and the
-//!   [`Delivery`] that carries either of them to an agent;
+//! - [`message`]: the [`Payload`] a game's messages carry, the [`Message`]
+//!   and [`Control`] that travel on the wire, and the [`Delivery`] that
+//!   carries either of them to an agent;
 //! - [`trajectory`]: the records an agent's loop produces and the [`Writer`]
 //!   that hands each one to every [`Sink`] it was given;
 //! - [`timer`]: the [`TimerSource`] an agent's deadlines come from;
@@ -48,9 +50,8 @@
 //! - [`episode`]: the [`Episode`] that runs a roster and its environment
 //!   from start to stop.
 //!
-//! On top of that runtime sits one game, [`werewolf`], whose
-//! [`WerewolfDomain`](werewolf::WerewolfDomain) names its types: the roles,
-//! phases and the [`werewolf::Message`] payload that a runtime [`Message`]
+//! On top of that runtime sits one game, [`werewolf`]: the roles, phases
+//! and the [`werewolf::Message`] payload that a runtime [`Message`]
 //! carries in a game of Werewolf, the [`Knowledge`](werewolf::Knowledge)
 //! a player folds its observations into, the
 //! [`Strategy`](werewolf::Strategy) that picks its moves, the
@@ -77,9 +78,9 @@ pub mod werewolf;
 
 pub use agent::{Action, Agent, CycleDispatch, Error, Handler, Instruction, Observation, Wiring};
 pub use clock::{Clock, Created, Received, Timestamp};
-pub use environment::{Effect, Environment};
+pub use environment::{Effect, Environment, Refusal};
 pub use episode::{Episode, EpisodeError, Failure};
-pub use message::{ActorId, Control, Delivery, Domain, Message, Payload};
+pub use message::{ActorId, Control, Delivery, Message, Payload};
 pub use router::{Queues, RouteError, Router};
 pub use timer::{ManualTimer, ManualTimerControl, TimerSource};
 // [`trajectory::Policy`] is deliberately not re-exported here. The crate

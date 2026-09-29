@@ -31,7 +31,7 @@
 //!
 //! # An ordinary agent cannot send a control, and the types say so
 //!
-//! [`Handler::handle`] returns `Vec<Action<D>>`. An action carries a
+//! [`Handler::handle`] returns `Vec<Action<P>>`. An action carries a
 //! payload and a set of recipients, and there is no constructor for a
 //! control or a reward on one, so a player's strategy has nothing to reach
 //! for. The check the [`Router`](crate::Router) makes — that a control's
@@ -55,23 +55,27 @@
 //! and stop everybody in one breath.
 
 use std::collections::BTreeSet;
+use std::marker::PhantomData;
 
 use crossbeam_channel::Sender;
+use serde::Serialize;
 
 use crate::agent::{Action, Handler, Observation};
 use crate::clock::{Clock, Timestamp};
-use crate::message::{ActorId, Control, Domain};
+use crate::message::{ActorId, Control, Payload};
 use crate::trajectory::{LogRecord, RewardRecord};
 
 /// What an environment's cycle produces: an action like any agent's, a
 /// control for some of the agents, or a reward for one of them.
 ///
-/// `Debug`, `Clone` and equality are written out rather than derived, for
-/// the reason [`Message`](crate::Message)'s are: a derive would ask them of
-/// `D`, the marker type, when what has to have them is `D::Payload`.
-pub enum Effect<D: Domain> {
+/// The two type parameters are the two things a game names: `W`, the
+/// numeric type its rewards are in, and `P`, what its messages carry. The
+/// reward type appears here and nowhere else in the runtime, because this
+/// is the one place a reward is produced (ADR-0016).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Effect<W, P: Payload> {
     /// Say something, as any agent says anything.
-    Act(Action<D>),
+    Act(Action<P>),
     /// Tell some agents to start or to stop.
     Control {
         /// The agents told. Never the environment itself: the episode is
@@ -91,11 +95,11 @@ pub enum Effect<D: Domain> {
         /// nothing to be rewarded for.
         agent: ActorId,
         /// What its behavior was worth, in the game's own units.
-        value: D::Reward,
+        value: W,
     },
 }
 
-impl<D: Domain> Effect<D> {
+impl<W, P: Payload> Effect<W, P> {
     /// A control for the given agents.
     pub fn control<I, A>(to: I, control: Control) -> Self
     where
@@ -109,7 +113,7 @@ impl<D: Domain> Effect<D> {
     }
 
     /// A reward of `value` for `agent`.
-    pub fn reward(agent: impl Into<ActorId>, value: D::Reward) -> Self {
+    pub fn reward(agent: impl Into<ActorId>, value: W) -> Self {
         Self::Reward {
             agent: agent.into(),
             value,
@@ -117,84 +121,12 @@ impl<D: Domain> Effect<D> {
     }
 }
 
-impl<D: Domain> std::fmt::Debug for Effect<D>
-where
-    D::Payload: std::fmt::Debug,
-    D::Reward: std::fmt::Debug,
-{
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Act(action) => f.debug_tuple("Act").field(action).finish(),
-            Self::Control { to, control } => f
-                .debug_struct("Control")
-                .field("to", to)
-                .field("control", control)
-                .finish(),
-            Self::Reward { agent, value } => f
-                .debug_struct("Reward")
-                .field("agent", agent)
-                .field("value", value)
-                .finish(),
-        }
-    }
-}
-
-impl<D: Domain> Clone for Effect<D> {
-    fn clone(&self) -> Self {
-        match self {
-            Self::Act(action) => Self::Act(action.clone()),
-            Self::Control { to, control } => Self::Control {
-                to: to.clone(),
-                control: *control,
-            },
-            Self::Reward { agent, value } => Self::Reward {
-                agent: agent.clone(),
-                value: *value,
-            },
-        }
-    }
-}
-
-impl<D: Domain> PartialEq for Effect<D>
-where
-    D::Payload: PartialEq,
-    D::Reward: PartialEq,
-{
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Act(mine), Self::Act(theirs)) => mine == theirs,
-            (
-                Self::Control { to, control },
-                Self::Control {
-                    to: other_to,
-                    control: other_control,
-                },
-            ) => to == other_to && control == other_control,
-            (
-                Self::Reward { agent, value },
-                Self::Reward {
-                    agent: other_agent,
-                    value: other_value,
-                },
-            ) => agent == other_agent && value == other_value,
-            _ => false,
-        }
-    }
-}
-
-impl<D: Domain> Eq for Effect<D>
-where
-    D::Payload: Eq,
-    D::Reward: Eq,
-{
-}
-
 /// The distinguished agent that controls an episode.
 ///
 /// It is a [`Handler`] with a wider return type, and the episode runs it
 /// through the same loop as everything else; see the
 /// [module documentation](self).
-pub trait Environment<D: Domain> {
+pub trait Environment<W, P: Payload> {
     /// The environment's opening effects, called once when the episode
     /// starts it.
     ///
@@ -205,7 +137,7 @@ pub trait Environment<D: Domain> {
     ///
     /// Opening effects are decided from nothing, for the reason
     /// [`Handler::start`]'s are.
-    fn start(&mut self, now: Timestamp) -> Vec<Effect<D>>;
+    fn start(&mut self, now: Timestamp) -> Vec<Effect<W, P>>;
 
     /// Folds one observation into the environment's state and says what to
     /// send, whom to control, and whom to reward.
@@ -217,7 +149,7 @@ pub trait Environment<D: Domain> {
     /// Nothing interrupts it, for the reason nothing interrupts
     /// [`Handler::handle`]: an agent does not know it is being stopped
     /// (ADR-0009), and the environment is the one deciding when anybody is.
-    fn handle(&mut self, observation: &Observation<D>) -> Vec<Effect<D>>;
+    fn handle(&mut self, observation: &Observation<P>) -> Vec<Effect<W, P>>;
 
     /// What the environment does when its deadline passes and nothing has
     /// arrived.
@@ -226,7 +158,7 @@ pub trait Environment<D: Domain> {
     /// deadline is not observing anything. The default does nothing, which
     /// is what both of the environments in the tree want — neither is
     /// configured with a timeout at all.
-    fn timeout(&mut self, _now: Timestamp) -> Vec<Effect<D>> {
+    fn timeout(&mut self, _now: Timestamp) -> Vec<Effect<W, P>> {
         Vec::new()
     }
 
@@ -245,16 +177,16 @@ pub trait Environment<D: Domain> {
 /// one without being generic over which.
 ///
 /// [`Episode`]: crate::Episode
-impl<D: Domain, E: Environment<D> + ?Sized> Environment<D> for Box<E> {
-    fn start(&mut self, now: Timestamp) -> Vec<Effect<D>> {
+impl<W, P: Payload, E: Environment<W, P> + ?Sized> Environment<W, P> for Box<E> {
+    fn start(&mut self, now: Timestamp) -> Vec<Effect<W, P>> {
         (**self).start(now)
     }
 
-    fn handle(&mut self, observation: &Observation<D>) -> Vec<Effect<D>> {
+    fn handle(&mut self, observation: &Observation<P>) -> Vec<Effect<W, P>> {
         (**self).handle(observation)
     }
 
-    fn timeout(&mut self, now: Timestamp) -> Vec<Effect<D>> {
+    fn timeout(&mut self, now: Timestamp) -> Vec<Effect<W, P>> {
         (**self).timeout(now)
     }
 
@@ -275,17 +207,35 @@ pub struct Commanded {
     pub control: Control,
 }
 
-/// An agent an environment tried to reward and could not: one that is not
-/// in the roster, or the environment itself.
+/// A reward the adapter refused to write, and why.
 ///
 /// Only a refusal travels here. A reward the adapter accepts is written and
-/// nothing is sent; this says the environment named somebody it could not
-/// be rewarding, which is a bug in the environment, and the episode turns
-/// it into the same error the router would give for addressing a stranger.
+/// nothing is sent; this says the environment produced a reward that could
+/// not become a record, which is a bug in the environment, and the episode
+/// fails rather than finishing with a trajectory that quietly lacks it.
+///
+/// There are two ways to fail and they are kept apart, because a reader
+/// told the wrong one would look in the wrong place: an agent that could
+/// not be rewarded is a name the environment got wrong, and a value that
+/// would not serialize is a reward *type* that cannot be logged at all.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rewarded {
-    /// The agent rewarded.
+    /// The agent the environment named.
     pub agent: ActorId,
+    /// What was wrong with the reward.
+    pub refusal: Refusal,
+}
+
+/// Why a reward was refused; see [`Rewarded`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refusal {
+    /// The agent named is not one this episode can reward: not in the
+    /// roster, or the environment itself.
+    NotRewardable,
+    /// The value would not serialize, so there is no record to write. The
+    /// reward type is the game's, and a type the log cannot hold is a bug
+    /// in the game rather than in any one reward.
+    Unserializable,
 }
 
 /// An [`Environment`] wearing a [`Handler`]'s face, so that the agent loop
@@ -327,19 +277,26 @@ pub struct Rewarded {
 /// makes "narrate the outcome, then stop everybody" a thing one cycle can
 /// say: each player observes the narration and stops afterwards, rather
 /// than stopping with the narration still on its queue and never seeing it.
-pub struct Adapter<D: Domain, E> {
+pub struct Adapter<W, P: Payload, E> {
     environment: E,
+    /// Which reward type this adapter serializes. The adapter stores no
+    /// reward — a reward is written the instant it is assigned — but `E`
+    /// alone does not say which [`Environment`] impl is meant when a type
+    /// implements more than one, so the parameter is carried here rather
+    /// than inferred. The function pointer makes the marker own nothing
+    /// and demand nothing of `W`.
+    reward: PhantomData<fn() -> W>,
     /// Whom this episode may reward: every agent in the roster but the
     /// environment itself. Fixed before any thread is spawned and never
     /// added to, so the adapter can answer the question rather than ask.
     rewardable: BTreeSet<ActorId>,
     commands: Sender<Commanded>,
     rewards: Sender<Rewarded>,
-    records: Sender<LogRecord<D>>,
+    records: Sender<LogRecord<P>>,
     clock: Clock,
 }
 
-impl<D: Domain, E: Environment<D>> Adapter<D, E> {
+impl<W: Serialize + Copy + Send + 'static, P: Payload, E: Environment<W, P>> Adapter<W, P, E> {
     /// Wraps `environment`, sending the controls it asks for on `commands`,
     /// writing the rewards it assigns to `records` stamped by `clock`, and
     /// naming each rewarded agent on `rewards` for the episode to check.
@@ -348,11 +305,12 @@ impl<D: Domain, E: Environment<D>> Adapter<D, E> {
         rewardable: BTreeSet<ActorId>,
         commands: Sender<Commanded>,
         rewards: Sender<Rewarded>,
-        records: Sender<LogRecord<D>>,
+        records: Sender<LogRecord<P>>,
         clock: Clock,
     ) -> Self {
         Self {
             environment,
+            reward: PhantomData,
             rewardable,
             commands,
             rewards,
@@ -373,7 +331,7 @@ impl<D: Domain, E: Environment<D>> Adapter<D, E> {
     /// [`Error::WriterClosed`](crate::Error::WriterClosed); there is
     /// nothing useful to add here, and failing the split would lose the
     /// cycle's actions as well.
-    fn split(&self, effects: Vec<Effect<D>>) -> Vec<Action<D>> {
+    fn split(&self, effects: Vec<Effect<W, P>>) -> Vec<Action<P>> {
         let mut actions = Vec::with_capacity(effects.len());
         for effect in effects {
             match effect {
@@ -388,9 +346,27 @@ impl<D: Domain, E: Environment<D>> Adapter<D, E> {
                     // the answer is here to be had rather than somewhere
                     // to be asked.
                     if !self.rewardable.contains(&agent) {
-                        let _ = self.rewards.send(Rewarded { agent });
+                        let _ = self.rewards.send(Rewarded {
+                            agent,
+                            refusal: Refusal::NotRewardable,
+                        });
                         continue;
                     }
+                    // Serialized here, where the reward type is still
+                    // known: the record carries JSON so that nothing
+                    // downstream of this line is generic over a reward
+                    // (ADR-0016). Reported and not written if it will not
+                    // serialize, for the reason a reward for a stranger is:
+                    // the episode is about to fail either way, and a
+                    // trajectory silently missing a reward the environment
+                    // assigned would be evidence of nothing.
+                    let Ok(value) = serde_json::to_value(value) else {
+                        let _ = self.rewards.send(Rewarded {
+                            agent,
+                            refusal: Refusal::Unserializable,
+                        });
+                        continue;
+                    };
                     // Stamped now, so that `created` is the instant the
                     // reward was decided rather than the instant anybody
                     // got around to it.
@@ -407,18 +383,20 @@ impl<D: Domain, E: Environment<D>> Adapter<D, E> {
     }
 }
 
-impl<D: Domain, E: Environment<D>> Handler<D> for Adapter<D, E> {
-    fn start(&mut self, now: Timestamp) -> Vec<Action<D>> {
+impl<W: Serialize + Copy + Send + 'static, P: Payload, E: Environment<W, P>> Handler<P>
+    for Adapter<W, P, E>
+{
+    fn start(&mut self, now: Timestamp) -> Vec<Action<P>> {
         let effects = self.environment.start(now);
         self.split(effects)
     }
 
-    fn handle(&mut self, observation: &Observation<D>) -> Vec<Action<D>> {
+    fn handle(&mut self, observation: &Observation<P>) -> Vec<Action<P>> {
         let effects = self.environment.handle(observation);
         self.split(effects)
     }
 
-    fn timeout(&mut self, now: Timestamp) -> Vec<Action<D>> {
+    fn timeout(&mut self, now: Timestamp) -> Vec<Action<P>> {
         let effects = self.environment.timeout(now);
         self.split(effects)
     }
@@ -428,7 +406,7 @@ impl<D: Domain, E: Environment<D>> Handler<D> for Adapter<D, E> {
     }
 }
 
-impl<D: Domain, E> std::fmt::Debug for Adapter<D, E> {
+impl<W, P: Payload, E> std::fmt::Debug for Adapter<W, P, E> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Adapter").finish_non_exhaustive()
     }
@@ -442,12 +420,12 @@ mod tests {
 
     use super::*;
     use crate::message::Message;
-    use crate::testing::{TestDomain, TestPayload, id, ids};
+    use crate::testing::{TestPayload, id, ids};
 
     /// The one observation a cycle hands the adapter. What it says never
     /// matters here: `Opener` answers whatever it is told with the same
     /// three effects, and these tests are about where each effect goes.
-    fn observation() -> Observation<TestDomain> {
+    fn observation() -> Observation<TestPayload> {
         Observation {
             message: Message::new(
                 "a",
@@ -463,15 +441,15 @@ mod tests {
     /// of them, and stops them.
     struct Opener;
 
-    impl Environment<TestDomain> for Opener {
-        fn start(&mut self, _now: Timestamp) -> Vec<Effect<TestDomain>> {
+    impl Environment<i32, TestPayload> for Opener {
+        fn start(&mut self, _now: Timestamp) -> Vec<Effect<i32, TestPayload>> {
             vec![
                 Effect::control(["a", "b"], Control::Start),
                 Effect::Act(Action::to(["a"], TestPayload::Step(1))),
             ]
         }
 
-        fn handle(&mut self, _: &Observation<TestDomain>) -> Vec<Effect<TestDomain>> {
+        fn handle(&mut self, _: &Observation<TestPayload>) -> Vec<Effect<i32, TestPayload>> {
             vec![
                 Effect::reward("a", 1),
                 Effect::control(["a", "b"], Control::Stop),
@@ -481,10 +459,10 @@ mod tests {
 
     /// The three channels an adapter writes to, and the adapter itself.
     struct Rig {
-        adapter: Adapter<TestDomain, Opener>,
+        adapter: Adapter<i32, TestPayload, Opener>,
         commanded: Receiver<Commanded>,
         rewarded: Receiver<Rewarded>,
-        records: Receiver<LogRecord<TestDomain>>,
+        records: Receiver<LogRecord<TestPayload>>,
     }
 
     fn rig() -> Rig {
@@ -559,15 +537,46 @@ mod tests {
         );
     }
 
+    /// An environment whose rewards are reals rather than integers, which
+    /// is the reason the reward type is a parameter at all (ADR-0007).
+    struct Scorer;
+
+    impl Environment<f64, TestPayload> for Scorer {
+        fn start(&mut self, _now: Timestamp) -> Vec<Effect<f64, TestPayload>> {
+            vec![Effect::reward("a", 0.5)]
+        }
+
+        fn handle(&mut self, _: &Observation<TestPayload>) -> Vec<Effect<f64, TestPayload>> {
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn a_reward_is_serialized_where_it_is_assigned_whatever_its_type() {
+        // The record carries JSON, so the reward type stops at this
+        // adapter (ADR-0016) — and it stops without being flattened to an
+        // integer on the way. A game scored in reals logs reals.
+        let (commands, _commanded) = unbounded();
+        let (paid, _rewarded) = unbounded();
+        let (recorder, records) = unbounded::<LogRecord<TestPayload>>();
+        let mut adapter =
+            Adapter::new(Scorer, ids(["a"]), commands, paid, recorder, Clock::start());
+        assert!(adapter.start(Timestamp::default()).is_empty());
+        let LogRecord::Reward(record) = records.try_recv().unwrap() else {
+            panic!("a reward is written as a reward record");
+        };
+        assert_eq!(record.value, serde_json::json!(0.5));
+    }
+
     /// An environment that rewards somebody who is not in the roster.
     struct Stranger;
 
-    impl Environment<TestDomain> for Stranger {
-        fn start(&mut self, _now: Timestamp) -> Vec<Effect<TestDomain>> {
+    impl Environment<i32, TestPayload> for Stranger {
+        fn start(&mut self, _now: Timestamp) -> Vec<Effect<i32, TestPayload>> {
             vec![Effect::reward("nobody", 1)]
         }
 
-        fn handle(&mut self, _: &Observation<TestDomain>) -> Vec<Effect<TestDomain>> {
+        fn handle(&mut self, _: &Observation<TestPayload>) -> Vec<Effect<i32, TestPayload>> {
             Vec::new()
         }
     }
@@ -579,7 +588,7 @@ mod tests {
         // the name is reported and the line is never written.
         let (commands, _commanded) = unbounded();
         let (paid, rewarded) = unbounded();
-        let (recorder, records) = unbounded::<LogRecord<TestDomain>>();
+        let (recorder, records) = unbounded::<LogRecord<TestPayload>>();
         let mut adapter = Adapter::new(
             Stranger,
             ids(["a", "b"]),
@@ -592,7 +601,8 @@ mod tests {
         assert_eq!(
             rewarded.try_recv(),
             Ok(Rewarded {
-                agent: id("nobody")
+                agent: id("nobody"),
+                refusal: Refusal::NotRewardable,
             })
         );
         assert!(
@@ -616,9 +626,9 @@ mod tests {
 
     #[test]
     fn an_effect_says_what_it_is() {
-        let act: Effect<TestDomain> = Effect::Act(Action::to(["a"], TestPayload::Step(1)));
-        let control: Effect<TestDomain> = Effect::control(["a"], Control::Stop);
-        let reward: Effect<TestDomain> = Effect::reward("a", -1);
+        let act: Effect<i32, TestPayload> = Effect::Act(Action::to(["a"], TestPayload::Step(1)));
+        let control: Effect<i32, TestPayload> = Effect::control(["a"], Control::Stop);
+        let reward: Effect<i32, TestPayload> = Effect::reward("a", -1);
         assert_eq!(act, act.clone());
         assert_eq!(control, control.clone());
         assert_eq!(reward, reward.clone());
@@ -654,17 +664,17 @@ mod tests {
         readings: Vec<Timestamp>,
     }
 
-    impl Environment<TestDomain> for Punctual {
-        fn start(&mut self, now: Timestamp) -> Vec<Effect<TestDomain>> {
+    impl Environment<i32, TestPayload> for Punctual {
+        fn start(&mut self, now: Timestamp) -> Vec<Effect<i32, TestPayload>> {
             self.readings.push(now);
             Vec::new()
         }
 
-        fn handle(&mut self, _: &Observation<TestDomain>) -> Vec<Effect<TestDomain>> {
+        fn handle(&mut self, _: &Observation<TestPayload>) -> Vec<Effect<i32, TestPayload>> {
             Vec::new()
         }
 
-        fn timeout(&mut self, now: Timestamp) -> Vec<Effect<TestDomain>> {
+        fn timeout(&mut self, now: Timestamp) -> Vec<Effect<i32, TestPayload>> {
             self.readings.push(now);
             Vec::new()
         }
@@ -715,7 +725,7 @@ mod tests {
     #[test]
     fn a_boxed_environment_forwards_the_new_hooks() {
         let wanted = at(4);
-        let mut boxed: Box<dyn Environment<TestDomain>> = Box::new(Punctual {
+        let mut boxed: Box<dyn Environment<i32, TestPayload>> = Box::new(Punctual {
             deadline: Some(wanted),
             readings: Vec::new(),
         });

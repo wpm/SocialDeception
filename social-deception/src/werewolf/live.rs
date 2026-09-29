@@ -32,7 +32,6 @@
 use std::fmt;
 use std::io::{self, Write};
 
-use super::WerewolfDomain;
 use super::message::{Cause, Message, Narration, Phase, Select};
 use crate::message::ActorId;
 use crate::trajectory::{ActionRecord, LogRecord, Sink};
@@ -54,7 +53,7 @@ const TIME_WIDTH: usize = 8;
 /// Only an action produces a line. Everything else is [`None`]; see the
 /// module documentation for why.
 #[must_use]
-pub fn line(record: &LogRecord<WerewolfDomain>, senders: usize) -> Option<String> {
+pub fn line(record: &LogRecord<Message>, senders: usize) -> Option<String> {
     let LogRecord::Action(action) = record else {
         return None;
     };
@@ -62,7 +61,7 @@ pub fn line(record: &LogRecord<WerewolfDomain>, senders: usize) -> Option<String
 }
 
 /// One action record as its four columns.
-fn rendered(action: &ActionRecord<WerewolfDomain>, senders: usize) -> String {
+fn rendered(action: &ActionRecord<Message>, senders: usize) -> String {
     // The sender goes in as `&str`, not as the `ActorId` it is: `ActorId`'s
     // `Display` writes straight through and so ignores the width, which is
     // the whole point of the column.
@@ -223,8 +222,8 @@ impl<W: Write> Text<W> {
     }
 }
 
-impl<W: Write + Send> Sink<WerewolfDomain> for Text<W> {
-    fn record(&mut self, record: &LogRecord<WerewolfDomain>) -> io::Result<()> {
+impl<W: Write + Send> Sink<Message> for Text<W> {
+    fn record(&mut self, record: &LogRecord<Message>) -> io::Result<()> {
         let Some(line) = line(record, self.senders) else {
             return Ok(());
         };
@@ -263,7 +262,7 @@ mod tests {
         recipients: [&str; N],
         nanos: u64,
         payload: Message,
-    ) -> LogRecord<WerewolfDomain> {
+    ) -> LogRecord<Message> {
         ActionRecord {
             agent: id(sender),
             seq: Seq(0),
@@ -274,7 +273,7 @@ mod tests {
     }
 
     /// The payload column of the one line `record` renders to.
-    fn payload(record: &LogRecord<WerewolfDomain>) -> String {
+    fn payload(record: &LogRecord<Message>) -> String {
         let rendered = line(record, 0).unwrap();
         rendered
             .split_once("\u{2192} ")
@@ -491,7 +490,7 @@ mod tests {
                 round: Round::new(1),
             }),
         );
-        let records: Vec<LogRecord<WerewolfDomain>> = vec![
+        let records: Vec<LogRecord<Message>> = vec![
             ObservationRecord {
                 agent: id("alice"),
                 seq: Seq(0),
@@ -520,7 +519,7 @@ mod tests {
             RewardRecord {
                 agent: id("alice"),
                 created: at(2),
-                value: 1,
+                value: serde_json::json!(1),
             }
             .into(),
         ];
@@ -546,7 +545,7 @@ mod tests {
                 round: Round::new(1),
             }),
         );
-        let cycle: LogRecord<WerewolfDomain> = CycleRecord {
+        let cycle: LogRecord<Message> = CycleRecord {
             agent: id("alice"),
             t_start: at(0),
             t_stop: at(1),

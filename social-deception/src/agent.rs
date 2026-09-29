@@ -151,17 +151,13 @@
 //!
 //! use crossbeam_channel::unbounded;
 //! use social_deception::{
-//!     Action, ActorId, Agent, Clock, Control, CycleDispatch, Delivery, Domain, Handler,
+//!     Action, ActorId, Agent, Clock, Control, CycleDispatch, Delivery, Handler,
 //!     JsonLines, Message, Observation, Sink, Wiring, Writer,
 //! };
 //! use social_deception::trajectory::Policy;
 //!
-//! struct Chat;
-//!
-//! impl Domain for Chat {
-//!     type Payload = String;
-//!     type Reward = i32;
-//! }
+//! // What this game's agents say to each other: a line of chat.
+//! type Chat = String;
 //!
 //! struct Echo;
 //!
@@ -225,7 +221,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver, Sender, TryRecvError, never, select};
 
 use crate::clock::{Clock, Created, Received, Timestamp};
-use crate::message::{ActorId, Control, Delivery, Domain, Message};
+use crate::message::{ActorId, Control, Delivery, Message, Payload};
 use crate::timer::TimerSource;
 use crate::trajectory::{
     ActionRecord, ControlRecord, CycleRecord, LogRecord, ObservationRecord, Seq, Woken,
@@ -237,58 +233,25 @@ use crate::trajectory::{
 /// instant this agent received it. The gap between the two is the
 /// observation's [`latency`](Received::latency), the whole staleness of
 /// what the agent is looking at.
-/// `Debug`, `Clone` and equality are written out rather than derived, for
-/// the reason [`Message`]'s are: a derive would ask them of `D`.
-pub struct Observation<D: Domain> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Observation<P: Payload> {
     /// The message.
-    pub message: Message<D>,
+    pub message: Message<P>,
     /// When this agent popped it: its cycle's `t_start`.
     pub received: Timestamp,
 }
 
-impl<D: Domain> Created for Observation<D> {
+impl<P: Payload> Created for Observation<P> {
     fn created(&self) -> Timestamp {
         self.message.created
     }
 }
 
-impl<D: Domain> Received for Observation<D> {
+impl<P: Payload> Received for Observation<P> {
     fn received(&self) -> Timestamp {
         self.received
     }
 }
-
-impl<D: Domain> fmt::Debug for Observation<D>
-where
-    D::Payload: fmt::Debug,
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Observation")
-            .field("message", &self.message)
-            .field("received", &self.received)
-            .finish()
-    }
-}
-
-impl<D: Domain> Clone for Observation<D> {
-    fn clone(&self) -> Self {
-        Self {
-            message: self.message.clone(),
-            received: self.received,
-        }
-    }
-}
-
-impl<D: Domain> PartialEq for Observation<D>
-where
-    D::Payload: PartialEq,
-{
-    fn eq(&self, other: &Self) -> bool {
-        self.message == other.message && self.received == other.received
-    }
-}
-
-impl<D: Domain> Eq for Observation<D> where D::Payload: Eq {}
 
 /// A control this agent has popped off its queue, and when.
 ///
@@ -324,14 +287,13 @@ impl Received for Instruction {
 /// instant, so the loop stamps both as it hands the action to the router;
 /// the stamped value is the [`Message`] on the wire and what the `action`
 /// record logs.
-/// `Debug`, `Clone` and equality are written out for the same reason
-/// [`Message`]'s are.
-pub struct Action<D: Domain> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Action<P: Payload> {
     /// The agents to send it to, possibly none. The set never contains the
     /// sender; the router enforces that.
     pub recipients: BTreeSet<ActorId>,
     /// What to say.
-    pub payload: D::Payload,
+    pub payload: P,
     /// Who really said it, and when, when this action is one agent
     /// passing on another's.
     ///
@@ -357,9 +319,9 @@ pub struct Origin {
     pub created: Timestamp,
 }
 
-impl<D: Domain> Action<D> {
+impl<P: Payload> Action<P> {
     /// An action addressed to the given recipients.
-    pub fn to<I, A>(recipients: I, payload: D::Payload) -> Self
+    pub fn to<I, A>(recipients: I, payload: P) -> Self
     where
         I: IntoIterator<Item = A>,
         A: Into<ActorId>,
@@ -388,7 +350,7 @@ impl<D: Domain> Action<D> {
         sender: impl Into<ActorId>,
         created: Timestamp,
         recipients: I,
-        payload: D::Payload,
+        payload: P,
     ) -> Self
     where
         I: IntoIterator<Item = A>,
@@ -405,49 +367,13 @@ impl<D: Domain> Action<D> {
     }
 }
 
-impl<D: Domain> fmt::Debug for Action<D>
-where
-    D::Payload: fmt::Debug,
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Action")
-            .field("recipients", &self.recipients)
-            .field("payload", &self.payload)
-            .field("origin", &self.origin)
-            .finish()
-    }
-}
-
-impl<D: Domain> Clone for Action<D> {
-    fn clone(&self) -> Self {
-        Self {
-            recipients: self.recipients.clone(),
-            payload: self.payload.clone(),
-            origin: self.origin.clone(),
-        }
-    }
-}
-
-impl<D: Domain> PartialEq for Action<D>
-where
-    D::Payload: PartialEq,
-{
-    fn eq(&self, other: &Self) -> bool {
-        self.recipients == other.recipients
-            && self.payload == other.payload
-            && self.origin == other.origin
-    }
-}
-
-impl<D: Domain> Eq for Action<D> where D::Payload: Eq {}
-
 /// A game's behavior for one agent.
 ///
 /// The loop calls [`handle`](Handler::handle) once per cycle with the one
 /// observation that cycle popped, and sends what comes back. Agent state
 /// lives in the implementing type. A handler never sees a [`Control`]; see
 /// the [module documentation](self).
-pub trait Handler<D: Domain> {
+pub trait Handler<P: Payload> {
     /// The agent's opening actions, called once when it is started.
     ///
     /// This is where an agent that acts before anybody has spoken to it does
@@ -456,7 +382,7 @@ pub trait Handler<D: Domain> {
     /// Opening actions are the agent's own, decided from nothing; a handler
     /// with work to do before it can name them has state to fold and belongs
     /// in `handle`.
-    fn start(&mut self, _now: Timestamp) -> Vec<Action<D>> {
+    fn start(&mut self, _now: Timestamp) -> Vec<Action<P>> {
         Vec::new()
     }
 
@@ -474,7 +400,7 @@ pub trait Handler<D: Domain> {
     /// agent, and with it the end of its episode, for as long as it blocks;
     /// the place to bound that is inside the handler, in whatever it is
     /// blocking on.
-    fn handle(&mut self, observation: &Observation<D>) -> Vec<Action<D>>;
+    fn handle(&mut self, observation: &Observation<P>) -> Vec<Action<P>>;
 
     /// What the agent does when its deadline passes and nothing has arrived.
     ///
@@ -484,7 +410,7 @@ pub trait Handler<D: Domain> {
     /// would have had to unwrap its way back out of it (ADR-0008). The
     /// default does nothing, which is what an agent without a timeout wants
     /// and what every agent in the tree wants today.
-    fn timeout(&mut self, _now: Timestamp) -> Vec<Action<D>> {
+    fn timeout(&mut self, _now: Timestamp) -> Vec<Action<P>> {
         Vec::new()
     }
 
@@ -535,9 +461,8 @@ pub trait Handler<D: Domain> {
 /// deliveries consumed and the messages produced arrive together, whoever
 /// counts in-flight deliveries never sees a cycle's inputs settled before
 /// its outputs exist.
-/// `Debug`, `Clone` and equality are written out for the same reason
-/// [`Message`]'s are.
-pub struct CycleDispatch<D: Domain> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CycleDispatch<P: Payload> {
     /// The agent whose cycle this was.
     pub agent: ActorId,
     /// How many deliveries the cycle took off its queue. A timeout is not a
@@ -545,7 +470,7 @@ pub struct CycleDispatch<D: Domain> {
     pub deliveries: usize,
     /// The messages the cycle sent, stamped with this agent as sender, in the
     /// order the handler returned them.
-    pub sent: Vec<Message<D>>,
+    pub sent: Vec<Message<P>>,
     /// Whether the agent is waiting on a deadline after this cycle.
     ///
     /// An agent that is has work of its own still to do: it will run
@@ -560,7 +485,7 @@ pub struct CycleDispatch<D: Domain> {
 ///
 /// One queue, carrying both kinds of thing said to the agent; the
 /// [module documentation](self) says why it is not two.
-pub struct Wiring<D: Domain> {
+pub struct Wiring<P: Payload> {
     /// The agent's id: the sender on everything it emits and the `agent` on
     /// every record it writes.
     pub id: ActorId,
@@ -569,11 +494,11 @@ pub struct Wiring<D: Domain> {
     /// The agent's queue: messages, which become [`Observation`]s when
     /// popped, and controls, which the loop acts on itself, in the order
     /// they were sent.
-    pub queue: Receiver<Delivery<D>>,
+    pub queue: Receiver<Delivery<P>>,
     /// Where each cycle's dispatch goes.
-    pub dispatches: Sender<CycleDispatch<D>>,
+    pub dispatches: Sender<CycleDispatch<P>>,
     /// Where the agent's trajectory goes.
-    pub records: Sender<LogRecord<D>>,
+    pub records: Sender<LogRecord<P>>,
     /// How long the agent waits before its deadline fires, or `None` for an
     /// agent that only ever reacts. A deadline that passes with nothing
     /// waiting runs a cycle that calls [`Handler::timeout`]; one that passes
@@ -581,46 +506,7 @@ pub struct Wiring<D: Domain> {
     pub timeout: Option<Duration>,
 }
 
-impl<D: Domain> fmt::Debug for CycleDispatch<D>
-where
-    D::Payload: fmt::Debug,
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("CycleDispatch")
-            .field("agent", &self.agent)
-            .field("deliveries", &self.deliveries)
-            .field("sent", &self.sent)
-            .field("waking", &self.waking)
-            .finish()
-    }
-}
-
-impl<D: Domain> Clone for CycleDispatch<D> {
-    fn clone(&self) -> Self {
-        Self {
-            agent: self.agent.clone(),
-            deliveries: self.deliveries,
-            sent: self.sent.clone(),
-            waking: self.waking,
-        }
-    }
-}
-
-impl<D: Domain> PartialEq for CycleDispatch<D>
-where
-    D::Payload: PartialEq,
-{
-    fn eq(&self, other: &Self) -> bool {
-        self.agent == other.agent
-            && self.deliveries == other.deliveries
-            && self.sent == other.sent
-            && self.waking == other.waking
-    }
-}
-
-impl<D: Domain> Eq for CycleDispatch<D> where D::Payload: Eq {}
-
-impl<D: Domain> fmt::Debug for Wiring<D> {
+impl<P: Payload> fmt::Debug for Wiring<P> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Wiring")
             .field("id", &self.id)
@@ -669,10 +555,10 @@ impl<H> Agent<H> {
     /// # Panics
     ///
     /// If the operating system refuses to create the thread.
-    pub fn spawn<D, T>(wiring: Wiring<D>, handler: H, timer: T) -> Self
+    pub fn spawn<P, T>(wiring: Wiring<P>, handler: H, timer: T) -> Self
     where
-        D: Domain,
-        H: Handler<D> + Send + 'static,
+        P: Payload,
+        H: Handler<P> + Send + 'static,
         T: TimerSource + Send + 'static,
     {
         let id = wiring.id.clone();
@@ -721,9 +607,9 @@ impl<H> Agent<H> {
 /// A `select!` receive is destructive, so whatever woke the loop is already
 /// in hand and has to be carried into the cycle rather than left to the
 /// drain to find.
-enum Wake<D: Domain> {
+enum Wake<P: Payload> {
     /// Something arrived on the queue, and here it is.
-    Delivered(Delivery<D>),
+    Delivered(Delivery<P>),
     /// The pending deadline passed.
     Deadline,
     /// The queue closed, which the drain that follows confirms without
@@ -747,13 +633,13 @@ enum Wake<D: Domain> {
 /// `Stop` path, where a message the wake-up had already taken is forgotten:
 /// it was still delivered, and an episode that never hears of a delivery
 /// waits forever for it (see [`episode`](crate::episode)).
-struct Popped<D: Domain> {
+struct Popped<P: Payload> {
     controls: Vec<Instruction>,
-    message: Option<Message<D>>,
+    message: Option<Message<P>>,
     deliveries: usize,
 }
 
-impl<D: Domain> Popped<D> {
+impl<P: Payload> Popped<P> {
     /// Whether the cycle popped nothing at all, which is how a wake-up that
     /// was only the queue closing is told from one that brought work.
     fn is_empty(&self) -> bool {
@@ -762,8 +648,8 @@ impl<D: Domain> Popped<D> {
 }
 
 /// The state of an agent's thread.
-struct Loop<D: Domain, H, T> {
-    wiring: Wiring<D>,
+struct Loop<P: Payload, H, T> {
+    wiring: Wiring<P>,
     handler: H,
     timer: T,
     /// The next sequence number to assign.
@@ -789,10 +675,10 @@ struct Loop<D: Domain, H, T> {
     pending: Option<(Timestamp, Receiver<Instant>)>,
 }
 
-impl<D, H, T> Loop<D, H, T>
+impl<P, H, T> Loop<P, H, T>
 where
-    D: Domain,
-    H: Handler<D>,
+    P: Payload,
+    H: Handler<P>,
     T: TimerSource,
 {
     fn run(mut self) -> Result<H, Error> {
@@ -832,7 +718,7 @@ where
     /// swapped for one that is never ready. The loop never waits again after
     /// learning that, but the swap keeps the arm honest in the one turn
     /// between the two.
-    fn wait(&self) -> Wake<D> {
+    fn wait(&self) -> Wake<P> {
         let (idle, spent) = (never(), never());
         let deadline = self.pending.as_ref().map_or(&idle, |(_, wake)| wake);
         let queue = if self.closed {
@@ -873,7 +759,7 @@ where
     /// already have taken ahead of a `Stop` cannot arise — the wake-up
     /// takes one thing and the pass stops at the stop it then finds — so
     /// the only thing forgotten is what was never taken.
-    fn drain(&mut self, woke_with: Wake<D>, t_start: Timestamp) -> Popped<D> {
+    fn drain(&mut self, woke_with: Wake<P>, t_start: Timestamp) -> Popped<P> {
         let (mut controls, mut message, mut deliveries) = (Vec::new(), None, 0);
         let mut in_hand = match woke_with {
             Wake::Delivered(delivery) => Some(delivery),
@@ -995,7 +881,7 @@ where
     fn cycle(
         &mut self,
         t_start: Timestamp,
-        popped: Popped<D>,
+        popped: Popped<P>,
         timed_out: bool,
     ) -> Result<bool, Error> {
         let Popped {
@@ -1122,7 +1008,7 @@ where
     /// increasing-stamp guarantee is per sender, and a relayed action is
     /// not this agent's to number. Advancing `last_created` for one would
     /// push this agent's next real action past an instant it never used.
-    fn stamp(&mut self, action: Action<D>) -> Message<D> {
+    fn stamp(&mut self, action: Action<P>) -> Message<P> {
         let Action {
             recipients,
             payload,
@@ -1157,7 +1043,7 @@ where
         seq
     }
 
-    fn record_observation(&mut self, observation: &Observation<D>) -> Result<Seq, Error> {
+    fn record_observation(&mut self, observation: &Observation<P>) -> Result<Seq, Error> {
         let seq = self.next_seq();
         self.send_record(
             ObservationRecord {
@@ -1172,7 +1058,7 @@ where
         Ok(seq)
     }
 
-    fn record_action(&mut self, message: &Message<D>) -> Result<Seq, Error> {
+    fn record_action(&mut self, message: &Message<P>) -> Result<Seq, Error> {
         let seq = self.next_seq();
         self.send_record(
             ActionRecord {
@@ -1201,7 +1087,7 @@ where
         Ok(seq)
     }
 
-    fn send_record(&self, record: LogRecord<D>) -> Result<(), Error> {
+    fn send_record(&self, record: LogRecord<P>) -> Result<(), Error> {
         self.wiring
             .records
             .send(record)
@@ -1218,7 +1104,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::testing::{TestDomain, TestPayload, joined, parse_lines, recording};
+    use crate::testing::{TestPayload, joined, parse_lines, recording};
     use crate::timer::{ManualTimer, ManualTimerControl};
 
     /// How long a test waits on a channel before giving up. A test only ever
@@ -1229,7 +1115,7 @@ mod tests {
     /// when deadlines fire.
     const EVERY: Duration = Duration::from_secs(1);
 
-    type TestMessage = Message<TestDomain>;
+    type TestMessage = Message<TestPayload>;
 
     fn at(nanos: u64) -> Timestamp {
         Timestamp::from(Duration::from_nanos(nanos))
@@ -1267,14 +1153,14 @@ mod tests {
         clock_readings: Vec<Timestamp>,
     }
 
-    impl Handler<TestDomain> for Recorder {
-        fn start(&mut self, now: Timestamp) -> Vec<Action<TestDomain>> {
+    impl Handler<TestPayload> for Recorder {
+        fn start(&mut self, now: Timestamp) -> Vec<Action<TestPayload>> {
             self.started += 1;
             self.clock_readings.push(now);
             Vec::new()
         }
 
-        fn handle(&mut self, observation: &Observation<TestDomain>) -> Vec<Action<TestDomain>> {
+        fn handle(&mut self, observation: &Observation<TestPayload>) -> Vec<Action<TestPayload>> {
             let TestPayload::Step(n) = observation.message.payload;
             self.seen.push(observation.message.payload.clone());
             vec![Action::to(
@@ -1283,7 +1169,7 @@ mod tests {
             )]
         }
 
-        fn timeout(&mut self, now: Timestamp) -> Vec<Action<TestDomain>> {
+        fn timeout(&mut self, now: Timestamp) -> Vec<Action<TestPayload>> {
             self.timeouts += 1;
             self.clock_readings.push(now);
             Vec::new()
@@ -1320,16 +1206,16 @@ mod tests {
         }
     }
 
-    impl Handler<TestDomain> for Punctual {
-        fn start(&mut self, now: Timestamp) -> Vec<Action<TestDomain>> {
+    impl Handler<TestPayload> for Punctual {
+        fn start(&mut self, now: Timestamp) -> Vec<Action<TestPayload>> {
             self.inner.start(now)
         }
 
-        fn handle(&mut self, observation: &Observation<TestDomain>) -> Vec<Action<TestDomain>> {
+        fn handle(&mut self, observation: &Observation<TestPayload>) -> Vec<Action<TestPayload>> {
             self.inner.handle(observation)
         }
 
-        fn timeout(&mut self, now: Timestamp) -> Vec<Action<TestDomain>> {
+        fn timeout(&mut self, now: Timestamp) -> Vec<Action<TestPayload>> {
             self.inner.timeout(now)
         }
 
@@ -1354,18 +1240,18 @@ mod tests {
         release: Receiver<()>,
     }
 
-    impl<H: Handler<TestDomain>> Handler<TestDomain> for Gated<H> {
-        fn start(&mut self, now: Timestamp) -> Vec<Action<TestDomain>> {
+    impl<H: Handler<TestPayload>> Handler<TestPayload> for Gated<H> {
+        fn start(&mut self, now: Timestamp) -> Vec<Action<TestPayload>> {
             self.inner.start(now)
         }
 
-        fn handle(&mut self, observation: &Observation<TestDomain>) -> Vec<Action<TestDomain>> {
+        fn handle(&mut self, observation: &Observation<TestPayload>) -> Vec<Action<TestPayload>> {
             self.entered.send(()).unwrap();
             self.release.recv().unwrap();
             self.inner.handle(observation)
         }
 
-        fn timeout(&mut self, now: Timestamp) -> Vec<Action<TestDomain>> {
+        fn timeout(&mut self, now: Timestamp) -> Vec<Action<TestPayload>> {
             self.entered.send(()).unwrap();
             self.release.recv().unwrap();
             self.inner.timeout(now)
@@ -1383,16 +1269,16 @@ mod tests {
         deadline: Arc<Mutex<Option<Timestamp>>>,
     }
 
-    impl Handler<TestDomain> for Once {
-        fn start(&mut self, now: Timestamp) -> Vec<Action<TestDomain>> {
+    impl Handler<TestPayload> for Once {
+        fn start(&mut self, now: Timestamp) -> Vec<Action<TestPayload>> {
             self.inner.start(now)
         }
 
-        fn handle(&mut self, observation: &Observation<TestDomain>) -> Vec<Action<TestDomain>> {
+        fn handle(&mut self, observation: &Observation<TestPayload>) -> Vec<Action<TestPayload>> {
             self.inner.handle(observation)
         }
 
-        fn timeout(&mut self, now: Timestamp) -> Vec<Action<TestDomain>> {
+        fn timeout(&mut self, now: Timestamp) -> Vec<Action<TestPayload>> {
             *self.deadline.lock().unwrap() = None;
             self.inner.timeout(now)
         }
@@ -1409,12 +1295,12 @@ mod tests {
     /// at anyone, and what one addressed to nobody is for is the log.
     struct Town(&'static [&'static str]);
 
-    impl Handler<TestDomain> for Town {
-        fn start(&mut self, _now: Timestamp) -> Vec<Action<TestDomain>> {
+    impl Handler<TestPayload> for Town {
+        fn start(&mut self, _now: Timestamp) -> Vec<Action<TestPayload>> {
             vec![Action::to(self.0.iter().copied(), TestPayload::Step(0))]
         }
 
-        fn handle(&mut self, _: &Observation<TestDomain>) -> Vec<Action<TestDomain>> {
+        fn handle(&mut self, _: &Observation<TestPayload>) -> Vec<Action<TestPayload>> {
             Vec::new()
         }
     }
@@ -1426,8 +1312,8 @@ mod tests {
     /// carried on.
     struct Relays(&'static str);
 
-    impl Handler<TestDomain> for Relays {
-        fn handle(&mut self, observation: &Observation<TestDomain>) -> Vec<Action<TestDomain>> {
+    impl Handler<TestPayload> for Relays {
+        fn handle(&mut self, observation: &Observation<TestPayload>) -> Vec<Action<TestPayload>> {
             vec![Action::relay(
                 observation.message.sender.clone(),
                 observation.message.created,
@@ -1440,8 +1326,8 @@ mod tests {
     /// Relays what it observes to `to`, then says something of its own.
     struct RelaysThenSpeaks(&'static str);
 
-    impl Handler<TestDomain> for RelaysThenSpeaks {
-        fn handle(&mut self, observation: &Observation<TestDomain>) -> Vec<Action<TestDomain>> {
+    impl Handler<TestPayload> for RelaysThenSpeaks {
+        fn handle(&mut self, observation: &Observation<TestPayload>) -> Vec<Action<TestPayload>> {
             vec![
                 Action::relay(
                     observation.message.sender.clone(),
@@ -1457,12 +1343,12 @@ mod tests {
     /// A panicking handler.
     struct Faulty;
 
-    impl Handler<TestDomain> for Faulty {
-        fn handle(&mut self, _: &Observation<TestDomain>) -> Vec<Action<TestDomain>> {
+    impl Handler<TestPayload> for Faulty {
+        fn handle(&mut self, _: &Observation<TestPayload>) -> Vec<Action<TestPayload>> {
             panic!("handler bug");
         }
 
-        fn timeout(&mut self, _now: Timestamp) -> Vec<Action<TestDomain>> {
+        fn timeout(&mut self, _now: Timestamp) -> Vec<Action<TestPayload>> {
             panic!("handler bug");
         }
     }
@@ -1471,18 +1357,18 @@ mod tests {
     struct Rig<H> {
         agent: Agent<H>,
         clock: Clock,
-        queue: Sender<Delivery<TestDomain>>,
-        dispatches: Receiver<CycleDispatch<TestDomain>>,
-        records: Receiver<LogRecord<TestDomain>>,
+        queue: Sender<Delivery<TestPayload>>,
+        dispatches: Receiver<CycleDispatch<TestPayload>>,
+        records: Receiver<LogRecord<TestPayload>>,
         timer: ManualTimerControl,
     }
 
     /// The channels of a rig, before the agent is spawned on them.
     struct Wires {
-        wiring: Wiring<TestDomain>,
-        queue: Sender<Delivery<TestDomain>>,
-        dispatches: Receiver<CycleDispatch<TestDomain>>,
-        records: Receiver<LogRecord<TestDomain>>,
+        wiring: Wiring<TestPayload>,
+        queue: Sender<Delivery<TestPayload>>,
+        dispatches: Receiver<CycleDispatch<TestPayload>>,
+        records: Receiver<LogRecord<TestPayload>>,
     }
 
     impl Wires {
@@ -1517,7 +1403,7 @@ mod tests {
         }
     }
 
-    fn rig<H: Handler<TestDomain> + Send + 'static>(
+    fn rig<H: Handler<TestPayload> + Send + 'static>(
         handler: H,
         timeout: Option<Duration>,
     ) -> Rig<H> {
@@ -1553,13 +1439,13 @@ mod tests {
             self.control(Control::Stop);
         }
 
-        fn dispatch(&self) -> CycleDispatch<TestDomain> {
+        fn dispatch(&self) -> CycleDispatch<TestPayload> {
             recv(&self.dispatches)
         }
 
         /// The records of one cycle: everything it wrote, then its cycle
         /// record.
-        fn cycle(&self) -> (Vec<LogRecord<TestDomain>>, CycleRecord) {
+        fn cycle(&self) -> (Vec<LogRecord<TestPayload>>, CycleRecord) {
             let mut records = Vec::new();
             loop {
                 match recv(&self.records) {
@@ -1573,7 +1459,7 @@ mod tests {
     /// A rig whose handler can be held mid-cycle, and the two ends of the
     /// gate: the channel that says the agent has entered a cycle, and the
     /// one that lets it out again.
-    fn gated_with<H: Handler<TestDomain> + Send + 'static>(
+    fn gated_with<H: Handler<TestPayload> + Send + 'static>(
         inner: H,
         timeout: Option<Duration>,
     ) -> (Rig<Gated<H>>, Receiver<()>, Sender<()>) {
@@ -1597,7 +1483,7 @@ mod tests {
 
     /// What kind of record this is, for a test that cares about the order
     /// of the kinds rather than their contents.
-    fn kind(record: &LogRecord<TestDomain>) -> &'static str {
+    fn kind(record: &LogRecord<TestPayload>) -> &'static str {
         match record {
             LogRecord::Observation(_) => "observation",
             LogRecord::Action(_) => "action",
@@ -1610,7 +1496,7 @@ mod tests {
     }
 
     /// The payloads of the action records among `records`, in order.
-    fn acted(records: &[LogRecord<TestDomain>]) -> Vec<TestPayload> {
+    fn acted(records: &[LogRecord<TestPayload>]) -> Vec<TestPayload> {
         records
             .iter()
             .filter_map(|record| match record {
@@ -2311,8 +2197,8 @@ mod tests {
     /// two of an agent's stamps could collide.
     struct Chatters(usize);
 
-    impl Handler<TestDomain> for Chatters {
-        fn handle(&mut self, _: &Observation<TestDomain>) -> Vec<Action<TestDomain>> {
+    impl Handler<TestPayload> for Chatters {
+        fn handle(&mut self, _: &Observation<TestPayload>) -> Vec<Action<TestPayload>> {
             (0..self.0)
                 .map(|n| Action::to(["b"], TestPayload::Step(n as u64)))
                 .collect()
@@ -2417,7 +2303,7 @@ mod tests {
 
     #[test]
     fn an_observation_and_a_control_know_their_own_latency() {
-        let observation = Observation::<TestDomain> {
+        let observation = Observation::<TestPayload> {
             message: step_at("b", 1, at(40)),
             received: at(55),
         };
@@ -2476,7 +2362,7 @@ mod tests {
             handler.seen,
             steps(std::array::from_fn::<u64, 20, _>(|i| i as u64 + 1))
         );
-        let records: Vec<LogRecord<TestDomain>> = wires.records.try_iter().collect();
+        let records: Vec<LogRecord<TestPayload>> = wires.records.try_iter().collect();
         let controls: Vec<Control> = records
             .iter()
             .filter_map(|record| match record {
@@ -2517,7 +2403,7 @@ mod tests {
         let handler = agent.join().unwrap();
         assert_eq!(handler.started, 1);
         assert!(handler.seen.is_empty(), "{:?}", handler.seen);
-        let records: Vec<LogRecord<TestDomain>> = wires.records.try_iter().collect();
+        let records: Vec<LogRecord<TestPayload>> = wires.records.try_iter().collect();
         assert!(
             !records
                 .iter()
@@ -2545,7 +2431,7 @@ mod tests {
         drop(wires.queue);
         agent.join().unwrap();
 
-        let records: Vec<LogRecord<TestDomain>> = wires.records.try_iter().collect();
+        let records: Vec<LogRecord<TestPayload>> = wires.records.try_iter().collect();
         let kinds: Vec<&str> = records.iter().map(kind).collect();
         // `Town` speaks when it starts and says nothing to an
         // observation, so the opening action between them is the start
@@ -2605,7 +2491,7 @@ mod tests {
         rig.stop();
         rig.agent.join().unwrap();
 
-        let records: Vec<LogRecord<TestDomain>> = rig.records.try_iter().collect();
+        let records: Vec<LogRecord<TestPayload>> = rig.records.try_iter().collect();
         let mut cycles = 0;
         let mut received: Vec<Timestamp> = Vec::new();
         for record in &records {

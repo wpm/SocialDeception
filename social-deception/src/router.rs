@@ -50,7 +50,7 @@ use std::fmt;
 use crossbeam_channel::Sender;
 
 use crate::clock::Clock;
-use crate::message::{ActorId, Control, Delivery, Domain, Message};
+use crate::message::{ActorId, Control, Delivery, Message, Payload};
 
 /// Why a message could not be routed.
 ///
@@ -92,31 +92,25 @@ impl Error for RouteError {}
 /// rather than which channel they were put on (ADR-0009). It is a struct of
 /// one field so that the router's map says what it holds, and so that a
 /// second thing an agent must be addressed by has somewhere to go.
-/// `Debug` and `Clone` are written out rather than derived, for the reason
-/// [`Message`]'s are: a derive would ask them of `D`.
-pub struct Queues<D: Domain> {
+///
+/// `Debug` is written out because a derive would print the channel, which
+/// says nothing a reader wants and changes from run to run.
+#[derive(Clone)]
+pub struct Queues<P: Payload> {
     /// Where everything said to the agent goes.
-    pub queue: Sender<Delivery<D>>,
+    pub queue: Sender<Delivery<P>>,
 }
 
-impl<D: Domain> fmt::Debug for Queues<D> {
+impl<P: Payload> fmt::Debug for Queues<P> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Queues").finish_non_exhaustive()
     }
 }
 
-impl<D: Domain> Clone for Queues<D> {
-    fn clone(&self) -> Self {
-        Self {
-            queue: self.queue.clone(),
-        }
-    }
-}
-
 /// The map from actor id to that actor's queues.
 #[derive(Debug)]
-pub struct Router<D: Domain> {
-    queues: BTreeMap<ActorId, Queues<D>>,
+pub struct Router<P: Payload> {
+    queues: BTreeMap<ActorId, Queues<P>>,
     /// Whoever has been stopped. Their queues are gone, and a message
     /// addressed to one of them is skipped rather than failing the
     /// episode: a queue closed because the environment stopped its agent
@@ -126,12 +120,12 @@ pub struct Router<D: Domain> {
     clock: Clock,
 }
 
-impl<D: Domain> Router<D> {
+impl<P: Payload> Router<P> {
     /// A router over the given queues, whose `environment` is the one agent
     /// allowed to [`command`](Router::command), stamping every control it
     /// sends with `clock`.
     #[must_use]
-    pub fn new(queues: BTreeMap<ActorId, Queues<D>>, environment: ActorId, clock: Clock) -> Self {
+    pub fn new(queues: BTreeMap<ActorId, Queues<P>>, environment: ActorId, clock: Clock) -> Self {
         Self {
             queues,
             stopped: BTreeSet::new(),
@@ -181,7 +175,7 @@ impl<D: Domain> Router<D> {
     ///   Recipients before it in the set have already received the message.
     ///
     /// Nothing is delivered when a validation fails.
-    pub fn route(&self, message: &Message<D>) -> Result<usize, RouteError> {
+    pub fn route(&self, message: &Message<P>) -> Result<usize, RouteError> {
         let Message {
             sender, recipients, ..
         } = message;
@@ -345,7 +339,7 @@ impl<D: Domain> Router<D> {
             .collect()
     }
 
-    fn queues_of(&self, id: &ActorId) -> Result<&Queues<D>, RouteError> {
+    fn queues_of(&self, id: &ActorId) -> Result<&Queues<P>, RouteError> {
         self.queues
             .get(id)
             .ok_or_else(|| RouteError::UnknownAgent(id.clone()))
@@ -358,15 +352,15 @@ mod tests {
 
     use super::*;
     use crate::clock::Timestamp;
-    use crate::testing::{TestDomain, TestPayload, id};
+    use crate::testing::{TestPayload, id};
 
     /// The receiving end of one agent's queue: what an agent's loop would
     /// be waiting on.
-    type Ends = Receiver<Delivery<TestDomain>>;
+    type Ends = Receiver<Delivery<TestPayload>>;
 
     /// A world whose agents are `names` and whose environment is the first
     /// of them, which is the only one allowed to command.
-    fn world(names: &[&str]) -> (Router<TestDomain>, BTreeMap<ActorId, Ends>) {
+    fn world(names: &[&str]) -> (Router<TestPayload>, BTreeMap<ActorId, Ends>) {
         let mut queues = BTreeMap::new();
         let mut ends = BTreeMap::new();
         for name in names {
@@ -381,7 +375,7 @@ mod tests {
     }
 
     /// The message of a delivery, or a panic saying what it was instead.
-    fn as_message(delivery: &Delivery<TestDomain>) -> &Message<TestDomain> {
+    fn as_message(delivery: &Delivery<TestPayload>) -> &Message<TestPayload> {
         match delivery {
             Delivery::Message(message) => message,
             other @ Delivery::Control { .. } => panic!("expected a message: {other:?}"),
@@ -396,7 +390,11 @@ mod tests {
 
     /// A message from `sender` to `recipients`, created at a time the router
     /// neither reads nor changes.
-    fn message<const N: usize>(sender: &str, recipients: [&str; N], n: u64) -> Message<TestDomain> {
+    fn message<const N: usize>(
+        sender: &str,
+        recipients: [&str; N],
+        n: u64,
+    ) -> Message<TestPayload> {
         Message::new(
             sender,
             recipients,
@@ -597,7 +595,7 @@ mod tests {
         router.control(&all(&["b"]), Control::Stop).unwrap();
         router.route(&message("a", ["b"], 2)).unwrap();
 
-        let delivered: Vec<Delivery<TestDomain>> = queues[&id("b")].try_iter().collect();
+        let delivered: Vec<Delivery<TestPayload>> = queues[&id("b")].try_iter().collect();
         assert_eq!(delivered.len(), 3);
         assert_eq!(as_message(&delivered[0]).payload, TestPayload::Step(1));
         assert!(

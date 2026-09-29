@@ -32,7 +32,10 @@
 //!
 //! The fifth is the odd one out. A [`RewardRecord`] is written by the
 //! **environment**, and belongs to the agent it names rather than to the
-//! agent that wrote it; see [`RewardRecord`] and ADR-0007.
+//! agent that wrote it; see [`RewardRecord`] and ADR-0007. It is also the
+//! only record carrying something this module does not know the type of,
+//! and it carries it already serialized, so that nothing here is generic
+//! over a reward.
 //!
 //! An observation and an action record the same message from the two sides of
 //! it, which is what makes the trajectory joinable: an observation in one
@@ -107,7 +110,6 @@
 //! {"type":"reward","agent":"alice","created":500,"value":1}
 //! ```
 
-use std::fmt;
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
@@ -115,9 +117,10 @@ use std::thread::{self, JoinHandle};
 
 use crossbeam_channel::{Sender, unbounded};
 use serde::{Serialize, Serializer};
+use serde_json::Value;
 
 use crate::clock::{Created, Timestamp};
-use crate::message::{ActorId, Control, Domain, Message};
+use crate::message::{ActorId, Control, Message, Payload};
 
 /// An agent's sequence number for one of its own records.
 ///
@@ -153,9 +156,9 @@ pub enum Woken {
 /// `agent` and `seq` because it is a property of the record's subject and a
 /// reader joins on it, and repeating it inside the message would be two
 /// places to read the same instant from.
-struct Envelope<'a, D: Domain>(&'a Message<D>);
+struct Envelope<'a, P: Payload>(&'a Message<P>);
 
-impl<D: Domain> Serialize for Envelope<'_, D> {
+impl<P: Payload> Serialize for Envelope<'_, P> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
         let mut message = serializer.serialize_struct("Message", 3)?;
@@ -168,9 +171,11 @@ impl<D: Domain> Serialize for Envelope<'_, D> {
 
 /// A message this agent popped off its queue.
 ///
-/// `Debug`, `Clone` and equality are written out rather than derived, for
-/// the reason [`Message`]'s are: a derive would ask them of `D`.
-pub struct ObservationRecord<D: Domain> {
+/// `Serialize` is written out because the record's wire shape is not its
+/// field shape: the message is written without the `created` this record
+/// already carries at the top level.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservationRecord<P: Payload> {
     /// The agent whose trajectory this record belongs to.
     pub agent: ActorId,
     /// The agent's sequence number for it.
@@ -180,10 +185,10 @@ pub struct ObservationRecord<D: Domain> {
     /// When this agent popped it: its cycle's `t_start`.
     pub received: Timestamp,
     /// The message.
-    pub message: Message<D>,
+    pub message: Message<P>,
 }
 
-impl<D: Domain> Serialize for ObservationRecord<D> {
+impl<P: Payload> Serialize for ObservationRecord<P> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
         let mut record = serializer.serialize_struct("ObservationRecord", 5)?;
@@ -198,13 +203,13 @@ impl<D: Domain> Serialize for ObservationRecord<D> {
 
 /// A message this agent sent.
 ///
-/// `Debug`, `Clone` and equality are written out for the same reason
-/// [`ObservationRecord`]'s are.
+/// `Serialize` is written out for the reason [`ObservationRecord`]'s is.
 ///
 /// There is no `received`: an action is logged by its sender, which knows
 /// only when it sent it. When each recipient received it is in that
 /// recipient's own observation record.
-pub struct ActionRecord<D: Domain> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActionRecord<P: Payload> {
     /// The agent whose trajectory this record belongs to.
     pub agent: ActorId,
     /// The agent's sequence number for it.
@@ -212,10 +217,10 @@ pub struct ActionRecord<D: Domain> {
     /// When the loop sent it, which is the `created` on the wire.
     pub created: Timestamp,
     /// The message as sent.
-    pub message: Message<D>,
+    pub message: Message<P>,
 }
 
-impl<D: Domain> Serialize for ActionRecord<D> {
+impl<P: Payload> Serialize for ActionRecord<P> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
         let mut record = serializer.serialize_struct("ActionRecord", 4)?;
@@ -257,30 +262,28 @@ pub struct ControlRecord {
 /// never sent, so nobody ever receives it, and it implements
 /// [`Created`] alone.
 ///
-/// `Debug`, `Clone` and equality are written out rather than derived, for
-/// the reason [`ObservationRecord`]'s are: a derive would ask them of `D`,
-/// the marker type, when what has to have them is `D::Reward`.
-pub struct RewardRecord<D: Domain> {
+/// The value is the reward **already serialized**. A reward's type is the
+/// environment's, and the environment is the only thing in the runtime
+/// that has one (ADR-0016): by the time a reward reaches this record it has
+/// been assigned, and nothing downstream — not this record, not the
+/// [`Writer`], not a [`Sink`] — does anything with it but write it out. So
+/// it is serialized where it is assigned and carried as JSON from there,
+/// which is what keeps the reward type off every type in this module.
+///
+/// `Debug`, `Clone` and equality are derived: no field mentions a game's
+/// types any more.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RewardRecord {
     /// The agent rewarded, whose trajectory this record belongs to.
     pub agent: ActorId,
     /// When the environment logged it.
     pub created: Timestamp,
-    /// What the agent's behavior was worth, in the game's own units.
-    pub value: D::Reward,
+    /// What the agent's behavior was worth, in the game's own units, as the
+    /// environment serialized it.
+    pub value: Value,
 }
 
-impl<D: Domain> Serialize for RewardRecord<D> {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeStruct;
-        let mut record = serializer.serialize_struct("RewardRecord", 3)?;
-        record.serialize_field("agent", &self.agent)?;
-        record.serialize_field("created", &self.created)?;
-        record.serialize_field("value", &self.value)?;
-        record.end()
-    }
-}
-
-impl<D: Domain> Created for RewardRecord<D> {
+impl Created for RewardRecord {
     fn created(&self) -> Timestamp {
         self.created
     }
@@ -309,215 +312,46 @@ pub struct CycleRecord {
 /// One record of a trajectory: what a [`Sink`] is handed.
 ///
 /// Internally tagged: the `type` field of each line names the record kind.
-/// `Debug`, `Clone` and equality are written out for the same reason
-/// [`ObservationRecord`]'s are.
-#[derive(Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", bound = "")]
-pub enum LogRecord<D: Domain> {
+pub enum LogRecord<P: Payload> {
     /// A message some agent popped.
-    Observation(ObservationRecord<D>),
+    Observation(ObservationRecord<P>),
     /// A message some agent sent.
-    Action(ActionRecord<D>),
+    Action(ActionRecord<P>),
     /// A control some agent popped.
     Control(ControlRecord),
     /// A reward the environment assigned to some agent.
-    Reward(RewardRecord<D>),
+    Reward(RewardRecord),
     /// A cycle of some agent's loop.
     Cycle(CycleRecord),
 }
 
-impl<D: Domain> fmt::Debug for ObservationRecord<D>
-where
-    D::Payload: fmt::Debug,
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ObservationRecord")
-            .field("agent", &self.agent)
-            .field("seq", &self.seq)
-            .field("created", &self.created)
-            .field("received", &self.received)
-            .field("message", &self.message)
-            .finish()
-    }
-}
-
-impl<D: Domain> Clone for ObservationRecord<D> {
-    fn clone(&self) -> Self {
-        Self {
-            agent: self.agent.clone(),
-            seq: self.seq,
-            created: self.created,
-            received: self.received,
-            message: self.message.clone(),
-        }
-    }
-}
-
-impl<D: Domain> PartialEq for ObservationRecord<D>
-where
-    D::Payload: PartialEq,
-{
-    fn eq(&self, other: &Self) -> bool {
-        self.agent == other.agent
-            && self.seq == other.seq
-            && self.created == other.created
-            && self.received == other.received
-            && self.message == other.message
-    }
-}
-
-impl<D: Domain> Eq for ObservationRecord<D> where D::Payload: Eq {}
-
-impl<D: Domain> fmt::Debug for ActionRecord<D>
-where
-    D::Payload: fmt::Debug,
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ActionRecord")
-            .field("agent", &self.agent)
-            .field("seq", &self.seq)
-            .field("created", &self.created)
-            .field("message", &self.message)
-            .finish()
-    }
-}
-
-impl<D: Domain> Clone for ActionRecord<D> {
-    fn clone(&self) -> Self {
-        Self {
-            agent: self.agent.clone(),
-            seq: self.seq,
-            created: self.created,
-            message: self.message.clone(),
-        }
-    }
-}
-
-impl<D: Domain> PartialEq for ActionRecord<D>
-where
-    D::Payload: PartialEq,
-{
-    fn eq(&self, other: &Self) -> bool {
-        self.agent == other.agent
-            && self.seq == other.seq
-            && self.created == other.created
-            && self.message == other.message
-    }
-}
-
-impl<D: Domain> Eq for ActionRecord<D> where D::Payload: Eq {}
-
-impl<D: Domain> fmt::Debug for RewardRecord<D>
-where
-    D::Reward: fmt::Debug,
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("RewardRecord")
-            .field("agent", &self.agent)
-            .field("created", &self.created)
-            .field("value", &self.value)
-            .finish()
-    }
-}
-
-impl<D: Domain> Clone for RewardRecord<D> {
-    fn clone(&self) -> Self {
-        Self {
-            agent: self.agent.clone(),
-            created: self.created,
-            value: self.value,
-        }
-    }
-}
-
-impl<D: Domain> PartialEq for RewardRecord<D>
-where
-    D::Reward: PartialEq,
-{
-    fn eq(&self, other: &Self) -> bool {
-        self.agent == other.agent && self.created == other.created && self.value == other.value
-    }
-}
-
-impl<D: Domain> Eq for RewardRecord<D> where D::Reward: Eq {}
-
-impl<D: Domain> fmt::Debug for LogRecord<D>
-where
-    D::Payload: fmt::Debug,
-    D::Reward: fmt::Debug,
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Observation(record) => f.debug_tuple("Observation").field(record).finish(),
-            Self::Action(record) => f.debug_tuple("Action").field(record).finish(),
-            Self::Control(record) => f.debug_tuple("Control").field(record).finish(),
-            Self::Reward(record) => f.debug_tuple("Reward").field(record).finish(),
-            Self::Cycle(record) => f.debug_tuple("Cycle").field(record).finish(),
-        }
-    }
-}
-
-impl<D: Domain> Clone for LogRecord<D> {
-    fn clone(&self) -> Self {
-        match self {
-            Self::Observation(record) => Self::Observation(record.clone()),
-            Self::Action(record) => Self::Action(record.clone()),
-            Self::Control(record) => Self::Control(record.clone()),
-            Self::Reward(record) => Self::Reward(record.clone()),
-            Self::Cycle(record) => Self::Cycle(record.clone()),
-        }
-    }
-}
-
-impl<D: Domain> PartialEq for LogRecord<D>
-where
-    D::Payload: PartialEq,
-    D::Reward: PartialEq,
-{
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Observation(a), Self::Observation(b)) => a == b,
-            (Self::Action(a), Self::Action(b)) => a == b,
-            (Self::Control(a), Self::Control(b)) => a == b,
-            (Self::Reward(a), Self::Reward(b)) => a == b,
-            (Self::Cycle(a), Self::Cycle(b)) => a == b,
-            _ => false,
-        }
-    }
-}
-
-impl<D: Domain> Eq for LogRecord<D>
-where
-    D::Payload: Eq,
-    D::Reward: Eq,
-{
-}
-
-impl<D: Domain> From<ObservationRecord<D>> for LogRecord<D> {
-    fn from(record: ObservationRecord<D>) -> Self {
+impl<P: Payload> From<ObservationRecord<P>> for LogRecord<P> {
+    fn from(record: ObservationRecord<P>) -> Self {
         Self::Observation(record)
     }
 }
 
-impl<D: Domain> From<ActionRecord<D>> for LogRecord<D> {
-    fn from(record: ActionRecord<D>) -> Self {
+impl<P: Payload> From<ActionRecord<P>> for LogRecord<P> {
+    fn from(record: ActionRecord<P>) -> Self {
         Self::Action(record)
     }
 }
 
-impl<D: Domain> From<ControlRecord> for LogRecord<D> {
+impl<P: Payload> From<ControlRecord> for LogRecord<P> {
     fn from(record: ControlRecord) -> Self {
         Self::Control(record)
     }
 }
 
-impl<D: Domain> From<RewardRecord<D>> for LogRecord<D> {
-    fn from(record: RewardRecord<D>) -> Self {
+impl<P: Payload> From<RewardRecord> for LogRecord<P> {
+    fn from(record: RewardRecord) -> Self {
         Self::Reward(record)
     }
 }
 
-impl<D: Domain> From<CycleRecord> for LogRecord<D> {
+impl<P: Payload> From<CycleRecord> for LogRecord<P> {
     fn from(record: CycleRecord) -> Self {
         Self::Cycle(record)
     }
@@ -534,14 +368,14 @@ impl<D: Domain> From<CycleRecord> for LogRecord<D> {
 ///
 /// A sink runs on the writer's thread and owns its destination, so it need
 /// not be `Sync`, but it must be `Send` to be moved onto that thread.
-pub trait Sink<D: Domain>: Send {
+pub trait Sink<P: Payload>: Send {
     /// Takes one record, in the order the writer received it.
     ///
     /// # Errors
     ///
     /// Whatever the destination returned. What happens next is the sink's
     /// [`Policy`].
-    fn record(&mut self, record: &LogRecord<D>) -> io::Result<()>;
+    fn record(&mut self, record: &LogRecord<P>) -> io::Result<()>;
 
     /// Called once, after the last record: flush, close.
     ///
@@ -596,10 +430,10 @@ impl Writer {
     /// discards what it receives, which is what an episode that records
     /// nothing wants.
     #[must_use]
-    pub fn spawn<D: Domain>(
-        sinks: Vec<(Box<dyn Sink<D>>, Policy)>,
-    ) -> (Sender<LogRecord<D>>, Self) {
-        let (sender, receiver) = unbounded::<LogRecord<D>>();
+    pub fn spawn<P: Payload>(
+        sinks: Vec<(Box<dyn Sink<P>>, Policy)>,
+    ) -> (Sender<LogRecord<P>>, Self) {
+        let (sender, receiver) = unbounded::<LogRecord<P>>();
         let thread = thread::spawn(move || {
             let mut live = sinks;
             for record in receiver {
@@ -634,8 +468,8 @@ impl Writer {
     /// # Errors
     ///
     /// Whatever [`File::create`] returns.
-    pub fn create<D: Domain>(path: impl AsRef<Path>) -> io::Result<(Sender<LogRecord<D>>, Self)> {
-        let sink: Box<dyn Sink<D>> = Box::new(JsonLines::new(File::create(path)?));
+    pub fn create<P: Payload>(path: impl AsRef<Path>) -> io::Result<(Sender<LogRecord<P>>, Self)> {
+        let sink: Box<dyn Sink<P>> = Box::new(JsonLines::new(File::create(path)?));
         Ok(Self::spawn(vec![(sink, Policy::Required)]))
     }
 }
@@ -646,9 +480,9 @@ impl Writer {
 /// A sink that has failed is gone: it is neither given later records nor
 /// finished, because a destination that refused one write has no reason to
 /// accept the next.
-fn deliver<D: Domain>(
-    sinks: &mut Vec<(Box<dyn Sink<D>>, Policy)>,
-    mut act: impl FnMut(&mut dyn Sink<D>) -> io::Result<()>,
+fn deliver<P: Payload>(
+    sinks: &mut Vec<(Box<dyn Sink<P>>, Policy)>,
+    mut act: impl FnMut(&mut dyn Sink<P>) -> io::Result<()>,
 ) -> io::Result<()> {
     let mut failed = None;
     sinks.retain_mut(|(sink, policy)| match act(sink.as_mut()) {
@@ -686,8 +520,8 @@ impl<W: Write> JsonLines<W> {
     }
 }
 
-impl<D: Domain, W: Write + Send> Sink<D> for JsonLines<W> {
-    fn record(&mut self, record: &LogRecord<D>) -> io::Result<()> {
+impl<P: Payload, W: Write + Send> Sink<P> for JsonLines<W> {
+    fn record(&mut self, record: &LogRecord<P>) -> io::Result<()> {
         serde_json::to_writer(&mut self.out, record)?;
         self.out.write_all(b"\n")
     }
@@ -709,7 +543,7 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
-    use crate::testing::{Shared, TestDomain, TestPayload, joined, parse_lines, recording};
+    use crate::testing::{Shared, TestPayload, joined, parse_lines, recording};
 
     fn at(nanos: u64) -> Timestamp {
         Timestamp::from(Duration::from_nanos(nanos))
@@ -717,7 +551,7 @@ mod tests {
 
     /// A handful of records of every kind: agent `a` pops a start and a
     /// message in one cycle and replies to `b`.
-    fn sample() -> Vec<LogRecord<TestDomain>> {
+    fn sample() -> Vec<LogRecord<TestPayload>> {
         let a = ActorId::new("a");
         vec![
             ControlRecord {
@@ -803,10 +637,13 @@ mod tests {
         // to, when the environment logged it, and what it is worth. No
         // `seq`, because the agent loop did not write it, and no
         // `received`, because nobody received it.
-        let reward: LogRecord<TestDomain> = RewardRecord {
+        // The value is already JSON by the time the record holds it: the
+        // environment serialized it where it assigned it, so the line reads
+        // exactly as it did when the record was generic over a reward type.
+        let reward: LogRecord<TestPayload> = RewardRecord {
             agent: ActorId::new("alice"),
             created: at(500),
-            value: 1,
+            value: json!(1),
         }
         .into();
         assert_eq!(
@@ -823,29 +660,29 @@ mod tests {
     fn a_reward_is_created_and_never_received() {
         // `Created` and not `Received`: a reward is logged, never sent,
         // so there is no instant at which anybody got it.
-        let reward: RewardRecord<TestDomain> = RewardRecord {
+        let reward = RewardRecord {
             agent: ActorId::new("alice"),
             created: at(500),
-            value: -1,
+            value: json!(-1),
         };
         assert_eq!(reward.created(), at(500));
         assert_eq!(reward, reward.clone());
         assert_ne!(
             reward,
             RewardRecord {
-                value: 1,
+                value: json!(1),
                 ..reward.clone()
             }
         );
         assert!(format!("{reward:?}").starts_with("RewardRecord"));
-        let line: LogRecord<TestDomain> = reward.into();
+        let line: LogRecord<TestPayload> = reward.into();
         assert!(format!("{line:?}").starts_with("Reward"));
         assert_eq!(line, line.clone());
     }
 
     #[test]
     fn a_timeout_cycle_records_what_woke_it_and_no_inputs() {
-        let cycle: LogRecord<TestDomain> = CycleRecord {
+        let cycle: LogRecord<TestPayload> = CycleRecord {
             agent: ActorId::new("a"),
             t_start: at(60),
             t_stop: at(61),
@@ -891,7 +728,7 @@ mod tests {
                 thread::spawn(move || {
                     let agent = ActorId::new(format!("agent-{i}"));
                     for seq in 0..10 {
-                        let record: LogRecord<TestDomain> = ControlRecord {
+                        let record: LogRecord<TestPayload> = ControlRecord {
                             agent: agent.clone(),
                             seq: Seq(seq),
                             created: at(seq),
@@ -987,8 +824,8 @@ mod tests {
         }
     }
 
-    impl Sink<TestDomain> for Spy {
-        fn record(&mut self, record: &LogRecord<TestDomain>) -> io::Result<()> {
+    impl Sink<TestPayload> for Spy {
+        fn record(&mut self, record: &LogRecord<TestPayload>) -> io::Result<()> {
             let mut seen = self.seen.lock().unwrap();
             if self.fails_from.is_some_and(|n| seen.len() >= n) {
                 return Err(io::Error::new(io::ErrorKind::BrokenPipe, "no reader"));
@@ -1004,7 +841,7 @@ mod tests {
     }
 
     /// Sends `sample` to `sender` and joins `writer`.
-    fn play(sender: Sender<LogRecord<TestDomain>>, writer: Writer) -> io::Result<()> {
+    fn play(sender: Sender<LogRecord<TestPayload>>, writer: Writer) -> io::Result<()> {
         for record in sample() {
             let _ = sender.send(record);
         }
@@ -1014,9 +851,9 @@ mod tests {
 
     /// Sends `sample` through a writer over `sinks`, each under its policy.
     fn play_into(sinks: [(Spy, Policy); 2]) -> io::Result<()> {
-        let sinks: Vec<(Box<dyn Sink<TestDomain>>, Policy)> = sinks
+        let sinks: Vec<(Box<dyn Sink<TestPayload>>, Policy)> = sinks
             .into_iter()
-            .map(|(sink, policy)| (Box::new(sink) as Box<dyn Sink<TestDomain>>, policy))
+            .map(|(sink, policy)| (Box::new(sink) as Box<dyn Sink<TestPayload>>, policy))
             .collect();
         let (sender, writer) = Writer::spawn(sinks);
         play(sender, writer)
@@ -1024,10 +861,10 @@ mod tests {
 
     #[test]
     fn a_required_sink_s_failure_is_loud_at_both_ends() {
-        let broken: Box<dyn Sink<TestDomain>> = Box::new(JsonLines::new(BrokenSink));
+        let broken: Box<dyn Sink<TestPayload>> = Box::new(JsonLines::new(BrokenSink));
         let (sender, writer) = Writer::spawn(vec![(broken, Policy::Required)]);
         // A record small enough to sit in the buffer.
-        let record: LogRecord<TestDomain> = CycleRecord {
+        let record: LogRecord<TestPayload> = CycleRecord {
             agent: ActorId::new("a"),
             t_start: at(0),
             t_stop: at(1),
@@ -1038,7 +875,7 @@ mod tests {
         .into();
         // A record larger than the buffer is written while the loop is still
         // running; the thread stops and drops its receiver at that point.
-        let big: LogRecord<TestDomain> = ActionRecord {
+        let big: LogRecord<TestPayload> = ActionRecord {
             agent: ActorId::new("a"),
             seq: Seq(0),
             created: at(0),
@@ -1058,7 +895,7 @@ mod tests {
         // checked.
         let error = writer.join().unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::StorageFull);
-        let late: LogRecord<TestDomain> = ControlRecord {
+        let late: LogRecord<TestPayload> = ControlRecord {
             agent: ActorId::new("a"),
             seq: Seq(1),
             created: at(2),
@@ -1097,13 +934,13 @@ mod tests {
         let bytes = Shared::new();
         let mut sink = JsonLines::new(bytes.clone());
         let record = &sample()[0];
-        Sink::<TestDomain>::record(&mut sink, record).unwrap();
+        Sink::<TestPayload>::record(&mut sink, record).unwrap();
         assert!(
             bytes.bytes().is_empty(),
             "a buffered record must not be on the destination yet"
         );
 
-        Sink::<TestDomain>::finish(&mut sink).unwrap();
+        Sink::<TestPayload>::finish(&mut sink).unwrap();
         assert_eq!(parse_lines(&bytes.bytes()), expected_lines()[..1]);
     }
 
@@ -1114,8 +951,8 @@ mod tests {
         // that gets to report it, and it must.
         let destination = UnflushableSink::default();
         let mut sink = JsonLines::new(destination.clone());
-        Sink::<TestDomain>::record(&mut sink, &sample()[0]).unwrap();
-        let error = Sink::<TestDomain>::finish(&mut sink).unwrap_err();
+        Sink::<TestPayload>::record(&mut sink, &sample()[0]).unwrap();
+        let error = Sink::<TestPayload>::finish(&mut sink).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::StorageFull);
         assert_eq!(*destination.0.lock().unwrap(), 1, "finish flushed once");
     }
@@ -1175,7 +1012,7 @@ mod tests {
 
     #[test]
     fn a_writer_with_no_sinks_drains_and_joins_cleanly() {
-        let (sender, writer) = Writer::spawn::<TestDomain>(Vec::new());
+        let (sender, writer) = Writer::spawn::<TestPayload>(Vec::new());
         play(sender, writer).unwrap();
     }
 }

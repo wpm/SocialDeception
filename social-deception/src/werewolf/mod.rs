@@ -52,8 +52,8 @@
 //! nothing.
 //!
 //! In the reinforcement-learning vocabulary of the design, a
-//! `crate::Message<WerewolfDomain>` — a runtime envelope carrying this
-//! module's [`Message`] — is the observation type, and the move a player's
+//! `crate::Message<Message>` — a runtime envelope carrying this module's
+//! [`Message`] — is the observation type, and the move a player's
 //! action carries is an [`ActorId`](crate::ActorId): the target inside the
 //! selection, not the selection itself. The set of targets the rules permit
 //! in a session is the *action space*, a `Vec<ActorId>` computed by the
@@ -133,8 +133,6 @@
 //! whatever reads a trajectory back; the payload's shape belongs to the
 //! environment alone.
 
-use crate::message::Domain;
-
 pub mod assignment;
 pub mod config;
 pub mod game;
@@ -148,23 +146,6 @@ pub mod seed;
 pub mod setup;
 pub mod strategy;
 pub mod transcript;
-
-/// Werewolf as a [`Domain`]: the types this game contributes to the
-/// runtime.
-///
-/// Its messages carry a [`Message`], and a player's reward is an integer,
-/// because a game of Werewolf is won or lost and nothing finer is scored.
-///
-/// The name is not `Werewolf`, which is the role a player may be dealt. A
-/// domain is the whole game; the role is one thing inside it, and the two
-/// would be hard to tell apart in a signature if they shared a name.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct WerewolfDomain;
-
-impl Domain for WerewolfDomain {
-    type Payload = Message;
-    type Reward = i32;
-}
 
 pub use assignment::Assignment;
 pub use config::{Config, ConfigError, RoleCounts};

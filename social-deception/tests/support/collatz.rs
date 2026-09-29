@@ -26,7 +26,7 @@
 //! Every value at every step is known in advance, so any difference between
 //! the trajectory an episode writes and the sequence computed independently
 //! is a bug in the runtime, not a model being unpredictable. That is what
-//! this ring is for: it is a second [`Domain`] beside Werewolf's, and a
+//! this ring is for: it is a second payload type beside Werewolf's, and a
 //! second [`Environment`] beside the moderator, which is what keeps the
 //! runtime honest about being generic, and the runtime's end-to-end test.
 
@@ -34,21 +34,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Serialize;
 use social_deception::{
-    Action, ActorId, Control, Domain, Effect, Environment, Handler, Observation, Timestamp,
+    Action, ActorId, Control, Effect, Environment, Handler, Observation, Timestamp,
 };
-
-/// The Collatz environment as a [`Domain`].
-///
-/// Its rewards are integers. Nothing assigns one yet: the type is named
-/// because a domain names both of a game's types, and a ring passing numbers
-/// around has no notion of winning to score.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct CollatzDomain;
-
-impl Domain for CollatzDomain {
-    type Payload = CollatzPayload;
-    type Reward = i32;
-}
 
 /// What Collatz agents say.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
@@ -147,7 +134,7 @@ impl Collatz {
     ///
     /// If the environment sends an agent a `Finished`, which is a message
     /// that only ever travels the other way.
-    fn reply(&self, observation: &Observation<CollatzDomain>) -> Vec<Action<CollatzDomain>> {
+    fn reply(&self, observation: &Observation<CollatzPayload>) -> Vec<Action<CollatzPayload>> {
         match observation.message.payload {
             // A chain that has reached 1 is over, and the environment is
             // the one that needs to know.
@@ -166,14 +153,14 @@ impl Collatz {
     }
 
     /// One step, addressed to the agent this one passes to.
-    fn pass(&self, step: CollatzPayload) -> Action<CollatzDomain> {
+    fn pass(&self, step: CollatzPayload) -> Action<CollatzPayload> {
         Action::to([self.to.clone()], step)
     }
 }
 
-impl Handler<CollatzDomain> for Collatz {
+impl Handler<CollatzPayload> for Collatz {
     /// Opens this agent's own chains, each at its starting value.
-    fn start(&mut self, _now: Timestamp) -> Vec<Action<CollatzDomain>> {
+    fn start(&mut self, _now: Timestamp) -> Vec<Action<CollatzPayload>> {
         self.opens
             .iter()
             .map(|&start| {
@@ -185,7 +172,7 @@ impl Handler<CollatzDomain> for Collatz {
             .collect()
     }
 
-    fn handle(&mut self, observation: &Observation<CollatzDomain>) -> Vec<Action<CollatzDomain>> {
+    fn handle(&mut self, observation: &Observation<CollatzPayload>) -> Vec<Action<CollatzPayload>> {
         self.reply(observation)
     }
 }
@@ -256,7 +243,7 @@ impl CollatzEnvironment {
 
     /// The one control that ends the episode, or nothing if chains are
     /// still running or the ring has already been stopped.
-    fn stop_if_done(&mut self) -> Vec<Effect<CollatzDomain>> {
+    fn stop_if_done(&mut self) -> Vec<Effect<i32, CollatzPayload>> {
         if self.done() && !self.stopped {
             self.stopped = true;
             vec![Effect::control(self.agents.clone(), Control::Stop)]
@@ -266,12 +253,12 @@ impl CollatzEnvironment {
     }
 }
 
-impl Environment<CollatzDomain> for CollatzEnvironment {
+impl Environment<i32, CollatzPayload> for CollatzEnvironment {
     /// Starts every agent of the ring, which is when they open their chains.
     ///
     /// A ring that opens nothing is over before it begins, and is stopped in
     /// the same cycle it is started.
-    fn start(&mut self, _now: Timestamp) -> Vec<Effect<CollatzDomain>> {
+    fn start(&mut self, _now: Timestamp) -> Vec<Effect<i32, CollatzPayload>> {
         let mut effects = vec![Effect::control(self.agents.clone(), Control::Start)];
         effects.extend(self.stop_if_done());
         effects
@@ -285,7 +272,10 @@ impl Environment<CollatzDomain> for CollatzEnvironment {
     ///
     /// If an agent sends the environment a step, which is a message that
     /// only ever travels around the ring.
-    fn handle(&mut self, observation: &Observation<CollatzDomain>) -> Vec<Effect<CollatzDomain>> {
+    fn handle(
+        &mut self,
+        observation: &Observation<CollatzPayload>,
+    ) -> Vec<Effect<i32, CollatzPayload>> {
         match observation.message.payload {
             CollatzPayload::Finished { chain } => self.finished(chain),
             CollatzPayload::Step { chain, value } => panic!(
@@ -308,7 +298,7 @@ mod tests {
 
     /// A step of chain `chain` observed by `a`. The times play no part in
     /// what an agent does with it, so one stand-in serves every test here.
-    fn observing(sender: &str, chain: u64, value: u64) -> Observation<CollatzDomain> {
+    fn observing(sender: &str, chain: u64, value: u64) -> Observation<CollatzPayload> {
         observation(sender, "a", CollatzPayload::Step { chain, value })
     }
 
@@ -317,7 +307,7 @@ mod tests {
         sender: &str,
         recipient: &str,
         payload: CollatzPayload,
-    ) -> Observation<CollatzDomain> {
+    ) -> Observation<CollatzPayload> {
         Observation {
             message: Message::new(sender, [recipient], Timestamp::default(), payload),
             received: Timestamp::default(),
@@ -325,7 +315,7 @@ mod tests {
     }
 
     /// A step of chain 27 observed by `a`.
-    fn step(sender: &str, value: u64) -> Observation<CollatzDomain> {
+    fn step(sender: &str, value: u64) -> Observation<CollatzPayload> {
         observing(sender, 27, value)
     }
 
@@ -333,16 +323,16 @@ mod tests {
     /// cycle has.
     fn sent(
         agent: &mut Collatz,
-        observation: &Observation<CollatzDomain>,
-    ) -> Vec<Action<CollatzDomain>> {
+        observation: &Observation<CollatzPayload>,
+    ) -> Vec<Action<CollatzPayload>> {
         agent.handle(observation)
     }
 
-    fn to_b(chain: u64, value: u64) -> Action<CollatzDomain> {
+    fn to_b(chain: u64, value: u64) -> Action<CollatzPayload> {
         Action::to(["b"], CollatzPayload::Step { chain, value })
     }
 
-    fn finished(chain: u64) -> Action<CollatzDomain> {
+    fn finished(chain: u64) -> Action<CollatzPayload> {
         Action::to([ENVIRONMENT], CollatzPayload::Finished { chain })
     }
 
@@ -441,22 +431,22 @@ mod tests {
 
     /// An agent's report that a chain has finished, as the environment
     /// observes it.
-    fn reports(who: &str, chain: u64) -> Observation<CollatzDomain> {
+    fn reports(who: &str, chain: u64) -> Observation<CollatzPayload> {
         observation(who, ENVIRONMENT, CollatzPayload::Finished { chain })
     }
 
-    fn start(agents: [&str; 2]) -> Effect<CollatzDomain> {
+    fn start(agents: [&str; 2]) -> Effect<i32, CollatzPayload> {
         Effect::control(agents, Control::Start)
     }
 
-    fn stop(agents: [&str; 2]) -> Effect<CollatzDomain> {
+    fn stop(agents: [&str; 2]) -> Effect<i32, CollatzPayload> {
         Effect::control(agents, Control::Stop)
     }
 
     fn folded(
         environment: &mut CollatzEnvironment,
-        observation: &Observation<CollatzDomain>,
-    ) -> Vec<Effect<CollatzDomain>> {
+        observation: &Observation<CollatzPayload>,
+    ) -> Vec<Effect<i32, CollatzPayload>> {
         environment.handle(observation)
     }
 

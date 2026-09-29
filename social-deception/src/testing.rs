@@ -13,11 +13,9 @@ use serde_json::Value;
 
 use crate::agent::Observation;
 use crate::clock::Timestamp;
-use crate::message::{ActorId, Domain, Message};
+use crate::message::{ActorId, Message, Payload};
 use crate::trajectory::{JsonLines, LogRecord, Policy, Sink, Writer};
-use crate::werewolf::{
-    self, Assignment, Faction, Knowledge, Narration, Phase, Role, Round, WerewolfDomain,
-};
+use crate::werewolf::{self, Assignment, Faction, Knowledge, Narration, Phase, Role, Round};
 
 pub(crate) use temp::TempDir;
 
@@ -30,16 +28,6 @@ pub(crate) const ME: &str = "me";
 pub(crate) enum TestPayload {
     /// A step, carrying its number.
     Step(u64),
-}
-
-/// The domain the runtime's own unit tests are written against, standing in
-/// for a game the runtime knows nothing about.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct TestDomain;
-
-impl Domain for TestDomain {
-    type Payload = TestPayload;
-    type Reward = i32;
 }
 
 /// A destination a test can read back after the writer has taken ownership
@@ -84,9 +72,9 @@ impl Write for Shared {
 
 /// A writer whose one required [`JsonLines`] sink writes to a buffer the
 /// test keeps, which is what a test that reads its trajectory back wants.
-pub(crate) fn recording<D: Domain>() -> (Sender<LogRecord<D>>, Writer, Shared) {
+pub(crate) fn recording<P: Payload>() -> (Sender<LogRecord<P>>, Writer, Shared) {
     let bytes = Shared::new();
-    let sink: Box<dyn Sink<D>> = Box::new(JsonLines::new(bytes.clone()));
+    let sink: Box<dyn Sink<P>> = Box::new(JsonLines::new(bytes.clone()));
     let (sender, writer) = Writer::spawn(vec![(sink, Policy::Required)]);
     (sender, writer, bytes)
 }
@@ -177,13 +165,13 @@ pub(crate) fn fast() -> crate::werewolf::config::Timing {
 /// Every werewolf unit test is a fold over what arrives, and the fold is a
 /// pure function of the payloads; the instant each message was created plays
 /// no part in it, so one stand-in time serves them all.
-pub(crate) fn from(sender: &str, payload: werewolf::Message) -> Message<WerewolfDomain> {
+pub(crate) fn from(sender: &str, payload: werewolf::Message) -> Message<werewolf::Message> {
     Message::new(sender, [ME], Timestamp::default(), payload)
 }
 
 /// A message as [`ME`] observes it, received at a time no test reads. Like
 /// the creation time in [`from`], it plays no part in any fold.
-pub(crate) fn observed(message: Message<WerewolfDomain>) -> Observation<WerewolfDomain> {
+pub(crate) fn observed(message: Message<werewolf::Message>) -> Observation<werewolf::Message> {
     Observation {
         message,
         received: Timestamp::default(),
@@ -191,7 +179,7 @@ pub(crate) fn observed(message: Message<WerewolfDomain>) -> Observation<Werewolf
 }
 
 /// A narration from the moderator to [`ME`].
-pub(crate) fn narrated(narration: Narration) -> Message<WerewolfDomain> {
+pub(crate) fn narrated(narration: Narration) -> Message<werewolf::Message> {
     from("moderator", werewolf::Message::Narration(narration))
 }
 
@@ -200,7 +188,7 @@ pub(crate) fn phase_began(
     round: u32,
     phase: Phase,
     living: BTreeSet<ActorId>,
-) -> Message<WerewolfDomain> {
+) -> Message<werewolf::Message> {
     narrated(Narration::PhaseBegan {
         round: Round::new(round),
         phase,
