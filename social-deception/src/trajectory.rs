@@ -146,7 +146,7 @@ pub enum Woken {
     Timeout,
 }
 
-/// The body of an `message` field: a message without its creation time, which
+/// The body of a `message` field: a message without its creation time, which
 /// the record carries at the top level instead.
 ///
 /// It is not a type of its own anywhere else. The creation time sits beside
@@ -779,7 +779,7 @@ mod tests {
     }
 
     #[test]
-    fn an_event_record_carries_its_creation_time_once_and_at_the_top() {
+    fn a_message_record_carries_its_creation_time_once_and_at_the_top() {
         // The message body is the sender, the recipients and the payload; the
         // instant it was created sits beside `seq`, where a reader joins on
         // it, and nowhere else.

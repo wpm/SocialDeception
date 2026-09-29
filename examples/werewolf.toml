@@ -14,7 +14,7 @@ players = ["alice", "bob", "carol", "dave", "erin", "frank", "grace"]
 # Where to write the trajectory. Optional: leave it out to write nothing.
 trajectory = "werewolf.jsonl"
 
-# The moderator's agent id. Optional, default "moderator". No player may
+# The moderator's actor id. Optional, default "moderator". No player may
 # share it.
 moderator = "moderator"
 

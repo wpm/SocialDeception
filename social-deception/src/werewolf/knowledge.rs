@@ -296,6 +296,11 @@ impl Knowledge {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Two types are called `Message`: this module's payload, which
+    // `super::*` brings in, and the runtime envelope that carries it.
+    // The envelope is named more often than the payload here, so it is
+    // the one that gets a short name.
+    use crate::Message as Envelope;
     use crate::testing::{ME, from, id, ids, narrated, observed, phase_began, target};
     use crate::werewolf::message::Select;
 
@@ -306,23 +311,18 @@ mod tests {
             .collect()
     }
 
-    fn assigned(role: Role, pack: BTreeSet<ActorId>) -> crate::Message<WerewolfDomain> {
+    fn assigned(role: Role, pack: BTreeSet<ActorId>) -> Envelope<WerewolfDomain> {
         narrated(Narration::Assigned { role, pack })
     }
 
-    fn investigated(target: &str, faction: Faction) -> crate::Message<WerewolfDomain> {
+    fn investigated(target: &str, faction: Faction) -> Envelope<WerewolfDomain> {
         narrated(Narration::Investigated {
             target: id(target),
             faction,
         })
     }
 
-    fn eliminated(
-        who: &str,
-        role: Role,
-        round: u32,
-        cause: Cause,
-    ) -> crate::Message<WerewolfDomain> {
+    fn eliminated(who: &str, role: Role, round: u32, cause: Cause) -> Envelope<WerewolfDomain> {
         narrated(Narration::Eliminated {
             who: id(who),
             role,
@@ -342,7 +342,7 @@ mod tests {
     /// A fresh state for this agent with every message folded in, in order.
     fn folded<'a>(
         role: Role,
-        messages: impl IntoIterator<Item = &'a crate::Message<WerewolfDomain>>,
+        messages: impl IntoIterator<Item = &'a Envelope<WerewolfDomain>>,
     ) -> Knowledge {
         let mut knowledge = Knowledge::new(id(ME), role);
         for message in messages {
@@ -363,7 +363,7 @@ mod tests {
 
     /// One player's nomination, forwarded by the moderator as the player
     /// that made it (ADR-0014).
-    fn nominated(who: &str, whom: &str, round: u32) -> crate::Message<WerewolfDomain> {
+    fn nominated(who: &str, whom: &str, round: u32) -> Envelope<WerewolfDomain> {
         from(
             who,
             Message::Select(Select {
@@ -376,7 +376,7 @@ mod tests {
     }
 
     /// A seer's whole game, from the deal to the werewolves' win.
-    fn a_seers_game() -> Vec<crate::Message<WerewolfDomain>> {
+    fn a_seers_game() -> Vec<Envelope<WerewolfDomain>> {
         vec![
             assigned(Role::Seer, BTreeSet::new()),
             phase_began(

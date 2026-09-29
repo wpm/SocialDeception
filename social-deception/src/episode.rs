@@ -476,8 +476,7 @@ enum Halt {
     /// An agent's thread has ended, or every agent's has; joining them says
     /// why.
     Departure,
-    /// A control message or a message could not be routed, or the episode
-    /// stalled.
+    /// A control or a message could not be routed, or the episode stalled.
     Error(EpisodeError),
 }
 

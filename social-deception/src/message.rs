@@ -352,7 +352,7 @@ mod tests {
     }
 
     #[test]
-    fn an_event_holds_its_recipients_in_canonical_order() {
+    fn a_message_holds_its_recipients_in_canonical_order() {
         // A message is written to a trajectory by `trajectory::Envelope`,
         // which is the only wire shape it has, so what is asserted here is
         // the set itself: the order the envelope will write.
@@ -362,7 +362,7 @@ mod tests {
     }
 
     #[test]
-    fn an_event_knows_when_it_was_created() {
+    fn a_message_knows_when_it_was_created() {
         let message = Message::<TestDomain>::new("a", ["b"], at(40), TestPayload::Step(7));
         assert_eq!(Created::created(&message), at(40));
     }
@@ -399,19 +399,19 @@ mod tests {
     }
 
     #[test]
-    fn agent_id_serializes_as_a_bare_string() {
+    fn actor_id_serializes_as_a_bare_string() {
         assert_eq!(json(&ActorId::new("alice")), serde_json::json!("alice"));
         assert_eq!(ActorId::new("alice").to_string(), "alice");
     }
 
     #[test]
-    fn agent_id_deserializes_from_a_bare_string() {
+    fn actor_id_deserializes_from_a_bare_string() {
         let id: ActorId = serde_json::from_value(serde_json::json!("alice")).unwrap();
         assert_eq!(id, ActorId::new("alice"));
     }
 
     #[test]
-    fn an_empty_agent_id_does_not_deserialize() {
+    fn an_empty_actor_id_does_not_deserialize() {
         let error = serde_json::from_value::<ActorId>(serde_json::json!("")).unwrap_err();
         assert!(error.to_string().contains("non-empty actor id"), "{error}");
         // Inside a collection too, since that is where a reader meets it.

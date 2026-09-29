@@ -500,13 +500,13 @@ fn message(
     direction: Direction,
     line: usize,
 ) -> Result<Record, TranscriptError> {
-    let message = record
+    let envelope = record
         .get("message")
         .and_then(Value::as_object)
         .ok_or_else(|| malformed(line, "no message"))?;
-    let sender: ActorId = decode(message, "sender", line)?;
-    let recipients: BTreeSet<ActorId> = decode(message, "recipients", line)?;
-    let payload = message
+    let sender: ActorId = decode(envelope, "sender", line)?;
+    let recipients: BTreeSet<ActorId> = decode(envelope, "recipients", line)?;
+    let payload = envelope
         .get("payload")
         .ok_or_else(|| malformed(line, "no payload"))?;
     let message = Message::deserialize(payload)
@@ -1543,7 +1543,7 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_agent_id_is_an_error_wherever_it_appears() {
+    fn an_empty_actor_id_is_an_error_wherever_it_appears() {
         // `ActorId` refuses to deserialize from the empty string, so an
         // empty id in the envelope is a malformed envelope and one in the
         // payload is a payload that is not a Werewolf message, each naming

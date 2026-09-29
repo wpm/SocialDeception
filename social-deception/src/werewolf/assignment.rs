@@ -120,7 +120,7 @@ impl Assignment {
         &self.pack
     }
 
-    /// Every player with its role, in agent-id order.
+    /// Every player with its role, in actor-id order.
     pub fn players(&self) -> impl Iterator<Item = (&ActorId, Role)> {
         self.roles.iter().map(|(who, role)| (who, *role))
     }

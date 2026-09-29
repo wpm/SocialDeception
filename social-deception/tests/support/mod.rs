@@ -730,7 +730,7 @@ mod tests {
     /// run that has already failed; on every other path it holds a stop
     /// back until nothing is in flight, and the stop arrives to an empty
     /// queue.
-    fn stopped_behind_an_event() -> Vec<Value> {
+    fn stopped_behind_a_message() -> Vec<Value> {
         vec![
             json!({"type": "control", "agent": "a", "seq": 0, "created": 10, "received": 30,
                    "control": "start"}),
@@ -758,11 +758,11 @@ mod tests {
     }
 
     #[test]
-    fn a_stop_reached_behind_an_event_passes() {
+    fn a_stop_reached_behind_a_message_passes() {
         // The answer to the message was sent, not withheld, and `b` observed
         // it: an agent stopped this way did the work queued ahead of the
         // stop, and the trajectory says so on both sides.
-        check(&stopped_behind_an_event());
+        check(&stopped_behind_a_message());
     }
 
     #[test]
@@ -773,7 +773,7 @@ mod tests {
         // — is gone with preemption itself (ADR-0009), so a control stamped
         // later than `t_start` is simply an input that was not popped when
         // it claims to have been.
-        let mut lines = stopped_behind_an_event();
+        let mut lines = stopped_behind_a_message();
         lines[5]["received"] = json!(81);
         check(&lines);
     }
@@ -789,7 +789,7 @@ mod tests {
     fn a_cycle_after_an_agents_stop_is_caught() {
         // A whole cycle after the one that popped the stop: the agent kept
         // running after it was told to stop.
-        let mut lines = stopped_behind_an_event();
+        let mut lines = stopped_behind_a_message();
         lines.insert(
             7,
             json!({"type": "cycle", "agent": "a", "t_start": 90, "t_stop": 91,
@@ -806,7 +806,7 @@ mod tests {
         // that the check has left to catch. The rest of the trajectory is
         // dropped, since a trajectory that ends at the stop is what the
         // other check already asserts.
-        let mut lines = stopped_behind_an_event()[..2].to_vec();
+        let mut lines = stopped_behind_a_message()[..2].to_vec();
         lines[0]["control"] = json!("stop");
         lines.insert(
             1,
@@ -982,7 +982,7 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "observed only by its recipients")]
-    fn an_event_delivered_to_a_non_recipient_is_caught() {
+    fn a_message_delivered_to_a_non_recipient_is_caught() {
         check(&edited(1, |line| {
             line["message"]["recipients"] = json!(["c"]);
         }));

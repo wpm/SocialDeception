@@ -3,12 +3,11 @@
 //! a pure state machine.
 //!
 //! The vocabulary is the [`Role`]s a player can be dealt, the [`Faction`]s
-//! they play for, the [`Round`] and [`Phase`] that locate a moment in a
-//! game, and [`Message`], the one payload type a runtime
-//! [`Message`](crate::Message) carries between the moderator and the
-//! players. The only facts it states are properties of a session kind
-//! itself, such as which phase it belongs to; every rule that depends on
-//! who is alive lives with the moderator and the roles, not here.
+//! they play for, the [`Round`] and [`Phase`] that locate a moment in a game,
+//! and [`Message`], the one payload type that travels between the moderator
+//! and the players. The only facts it states are properties of a session kind
+//! itself, such as which phase it belongs to; every rule that depends on who
+//! is alive lives with the moderator and the roles, not here.
 //!
 //! Two types are called `Message`, and the module path tells them apart:
 //! unqualified within `werewolf` it is this game's payload, and the
@@ -155,8 +154,7 @@ pub mod transcript;
 /// Werewolf as a [`Domain`]: the types this game contributes to the
 /// runtime.
 ///
-/// Its messages carry a [`Message`] — this module's payload, not the
-/// runtime envelope of the same name — and a player's reward is an integer,
+/// Its messages carry a [`Message`], and a player's reward is an integer,
 /// because a game of Werewolf is won or lost and nothing finer is scored.
 ///
 /// The name is not `Werewolf`, which is the role a player may be dealt. A

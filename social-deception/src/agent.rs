@@ -1646,7 +1646,7 @@ mod tests {
     }
 
     #[test]
-    fn a_cycle_takes_one_event_and_leaves_the_rest() {
+    fn a_cycle_takes_one_message_and_leaves_the_rest() {
         // Three messages are waiting before the agent is even spawned, so
         // nothing about the scheduler decides what it finds: one cycle
         // could have had all three. It takes them one at a time, in queue
@@ -1716,7 +1716,7 @@ mod tests {
     }
 
     #[test]
-    fn an_event_arriving_mid_cycle_waits_for_a_cycle_of_its_own() {
+    fn a_message_arriving_mid_cycle_waits_for_a_cycle_of_its_own() {
         let (rig, busy, release) = gated();
         rig.start();
         // The start's cycle observes nothing, so it never enters the
@@ -2017,7 +2017,7 @@ mod tests {
     }
 
     #[test]
-    fn a_handler_deadline_that_passed_while_an_event_waited_calls_handle() {
+    fn a_handler_deadline_that_passed_while_a_message_waited_calls_handle() {
         // ADR-0008 is unchanged by ADR-0010: a deadline that passes while a
         // message is waiting joins that message's cycle, which observes. The
         // record still says the deadline woke it, which is why a handler
@@ -2454,7 +2454,7 @@ mod tests {
     }
 
     #[test]
-    fn a_stop_queued_behind_many_events_is_reached_behind_them() {
+    fn a_stop_queued_behind_many_messages_is_reached_behind_them() {
         // Everything is queued before the agent is spawned, so the order is
         // the queue's doing and nothing else: twenty messages went on the
         // wire first and the stop last. With one queue that is what the
@@ -2537,7 +2537,7 @@ mod tests {
     }
 
     #[test]
-    fn a_cycle_takes_the_controls_at_the_head_before_the_event_behind_them() {
+    fn a_cycle_takes_the_controls_at_the_head_before_the_message_behind_them() {
         // One queue still does not mean one thing per cycle. A start and a
         // message waiting together are one cycle: the start hook runs first,
         // and the message is observed after it, which is the order they were

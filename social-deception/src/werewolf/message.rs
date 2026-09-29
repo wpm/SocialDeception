@@ -1,9 +1,5 @@
 //! Everything said in a Werewolf episode: the [`Message`] payload and the
 //! vocabulary of rounds, phases, sessions and targets it is built from.
-//!
-//! The [`Message`] here is this game's payload. The runtime's envelope,
-//! which carries one between actors, is [`crate::Message`]; the two are
-//! told apart by the module path.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -378,7 +374,7 @@ mod tests {
     }
 
     #[test]
-    fn a_selection_names_its_session_and_a_bare_agent_id() {
+    fn a_selection_names_its_session_and_a_bare_actor_id() {
         // A target is an agent and nothing else: no move wraps it, and
         // nothing means "nobody" (ADR-0011). The session is the round and
         // the kind, which both sides derive rather than correlate by an
@@ -395,7 +391,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_id_serializes_as_a_bare_string_and_deserializes_from_one() {
+    fn actor_id_serializes_as_a_bare_string_and_deserializes_from_one() {
         let alice = ActorId::new("alice");
         assert_eq!(json(&alice), json!("alice"));
         let back: ActorId = serde_json::from_value(json!("alice")).unwrap();

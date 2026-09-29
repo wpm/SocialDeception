@@ -386,7 +386,7 @@ mod tests {
     }
 
     /// The message of a delivery, or a panic saying what it was instead.
-    fn as_event(delivery: &Delivery<TestDomain>) -> &Message<TestDomain> {
+    fn as_message(delivery: &Delivery<TestDomain>) -> &Message<TestDomain> {
         match delivery {
             Delivery::Message(message) => message,
             other @ Delivery::Control { .. } => panic!("expected a message: {other:?}"),
@@ -411,7 +411,7 @@ mod tests {
     }
 
     #[test]
-    fn an_event_is_copied_to_each_recipient_and_nobody_else() {
+    fn a_message_is_copied_to_each_recipient_and_nobody_else() {
         let (router, queues) = world(&["a", "b", "c"]);
         let sent = message("a", ["b", "c"], 7);
         assert_eq!(router.route(&sent), Ok(2));
@@ -438,7 +438,7 @@ mod tests {
         let sent = Message::new("a", ["b"], created, TestPayload::Step(1));
         router.route(&sent).unwrap();
         let delivered = queues[&id("b")].try_recv().unwrap();
-        assert_eq!(as_event(&delivered).created, created);
+        assert_eq!(as_message(&delivered).created, created);
     }
 
     #[test]
@@ -591,7 +591,7 @@ mod tests {
     }
 
     #[test]
-    fn events_and_controls_share_one_queue_in_the_order_they_were_sent() {
+    fn messages_and_controls_share_one_queue_in_the_order_they_were_sent() {
         // One queue per agent, so a control takes its place behind whatever
         // was sent to that agent before it (ADR-0009). The router does no
         // reordering: getting a stop to an agent with an empty queue is the
@@ -604,7 +604,7 @@ mod tests {
 
         let delivered: Vec<Delivery<TestDomain>> = queues[&id("b")].try_iter().collect();
         assert_eq!(delivered.len(), 3);
-        assert_eq!(as_event(&delivered[0]).payload, TestPayload::Step(1));
+        assert_eq!(as_message(&delivered[0]).payload, TestPayload::Step(1));
         assert!(
             matches!(
                 delivered[1],
@@ -615,7 +615,7 @@ mod tests {
             ),
             "the stop is second, where it was sent: {delivered:?}"
         );
-        assert_eq!(as_event(&delivered[2]).payload, TestPayload::Step(2));
+        assert_eq!(as_message(&delivered[2]).payload, TestPayload::Step(2));
     }
 
     #[test]
