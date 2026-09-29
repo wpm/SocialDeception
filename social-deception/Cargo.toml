@@ -7,16 +7,10 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 publish.workspace = true
-# `cargo run` with no `--bin` runs this one.
-default-run = "social-deception"
 
 [lib]
 name = "social_deception"
 path = "src/lib.rs"
-
-[[bin]]
-name = "social-deception"
-path = "src/main.rs"
 
 [[bin]]
 name = "werewolf"

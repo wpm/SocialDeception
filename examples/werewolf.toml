@@ -2,7 +2,7 @@
 #
 # Run it with:
 #
-#     cargo run --bin werewolf -- play examples/werewolf.toml
+#     cargo run -- play examples/werewolf.toml
 
 # The master seed. Every generator in the episode is derived from it, so a
 # run is reproducible from this file alone.

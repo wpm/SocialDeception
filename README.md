@@ -43,7 +43,7 @@ uniform random policy, and writes the trajectory beside the configuration
 that reproduces it. The example at `examples/werewolf.toml` is a
 seven-player game:
 
-    cargo run --bin werewolf -- play examples/werewolf.toml
+    cargo run -- play examples/werewolf.toml
 
 That narrates the game as it happens, a line per thing that is said —
 the time, who said it, who heard it, and what it was — and then prints
@@ -57,7 +57,7 @@ It also writes `werewolf.jsonl`, the trajectory, and `werewolf.jsonl.toml`,
 the effective configuration, at the repository root, where both are
 ignored by git. To read the game back:
 
-    cargo run --bin werewolf -- replay werewolf.jsonl
+    cargo run -- replay werewolf.jsonl
 
 That renders the logical game the trajectory records — the deal, each
 round's moves and deaths, and who won — and ends with the reward every
@@ -66,7 +66,7 @@ was never said to anybody.
 
 and to play it again from what it left behind, whatever flags produced it:
 
-    cargo run --bin werewolf -- play werewolf.jsonl.toml --trajectory rerun.jsonl
+    cargo run -- play werewolf.jsonl.toml --trajectory rerun.jsonl
 
 `--seed` overrides the configuration's seed. `--help` on either command
 lists the rest.

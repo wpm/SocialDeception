@@ -10,7 +10,7 @@ target
 *.pdb
 
 # Trajectories and their effective configs, as written at the repository
-# root by the example: `cargo run --bin werewolf -- play examples/werewolf.toml`
+# root by the example: `cargo run -- play examples/werewolf.toml`
 /*.jsonl
 /*.jsonl.toml
 
