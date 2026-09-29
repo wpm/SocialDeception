@@ -1,5 +1,6 @@
 //! Werewolf's own invariants: what the log of a game of Werewolf
-//! satisfies beyond what [`super::check`] asserts of any log.
+//! satisfies beyond what [`super::actor::check`] asserts of any log of an
+//! [`actor`](social_deception::actor) runtime episode.
 //!
 //! The checks are written against the parsed lines, the way the runtime's own
 //! checks are, and read the game the way the transcript reader does: from the
@@ -129,8 +130,8 @@ struct Play<'a> {
 /// Asserts everything the log of a game played from `config` must
 /// satisfy; see the [module documentation](self).
 ///
-/// Run [`super::check`] first: these checks assume the moderator's records
-/// are in sequence order and that every message names its recipients.
+/// Run [`super::actor::check`] first: these checks assume the moderator's
+/// records are in sequence order and that every message names its recipients.
 ///
 /// # Panics
 ///
@@ -265,6 +266,9 @@ fn forwards_of<'a>(
             Message::Select(_) => {
                 panic!("the moderator relays a selection rather than sending one: {line}")
             }
+            Message::Reminder(_) => panic!(
+                "a reminder is logged where it arrives and not where it is set (ADR-0016): {line}"
+            ),
         })
         .map(|(at, line, envelope)| {
             assert_eq!(
@@ -317,6 +321,55 @@ fn leaders(votes: &BTreeMap<ActorId, ActorId>) -> BTreeSet<ActorId> {
         .collect()
 }
 
+/// Every selection the moderator heard, in file order.
+///
+/// The moderator hears two things: selections from players, and the reminders
+/// it set for itself, which arrive as ordinary messages from itself
+/// (ADR-0016). Its own reminders are its clocks running and say nothing about
+/// the game, so they are checked to be its own and then dropped; everything
+/// else is a selection or the log is wrong.
+fn heard_by<'a>(
+    lines: &'a [Value],
+    config: &'a Config,
+    players: &BTreeSet<&ActorId>,
+) -> Vec<Heard<'a>> {
+    records_of(lines, &config.moderator, "observation")
+        .filter_map(|(at, line)| {
+            let from = ActorId::deserialize(&line["message"]["sender"]).unwrap();
+            let selection = match message(line) {
+                Message::Select(selection) => selection,
+                Message::Reminder(_) => {
+                    assert_eq!(
+                        from, config.moderator,
+                        "a reminder is always self-directed: {line}"
+                    );
+                    assert_eq!(
+                        recipients(line),
+                        [config.moderator.clone()]
+                            .into_iter()
+                            .collect::<BTreeSet<ActorId>>(),
+                        "a reminder is addressed to the actor that set it and nobody else: {line}"
+                    );
+                    return None;
+                }
+                other => panic!(
+                    "the moderator hears selections and its own reminders, not {other:?}: {line}"
+                ),
+            };
+            assert!(
+                players.contains(&from),
+                "the moderator hears only from players: {line}"
+            );
+            Some(Heard {
+                at,
+                from,
+                selection,
+                line,
+            })
+        })
+        .collect()
+}
+
 impl<'a> Play<'a> {
     /// Reads the moderator's records out of `lines` and the facts the
     /// checks need out of them.
@@ -336,7 +389,7 @@ impl<'a> Play<'a> {
             // caught one.
             .filter_map(|(at, line)| match message(line) {
                 Message::Narration(narration) => Some((at, line, narration)),
-                Message::Relayed(_) | Message::Select(_) => None,
+                Message::Relayed(_) | Message::Select(_) | Message::Reminder(_) => None,
             })
             .map(|(at, line, narration)| {
                 let to = recipients(line);
@@ -352,24 +405,7 @@ impl<'a> Play<'a> {
                 }
             })
             .collect();
-        let heard: Vec<Heard> = records_of(lines, &config.moderator, "observation")
-            .map(|(at, line)| {
-                let Message::Select(selection) = message(line) else {
-                    panic!("the moderator hears only selections: {line}");
-                };
-                let from = ActorId::deserialize(&line["message"]["sender"]).unwrap();
-                assert!(
-                    players.contains(&from),
-                    "the moderator hears only from players: {line}"
-                );
-                Heard {
-                    at,
-                    from,
-                    selection,
-                    line,
-                }
-            })
-            .collect();
+        let heard = heard_by(lines, config, &players);
 
         let mut phases = Vec::new();
         let mut roles = Vec::new();
@@ -699,8 +735,8 @@ impl<'a> Play<'a> {
                     );
                     outcomes += 1;
                 }
-                Message::Select(_) | Message::Relayed(_) => {
-                    unreachable!("a relayed selection is not among the moderator's own words")
+                Message::Select(_) | Message::Relayed(_) | Message::Reminder(_) => {
+                    unreachable!("a relay and a reminder are not among the moderator's own words")
                 }
             }
         }
@@ -823,7 +859,7 @@ impl<'a> Play<'a> {
                     living,
                 }) => phases.began(said, *round, *phase, living),
                 Message::Narration(narration) => phases.narrated(said, narration),
-                Message::Select(_) | Message::Relayed(_) => {
+                Message::Select(_) | Message::Relayed(_) | Message::Reminder(_) => {
                     unreachable!("`said` is the moderator's narrations alone")
                 }
             }
@@ -1745,10 +1781,22 @@ mod tests {
         // ADR-0015 a relay is the only thing the moderator says about one.
         // dave and erin are the pack; alice is a villager, and a devour
         // passed on to her tells her both that somebody is being eaten and,
-        // by the envelope, that dave is a wolf.
+        // by the envelope, which of the two is a wolf.
+        //
+        // Who the relay really went to is left alone and alice is added, so
+        // that the only thing wrong with the line is the villager among its
+        // recipients: naming a fixed pair would risk naming the wolf whose
+        // selection it is, which a different check catches first.
         let mut lines = fixture();
         let index = find(&lines, "moderator", "action", relay_in(1, "Devour"));
-        recipients(&mut lines[index], &["alice", "erin"]);
+        let mut to: Vec<String> = lines[index]["message"]["recipients"]
+            .as_array()
+            .expect("a relay lists its recipients")
+            .iter()
+            .map(|who| who.as_str().expect("an id is a string").to_owned())
+            .collect();
+        to.push("alice".to_owned());
+        lines[index]["message"]["recipients"] = json!(to);
         check(&lines, &config());
     }
 
@@ -2119,7 +2167,7 @@ mod tests {
             .max()
             .expect("somebody is stopped");
         lines[index]["t"] = json!(end + 1);
-        super::super::check(&lines);
+        super::super::actor::check(&lines);
     }
 
     #[test]
@@ -2153,7 +2201,7 @@ mod tests {
             late > 0,
             "the fixture should hold a player stopped before it was paid"
         );
-        super::super::check(&lines);
+        super::super::actor::check(&lines);
     }
 
     #[test]

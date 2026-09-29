@@ -172,7 +172,7 @@ pub(crate) fn check_reward(line: &Value) {
 /// left to have produced it. The check is on the times and not on file
 /// order, because a reward is written by the environment's thread and its
 /// line lands wherever the writer took it.
-fn check_rewards_precede_their_stop(lines: &[Value]) {
+pub(crate) fn check_rewards_precede_their_stop(lines: &[Value]) {
     let Some(end) = lines
         .iter()
         .filter(|line| line["type"] == "control" && line["control"] == "stop")

@@ -464,10 +464,12 @@ impl Game {
     /// The earliest instant at which [`expire`](Self::expire) would close
     /// something, or `None` when no session is open.
     ///
-    /// This is what the moderator hands
-    /// [`Handler::deadline`](crate::Handler::deadline): the minimum over the
-    /// open sessions of each one's hard limit and, for a night session whose
-    /// members have all selected, the end of its quiet period.
+    /// This is what the moderator sets its next
+    /// [`Reminder`](crate::actor::Reminder) for: the minimum over the open
+    /// sessions of each one's hard limit and, for a night session whose
+    /// members have all selected, the end of its quiet period. The moderator
+    /// reads it after every observation, because any selection may have moved
+    /// it in.
     #[must_use]
     pub fn next_deadline(&self) -> Option<Instant> {
         if self.outcome.is_some() {
@@ -476,11 +478,30 @@ impl Game {
         self.sessions.iter().map(Session::deadline).min()
     }
 
-    /// Which phase of which round the game is in, for a test that has to
-    /// tell one phase's directives from the next.
-    #[cfg(test)]
+    /// The shortest quiet period any of this game's night sessions runs on.
+    ///
+    /// It is what the moderator measures its farewell interval against: a
+    /// configuration that sets a quiet period of *q* is asserting that *q* is
+    /// long enough for a player to be scheduled and answer, since a player that
+    /// takes longer than *q* to be heard has already lost its selections. The
+    /// day has no quiet period and so has no say in it.
     #[must_use]
-    pub(crate) fn phase_now(&self) -> (Phase, Round) {
+    pub fn shortest_quiet_period(&self) -> Duration {
+        self.timing
+            .pack
+            .quiet
+            .min(self.timing.seer.quiet)
+            .min(self.timing.doctor.quiet)
+    }
+
+    /// Which phase of which round the game is in.
+    ///
+    /// The moderator reads it to say which phase's clocks a reminder it is
+    /// setting was set for, which is provenance in the log and nothing the
+    /// game reads back (see [`Look`](super::message::Look)). A test reads it
+    /// to tell one phase's directives from the next.
+    #[must_use]
+    pub const fn phase_now(&self) -> (Phase, Round) {
         (self.phase, self.round)
     }
 

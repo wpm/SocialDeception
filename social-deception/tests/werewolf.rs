@@ -2,9 +2,10 @@
 //!
 //! Each test plays real episodes, with the log going to a file, reads
 //! the file back, and checks it against two sets of invariants: the ones in
-//! [`support`] that every log satisfies whatever the environment,
-//! unchanged, and Werewolf's own in [`support::werewolf`]. The first set is
-//! run on every log produced here; if it ever needed changing to
+//! [`support::actor`] that every log of an
+//! [`actor`](social_deception::actor) runtime episode satisfies whatever the
+//! game, unchanged, and Werewolf's own in [`support::werewolf`]. The first
+//! set is run on every log produced here; if it ever needed changing to
 //! accommodate Werewolf, Werewolf would be doing something the runtime does
 //! not intend.
 //!
@@ -137,7 +138,7 @@ fn town(seed: u64) -> Config {
 /// invariant it breaks.
 fn read(path: &Path, config: &Config) -> Transcript {
     let lines = support::parse(&fs::read(path).unwrap());
-    support::check(&lines);
+    support::actor::check(&lines);
     support::werewolf::check(&lines, config);
     Transcript::read(&lines, &config.moderator).unwrap()
 }

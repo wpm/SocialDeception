@@ -81,6 +81,26 @@ pub enum Message {
     /// player may send more than one in the same session; its latest is its
     /// vote (ADR-0011).
     Select(Select),
+    /// Moderator to itself: a session's clock may have run out, so look.
+    ///
+    /// This is the moderator's private payload, the one nobody else ever
+    /// sends and the one nobody else ever receives: a
+    /// [`Reminder`](crate::actor::Reminder) is always self-directed
+    /// (ADR-0016), and the moderator is the only actor in this game that
+    /// keeps a clock. It replaces the old runtime's `deadline`/`timeout`
+    /// pair: instead of telling the loop when to wake it, the moderator
+    /// reminds itself, and when the reminder arrives it asks the game what
+    /// that instant closed (ADR-0018).
+    ///
+    /// **A reminder for a limit that has since moved is ignored, and nothing
+    /// is cancelled.** Reminders accumulate and each fires once, so a night
+    /// session whose quiet period restarted has a reminder outstanding for
+    /// the limit it no longer has; when that one arrives the game finds
+    /// nothing expired and says nothing. What the payload carries is
+    /// therefore not authority but provenance: which phase of which round
+    /// the moderator set it in, so a reader of the log can tell one
+    /// reminder from another.
+    Reminder(Look),
     /// Moderator to the players who should see it: a selection a player made,
     /// in the envelope that names who made it.
     ///
@@ -92,6 +112,38 @@ pub enum Message {
     /// log joins the relay back to the player's own action record on the
     /// envelope's `(from, seq)`.
     Relayed(Envelope<Select>),
+}
+
+/// Why the moderator reminded itself to look.
+///
+/// Two kinds, and the difference matters, because reminders **accumulate** and
+/// a game ends with several outstanding (ADR-0016):
+///
+/// - a [`Session`](Look::Session) reminder asks the moderator to check its
+///   clocks. Which phase it names is provenance and nothing else: what a
+///   reminder closes is decided by asking
+///   [`Game::expire`](super::Game::expire) with the instant the reminder
+///   *arrived*, so a reminder set for a deadline that has since moved arrives,
+///   closes nothing, and is forgotten;
+/// - a [`Farewell`](Look::Farewell) reminder is the one the moderator sets
+///   after announcing the outcome, and the one whose arrival **stops
+///   everybody**. It has to be told apart from a session reminder rather than
+///   recognized by arriving after the outcome, because the stale session
+///   reminders still on the timer when the game ends arrive after the outcome
+///   too — and one of them arriving first would cut the farewell's wait short,
+///   which is the wait the survivors' last narration depends on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Look {
+    /// Check whether a session's clock has run out.
+    Session {
+        /// The round whose clocks the moderator was watching when it set it.
+        round: Round,
+        /// Which half of that round.
+        phase: Phase,
+    },
+    /// The game is over and its last narrations have had time to arrive: stop
+    /// everybody.
+    Farewell,
 }
 
 /// A true statement from the moderator to the players it is addressed to.

@@ -22,7 +22,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde_json::Value;
 
-use super::{agent, check_reward, check_the_header, message, seq, time};
+use super::{
+    agent, check_reward, check_rewards_precede_their_stop, check_the_header, message, seq, time,
+};
 
 /// Every record kind an actor-runtime log holds.
 const KINDS: [&str; 8] = [
@@ -54,6 +56,9 @@ const KINDS: [&str; 8] = [
 /// - nothing follows an actor's `Stop` in its records but the cycle its
 ///   handler was in the middle of, what that cycle yielded as `unsent`, and
 ///   what the stop left `undelivered`;
+/// - every reward is logged before the episode's last stop, which is the one
+///   bound on a reward that survives ADR-0012: an actor stopped mid-episode
+///   is still paid at the end, after its own records have closed;
 /// - every observation joins exactly one action by `(from, seq)`, and every
 ///   action's recipient either observed it or has it as `undelivered`.
 ///
@@ -75,6 +80,7 @@ pub fn check(lines: &[Value]) {
         }
     }
     check_sequence_numbers(lines);
+    check_rewards_precede_their_stop(lines);
     check_cycles_bracket_their_observations(lines);
     check_nothing_follows_a_stop(lines);
     check_the_join(lines);
@@ -258,18 +264,31 @@ fn check_cycles_bracket_their_observations(lines: &[Value]) {
 /// The numbers are **everything its handler yielded**, whether or not it was
 /// carried out: an actor that was stopped mid-call still decided, and the
 /// `unsent` records carry the numbers it decided under, so the sequence stays
-/// dense. What is *not* numbered here is a reminder that was never observed —
-/// it is one of the `undelivered` records, and it carries the number it was
-/// given when it was set, which is one of the sender's own.
+/// dense.
+///
+/// A **reminder** is the awkward one, because it is numbered where it is set
+/// and logged somewhere else (ADR-0016): as an `observation` if it fired, as
+/// an `undelivered` if a `Stop` preempted it, and as an `unsent` if it was
+/// yielded after the stop. Each of the three carries the number the reminder
+/// was given, and all three belong to the setter's own sequence, so all three
+/// are counted here. A reminder never produces an `action` record at all,
+/// which is why counting actions alone would find a hole wherever one was
+/// set.
+///
+/// A *message's* observation is somebody else's number and is not counted;
+/// what tells the two apart is the sender, which for a reminder is the actor
+/// itself.
 fn check_sequence_numbers(lines: &[Value]) {
-    // Everything an actor sent, in send order. `action` and `unsent` are the
-    // two ends of one decision; an `undelivered` reminder is the actor's own
-    // message too, and its number belongs to the same sequence.
+    // Everything an actor decided, by the number it decided under. `action`
+    // and `unsent` are the two ends of one decision. A reminder is its
+    // setter's own message wherever it turns up, and its number belongs to
+    // the same sequence.
     let mut sent: HashMap<&str, Vec<u64>> = HashMap::new();
     for line in lines.iter().filter(|line| {
         line["type"] == "action"
             || line["type"] == "unsent"
-            || (line["type"] == "undelivered" && is_a_reminder(line))
+            || ((line["type"] == "undelivered" || line["type"] == "observation")
+                && is_a_reminder(line))
     }) {
         sent.entry(message(line).0).or_default().push(seq(line));
     }

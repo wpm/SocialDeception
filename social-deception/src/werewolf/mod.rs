@@ -21,15 +21,16 @@
 //! The rules live in [`Game`] ([`game`]), which takes an [`Assignment`] and
 //! plays the game as a fold over players' responses, producing
 //! [`Directive`]s that say what to tell whom. The [`Moderator`]
-//! ([`moderator`]) is the agent that runs a game: the thin
-//! [`Environment`](crate::Environment) that folds the observations it pops
-//! into the game, sends the directives as messages, and — being the
-//! episode's environment — starts the players when it begins and stops them
-//! when the game is over.
+//! ([`moderator`]) is the actor that runs a game: the thin
+//! [`Step`](crate::actor::Step) that folds each observation into the game,
+//! sends the directives as messages, sets the reminders its sessions' clocks
+//! call for, and — being the episode's environment — starts the players when
+//! it begins and stops everybody, itself included, when the game is over.
 //!
 //! The seam with the runtime is [`setup`]: [`episode`] builds a populated
-//! [`Episode`](crate::Episode) from a [`Config`], seating every player and
-//! the moderator, and [`run`] runs one to its [`Outcome`] or a [`RunError`].
+//! [`Episode`](crate::actor::Episode) from a [`Config`], seating every player
+//! and the moderator, and [`run`] runs one to its [`Outcome`] or a
+//! [`RunError`].
 //! The `werewolf` binary's `play` is that, with the effective configuration
 //! written beside the log.
 //!
@@ -152,11 +153,11 @@ pub use config::{Config, ConfigError, RoleCounts};
 pub use game::{Directive, Game};
 pub use knowledge::{Death, Knowledge, Phased};
 pub use live::Text;
-pub use message::{Cause, Message, Narration, Outcome, Phase, Round, Select, SessionKind};
+pub use message::{Cause, Look, Message, Narration, Outcome, Phase, Round, Select, SessionKind};
 pub use moderator::Moderator;
 pub use player::Player;
 pub use role::{Faction, Role};
 pub use seed::seed_for;
-pub use setup::{RunError, episode, run};
+pub use setup::{RunError, episode, limit, run};
 pub use strategy::{RandomStrategy, Strategy, View};
 pub use transcript::{PhaseRecord, RoundRecord, Transcript, TranscriptError};
