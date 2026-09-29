@@ -74,11 +74,12 @@ use std::fmt;
 use std::panic::{self, AssertUnwindSafe};
 
 use crossbeam_channel::{Receiver, Sender, select, unbounded};
+use serde::Serialize;
 
 use crate::agent::{self, Action, Agent, CycleDispatch, Handler, Observation, Wiring};
 use crate::clock::{Clock, Timestamp};
-use crate::environment::{Adapter, Commanded, Environment, Rewarded};
-use crate::message::{ActorId, Control, Delivery, Domain};
+use crate::environment::{Adapter, Commanded, Environment, Refusal, Rewarded};
+use crate::message::{ActorId, Control, Delivery, Payload};
 use crate::router::{Queues, RouteError, Router};
 use crate::trajectory::LogRecord;
 
@@ -143,6 +144,13 @@ pub enum EpisodeError {
     /// question — [`Agents`](Self::Agents) reports that when it did, and
     /// this reports the departure when it did not.
     Departed,
+    /// The environment assigned a reward that would not serialize, so
+    /// there was no record to write for the agent named.
+    ///
+    /// The reward type is the game's, and one the log cannot hold makes
+    /// every reward of that type unloggable, so the episode fails rather
+    /// than finishing with a trajectory that is silently missing them.
+    Reward(ActorId),
     /// Some agents' threads did not end cleanly, and why.
     Agents(Vec<(ActorId, Failure)>),
 }
@@ -152,6 +160,9 @@ impl fmt::Display for EpisodeError {
         match self {
             Self::DuplicateAgent(id) => write!(f, "agent {id} is in the roster twice"),
             Self::Control(error) => write!(f, "could not deliver a control: {error}"),
+            Self::Reward(agent) => {
+                write!(f, "the reward for {agent} could not be serialized")
+            }
             Self::Route { agent, error } => {
                 write!(
                     f,
@@ -181,9 +192,11 @@ impl Error for EpisodeError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Control(error) | Self::Route { error, .. } => Some(error),
-            Self::DuplicateAgent(_) | Self::Stalled { .. } | Self::Departed | Self::Agents(_) => {
-                None
-            }
+            Self::DuplicateAgent(_)
+            | Self::Stalled { .. }
+            | Self::Departed
+            | Self::Reward(_)
+            | Self::Agents(_) => None,
         }
     }
 }
@@ -194,15 +207,15 @@ impl Error for EpisodeError {
 /// Build it with [`Episode::new`], which takes the environment, add agents
 /// with [`Episode::add`], then [`Episode::run`] it. The roster is fixed
 /// from the moment `run` starts.
-pub struct Episode<D: Domain> {
-    roster: BTreeMap<ActorId, Box<dyn Handler<D> + Send>>,
+pub struct Episode<W, P: Payload> {
+    roster: BTreeMap<ActorId, Box<dyn Handler<P> + Send>>,
     environment_id: ActorId,
-    environment: Box<dyn Environment<D> + Send>,
-    records: Sender<LogRecord<D>>,
+    environment: Box<dyn Environment<W, P> + Send>,
+    records: Sender<LogRecord<P>>,
     clock: Clock,
 }
 
-impl<D: Domain> fmt::Debug for Episode<D> {
+impl<W, P: Payload> fmt::Debug for Episode<W, P> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Episode")
             .field("environment", &self.environment_id)
@@ -211,15 +224,15 @@ impl<D: Domain> fmt::Debug for Episode<D> {
     }
 }
 
-impl<D: Domain> Episode<D> {
+impl<W: Serialize + Copy + Send + 'static, P: Payload> Episode<W, P> {
     /// An episode of `environment`, seated under `environment_id`, with no
     /// agents yet, whose trajectory goes to `records` and which is timed by
     /// a [`Clock`] started now.
     #[must_use]
     pub fn new(
-        records: Sender<LogRecord<D>>,
+        records: Sender<LogRecord<P>>,
         environment_id: impl Into<ActorId>,
-        environment: impl Environment<D> + Send + 'static,
+        environment: impl Environment<W, P> + Send + 'static,
     ) -> Self {
         Self::with_clock(records, environment_id, environment, Clock::start())
     }
@@ -227,9 +240,9 @@ impl<D: Domain> Episode<D> {
     /// The same, timed by `clock`.
     #[must_use]
     pub fn with_clock(
-        records: Sender<LogRecord<D>>,
+        records: Sender<LogRecord<P>>,
         environment_id: impl Into<ActorId>,
-        environment: impl Environment<D> + Send + 'static,
+        environment: impl Environment<W, P> + Send + 'static,
         clock: Clock,
     ) -> Self {
         Self {
@@ -250,7 +263,7 @@ impl<D: Domain> Episode<D> {
     pub fn add(
         &mut self,
         id: impl Into<ActorId>,
-        handler: impl Handler<D> + Send + 'static,
+        handler: impl Handler<P> + Send + 'static,
     ) -> Result<(), EpisodeError> {
         let id = id.into();
         if id == self.environment_id || self.roster.contains_key(&id) {
@@ -309,7 +322,7 @@ impl<D: Domain> Episode<D> {
         let (obituary, obituaries) = unbounded();
         let (asked_for, commands) = unbounded();
         let (paid, rewards) = unbounded();
-        let mut handlers: BTreeMap<ActorId, Box<dyn Handler<D> + Send>> = roster;
+        let mut handlers: BTreeMap<ActorId, Box<dyn Handler<P> + Send>> = roster;
         handlers.insert(
             environment_id.clone(),
             Box::new(Adapter::new(
@@ -392,29 +405,29 @@ impl<D: Domain> Episode<D> {
 
 /// The running agents of an episode: its environment's thread and every
 /// other.
-type Threads<D> = Vec<Agent<Watched<D>>>;
+type Threads<P> = Vec<Agent<Watched<P>>>;
 
 /// What spawning an episode's threads leaves the episode holding.
-struct Spawned<D: Domain> {
+struct Spawned<P: Payload> {
     /// Where to address each agent, which is what the router is built from.
-    queues: BTreeMap<ActorId, Queues<D>>,
+    queues: BTreeMap<ActorId, Queues<P>>,
     /// A receiving half of every queue, kept alive until every thread has
     /// been joined, so that a message to an agent that has already stopped
     /// is delivered and never read rather than failing its sender.
-    held: Vec<Receiver<Delivery<D>>>,
+    held: Vec<Receiver<Delivery<P>>>,
     /// The threads themselves.
-    agents: Threads<D>,
+    agents: Threads<P>,
 }
 
 /// Wires and spawns one thread per handler, in roster order.
-fn spawn<D: Domain>(
-    handlers: BTreeMap<ActorId, Box<dyn Handler<D> + Send>>,
+fn spawn<P: Payload>(
+    handlers: BTreeMap<ActorId, Box<dyn Handler<P> + Send>>,
     ids: &BTreeSet<ActorId>,
-    dispatch: &Sender<CycleDispatch<D>>,
+    dispatch: &Sender<CycleDispatch<P>>,
     obituary: &Sender<ActorId>,
-    records: &Sender<LogRecord<D>>,
+    records: &Sender<LogRecord<P>>,
     clock: Clock,
-) -> Spawned<D> {
+) -> Spawned<P> {
     let mut queues = BTreeMap::new();
     let mut held = Vec::with_capacity(ids.len());
     let mut agents = Vec::with_capacity(ids.len());
@@ -446,7 +459,7 @@ fn spawn<D: Domain>(
 
 /// Splits the environment's agent out of the roster's, so that the two can
 /// be stopped and joined in their own order.
-fn split<D: Domain>(agents: Threads<D>, environment: &ActorId) -> (Threads<D>, Threads<D>) {
+fn split<P: Payload>(agents: Threads<P>, environment: &ActorId) -> (Threads<P>, Threads<P>) {
     agents
         .into_iter()
         .partition(|agent| agent.id() == environment)
@@ -518,10 +531,10 @@ use Halt::Departure;
 ///
 /// Nothing in flight, no stop waiting to be issued, and some agent still
 /// running is a stall; see the [module documentation](self).
-fn drive<D: Domain>(
-    router: &mut Router<D>,
+fn drive<P: Payload>(
+    router: &mut Router<P>,
     environment: &Seat,
-    dispatches: &Receiver<CycleDispatch<D>>,
+    dispatches: &Receiver<CycleDispatch<P>>,
     obituaries: &Receiver<ActorId>,
     mut in_flight: usize,
     running: &mut BTreeSet<ActorId>,
@@ -590,13 +603,21 @@ fn drive<D: Domain>(
             // The rewards of this cycle, checked but not routed: a reward
             // is already in the trajectory and is not a delivery, so
             // nothing here adds to the in-flight count. What is left is
-            // whether the environment named an agent it could reward.
-            // Only a refusal arrives here: the adapter writes a reward it
-            // accepts and says nothing. What comes is a name it would not
-            // write, which the router turns into the error it would give
-            // for addressing that name.
-            while let Ok(Rewarded { agent }) = rewarded.try_recv() {
-                router.rewardable(environment, &agent).map_err(refused)?;
+            // whether the environment produced a reward that could become
+            // a record. Only a refusal arrives here: the adapter writes a
+            // reward it accepts and says nothing. A name it would not
+            // write the router turns into the error it would give for
+            // addressing that name; a value it could not serialize is the
+            // reward type's fault rather than the name's, and says so.
+            while let Ok(Rewarded { agent, refusal }) = rewarded.try_recv() {
+                match refusal {
+                    Refusal::NotRewardable => {
+                        router.rewardable(environment, &agent).map_err(refused)?;
+                    }
+                    Refusal::Unserializable => {
+                        return Err(Halt::Error(EpisodeError::Reward(agent)));
+                    }
+                }
             }
             while let Ok(Commanded { to, control }) = commanded.try_recv() {
                 match control {
@@ -661,22 +682,22 @@ fn drive<D: Domain>(
 /// handler it gets back. Before shutdown an obituary can only mean the
 /// first two, and it is what keeps the episode from waiting forever for a
 /// cycle that will never be reported.
-struct Watched<D: Domain> {
+struct Watched<P: Payload> {
     id: ActorId,
-    handler: Box<dyn Handler<D> + Send>,
+    handler: Box<dyn Handler<P> + Send>,
     obituary: Sender<ActorId>,
 }
 
-impl<D: Domain> Handler<D> for Watched<D> {
-    fn start(&mut self, now: Timestamp) -> Vec<Action<D>> {
+impl<P: Payload> Handler<P> for Watched<P> {
+    fn start(&mut self, now: Timestamp) -> Vec<Action<P>> {
         self.handler.start(now)
     }
 
-    fn handle(&mut self, observation: &Observation<D>) -> Vec<Action<D>> {
+    fn handle(&mut self, observation: &Observation<P>) -> Vec<Action<P>> {
         self.handler.handle(observation)
     }
 
-    fn timeout(&mut self, now: Timestamp) -> Vec<Action<D>> {
+    fn timeout(&mut self, now: Timestamp) -> Vec<Action<P>> {
         self.handler.timeout(now)
     }
 
@@ -685,7 +706,7 @@ impl<D: Domain> Handler<D> for Watched<D> {
     }
 }
 
-impl<D: Domain> Drop for Watched<D> {
+impl<P: Payload> Drop for Watched<P> {
     fn drop(&mut self) {
         // After shutdown nobody is listening, and that is fine.
         let _ = self.obituary.send(self.id.clone());
@@ -693,7 +714,7 @@ impl<D: Domain> Drop for Watched<D> {
 }
 
 /// Joins every thread and collects the ones that did not end cleanly.
-fn join<D: Domain>(agents: Vec<Agent<Watched<D>>>) -> Vec<(ActorId, Failure)> {
+fn join<P: Payload>(agents: Vec<Agent<Watched<P>>>) -> Vec<(ActorId, Failure)> {
     agents
         .into_iter()
         .filter_map(|agent| {
@@ -744,14 +765,6 @@ mod tests {
 
     use Count::{Done, Say};
 
-    /// The domain of the counting games below.
-    struct Counting;
-
-    impl Domain for Counting {
-        type Payload = Count;
-        type Reward = i32;
-    }
-
     /// The environment of the counting games: it starts the agents it was
     /// built with and stops them all once each has said [`Done`].
     ///
@@ -774,12 +787,12 @@ mod tests {
         }
     }
 
-    impl Environment<Counting> for Referee {
-        fn start(&mut self, _now: Timestamp) -> Vec<Effect<Counting>> {
+    impl Environment<i32, Count> for Referee {
+        fn start(&mut self, _now: Timestamp) -> Vec<Effect<i32, Count>> {
             vec![Effect::control(self.agents.clone(), Control::Start)]
         }
 
-        fn handle(&mut self, observation: &Observation<Counting>) -> Vec<Effect<Counting>> {
+        fn handle(&mut self, observation: &Observation<Count>) -> Vec<Effect<i32, Count>> {
             if observation.message.payload == Done {
                 self.working.remove(&observation.message.sender);
             }
@@ -812,8 +825,8 @@ mod tests {
         }
     }
 
-    impl Environment<Counting> for Paymaster {
-        fn start(&mut self, _now: Timestamp) -> Vec<Effect<Counting>> {
+    impl Environment<i32, Count> for Paymaster {
+        fn start(&mut self, _now: Timestamp) -> Vec<Effect<i32, Count>> {
             vec![
                 Effect::control(["a", "b"], Control::Start),
                 Effect::reward(self.to.clone(), self.value),
@@ -821,13 +834,13 @@ mod tests {
             ]
         }
 
-        fn handle(&mut self, _: &Observation<Counting>) -> Vec<Effect<Counting>> {
+        fn handle(&mut self, _: &Observation<Count>) -> Vec<Effect<i32, Count>> {
             Vec::new()
         }
     }
 
     /// An episode of a [`Paymaster`] over two mute agents, and its writer.
-    fn paid(to: &str, value: i32) -> (Episode<Counting>, Writer, Shared) {
+    fn paid(to: &str, value: i32) -> (Episode<i32, Count>, Writer, Shared) {
         let (records, writer, bytes) = recording();
         let mut episode = Episode::new(records, REFEREE, Paymaster::paying(to, value));
         episode.add("a", Mute).unwrap();
@@ -904,16 +917,79 @@ mod tests {
         );
     }
 
+    /// A reward type that no JSON document can hold: a map whose keys are
+    /// not strings, which `serde_json` refuses rather than inventing a
+    /// spelling for.
+    ///
+    /// Contrived, because every reward type in the tree is an integer. What
+    /// it stands for is any reward a game might name whose values the log
+    /// cannot carry, which the episode has to report rather than quietly
+    /// leave out.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    struct Unwritable;
+
+    impl Serialize for Unwritable {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            use serde::ser::SerializeMap;
+            // A pair, which has no spelling as a JSON object key; an
+            // integer key would be coerced to a string and serialize.
+            let mut map = serializer.serialize_map(Some(1))?;
+            map.serialize_entry(&(0u8, 0u8), &0u8)?;
+            map.end()
+        }
+    }
+
+    /// An environment that pays one agent in a currency the log cannot
+    /// hold.
+    struct Counterfeiter;
+
+    impl Environment<Unwritable, Count> for Counterfeiter {
+        fn start(&mut self, _now: Timestamp) -> Vec<Effect<Unwritable, Count>> {
+            vec![
+                Effect::control(["a", "b"], Control::Start),
+                Effect::reward("a", Unwritable),
+                Effect::control(["a", "b"], Control::Stop),
+            ]
+        }
+
+        fn handle(&mut self, _: &Observation<Count>) -> Vec<Effect<Unwritable, Count>> {
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn a_reward_that_will_not_serialize_fails_the_episode_and_is_not_written() {
+        // The neighboring refusal — a reward for somebody outside the
+        // roster — fails the episode, and this fails it for the same
+        // reason: a trajectory that quietly lacks a reward the environment
+        // assigned is evidence of nothing. The error names the agent and
+        // says the reward, not the name, was the problem.
+        let (records, writer, bytes) = recording();
+        let mut episode = Episode::new(records, REFEREE, Counterfeiter);
+        episode.add("a", Mute).unwrap();
+        episode.add("b", Mute).unwrap();
+        assert_eq!(
+            episode.run().unwrap_err(),
+            EpisodeError::Reward(ActorId::new("a"))
+        );
+        let written = joined(writer, &bytes);
+        let lines = parse_lines(&written);
+        assert!(
+            lines.iter().all(|line| line["type"] != "reward"),
+            "the reward that could not be written is not in the trajectory"
+        );
+    }
+
     /// An environment that starts its agents and never stops them, so that
     /// whatever they do the episode ends by stalling.
     struct Absent<const N: usize>([&'static str; N]);
 
-    impl<const N: usize> Environment<Counting> for Absent<N> {
-        fn start(&mut self, _now: Timestamp) -> Vec<Effect<Counting>> {
+    impl<const N: usize> Environment<i32, Count> for Absent<N> {
+        fn start(&mut self, _now: Timestamp) -> Vec<Effect<i32, Count>> {
             vec![Effect::control(self.0, Control::Start)]
         }
 
-        fn handle(&mut self, _: &Observation<Counting>) -> Vec<Effect<Counting>> {
+        fn handle(&mut self, _: &Observation<Count>) -> Vec<Effect<i32, Count>> {
             Vec::new()
         }
     }
@@ -923,7 +999,7 @@ mod tests {
 
     /// The number an observation carries, if it is one: everything a
     /// counting agent hears that is not a [`Done`].
-    fn count(observation: &Observation<Counting>) -> Option<u64> {
+    fn count(observation: &Observation<Count>) -> Option<u64> {
         match observation.message.payload {
             Say(n) => Some(n),
             Done => None,
@@ -931,7 +1007,7 @@ mod tests {
     }
 
     /// An agent's way of telling the environment it has finished.
-    fn done() -> Action<Counting> {
+    fn done() -> Action<Count> {
         Action::to([REFEREE], Done)
     }
 
@@ -949,13 +1025,13 @@ mod tests {
     }
 
     impl Rally {
-        fn to_partner(&self, n: u64) -> Action<Counting> {
+        fn to_partner(&self, n: u64) -> Action<Count> {
             Action::to([self.partner.clone()], Say(n))
         }
     }
 
-    impl Handler<Counting> for Rally {
-        fn start(&mut self, _now: Timestamp) -> Vec<Action<Counting>> {
+    impl Handler<Count> for Rally {
+        fn start(&mut self, _now: Timestamp) -> Vec<Action<Count>> {
             if self.serves {
                 vec![self.to_partner(1)]
             } else {
@@ -963,7 +1039,7 @@ mod tests {
             }
         }
 
-        fn handle(&mut self, observation: &Observation<Counting>) -> Vec<Action<Counting>> {
+        fn handle(&mut self, observation: &Observation<Count>) -> Vec<Action<Count>> {
             let Some(heard) = count(observation) else {
                 return Vec::new();
             };
@@ -1001,13 +1077,13 @@ mod tests {
         }
     }
 
-    impl Handler<Counting> for Hub {
-        fn start(&mut self, _now: Timestamp) -> Vec<Action<Counting>> {
+    impl Handler<Count> for Hub {
+        fn start(&mut self, _now: Timestamp) -> Vec<Action<Count>> {
             let everybody = self.spokes.iter().cloned().chain([ActorId::new(REFEREE)]);
             vec![Action::to(everybody, Say(0))]
         }
 
-        fn handle(&mut self, observation: &Observation<Counting>) -> Vec<Action<Counting>> {
+        fn handle(&mut self, observation: &Observation<Count>) -> Vec<Action<Count>> {
             if count(observation).is_some() {
                 self.heard += 1;
             }
@@ -1022,8 +1098,8 @@ mod tests {
     /// Replies once to whoever sends it a number, and is then done.
     struct Spoke;
 
-    impl Handler<Counting> for Spoke {
-        fn handle(&mut self, observation: &Observation<Counting>) -> Vec<Action<Counting>> {
+    impl Handler<Count> for Spoke {
+        fn handle(&mut self, observation: &Observation<Count>) -> Vec<Action<Count>> {
             if count(observation).is_none() {
                 return Vec::new();
             }
@@ -1037,12 +1113,12 @@ mod tests {
     /// Sends one message to `to` when it starts, whoever that is.
     struct Addresses(&'static str);
 
-    impl Handler<Counting> for Addresses {
-        fn start(&mut self, _now: Timestamp) -> Vec<Action<Counting>> {
+    impl Handler<Count> for Addresses {
+        fn start(&mut self, _now: Timestamp) -> Vec<Action<Count>> {
             vec![Action::to([self.0], Say(1))]
         }
 
-        fn handle(&mut self, _: &Observation<Counting>) -> Vec<Action<Counting>> {
+        fn handle(&mut self, _: &Observation<Count>) -> Vec<Action<Count>> {
             Vec::new()
         }
     }
@@ -1050,20 +1126,20 @@ mod tests {
     /// Says nothing, ever, so an episode of it stalls.
     struct Mute;
 
-    impl Handler<Counting> for Mute {
-        fn handle(&mut self, _: &Observation<Counting>) -> Vec<Action<Counting>> {
+    impl Handler<Count> for Mute {
+        fn handle(&mut self, _: &Observation<Count>) -> Vec<Action<Count>> {
             Vec::new()
         }
     }
 
     struct Panics;
 
-    impl Handler<Counting> for Panics {
-        fn start(&mut self, _now: Timestamp) -> Vec<Action<Counting>> {
+    impl Handler<Count> for Panics {
+        fn start(&mut self, _now: Timestamp) -> Vec<Action<Count>> {
             panic!("the handler is broken")
         }
 
-        fn handle(&mut self, _: &Observation<Counting>) -> Vec<Action<Counting>> {
+        fn handle(&mut self, _: &Observation<Count>) -> Vec<Action<Count>> {
             panic!("the handler is broken")
         }
     }
@@ -1087,7 +1163,7 @@ mod tests {
 
     /// An episode refereed over the named agents, whose trajectory goes to
     /// the writer returned beside it.
-    fn refereed<const N: usize>(agents: [&str; N]) -> (Episode<Counting>, Writer, Shared) {
+    fn refereed<const N: usize>(agents: [&str; N]) -> (Episode<i32, Count>, Writer, Shared) {
         let (records, writer, bytes) = recording();
         (
             Episode::new(records, REFEREE, Referee::over(agents)),
@@ -1096,7 +1172,7 @@ mod tests {
         )
     }
 
-    fn rally(limit: u64) -> (Episode<Counting>, Writer, Shared) {
+    fn rally(limit: u64) -> (Episode<i32, Count>, Writer, Shared) {
         let (mut episode, writer, bytes) = refereed(["a", "b"]);
         for (me, partner, serves) in [("a", "b", true), ("b", "a", false)] {
             episode
@@ -1445,7 +1521,7 @@ mod tests {
             .source()
             .is_none()
         );
-        let (records, _writer) = Writer::spawn::<Counting>(Vec::new());
+        let (records, _writer) = Writer::spawn::<Count>(Vec::new());
         assert!(
             format!("{:?}", Episode::new(records, REFEREE, Referee::over([])))
                 .starts_with("Episode")

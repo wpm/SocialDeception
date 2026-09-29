@@ -45,7 +45,6 @@
 
 use std::collections::BTreeSet;
 
-use super::WerewolfDomain;
 use super::knowledge::Knowledge;
 use super::message::{Message, Narration, Round, Select, SessionKind};
 use super::role::Role;
@@ -151,7 +150,7 @@ impl<S: Strategy> Player<S> {
     }
 }
 
-impl<S: Strategy> Handler<WerewolfDomain> for Player<S> {
+impl<S: Strategy> Handler<Message> for Player<S> {
     /// Folds the observation into what the player knows and, if it was a
     /// phase beginning a session its role is a member of, selections from
     /// the state every earlier observation produced, this one included.
@@ -167,10 +166,7 @@ impl<S: Strategy> Handler<WerewolfDomain> for Player<S> {
     /// panic for the other reason [`Role::action_space`] gives, since the
     /// kind it passes came from this player's own
     /// [`Role::asked_in`].
-    fn handle(
-        &mut self,
-        observation: &Observation<WerewolfDomain>,
-    ) -> Vec<agent::Action<WerewolfDomain>> {
+    fn handle(&mut self, observation: &Observation<Message>) -> Vec<agent::Action<Message>> {
         self.knowledge.observe(observation);
         match &observation.message.payload {
             // A phase beginning is what makes a player act, and it acts
@@ -244,7 +240,7 @@ mod tests {
         }
     }
 
-    fn eliminated(who: &str, round: u32) -> crate::Message<WerewolfDomain> {
+    fn eliminated(who: &str, round: u32) -> crate::Message<Message> {
         narrated(Narration::Eliminated {
             who: id(who),
             role: Role::Villager,
@@ -267,7 +263,7 @@ mod tests {
         kind: SessionKind,
         target: ActorId,
         seen_by: [&str; N],
-    ) -> Action<WerewolfDomain> {
+    ) -> Action<Message> {
         Action::to(
             [ActorId::new(MODERATOR)],
             Message::Select(Select {
@@ -281,7 +277,7 @@ mod tests {
 
     /// A selection of a kind only the moderator sees: the seer's and the
     /// doctor's own business.
-    fn privately(round: u32, kind: SessionKind, target: ActorId) -> Action<WerewolfDomain> {
+    fn privately(round: u32, kind: SessionKind, target: ActorId) -> Action<Message> {
         selecting(round, kind, target, [])
     }
 
@@ -290,8 +286,8 @@ mod tests {
     /// in order.
     fn handling<S: Strategy, const N: usize>(
         player: &mut Player<S>,
-        messages: [crate::Message<WerewolfDomain>; N],
-    ) -> Vec<Action<WerewolfDomain>> {
+        messages: [crate::Message<Message>; N],
+    ) -> Vec<Action<Message>> {
         messages
             .into_iter()
             .flat_map(|message| player.handle(&observed(message)))
@@ -413,7 +409,7 @@ mod tests {
         // What differs is the audience the moderator is asked to forward
         // to: the protect is nobody else's business, the nomination is
         // public.
-        let seen_by = |action: &Action<WerewolfDomain>| match &action.payload {
+        let seen_by = |action: &Action<Message>| match &action.payload {
             Message::Select(selection) => selection.seen_by.clone(),
             other @ Message::Narration(_) => panic!("a selection, not {other:?}"),
         };

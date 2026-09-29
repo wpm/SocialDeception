@@ -54,7 +54,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::WerewolfDomain;
 use super::message::{Cause, Message, Narration, Outcome, Phase, Round, SessionKind};
 use super::role::{Faction, Role};
 use crate::agent::Observation;
@@ -196,7 +195,7 @@ impl Knowledge {
     /// player type that was built disagree, which is a wiring bug, and it
     /// fails at the start of the episode rather than producing a plausible
     /// game.
-    pub fn observe(&mut self, observation: &Observation<WerewolfDomain>) {
+    pub fn observe(&mut self, observation: &Observation<Message>) {
         match &observation.message.payload {
             Message::Narration(narration) => self.narrated(narration),
             // The sender's latest selection, which replaces whatever it
@@ -311,18 +310,18 @@ mod tests {
             .collect()
     }
 
-    fn assigned(role: Role, pack: BTreeSet<ActorId>) -> Envelope<WerewolfDomain> {
+    fn assigned(role: Role, pack: BTreeSet<ActorId>) -> Envelope<Message> {
         narrated(Narration::Assigned { role, pack })
     }
 
-    fn investigated(target: &str, faction: Faction) -> Envelope<WerewolfDomain> {
+    fn investigated(target: &str, faction: Faction) -> Envelope<Message> {
         narrated(Narration::Investigated {
             target: id(target),
             faction,
         })
     }
 
-    fn eliminated(who: &str, role: Role, round: u32, cause: Cause) -> Envelope<WerewolfDomain> {
+    fn eliminated(who: &str, role: Role, round: u32, cause: Cause) -> Envelope<Message> {
         narrated(Narration::Eliminated {
             who: id(who),
             role,
@@ -342,7 +341,7 @@ mod tests {
     /// A fresh state for this agent with every message folded in, in order.
     fn folded<'a>(
         role: Role,
-        messages: impl IntoIterator<Item = &'a Envelope<WerewolfDomain>>,
+        messages: impl IntoIterator<Item = &'a Envelope<Message>>,
     ) -> Knowledge {
         let mut knowledge = Knowledge::new(id(ME), role);
         for message in messages {
@@ -363,7 +362,7 @@ mod tests {
 
     /// One player's nomination, forwarded by the moderator as the player
     /// that made it (ADR-0014).
-    fn nominated(who: &str, whom: &str, round: u32) -> Envelope<WerewolfDomain> {
+    fn nominated(who: &str, whom: &str, round: u32) -> Envelope<Message> {
         from(
             who,
             Message::Select(Select {
@@ -376,7 +375,7 @@ mod tests {
     }
 
     /// A seer's whole game, from the deal to the werewolves' win.
-    fn a_seers_game() -> Vec<Envelope<WerewolfDomain>> {
+    fn a_seers_game() -> Vec<Envelope<Message>> {
         vec![
             assigned(Role::Seer, BTreeSet::new()),
             phase_began(

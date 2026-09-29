@@ -1,6 +1,6 @@
 //! What travels on the wire: [`Message`], [`Control`] and the [`Delivery`]
-//! that carries either of them, and the [`Domain`] that names a game's
-//! types.
+//! that carries either of them, and the [`Payload`] a game's messages
+//! carry.
 //!
 //! Two kinds of thing reach an agent, and the distinction is the one
 //! ADR-0007 draws. A [`Message`] is *in-domain* data: something an agent said
@@ -37,26 +37,6 @@ use crate::clock::{Created, Timestamp};
 pub trait Payload: Serialize + Send + Clone + 'static {}
 
 impl<P: Serialize + Send + Clone + 'static> Payload for P {}
-
-/// The types one game contributes to the runtime.
-///
-/// The runtime is generic over a `Domain` rather than over the payload and
-/// the reward separately. The trait carries no behavior; it names a set of
-/// types, as [`Payload`] names a bound. One trait rather than two type
-/// parameters means a future per-game type is one more associated type here
-/// instead of another parameter on every signature in the crate.
-///
-/// The reward type is only carried and serialized, never added up by the
-/// runtime, so it needs no arithmetic bound. It is named here before
-/// anything logs a reward, so that the generic parameter does not have to
-/// change twice.
-pub trait Domain: 'static {
-    /// What this game's messages carry.
-    type Payload: Payload;
-    /// The numeric type of this game's rewards. Integers for a game scored
-    /// in wins and losses, reals for one scored more finely.
-    type Reward: Serialize + Copy + Send + 'static;
-}
 
 /// The name of an actor within an episode.
 ///
@@ -143,10 +123,12 @@ pub enum Control {
 /// wire it is only a message. The sender and the creation time are stamped by
 /// the loop as it sends, never by the handler, which is why the value a
 /// handler returns is an `Action` and not this.
-/// `Debug`, `Clone`, equality and `Serialize` are implemented by hand
-/// rather than derived, because a derive would demand each of them of `D`,
-/// the marker type, when what actually has to have them is `D::Payload`.
-pub struct Message<D: Domain> {
+///
+/// It has no `Serialize` of its own: a message goes into a trajectory
+/// through the record that carries it, which writes it without the
+/// `created` that record already carries at the top level.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Message<P: Payload> {
     /// The agent that sent it.
     pub sender: ActorId,
     /// The agents it was addressed to, in canonical order.
@@ -156,16 +138,16 @@ pub struct Message<D: Domain> {
     /// The instant the sender sent it.
     pub created: Timestamp,
     /// What was said. Its meaning belongs to the game.
-    pub payload: D::Payload,
+    pub payload: P,
 }
 
-impl<D: Domain> Message<D> {
+impl<P: Payload> Message<P> {
     /// A message from `sender` to `recipients`, created at `created`.
     pub fn new<I, A>(
         sender: impl Into<ActorId>,
         recipients: I,
         created: Timestamp,
-        payload: D::Payload,
+        payload: P,
     ) -> Self
     where
         I: IntoIterator<Item = A>,
@@ -180,50 +162,11 @@ impl<D: Domain> Message<D> {
     }
 }
 
-impl<D: Domain> Created for Message<D> {
+impl<P: Payload> Created for Message<P> {
     fn created(&self) -> Timestamp {
         self.created
     }
 }
-
-impl<D: Domain> fmt::Debug for Message<D>
-where
-    D::Payload: fmt::Debug,
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Message")
-            .field("sender", &self.sender)
-            .field("recipients", &self.recipients)
-            .field("created", &self.created)
-            .field("payload", &self.payload)
-            .finish()
-    }
-}
-
-impl<D: Domain> Clone for Message<D> {
-    fn clone(&self) -> Self {
-        Self {
-            sender: self.sender.clone(),
-            recipients: self.recipients.clone(),
-            created: self.created,
-            payload: self.payload.clone(),
-        }
-    }
-}
-
-impl<D: Domain> PartialEq for Message<D>
-where
-    D::Payload: PartialEq,
-{
-    fn eq(&self, other: &Self) -> bool {
-        self.sender == other.sender
-            && self.recipients == other.recipients
-            && self.created == other.created
-            && self.payload == other.payload
-    }
-}
-
-impl<D: Domain> Eq for Message<D> where D::Payload: Eq {}
 
 /// One thing on an agent's queue: a message, or a control and when it was
 /// sent.
@@ -248,15 +191,14 @@ impl<D: Domain> Eq for Message<D> where D::Payload: Eq {}
 /// A control carries its `created` here because nothing else does: a
 /// [`Message`] has a field for the instant its sender made it and a
 /// [`Control`] is a bare two-variant enum, so the stamp travels beside it.
-/// `Debug`, `Clone` and equality are written out rather than derived, for
-/// the reason [`Message`]'s are: a derive would ask them of `D`.
 ///
 /// [`Observation`]: crate::Observation
-pub enum Delivery<D: Domain> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Delivery<P: Payload> {
     /// In-domain data: what becomes the recipient's [`Observation`].
     ///
     /// [`Observation`]: crate::Observation
-    Message(Message<D>),
+    Message(Message<P>),
     /// An out-of-domain instruction, and the instant the sender sent it.
     Control {
         /// What the agent is told.
@@ -267,62 +209,13 @@ pub enum Delivery<D: Domain> {
     },
 }
 
-impl<D: Domain> Delivery<D> {
+impl<P: Payload> Delivery<P> {
     /// A control delivery stamped with `created`.
     #[must_use]
     pub const fn control(control: Control, created: Timestamp) -> Self {
         Self::Control { control, created }
     }
 }
-
-impl<D: Domain> fmt::Debug for Delivery<D>
-where
-    D::Payload: fmt::Debug,
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Message(message) => f.debug_tuple("Message").field(message).finish(),
-            Self::Control { control, created } => f
-                .debug_struct("Control")
-                .field("control", control)
-                .field("created", created)
-                .finish(),
-        }
-    }
-}
-
-impl<D: Domain> Clone for Delivery<D> {
-    fn clone(&self) -> Self {
-        match self {
-            Self::Message(message) => Self::Message(message.clone()),
-            Self::Control { control, created } => Self::Control {
-                control: *control,
-                created: *created,
-            },
-        }
-    }
-}
-
-impl<D: Domain> PartialEq for Delivery<D>
-where
-    D::Payload: PartialEq,
-{
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Message(mine), Self::Message(theirs)) => mine == theirs,
-            (
-                Self::Control { control, created },
-                Self::Control {
-                    control: other_control,
-                    created: other_created,
-                },
-            ) => control == other_control && created == other_created,
-            _ => false,
-        }
-    }
-}
-
-impl<D: Domain> Eq for Delivery<D> where D::Payload: Eq {}
 
 #[cfg(test)]
 mod tests {
@@ -333,14 +226,6 @@ mod tests {
     #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
     enum TestPayload {
         Step(u64),
-    }
-
-    /// A domain whose messages carry a [`TestPayload`].
-    struct TestDomain;
-
-    impl Domain for TestDomain {
-        type Payload = TestPayload;
-        type Reward = i32;
     }
 
     fn at(nanos: u64) -> Timestamp {
@@ -356,14 +241,14 @@ mod tests {
         // A message is written to a trajectory by `trajectory::Envelope`,
         // which is the only wire shape it has, so what is asserted here is
         // the set itself: the order the envelope will write.
-        let message = Message::<TestDomain>::new("a", ["c", "b"], at(40), TestPayload::Step(7));
+        let message = Message::<TestPayload>::new("a", ["c", "b"], at(40), TestPayload::Step(7));
         let recipients: Vec<&str> = message.recipients.iter().map(ActorId::as_str).collect();
         assert_eq!(recipients, ["b", "c"]);
     }
 
     #[test]
     fn a_message_knows_when_it_was_created() {
-        let message = Message::<TestDomain>::new("a", ["b"], at(40), TestPayload::Step(7));
+        let message = Message::<TestPayload>::new("a", ["b"], at(40), TestPayload::Step(7));
         assert_eq!(Created::created(&message), at(40));
     }
 
@@ -371,7 +256,7 @@ mod tests {
     fn a_delivery_is_one_kind_or_the_other_and_says_which() {
         // The whole point of the enum: one queue carries both, and what
         // came off it is still unambiguously a message or a control.
-        let message = Message::<TestDomain>::new("a", ["b"], at(40), TestPayload::Step(7));
+        let message = Message::<TestPayload>::new("a", ["b"], at(40), TestPayload::Step(7));
         let carried = Delivery::Message(message.clone());
         let Delivery::Message(back) = &carried else {
             panic!("a message delivery is a message: {carried:?}");
@@ -381,13 +266,13 @@ mod tests {
 
         // A control has nowhere of its own to keep the instant it was sent,
         // so the delivery keeps it.
-        let stop = Delivery::<TestDomain>::control(Control::Stop, at(10));
+        let stop = Delivery::<TestPayload>::control(Control::Stop, at(10));
         let Delivery::Control { control, created } = stop else {
             panic!("a control delivery is a control: {stop:?}");
         };
         assert_eq!((control, created), (Control::Stop, at(10)));
         assert_ne!(
-            Delivery::<TestDomain>::control(Control::Stop, at(10)),
+            Delivery::<TestPayload>::control(Control::Stop, at(10)),
             Delivery::control(Control::Start, at(10))
         );
     }

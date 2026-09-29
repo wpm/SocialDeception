@@ -83,7 +83,6 @@ use crossbeam_channel::Sender;
 
 use std::collections::BTreeSet;
 
-use super::WerewolfDomain;
 use super::game::{Directive, Game};
 use super::message::{Message, Outcome};
 use crate::agent::{Action, Observation};
@@ -121,7 +120,7 @@ impl Moderator {
     /// # Panics
     ///
     /// If a player sends the moderator a narration.
-    fn fold(&mut self, observation: &Observation<WerewolfDomain>) -> Vec<Directive> {
+    fn fold(&mut self, observation: &Observation<Message>) -> Vec<Directive> {
         let sender = &observation.message.sender;
         let now = observation.received;
         let mut directives = match &observation.message.payload {
@@ -146,8 +145,8 @@ impl Moderator {
     /// ended, the outcome published on the channel, every player paid, and
     /// every player stopped. The order is the shutdown sequence; see the
     /// [module documentation](self).
-    fn say(&mut self, directives: Vec<Directive>) -> Vec<Effect<WerewolfDomain>> {
-        let mut effects: Vec<Effect<WerewolfDomain>> = directives.into_iter().map(send).collect();
+    fn say(&mut self, directives: Vec<Directive>) -> Vec<Effect<i32, Message>> {
+        let mut effects: Vec<Effect<i32, Message>> = directives.into_iter().map(send).collect();
         if let Some(outcome) = self.game.outcome() {
             // The caller may have dropped the receiver. That is not the
             // game's problem: the in-world announcement is the record.
@@ -179,7 +178,7 @@ impl Moderator {
 ///
 /// Most are something said; a [`Directive::Stop`] is the game putting a
 /// player out of it, which is a control rather than a message (ADR-0012).
-fn send(directive: Directive) -> Effect<WerewolfDomain> {
+fn send(directive: Directive) -> Effect<i32, Message> {
     match directive {
         Directive::Narrate { to, narration } => {
             Effect::Act(Action::to(to, Message::Narration(narration)))
@@ -197,7 +196,7 @@ fn send(directive: Directive) -> Effect<WerewolfDomain> {
     }
 }
 
-impl Environment<WerewolfDomain> for Moderator {
+impl Environment<i32, Message> for Moderator {
     /// Starts every player, then begins the game and says what it wants
     /// said at the start: the roles, and that the first night has begun.
     /// The players take it from there (ADR-0014).
@@ -206,7 +205,7 @@ impl Environment<WerewolfDomain> for Moderator {
     /// cycle's messages before its controls either way, so what a player
     /// actually sees is its `Start` — controls are popped first — and then
     /// the opening narrations.
-    fn start(&mut self, now: Timestamp) -> Vec<Effect<WerewolfDomain>> {
+    fn start(&mut self, now: Timestamp) -> Vec<Effect<i32, Message>> {
         let opening = self.game.begin(now);
         let mut effects = vec![Effect::control(self.players(), Control::Start)];
         effects.extend(self.say(opening));
@@ -222,7 +221,7 @@ impl Environment<WerewolfDomain> for Moderator {
     ///
     /// If a player sends the moderator a narration, or if a selection is one
     /// the game cannot accept; see [`Game::select`].
-    fn handle(&mut self, observation: &Observation<WerewolfDomain>) -> Vec<Effect<WerewolfDomain>> {
+    fn handle(&mut self, observation: &Observation<Message>) -> Vec<Effect<i32, Message>> {
         // Whether the game is over is the game's to say, and it is asked
         // before every observation, so the one that ends it is the last
         // folded and the only one after which the outcome is seen for the
@@ -244,7 +243,7 @@ impl Environment<WerewolfDomain> for Moderator {
     /// narrated to nobody (ADR-0015); what its members hear is what the
     /// phase came to, and the last of a night's sessions resolves the
     /// night.
-    fn timeout(&mut self, now: Timestamp) -> Vec<Effect<WerewolfDomain>> {
+    fn timeout(&mut self, now: Timestamp) -> Vec<Effect<i32, Message>> {
         if self.game.outcome().is_some() {
             return Vec::new();
         }
@@ -289,7 +288,7 @@ mod tests {
     /// A message from a player to the moderator, as the moderator observes
     /// it. The creation time plays no part in the fold, so one stand-in
     /// serves every test here.
-    fn from_player(who: &str, payload: Message) -> Observation<WerewolfDomain> {
+    fn from_player(who: &str, payload: Message) -> Observation<Message> {
         observed(crate::Message::new(
             who,
             [MODERATOR],
@@ -303,7 +302,7 @@ mod tests {
         round: Round,
         kind: SessionKind,
         target: ActorId,
-    ) -> Observation<WerewolfDomain> {
+    ) -> Observation<Message> {
         from_player(
             who.as_str(),
             Message::Select(Select {
@@ -343,7 +342,7 @@ mod tests {
     }
 
     /// The actions among some effects, in order.
-    fn actions(effects: &[Effect<WerewolfDomain>]) -> Vec<Action<WerewolfDomain>> {
+    fn actions(effects: &[Effect<i32, Message>]) -> Vec<Action<Message>> {
         effects
             .iter()
             .filter_map(|effect| match effect {
@@ -354,7 +353,7 @@ mod tests {
     }
 
     /// The controls among some effects, in order.
-    fn controls(effects: &[Effect<WerewolfDomain>]) -> Vec<(BTreeSet<ActorId>, Control)> {
+    fn controls(effects: &[Effect<i32, Message>]) -> Vec<(BTreeSet<ActorId>, Control)> {
         effects
             .iter()
             .filter_map(|effect| match effect {
@@ -366,7 +365,7 @@ mod tests {
 
     /// The rewards among some effects, by the agent paid, in the order the
     /// moderator assigned them.
-    fn rewards(effects: &[Effect<WerewolfDomain>]) -> Vec<(ActorId, i32)> {
+    fn rewards(effects: &[Effect<i32, Message>]) -> Vec<(ActorId, i32)> {
         effects
             .iter()
             .filter_map(|effect| match effect {
@@ -388,11 +387,11 @@ mod tests {
     /// A player the rules leave nowhere to select says nothing, which is
     /// the same thing the game means by leaving it out of the session.
     fn respond(
-        actions: &[Action<WerewolfDomain>],
+        actions: &[Action<Message>],
         strategy: Strategy,
         game: &Game,
         roles: &Assignment,
-    ) -> Vec<Observation<WerewolfDomain>> {
+    ) -> Vec<Observation<Message>> {
         actions
             .iter()
             .filter_map(|action| match &action.payload {
@@ -430,7 +429,7 @@ mod tests {
         moderator: &mut Moderator,
         strategy: Strategy,
         roles: &Assignment,
-    ) -> Vec<Effect<WerewolfDomain>> {
+    ) -> Vec<Effect<i32, Message>> {
         /// Far enough apart that one phase's clocks never reach the next.
         const STEP: u64 = 10_000;
 
@@ -439,7 +438,7 @@ mod tests {
         let mut pending = respond(&actions(&produced), strategy, &moderator.game, roles);
         while moderator.game.outcome().is_none() {
             clock += STEP;
-            let mut effects: Vec<Effect<WerewolfDomain>> = pending
+            let mut effects: Vec<Effect<i32, Message>> = pending
                 .iter()
                 .flat_map(|observation| moderator.handle(observation))
                 .collect();
@@ -470,12 +469,12 @@ mod tests {
         assignment: Assignment,
         outcome: Outcome,
         receiver: Receiver<Outcome>,
-        sent: Vec<Action<WerewolfDomain>>,
+        sent: Vec<Action<Message>>,
         commanded: Vec<(BTreeSet<ActorId>, Control)>,
         paid: Vec<(ActorId, i32)>,
         /// Every effect in the order the moderator produced it, which is
         /// what the shutdown's ordering is asserted against.
-        effects: Vec<Effect<WerewolfDomain>>,
+        effects: Vec<Effect<i32, Message>>,
     }
 
     /// Every combination of assignment and stub strategy, played out.
@@ -502,7 +501,7 @@ mod tests {
 
     /// The outcome announced among some actions, and whom it was announced
     /// to.
-    fn announced_outcome(sent: &[Action<WerewolfDomain>]) -> (&BTreeSet<ActorId>, &Outcome) {
+    fn announced_outcome(sent: &[Action<Message>]) -> (&BTreeSet<ActorId>, &Outcome) {
         sent.iter()
             .find_map(|action| match &action.payload {
                 Message::Narration(Narration::Outcome(outcome)) => {
@@ -513,11 +512,11 @@ mod tests {
             .expect("no outcome was announced")
     }
 
-    fn narrate<const N: usize>(to: [&str; N], narration: Narration) -> Action<WerewolfDomain> {
+    fn narrate<const N: usize>(to: [&str; N], narration: Narration) -> Action<Message> {
         Action::to(to, Message::Narration(narration))
     }
 
-    fn assigned<const N: usize>(to: &str, role: Role, pack: [&str; N]) -> Action<WerewolfDomain> {
+    fn assigned<const N: usize>(to: &str, role: Role, pack: [&str; N]) -> Action<Message> {
         narrate(
             [to],
             Narration::Assigned {
