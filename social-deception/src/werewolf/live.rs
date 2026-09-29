@@ -988,7 +988,7 @@ mod tests {
                 agent: id("alice"),
                 t_start: at(0),
                 t_stop: at(1),
-                woken: Woken::Queue,
+                woken: Some(Woken::Queue),
                 observed: None,
             }
             .into(),
@@ -1027,7 +1027,7 @@ mod tests {
             agent: id("alice"),
             t_start: at(0),
             t_stop: at(1),
-            woken: Woken::Queue,
+            woken: Some(Woken::Queue),
             observed: None,
         }
         .into();

@@ -894,11 +894,11 @@ where
             agent: self.wiring.id.clone(),
             t_start,
             t_stop: Instant::now(),
-            woken: if timed_out {
+            woken: Some(if timed_out {
                 Woken::Timeout
             } else {
                 Woken::Queue
-            },
+            }),
             observed,
         };
         self.wiring
@@ -1367,6 +1367,10 @@ mod tests {
             // environment's, and it goes out through the adapter.
             Record::Reward(_) => "reward",
             Record::Cycle(_) => "cycle",
+            // Nor either of these: only the `actor` runtime stops an actor
+            // with anything still in its inbox (ADR-0016).
+            Record::Undelivered(_) => "undelivered",
+            Record::Unsent(_) => "unsent",
         }
     }
 
@@ -1529,7 +1533,7 @@ mod tests {
         rig.start();
         assert_eq!(rig.dispatch().deliveries, 1);
         let (_, started) = rig.cycle();
-        assert_eq!(started.woken, Woken::Queue);
+        assert_eq!(started.woken, Some(Woken::Queue));
         let first = recv(rig.timer.requests());
         assert_eq!(first, started.t_start + EVERY);
 
@@ -1544,7 +1548,7 @@ mod tests {
             records.is_empty(),
             "a timeout cycle records nothing it popped: {records:?}"
         );
-        assert_eq!(timed_out.woken, Woken::Timeout);
+        assert_eq!(timed_out.woken, Some(Woken::Timeout));
         assert!(
             timed_out.observed.is_none(),
             "a timeout cycle observed nothing: {timed_out:?}"
@@ -1584,7 +1588,7 @@ mod tests {
         rig.timer.fire().unwrap();
         assert_eq!(rig.dispatch().deliveries, 0);
         let (_, timed_out) = rig.cycle();
-        assert_eq!(timed_out.woken, Woken::Timeout);
+        assert_eq!(timed_out.woken, Some(Woken::Timeout));
         assert!(timed_out.t_start > started.t_start);
 
         rig.stop();
@@ -1766,7 +1770,7 @@ mod tests {
         // and there would be one fewer cycle than this test counts.
         rig.dispatch();
         let (_, started) = rig.cycle();
-        assert_eq!(started.woken, Woken::Queue);
+        assert_eq!(started.woken, Some(Woken::Queue));
 
         // Hold the agent inside a cycle, so that the deadline and the second
         // message are both queued before it next waits, for the reason the
@@ -1783,10 +1787,10 @@ mod tests {
         rig.dispatch();
         let (_, first) = rig.cycle();
         let (_, joined) = rig.cycle();
-        assert_eq!(first.woken, Woken::Queue);
+        assert_eq!(first.woken, Some(Woken::Queue));
         assert_eq!(
             joined.woken,
-            Woken::Timeout,
+            Some(Woken::Timeout),
             "the cycle the deadline joined says the deadline woke it"
         );
         rig.stop();
@@ -1819,7 +1823,7 @@ mod tests {
         rig.timer.fire().unwrap();
         rig.dispatch();
         let (_, timed_out) = rig.cycle();
-        assert_eq!(timed_out.woken, Woken::Timeout);
+        assert_eq!(timed_out.woken, Some(Woken::Timeout));
         assert_eq!(recv(rig.timer.requests()), timed_out.t_start + EVERY);
 
         rig.stop();

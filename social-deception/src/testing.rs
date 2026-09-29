@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use crate::agent::Observation;
 use crate::clock::Clock;
-use crate::log::{JsonLines, Policy, Record, Sink, Writer};
+use crate::log::{JsonLines, Policy, Record, Sink, Sinks, Writer};
 use crate::message::{ActorId, Envelope, Message, Payload};
 use crate::werewolf::{self, Assignment, Faction, Knowledge, Narration, Phase, Role, Round};
 
@@ -99,10 +99,22 @@ impl Write for Shared {
 /// A writer whose one required [`JsonLines`] sink writes to a buffer the
 /// test keeps, which is what a test that reads its log back wants.
 pub(crate) fn recording<P: Payload>(clock: Clock) -> (Sender<Record<P>>, Writer, Shared) {
+    let (sinks, bytes) = sinking();
+    let (sender, writer) = Writer::spawn(sinks, clock);
+    (sender, writer, bytes)
+}
+
+/// One required [`JsonLines`] sink over a buffer the test keeps, for a
+/// caller that hands its sinks to something that starts the writer itself.
+///
+/// The [`actor`](crate::actor) runtime's `Episode` takes its sinks rather
+/// than a records channel, because starting the clock and the writer is what
+/// makes the shared-origin invariant structural (ADR-0017). So a test of it
+/// wants the sink and not the sender.
+pub(crate) fn sinking<P: Payload>() -> (Sinks<P>, Shared) {
     let bytes = Shared::new();
     let sink: Box<dyn Sink<P>> = Box::new(JsonLines::new(bytes.clone()));
-    let (sender, writer) = Writer::spawn(vec![(sink, Policy::Required)], clock);
-    (sender, writer, bytes)
+    (vec![(sink, Policy::Required)], bytes)
 }
 
 /// Joins `writer` and gives back everything its [`JsonLines`] sink wrote

@@ -53,6 +53,21 @@
 //! - a [`CycleRecord`] closing the cycle: the handling window, what woke it,
 //!   and the `(from, seq)` of the observation it was called with, if any.
 //!
+//! Under the [`actor`](crate::actor) runtime a cycle is one **handler call**
+//! rather than one turn of a loop, so its record says nothing about what woke
+//! it and its window brackets exactly that call. Two more kinds appear there
+//! and nowhere else, because that runtime stops an actor whenever its
+//! environment says so rather than only when nothing is in flight (ADR-0016):
+//!
+//! - an [`UndeliveredRecord`] for a message the actor was stopped before it
+//!   could observe, and for every reminder it was still holding;
+//! - an [`UnsentRecord`] for a message its handler yielded after the stop,
+//!   which was carried nowhere.
+//!
+//! Each carries the same fields as the observation or action record it would
+//! have been, so a reader following a message from its sender to its
+//! recipients finds the ones that went nowhere on the same `(from, seq)` join.
+//!
 //! The last is the odd one out. A [`RewardRecord`] is written by the
 //! **environment**, and belongs to the agent it names rather than to the
 //! agent that wrote it; see [`RewardRecord`] and ADR-0007. It is also the
@@ -104,7 +119,8 @@
 //!
 //! [`JsonLines`] writes one JSON object per line, wrapped in [`Record`],
 //! whose `type` field is `episode`, `observation`, `action`, `control`,
-//! `reward` or `cycle`. Every `t` is whole nanoseconds since the episode's
+//! `reward`, `cycle`, `undelivered` or `unsent`. Every `t` is whole
+//! nanoseconds since the episode's
 //! origin. Nothing here reads a log back; only `Serialize` is required of a
 //! payload or a reward.
 //!
@@ -385,6 +401,22 @@ pub struct RewardRecord<T = Instant> {
 /// listed by record number, which is what lets a reader group a cycle's
 /// records without the file's order meaning anything: the actions belong to
 /// the cycle whose window contains them.
+///
+/// Under the [`actor`](crate::actor) runtime a cycle is **one handler call**:
+/// its window, and the observation it was called with. A `start` call is a
+/// cycle with no observation. Actions a lazy iterator yields during the call
+/// may appear in the log *before* the cycle record, because they are sent as
+/// they are yielded and the cycle record closes the call.
+///
+/// There, **one actor's windows can overlap**, and a reader that groups by
+/// window has to allow for it. `t_start` is the instant the observation
+/// *arrived*, not the instant the call began — those are the same only when the
+/// handler was idle. A message that waited while the handler was busy opens a
+/// window that starts before the previous one ended. The arrival is the right
+/// stamp: it is the one fact about the message, and the whole point of a
+/// separate perception thread is that it is not delayed by a handler. What the
+/// windows still give a reader is which call an action belongs to, since an
+/// action lies in the window of the call that yielded it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CycleRecord<T = Instant> {
     /// The agent whose cycle this was.
@@ -394,12 +426,97 @@ pub struct CycleRecord<T = Instant> {
     pub t_start: T,
     /// When it finished, including sending its actions.
     pub t_stop: T,
-    /// What started the cycle.
-    pub woken: Woken,
+    /// What started the cycle, or `None` for a cycle of the
+    /// [`actor`](crate::actor) runtime, where there is nothing to say: an
+    /// actor's handler thread runs a cycle when an observation reaches it,
+    /// and a reminder arrives as one of those rather than as a wake-up
+    /// (ADR-0016).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub woken: Option<Woken>,
     /// The observation the handler was called with, if any. A cycle that
     /// popped only controls, or that woke on its deadline, has none.
     #[serde(flatten, skip_serializing_if = "Option::is_none")]
     pub observed: Option<Key>,
+}
+
+/// A message an actor received but will never observe, because it was stopped
+/// first.
+///
+/// A [`Control::Stop`] preempts everything (ADR-0016): it takes effect when
+/// the actor's perception thread sees it, ahead of anything in its inbox. What
+/// was in the inbox, and every reminder the actor was holding, is logged as
+/// one of these and forwarded nowhere.
+///
+/// It carries the same fields as the [`ObservationRecord`] it would have been,
+/// so a reader that follows a message from its sender's action to its
+/// recipients' observations finds the ones that went nowhere here, with the
+/// same `(from, seq)` join.
+///
+/// The old runtime produced none of these, because it stopped an actor only
+/// when nothing was in flight. This runtime stops one whenever the environment
+/// says so, so they are produced and mean what they say: an environment that
+/// wants its last word heard sets a reminder and stops everybody when it
+/// arrives.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UndeliveredRecord<P: Payload, T = Instant> {
+    /// The actor this record belongs to: the one that will not observe it.
+    pub agent: ActorId,
+    /// When its perception thread gave up on it.
+    pub t: T,
+    /// The message it is: who sent it and which of theirs it is. A reminder's
+    /// `from` is the actor itself.
+    pub key: Key,
+    /// The message.
+    pub message: Message<P>,
+}
+
+impl<P: Payload> Serialize for UndeliveredRecord<P, Elapsed> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut record = serializer.serialize_struct("UndeliveredRecord", 5)?;
+        record.serialize_field("agent", &self.agent)?;
+        record.serialize_field("t", &self.t)?;
+        record.serialize_field("from", &self.key.from)?;
+        record.serialize_field("seq", &self.key.seq)?;
+        record.serialize_field("message", &Wire(&self.message))?;
+        record.end()
+    }
+}
+
+/// A message an actor's handler yielded that was carried nowhere, because the
+/// actor had already been stopped.
+///
+/// A call in progress is not interrupted when a `Stop` arrives (ADR-0016): the
+/// perception thread sets the actor's stopped flag, and the handler thread
+/// logs whatever the call yields after that as one of these and carries none
+/// of it out. So the log says what a handler decided even when the episode had
+/// no use for it.
+///
+/// It carries the same fields as the [`ActionRecord`] it would have been. A
+/// reminder that was yielded too late is one of these too: nothing came back
+/// from it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsentRecord<P: Payload, T = Instant> {
+    /// The actor this record belongs to: the one whose handler yielded it.
+    pub agent: ActorId,
+    /// When its handler thread declined to carry it out.
+    pub t: T,
+    /// The message it would have been.
+    pub key: Key,
+    /// The message as it would have been sent.
+    pub message: Message<P>,
+}
+
+impl<P: Payload> Serialize for UnsentRecord<P, Elapsed> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut record = serializer.serialize_struct("UnsentRecord", 4)?;
+        record.serialize_field("agent", &self.agent)?;
+        record.serialize_field("t", &self.t)?;
+        record.serialize_field("seq", &self.key.seq)?;
+        record.serialize_field("message", &Wire(&self.message))?;
+        record.end()
+    }
 }
 
 /// One record of the log: what a [`Sink`] is handed.
@@ -413,7 +530,8 @@ pub struct CycleRecord<T = Instant> {
 #[serde(
     tag = "type",
     rename_all = "snake_case",
-    bound = "ObservationRecord<P, T>: Serialize, ActionRecord<P, T>: Serialize, T: Serialize"
+    bound = "ObservationRecord<P, T>: Serialize, ActionRecord<P, T>: Serialize, \
+             UndeliveredRecord<P, T>: Serialize, UnsentRecord<P, T>: Serialize, T: Serialize"
 )]
 pub enum Record<P: Payload, T = Instant> {
     /// The header: when the episode started.
@@ -428,6 +546,10 @@ pub enum Record<P: Payload, T = Instant> {
     Reward(RewardRecord<T>),
     /// A cycle of some agent's loop.
     Cycle(CycleRecord<T>),
+    /// A message some actor was stopped before it could observe.
+    Undelivered(UndeliveredRecord<P, T>),
+    /// A message some actor's handler yielded after it had been stopped.
+    Unsent(UnsentRecord<P, T>),
 }
 
 impl<P: Payload> Record<P, Instant> {
@@ -466,6 +588,18 @@ impl<P: Payload> Record<P, Instant> {
                 t_stop: offset(record.t_stop),
                 woken: record.woken,
                 observed: record.observed,
+            }),
+            Self::Undelivered(record) => Record::Undelivered(UndeliveredRecord {
+                agent: record.agent,
+                t: offset(record.t),
+                key: record.key,
+                message: record.message,
+            }),
+            Self::Unsent(record) => Record::Unsent(UnsentRecord {
+                agent: record.agent,
+                t: offset(record.t),
+                key: record.key,
+                message: record.message,
             }),
         }
     }
@@ -506,6 +640,25 @@ impl<P: Payload, T> From<CycleRecord<T>> for Record<P, T> {
         Self::Cycle(record)
     }
 }
+
+impl<P: Payload, T> From<UndeliveredRecord<P, T>> for Record<P, T> {
+    fn from(record: UndeliveredRecord<P, T>) -> Self {
+        Self::Undelivered(record)
+    }
+}
+
+impl<P: Payload, T> From<UnsentRecord<P, T>> for Record<P, T> {
+    fn from(record: UnsentRecord<P, T>) -> Self {
+        Self::Unsent(record)
+    }
+}
+
+/// The sinks a log writer is built from: each a format bound to a destination,
+/// with what its failure costs.
+///
+/// A name for what a caller hands over, because the list is a thing in its own
+/// right: it is what an episode's log *is*, in the order the records reach it.
+pub type Sinks<P> = Vec<(Box<dyn Sink<P>>, Policy)>;
 
 /// A consumer of log records: a format bound to a destination.
 ///
@@ -590,10 +743,7 @@ impl Writer {
     /// discards what it receives, which is what an episode that records
     /// nothing wants.
     #[must_use]
-    pub fn spawn<P: Payload>(
-        sinks: Vec<(Box<dyn Sink<P>>, Policy)>,
-        clock: Clock,
-    ) -> (Sender<Record<P>>, Self) {
+    pub fn spawn<P: Payload>(sinks: Sinks<P>, clock: Clock) -> (Sender<Record<P>>, Self) {
         let (sender, receiver) = unbounded::<Record<P>>();
         let thread = thread::spawn(move || {
             let mut live = sinks;
@@ -648,7 +798,7 @@ impl Writer {
 /// finished, because a destination that refused one write has no reason to
 /// accept the next.
 fn deliver<P: Payload>(
-    sinks: &mut Vec<(Box<dyn Sink<P>>, Policy)>,
+    sinks: &mut Sinks<P>,
     mut act: impl FnMut(&mut dyn Sink<P>) -> io::Result<()>,
 ) -> io::Result<()> {
     let mut failed = None;
@@ -753,7 +903,7 @@ mod tests {
                 agent: a,
                 t_start: at(origin, 30),
                 t_stop: at(origin, 50),
-                woken: Woken::Queue,
+                woken: Some(Woken::Queue),
                 observed: Some(key("b", 4)),
             }
             .into(),
@@ -906,7 +1056,7 @@ mod tests {
             agent: ActorId::new("a"),
             t_start: Elapsed::from(Duration::from_nanos(60)),
             t_stop: Elapsed::from(Duration::from_nanos(61)),
-            woken: Woken::Timeout,
+            woken: Some(Woken::Timeout),
             observed: None,
         }
         .into();
@@ -923,7 +1073,7 @@ mod tests {
             agent: ActorId::new("a"),
             t_start: Elapsed::from(Duration::MAX),
             t_stop: Elapsed::from(Duration::MAX),
-            woken: Woken::Queue,
+            woken: Some(Woken::Queue),
             observed: None,
         }
         .into();
@@ -1123,7 +1273,7 @@ mod tests {
             agent: ActorId::new("a"),
             t_start: clock.origin(),
             t_stop: clock.origin(),
-            woken: Woken::Queue,
+            woken: Some(Woken::Queue),
             observed: None,
         }
         .into();

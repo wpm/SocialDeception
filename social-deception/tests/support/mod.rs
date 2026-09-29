@@ -6,8 +6,19 @@
 //! The checks here are properties of the log, not of any game. They are
 //! meant to run unchanged against episodes where no independent check on the
 //! content is available.
+//!
+//! # Two runtimes, two sets of invariants
+//!
+//! [`check`] is the old runtime's. Several of its invariants are false under
+//! the [`actor`](social_deception::actor) runtime on purpose — a reminder is
+//! an actor's own message to itself, a cycle says nothing about what woke it,
+//! a send may be addressed to nobody — so that runtime's invariants are in
+//! [`actor`], and its Collatz ring is in [`collatz_actor`]. Werewolf runs on
+//! the old runtime until issue #116, so [`werewolf`] builds on [`check`].
 
+pub mod actor;
 pub mod collatz;
+pub mod collatz_actor;
 mod temp;
 pub mod werewolf;
 
@@ -105,7 +116,7 @@ pub fn check(lines: &[Value]) {
 /// The header's `start_unix_ns` is the one wall-clock time anywhere in the
 /// log, so it is checked for its presence and its type and never for its
 /// value: it is different on every run by construction (ADR-0017).
-fn check_the_header(lines: &[Value]) {
+pub(crate) fn check_the_header(lines: &[Value]) {
     let header = lines.first().expect("a log has at least its header");
     assert_eq!(header["type"], "episode", "the first line is the header");
     assert!(
@@ -127,7 +138,7 @@ fn check_the_header(lines: &[Value]) {
 /// The two absences are the point. A reward has no `seq` because a sequence
 /// number is a message's and a reward is not a message, and no message
 /// because it is logged rather than said.
-fn check_reward(line: &Value) {
+pub(crate) fn check_reward(line: &Value) {
     agent(line);
     time(line, "t");
     assert!(
@@ -262,7 +273,7 @@ pub fn time(line: &Value, key: &str) -> u64 {
 /// What a record says about the message it carries: its sender, its
 /// recipients and its payload, which together with the key are what an
 /// observation and its action must agree on.
-fn message(line: &Value) -> (&str, Vec<&Value>, &Value) {
+pub(crate) fn message(line: &Value) -> (&str, Vec<&Value>, &Value) {
     let message = &line["message"];
     let sender = message["sender"]
         .as_str()
