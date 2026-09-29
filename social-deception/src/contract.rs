@@ -36,7 +36,7 @@
 //!
 //! The iterator borrows the handler, so neither trait is `dyn`-compatible.
 //! Nothing requires them to be: an actor's threads are generic over the
-//! handler, and an [`Episode`](super::episode::Episode) erases the type into
+//! handler, and an [`Episode`](crate::episode::Episode) erases the type into
 //! a boxed closure when a handler is added.
 
 use std::time::Instant;
@@ -74,7 +74,7 @@ pub struct Observation<P: Payload> {
 ///   can only send you a message asking you to, and your handler may answer
 ///   with a reminder of its own. A reminder has no recipients.
 /// - **It is the only way an actor sends itself a message.** The
-///   [`Router`](super::router::Router) refuses a send whose recipients
+///   [`Router`](crate::router::Router) refuses a send whose recipients
 ///   include its sender, so there is no loopback anywhere else.
 /// - **The deadline is required.** Since a reminder is the only way to send
 ///   oneself a message, one wanted at once is a reminder whose deadline is

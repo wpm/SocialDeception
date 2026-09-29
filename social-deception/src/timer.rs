@@ -1,113 +1,183 @@
-//! Where an agent's wake-ups come from.
+//! The reminders an actor is holding, and what tells it one is due.
 //!
-//! An agent that has a deadline waits on its queues and on a wake channel at
-//! the same time, and the wake channel firing is what makes it run a cycle
-//! it was not given anything to observe: one that calls
-//! [`Handler::timeout`](crate::Handler::timeout), unless a message was
-//! waiting too, in which case the deadline joins that message's cycle and the
-//! agent observes it as usual. A [`TimerSource`] is whatever hands out those
-//! wake channels. In production it is the episode [`Clock`], whose channels fire
-//! when the process's monotonic clock reaches the deadline. In tests it is a
-//! [`ManualTimer`], whose channel fires when the test says so, so that timing
-//! behavior can be exercised without sleeping.
+//! An [`Action::Remind`](crate::Action::Remind) is handed to the actor's own
+//! perception thread, which holds it in [`Reminders`] until its deadline. At
+//! the deadline the payload is delivered back to the actor as an ordinary
+//! message from itself and observed like any other.
 //!
-//! A wake channel is asked for with an absolute deadline, never with an
-//! interval. That is what keeps the deadline fixed while messages arrive: an
-//! agent that is spoken to keeps waiting on the same channel, so its deadline
-//! is never pushed back.
+//! # Two kinds of timer, and no trait
+//!
+//! The perception thread waits on **one** channel for its reminders, because
+//! `crossbeam`'s `select!` waits on a fixed set of channels and an actor may
+//! hold any number of reminders. So [`Reminders`] keeps them ordered by
+//! deadline and arms one channel for the earliest of them.
+//!
+//! In production that channel comes from `crossbeam_channel::at`, which fires
+//! when the process's monotonic clock reaches the deadline. In tests it is an
+//! **ordinary channel the test holds the sender of**, so a test fires the
+//! timer when it chooses and timed behavior is deterministic with no sleeping
+//! and no trait: [`Timer::held`] hands back the sender, and firing it makes
+//! the perception thread deliver whatever is due — which under a held timer is
+//! everything, since the test rather than the clock decides when a deadline
+//! has passed.
+//!
+//! That replaced `TimerSource`, a trait with a real implementation and a
+//! `ManualTimer` that only one module's tests used. One enum with two cases is
+//! smaller than a trait with two implementations, and it is what lets
+//! [`Clock`](crate::Clock) stay an origin and nothing else: no test
+//! constructs a clock in order to control when a deadline fires.
 
+use std::collections::BTreeMap;
 use std::time::Instant;
 
-use crossbeam_channel::{Receiver, SendError, Sender, at, unbounded};
+use crossbeam_channel::{Receiver, Sender, at, never, unbounded};
 
-use crate::clock::Clock;
-
-/// A source of wake channels.
+/// Where an actor's reminder wake-ups come from.
 ///
-/// The value a wake channel delivers is the instant it fired; the agent loop
-/// ignores it. A channel fires at most once and must never disconnect while
-/// the agent may still be waiting on it.
-pub trait TimerSource {
-    /// A channel that delivers one message once `deadline` has passed.
-    fn wake_at(&mut self, deadline: Instant) -> Receiver<Instant>;
-}
-
-impl TimerSource for Clock {
-    /// A channel driven by real elapsed time. A deadline already in the past
-    /// fires immediately.
-    ///
-    /// A deadline is an [`Instant`] on the process's monotonic clock, which
-    /// is the clock `crossbeam` waits on, so the episode's origin plays no
-    /// part here. The [`Clock`] is the production timer source because it is
-    /// what every actor already holds, not because it converts anything.
-    fn wake_at(&mut self, deadline: Instant) -> Receiver<Instant> {
-        at(deadline)
-    }
-}
-
-/// A timer source driven by a test.
-///
-/// Every deadline an agent asks for is reported on the request channel that
-/// [`ManualTimer::new`] returns alongside it, and the agent's wake channel
-/// fires when [`ManualTimerControl::fire`] is called. A fire that arrives
-/// before the agent is waiting is kept and delivered at the next wait; the
-/// deadline value plays no part in when a fire is delivered.
+/// A [`real`](Timer::real) timer is driven by the process's monotonic clock; a
+/// [`held`](Timer::held) one is driven by whoever holds the sender it gave
+/// back, which in a test is the test.
 #[derive(Debug)]
-pub struct ManualTimer {
-    requests: Sender<Instant>,
-    wake: Receiver<Instant>,
+pub enum Timer {
+    /// Driven by elapsed time: each deadline is armed with
+    /// `crossbeam_channel::at`.
+    Real,
+    /// Driven by a channel somebody else holds the sender of. Every fire on
+    /// it makes the perception thread deliver every reminder it is holding,
+    /// earliest first, because under a held timer the holder and not the
+    /// clock is what says a deadline has passed.
+    Held(Receiver<Instant>),
 }
 
-/// The test's end of a [`ManualTimer`].
+impl Timer {
+    /// A timer driven by real elapsed time, as a run uses.
+    #[must_use]
+    pub const fn real() -> Self {
+        Self::Real
+    }
+
+    /// A timer driven by the sender this returns beside it, as a test uses.
+    #[must_use]
+    pub fn held() -> (Self, Sender<Instant>) {
+        let (fire, fired) = unbounded();
+        (Self::Held(fired), fire)
+    }
+
+    /// Whether every fire on this timer delivers everything held rather than
+    /// only what the clock says is due.
+    const fn is_held(&self) -> bool {
+        matches!(self, Self::Held(_))
+    }
+
+    /// The channel to wait on for a reminder due at `earliest`, or one that
+    /// never fires if the actor holds none.
+    fn arm(&self, earliest: Option<Instant>) -> Receiver<Instant> {
+        match self {
+            // A real timer arms the earliest deadline it has been given; a
+            // deadline already past fires at once.
+            Self::Real => earliest.map_or_else(never, at),
+            // A held timer is the one channel throughout, whether or not
+            // anything is held: a fire that arrives before any reminder was
+            // set finds nothing due and delivers nothing.
+            Self::Held(fired) => fired.clone(),
+        }
+    }
+}
+
+/// The reminders one actor is holding, ordered by deadline, and the channel
+/// armed for the earliest of them.
 ///
-/// Dropping it disconnects the agent's wake channel, which the agent reports
-/// as an error rather than a wake-up.
+/// Reminders **accumulate** and each fires once; nothing is cancelled. Two
+/// set for the same instant both fire, in the order they were set, which is
+/// why the map's values are queues.
 #[derive(Debug)]
-pub struct ManualTimerControl {
-    requests: Receiver<Instant>,
-    fire: Sender<Instant>,
-}
-
-impl ManualTimer {
-    /// Creates a manual timer and the control that drives it.
-    #[must_use]
-    pub fn new() -> (Self, ManualTimerControl) {
-        let (requests, requested) = unbounded();
-        let (fire, wake) = unbounded();
-        (
-            Self { requests, wake },
-            ManualTimerControl {
-                requests: requested,
-                fire,
-            },
-        )
-    }
-}
-
-impl TimerSource for ManualTimer {
-    fn wake_at(&mut self, deadline: Instant) -> Receiver<Instant> {
-        // A control that has stopped listening for requests is not an error:
-        // the test may only care about firing.
-        let _ = self.requests.send(deadline);
-        self.wake.clone()
-    }
-}
-
-impl ManualTimerControl {
-    /// The deadlines the agent has asked for, in the order it asked.
-    #[must_use]
-    pub fn requests(&self) -> &Receiver<Instant> {
-        &self.requests
-    }
-
-    /// Fires the agent's wake channel.
+pub struct Reminders<P> {
+    timer: Timer,
+    /// What is held, earliest deadline first, and within a deadline in the
+    /// order the reminders were set.
     ///
-    /// # Errors
+    /// Each entry carries the sequence number the reminder was given when it
+    /// was set, because that is the number the message it becomes will carry
+    /// (ADR-0016): a reminder is numbered where every other message is, at
+    /// the moment its actor decided to send it.
+    held: BTreeMap<Instant, Vec<(u64, P)>>,
+    /// The channel armed for [`earliest`](Self::earliest), kept so that the
+    /// perception thread's `select!` has something to borrow.
+    armed: Receiver<Instant>,
+}
+
+impl<P> Reminders<P> {
+    /// An actor holding nothing, whose wake-ups come from `timer`.
+    #[must_use]
+    pub fn new(timer: Timer) -> Self {
+        let armed = timer.arm(None);
+        Self {
+            timer,
+            held: BTreeMap::new(),
+            armed,
+        }
+    }
+
+    /// The channel the perception thread waits on.
     ///
-    /// If the timer has been dropped, which happens when the agent's thread
-    /// has exited.
-    pub fn fire(&self) -> Result<(), SendError<Instant>> {
-        self.fire.send(Instant::now())
+    /// It is re-armed whenever the earliest deadline changes, so an actor
+    /// that sets a nearer reminder waits on the nearer one.
+    #[must_use]
+    pub const fn armed(&self) -> &Receiver<Instant> {
+        &self.armed
+    }
+
+    /// The earliest deadline held, if any.
+    fn earliest(&self) -> Option<Instant> {
+        self.held.keys().next().copied()
+    }
+
+    /// Holds `payload` until `deadline`, numbered `seq`.
+    pub fn hold(&mut self, deadline: Instant, seq: u64, payload: P) {
+        let earliest = self.earliest();
+        self.held.entry(deadline).or_default().push((seq, payload));
+        // Re-armed only when the earliest moved, so an actor that keeps
+        // setting later reminders waits on the channel it already has.
+        if earliest != self.earliest() {
+            self.armed = self.timer.arm(self.earliest());
+        }
+    }
+
+    /// Whatever is due at `now`, earliest deadline first, taken out of the
+    /// held set: each reminder fires once.
+    ///
+    /// Under a [`held`](Timer::held) timer everything is due, because the
+    /// holder of the timer and not the clock is what says a deadline has
+    /// passed.
+    ///
+    /// # Panics
+    ///
+    /// Never in practice: the earliest deadline is one of the held ones by
+    /// construction, so the removal below cannot miss.
+    pub fn due(&mut self, now: Instant) -> Vec<(u64, P)> {
+        let mut due = Vec::new();
+        while let Some(deadline) = self.earliest() {
+            if !self.timer.is_held() && deadline > now {
+                break;
+            }
+            due.extend(
+                self.held
+                    .remove(&deadline)
+                    .expect("the earliest deadline is one of the held ones"),
+            );
+        }
+        self.armed = self.timer.arm(self.earliest());
+        due
+    }
+
+    /// Everything still held, earliest deadline first, leaving nothing.
+    ///
+    /// This is what a stopped actor's perception thread logs as undelivered:
+    /// a reminder its actor set and will never observe.
+    pub fn drain(&mut self) -> Vec<(u64, P)> {
+        let held = std::mem::take(&mut self.held);
+        self.armed = self.timer.arm(None);
+        held.into_values().flatten().collect()
     }
 }
 
@@ -119,59 +189,99 @@ mod tests {
 
     use super::*;
 
+    /// An instant far enough ahead that no test reaches it.
+    fn later() -> Instant {
+        Instant::now() + Duration::from_secs(3600)
+    }
+
     #[test]
-    fn clock_wakes_no_earlier_than_the_deadline() {
-        let mut clock = Clock::start();
+    fn an_actor_holding_nothing_waits_on_a_channel_that_never_fires() {
+        let reminders = Reminders::<u64>::new(Timer::real());
+        assert_eq!(reminders.armed().try_recv(), Err(TryRecvError::Empty));
+    }
+
+    #[test]
+    fn a_real_timer_fires_when_the_deadline_passes() {
+        let mut reminders = Reminders::new(Timer::real());
         let deadline = Instant::now() + Duration::from_millis(2);
-        clock.wake_at(deadline).recv().unwrap();
-        assert!(Instant::now() >= deadline);
+        reminders.hold(deadline, 0, "soon");
+        let fired = reminders.armed().recv().unwrap();
+        assert!(fired >= deadline);
+        assert_eq!(reminders.due(Instant::now()), [(0, "soon")]);
     }
 
     #[test]
-    fn clock_wakes_immediately_for_a_deadline_that_has_passed() {
-        let mut clock = Clock::start();
-        assert!(clock.wake_at(Instant::now()).recv().is_ok());
+    fn a_real_timer_does_not_fire_early() {
+        let mut reminders = Reminders::new(Timer::real());
+        reminders.hold(later(), 0, "far");
+        assert_eq!(reminders.armed().try_recv(), Err(TryRecvError::Empty));
+        assert!(reminders.due(Instant::now()).is_empty());
     }
 
     #[test]
-    fn clock_does_not_wake_early_for_a_far_deadline() {
-        let mut clock = Clock::start();
-        let wake = clock.wake_at(Instant::now() + Duration::from_secs(3600));
-        assert_eq!(wake.try_recv(), Err(TryRecvError::Empty));
+    fn a_nearer_reminder_re_arms_the_channel() {
+        let mut reminders = Reminders::new(Timer::real());
+        reminders.hold(later(), 0, "far");
+        reminders.hold(Instant::now() + Duration::from_millis(2), 1, "soon");
+        // The nearer one fires, which the far channel would not have.
+        reminders.armed().recv().unwrap();
+        assert_eq!(reminders.due(Instant::now()), [(1, "soon")]);
     }
 
     #[test]
-    fn manual_timer_reports_requests_and_fires_on_command() {
-        let (mut timer, control) = ManualTimer::new();
-        let deadline = Instant::now() + Duration::from_secs(1);
-        let wake = timer.wake_at(deadline);
-        assert_eq!(control.requests().try_recv(), Ok(deadline));
-        assert_eq!(wake.try_recv(), Err(TryRecvError::Empty));
-        control.fire().unwrap();
-        assert!(wake.try_recv().is_ok());
-        assert_eq!(wake.try_recv(), Err(TryRecvError::Empty));
+    fn reminders_accumulate_and_each_fires_once() {
+        let mut reminders = Reminders::new(Timer::real());
+        let now = Instant::now();
+        reminders.hold(now, 0, "first");
+        reminders.hold(now, 1, "second");
+        assert_eq!(reminders.due(now), [(0, "first"), (1, "second")]);
+        assert!(reminders.due(now).is_empty(), "each fires once");
     }
 
     #[test]
-    fn manual_timer_keeps_an_early_fire_for_the_next_wait() {
-        let (mut timer, control) = ManualTimer::new();
-        control.fire().unwrap();
-        let wake = timer.wake_at(Instant::now());
-        assert!(wake.try_recv().is_ok());
+    fn what_is_due_comes_earliest_first_and_leaves_the_rest() {
+        let mut reminders = Reminders::new(Timer::real());
+        let now = Instant::now();
+        reminders.hold(now + Duration::from_nanos(2), 1, "later");
+        reminders.hold(now, 0, "now");
+        reminders.hold(later(), 2, "far");
+        assert_eq!(
+            reminders.due(now + Duration::from_nanos(2)),
+            [(0, "now"), (1, "later")]
+        );
+        assert_eq!(reminders.drain(), [(2, "far")]);
     }
 
     #[test]
-    fn dropping_the_control_disconnects_the_wake_channel() {
-        let (mut timer, control) = ManualTimer::new();
-        let wake = timer.wake_at(Instant::now());
-        drop(control);
-        assert_eq!(wake.try_recv(), Err(TryRecvError::Disconnected));
+    fn a_held_timer_fires_when_the_test_says_so_and_delivers_everything() {
+        let (timer, fire) = Timer::held();
+        let mut reminders = Reminders::new(timer);
+        // Both deadlines are in the future, so a real timer would deliver
+        // neither; a held one delivers what the test asked for.
+        reminders.hold(later(), 0, "far");
+        reminders.hold(later() + Duration::from_secs(1), 1, "further");
+        assert_eq!(reminders.armed().try_recv(), Err(TryRecvError::Empty));
+        fire.send(Instant::now()).unwrap();
+        reminders.armed().recv().unwrap();
+        assert_eq!(reminders.due(Instant::now()), [(0, "far"), (1, "further")]);
     }
 
     #[test]
-    fn firing_a_dropped_timer_is_an_error() {
-        let (timer, control) = ManualTimer::new();
-        drop(timer);
-        assert!(control.fire().is_err());
+    fn a_held_timer_fired_with_nothing_held_delivers_nothing() {
+        let (timer, fire) = Timer::held();
+        let mut reminders = Reminders::<&str>::new(timer);
+        fire.send(Instant::now()).unwrap();
+        reminders.armed().recv().unwrap();
+        assert!(reminders.due(Instant::now()).is_empty());
+    }
+
+    #[test]
+    fn draining_leaves_nothing_and_disarms() {
+        let mut reminders = Reminders::new(Timer::real());
+        reminders.hold(Instant::now(), 0, "due");
+        reminders.hold(later(), 1, "far");
+        assert_eq!(reminders.drain(), [(0, "due"), (1, "far")]);
+        assert!(reminders.drain().is_empty());
+        assert_eq!(reminders.armed().try_recv(), Err(TryRecvError::Empty));
     }
 }

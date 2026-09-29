@@ -85,7 +85,7 @@ pub enum Message {
     ///
     /// This is the moderator's private payload, the one nobody else ever
     /// sends and the one nobody else ever receives: a
-    /// [`Reminder`](crate::actor::Reminder) is always self-directed
+    /// [`Reminder`](crate::Reminder) is always self-directed
     /// (ADR-0016), and the moderator is the only actor in this game that
     /// keeps a clock. It replaces the old runtime's `deadline`/`timeout`
     /// pair: instead of telling the loop when to wake it, the moderator

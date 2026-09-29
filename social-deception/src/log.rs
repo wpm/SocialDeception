@@ -34,30 +34,27 @@
 //!
 //! The log's first line is an [`EpisodeRecord`], the header: the episode's
 //! wall-clock start, which is the only wall-clock time anywhere in the log.
-//! Everything after it is an agent's.
 //!
-//! An agent runs one cycle per wake-up: it pops the controls at the head of
-//! its queue and at most one message, hands that one observation to its
-//! handler, and sends the actions that come back. Each cycle produces:
+//! Everything after it is an actor's. An actor's **cycle** is one handler
+//! call: one observation in, and the actions it yielded (ADR-0016). Each
+//! cycle produces:
 //!
-//! - an [`ObservationRecord`] for the observation it popped, if it popped
-//!   one, written the instant it is popped and carrying that instant, along
-//!   with the `(from, seq)` of the message. At most one per cycle: a cycle
-//!   handles one observation (ADR-0008);
-//! - a [`ControlRecord`] per control popped, likewise, and with no `seq`: a
-//!   control is not a message and nobody numbered it;
+//! - an [`ObservationRecord`] for the observation the call was made with,
+//!   written the instant the message *arrived* and carrying that instant,
+//!   along with the `(from, seq)` of the message. At most one per cycle: a
+//!   handler is called once per observation;
+//! - a [`ControlRecord`] per control the actor received, likewise, and with
+//!   no `seq`: a control is not a message and nobody numbered it;
 //! - an [`ActionRecord`] per action sent, written the instant it is sent and
-//!   carrying that instant and the message's own `seq`. Every action a
-//!   handler returns is sent, so there is a record per action and no other
-//!   kind for one (ADR-0009);
-//! - a [`CycleRecord`] closing the cycle: the handling window, what woke it,
-//!   and the `(from, seq)` of the observation it was called with, if any.
+//!   carrying that instant and the message's own `seq`. Actions are sent as
+//!   the handler yields them, so there is a record per action and no other
+//!   kind for one;
+//! - a [`CycleRecord`] closing the call: its window, and the `(from, seq)` of
+//!   the observation it was called with, if any.
 //!
-//! Under the [`actor`](crate::actor) runtime a cycle is one **handler call**
-//! rather than one turn of a loop, so its record says nothing about what woke
-//! it and its window brackets exactly that call. Two more kinds appear there
-//! and nowhere else, because that runtime stops an actor whenever its
-//! environment says so rather than only when nothing is in flight (ADR-0016):
+//! Two more kinds appear when an actor is stopped, which an environment may
+//! do whenever its rules say so rather than only when nothing is in flight
+//! (ADR-0016):
 //!
 //! - an [`UndeliveredRecord`] for a message the actor was stopped before it
 //!   could observe, and for every reminder it was still holding;
@@ -127,16 +124,14 @@
 //! ```json
 //! {"type":"episode","start_unix_ns":1790630400000000000}
 //! {"type":"control","agent":"alice","t":12,"control":"start"}
-//! {"type":"cycle","agent":"alice","t_start":12,"t_stop":13,"woken":"queue"}
+//! {"type":"cycle","agent":"alice","t_start":12,"t_stop":13}
 //! {"type":"observation","agent":"alice","t":55,"from":"moderator","seq":0,"message":{"sender":"moderator","recipients":["alice"],"payload":{"Request":{}}}}
 //! {"type":"action","agent":"alice","t":90,"seq":0,"message":{"sender":"alice","recipients":["moderator"],"payload":{"Response":{}}}}
-//! {"type":"cycle","agent":"alice","t_start":55,"t_stop":90,"woken":"queue","from":"moderator","seq":0}
+//! {"type":"cycle","agent":"alice","t_start":55,"t_stop":90,"from":"moderator","seq":0}
 //! {"type":"reward","agent":"alice","t":500,"value":1}
 //! ```
 
-use std::fs::File;
 use std::io::{self, BufWriter, Write};
-use std::path::Path;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -184,25 +179,6 @@ impl Serialize for Elapsed {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_u64(self.nanos())
     }
-}
-
-/// What started a cycle.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Woken {
-    /// Something was waiting on the agent's queue.
-    Queue,
-    /// The agent's deadline had passed when the cycle began.
-    ///
-    /// It says when the cycle ran, not what it decided from. A deadline
-    /// that passes while nothing is waiting runs a cycle that observes
-    /// nothing and calls [`Handler::timeout`](crate::Handler::timeout); one
-    /// that passes while a message is waiting joins that message's cycle,
-    /// which observes it and calls
-    /// [`Handler::handle`](crate::Handler::handle) like any other. Either
-    /// way the deadline is retired and the next is measured from this
-    /// cycle, which is what the mark is for.
-    Timeout,
 }
 
 /// Which message a record is about: its sender and that sender's sequence
@@ -278,8 +254,13 @@ pub struct EpisodeRecord {
 
 impl EpisodeRecord {
     /// The header for an episode whose origin is `clock`'s.
+    ///
+    /// Crate-private because it takes a clock: the writer builds the header
+    /// from the one clock it was started with, and a caller that could build
+    /// one could name an origin the record offsets are not measured from
+    /// (ADR-0017).
     #[must_use]
-    pub const fn of(clock: Clock) -> Self {
+    pub(crate) const fn of(clock: Clock) -> Self {
         Self {
             start_unix_ns: clock.start_unix_ns(),
         }
@@ -402,14 +383,14 @@ pub struct RewardRecord<T = Instant> {
 /// records without the file's order meaning anything: the actions belong to
 /// the cycle whose window contains them.
 ///
-/// Under the [`actor`](crate::actor) runtime a cycle is **one handler call**:
-/// its window, and the observation it was called with. A `start` call is a
-/// cycle with no observation. Actions a lazy iterator yields during the call
-/// may appear in the log *before* the cycle record, because they are sent as
-/// they are yielded and the cycle record closes the call.
+/// A cycle is **one handler call**: its window, and the observation it was
+/// called with. A `start` call is a cycle with no observation. Actions a lazy
+/// iterator yields during the call may appear in the log *before* the cycle
+/// record, because they are sent as they are yielded and the cycle record
+/// closes the call.
 ///
-/// There, **one actor's windows can overlap**, and a reader that groups by
-/// window has to allow for it. `t_start` is the instant the observation
+/// **One actor's windows can overlap**, and a reader that groups by window
+/// has to allow for it. `t_start` is the instant the observation
 /// *arrived*, not the instant the call began — those are the same only when the
 /// handler was idle. A message that waited while the handler was busy opens a
 /// window that starts before the previous one ended. The arrival is the right
@@ -419,22 +400,15 @@ pub struct RewardRecord<T = Instant> {
 /// action lies in the window of the call that yielded it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CycleRecord<T = Instant> {
-    /// The agent whose cycle this was.
+    /// The actor whose cycle this was.
     pub agent: ActorId,
-    /// When the agent popped its queue, and so when everything it popped was
-    /// received.
+    /// When the observation the handler was called with **arrived**, which is
+    /// not when the call began unless the handler was idle.
     pub t_start: T,
-    /// When it finished, including sending its actions.
+    /// When the call returned, including sending everything it yielded.
     pub t_stop: T,
-    /// What started the cycle, or `None` for a cycle of the
-    /// [`actor`](crate::actor) runtime, where there is nothing to say: an
-    /// actor's handler thread runs a cycle when an observation reaches it,
-    /// and a reminder arrives as one of those rather than as a wake-up
-    /// (ADR-0016).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub woken: Option<Woken>,
-    /// The observation the handler was called with, if any. A cycle that
-    /// popped only controls, or that woke on its deadline, has none.
+    /// The observation the handler was called with, if any. A `start` call
+    /// has none.
     #[serde(flatten, skip_serializing_if = "Option::is_none")]
     pub observed: Option<Key>,
 }
@@ -555,8 +529,13 @@ pub enum Record<P: Payload, T = Instant> {
 impl<P: Payload> Record<P, Instant> {
     /// The same record with every instant converted to an offset from
     /// `clock`'s origin, which is the form a [`Sink`] is given.
+    ///
+    /// Crate-private because it takes a clock. **Only the writer converts**,
+    /// and it converts with the episode's one clock; the `Instant`-shaped
+    /// record a sink can never see is what keeps that a rule the types state
+    /// rather than a convention (ADR-0017).
     #[must_use]
-    pub fn elapsed(self, clock: Clock) -> Record<P, Elapsed> {
+    pub(crate) fn elapsed(self, clock: Clock) -> Record<P, Elapsed> {
         let offset = |t| Elapsed::from(clock.offset(t));
         match self {
             Self::Episode(header) => Record::Episode(header),
@@ -586,7 +565,6 @@ impl<P: Payload> Record<P, Instant> {
                 agent: record.agent,
                 t_start: offset(record.t_start),
                 t_stop: offset(record.t_stop),
-                woken: record.woken,
                 observed: record.observed,
             }),
             Self::Undelivered(record) => Record::Undelivered(UndeliveredRecord {
@@ -713,8 +691,8 @@ pub enum Policy {
 /// instants to offsets from the episode's origin, and hands each sink every
 /// record it receives.
 ///
-/// Records reach it over an in-process channel whose sender is handed out by
-/// [`Writer::spawn`]; every agent gets a clone. The thread runs until every
+/// Records reach it over an in-process channel whose sender the episode that
+/// started it hands out; every actor gets a clone. The thread runs until every
 /// sender has been dropped, then finishes each sink and exits.
 /// [`Writer::join`] waits for that and reports how it went.
 ///
@@ -736,14 +714,22 @@ impl Writer {
     /// that feeds it.
     ///
     /// `clock` is the episode's, captured before this is called and shared
-    /// with every agent, which is what puts a writer's offsets and an
-    /// agent's own measurements on one timeline.
+    /// with every actor, which is what puts a writer's offsets and an
+    /// actor's own measurements on one timeline.
+    ///
+    /// It is **crate-private**, along with everything else here that takes a
+    /// clock, and that is what makes the shared origin structural (ADR-0017).
+    /// An actor's threads are started only by an
+    /// [`Episode`](crate::Episode), which starts the clock itself, so no
+    /// caller can hand a writer one origin and an actor another.
+    /// [`Clock::start`](crate::Clock::start) says what a caller's own clock
+    /// can still reach, and why that is wanted.
     ///
     /// A writer with no sinks at all is allowed: it drains the channel and
     /// discards what it receives, which is what an episode that records
     /// nothing wants.
     #[must_use]
-    pub fn spawn<P: Payload>(sinks: Sinks<P>, clock: Clock) -> (Sender<Record<P>>, Self) {
+    pub(crate) fn spawn<P: Payload>(sinks: Sinks<P>, clock: Clock) -> (Sender<Record<P>>, Self) {
         let (sender, receiver) = unbounded::<Record<P>>();
         let thread = thread::spawn(move || {
             let mut live = sinks;
@@ -760,7 +746,7 @@ impl Writer {
 
     /// Waits for the writer to finish.
     ///
-    /// The writer finishes when every sender returned by [`Writer::spawn`]
+    /// The writer finishes when every sender the episode handed out
     /// has been dropped, or earlier if a required sink failed. Drop the
     /// senders before calling this, or it never returns.
     ///
@@ -773,21 +759,6 @@ impl Writer {
         self.thread
             .join()
             .map_err(|_| io::Error::other("log writer thread panicked"))?
-    }
-
-    /// Creates (or truncates) the file at `path` and starts a writer whose
-    /// one sink writes JSON Lines to it, as a run whose log is that file
-    /// requires.
-    ///
-    /// # Errors
-    ///
-    /// Whatever [`File::create`] returns.
-    pub fn create<P: Payload>(
-        path: impl AsRef<Path>,
-        clock: Clock,
-    ) -> io::Result<(Sender<Record<P>>, Self)> {
-        let sink: Box<dyn Sink<P>> = Box::new(JsonLines::new(File::create(path)?));
-        Ok(Self::spawn(vec![(sink, Policy::Required)], clock))
     }
 }
 
@@ -858,6 +829,8 @@ mod tests {
 
     use serde_json::{Value, json};
 
+    use std::fs::File;
+
     use super::*;
     use crate::testing::{Shared, TestPayload, header_anchor, joined, parse_lines, recording};
 
@@ -903,7 +876,6 @@ mod tests {
                 agent: a,
                 t_start: at(origin, 30),
                 t_stop: at(origin, 50),
-                woken: Some(Woken::Queue),
                 observed: Some(key("b", 4)),
             }
             .into(),
@@ -918,7 +890,7 @@ mod tests {
                    "message": {"sender": "b", "recipients": ["a"], "payload": {"Step": 6}}}),
             json!({"type": "action", "agent": "a", "t": 40, "seq": 0,
                    "message": {"sender": "a", "recipients": ["b"], "payload": {"Step": 3}}}),
-            json!({"type": "cycle", "agent": "a", "t_start": 30, "t_stop": 50, "woken": "queue",
+            json!({"type": "cycle", "agent": "a", "t_start": 30, "t_stop": 50,
                    "from": "b", "seq": 4}),
         ]
     }
@@ -1051,19 +1023,18 @@ mod tests {
     }
 
     #[test]
-    fn a_timeout_cycle_records_what_woke_it_and_observes_nothing() {
+    fn a_cycle_that_observed_nothing_writes_a_window_and_nothing_else() {
+        // What a `start` call is: the hook ran, and no message was behind it.
         let cycle: Record<TestPayload, Elapsed> = CycleRecord {
             agent: ActorId::new("a"),
             t_start: Elapsed::from(Duration::from_nanos(60)),
             t_stop: Elapsed::from(Duration::from_nanos(61)),
-            woken: Some(Woken::Timeout),
             observed: None,
         }
         .into();
         assert_eq!(
             serde_json::to_value(&cycle).unwrap(),
-            json!({"type": "cycle", "agent": "a", "t_start": 60, "t_stop": 61,
-                   "woken": "timeout"})
+            json!({"type": "cycle", "agent": "a", "t_start": 60, "t_stop": 61})
         );
     }
 
@@ -1073,7 +1044,6 @@ mod tests {
             agent: ActorId::new("a"),
             t_start: Elapsed::from(Duration::MAX),
             t_stop: Elapsed::from(Duration::MAX),
-            woken: Some(Woken::Queue),
             observed: None,
         }
         .into();
@@ -1168,7 +1138,12 @@ mod tests {
             COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
         let clock = Clock::start();
-        let (sender, writer) = Writer::create(&path, clock).unwrap();
+        // The sink an episode's `to_file` builds, assembled here by hand:
+        // nothing public takes a clock, so a writer is started only from
+        // inside the crate (ADR-0017).
+        let sink: Box<dyn Sink<TestPayload>> =
+            Box::new(JsonLines::new(File::create(&path).unwrap()));
+        let (sender, writer) = Writer::spawn(vec![(sink, Policy::Required)], clock);
         for record in sample(clock.origin()) {
             sender.send(record).unwrap();
         }
@@ -1273,7 +1248,6 @@ mod tests {
             agent: ActorId::new("a"),
             t_start: clock.origin(),
             t_stop: clock.origin(),
-            woken: Some(Woken::Queue),
             observed: None,
         }
         .into();

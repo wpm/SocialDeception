@@ -87,9 +87,9 @@ use super::moderator::Moderator;
 use super::player::Player;
 use super::role::Role;
 use super::strategy::RandomStrategy;
-use crate::actor::{Episode, EpisodeError, Policy as Policies};
 use crate::log::{JsonLines, Policy, Sinks};
 use crate::message::ActorId;
+use crate::{Episode, EpisodeError, Policy as Policies};
 
 /// Why a run did not end with an outcome.
 #[derive(Debug)]
@@ -335,10 +335,10 @@ mod tests {
     use std::path::Path;
 
     use super::*;
-    use crate::actor::{Action, Observation};
     use crate::testing::{TempDir, fast, id, ids, parse_lines};
     use crate::werewolf::config::{DEFAULT_MODERATOR, RoleCounts};
     use crate::werewolf::transcript::{self, Transcript};
+    use crate::{Action, Observation};
 
     const SEED: u64 = 20_260_918;
 

@@ -22,13 +22,13 @@
 //! plays the game as a fold over players' responses, producing
 //! [`Directive`]s that say what to tell whom. The [`Moderator`]
 //! ([`moderator`]) is the actor that runs a game: the thin
-//! [`Step`](crate::actor::Step) that folds each observation into the game,
+//! [`Step`](crate::Step) that folds each observation into the game,
 //! sends the directives as messages, sets the reminders its sessions' clocks
 //! call for, and — being the episode's environment — starts the players when
 //! it begins and stops everybody, itself included, when the game is over.
 //!
 //! The seam with the runtime is [`setup`]: [`episode`] builds a populated
-//! [`Episode`](crate::actor::Episode) from a [`Config`], seating every player
+//! [`Episode`](crate::Episode) from a [`Config`], seating every player
 //! and the moderator, and [`run`] runs one to its [`Outcome`] or a
 //! [`RunError`].
 //! The `werewolf` binary's `play` is that, with the effective configuration

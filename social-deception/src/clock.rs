@@ -48,6 +48,24 @@ pub struct Clock {
 
 impl Clock {
     /// Starts a clock whose origin is now.
+    ///
+    /// It is public, and that is safe because **nothing public takes a clock**.
+    /// An [`Episode`](crate::Episode) starts its own and hands a copy to every
+    /// actor and to the log writer; everything that accepts one — starting an
+    /// actor's threads, starting the writer, building the log's header, and
+    /// converting a record's instants to offsets — is crate-private. So a
+    /// clock started here cannot be wired in beside a second origin, and a log
+    /// whose header names one moment and whose offsets are measured from
+    /// another is not a thing a caller can build (ADR-0017).
+    ///
+    /// [`Episode::clock`](crate::Episode::clock) hands one *out*, which is how
+    /// a test asserts that the actors and the writer share an origin. Handing
+    /// one out cannot introduce a second.
+    ///
+    /// What a clock started here can reach is a handler's `start` hook, called
+    /// directly. That is the affordance ADR-0016 asks for: a policy is a
+    /// function from an observation to actions, and a test exercises it with no
+    /// threads, no channels and no episode.
     #[must_use]
     pub fn start() -> Self {
         Self {

@@ -406,7 +406,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::log::{ControlRecord, CycleRecord, Key, ObservationRecord, RewardRecord, Woken};
+    use crate::log::{ControlRecord, CycleRecord, Key, ObservationRecord, RewardRecord};
     use crate::message::{Control, Envelope};
     use crate::testing::{Shared, id, ids};
     use crate::werewolf::message::{Outcome, Round, SessionKind};
@@ -1001,7 +1001,6 @@ mod tests {
                 agent: id("alice"),
                 t_start: at(0),
                 t_stop: at(1),
-                woken: Some(Woken::Queue),
                 observed: None,
             }
             .into(),
@@ -1040,7 +1039,6 @@ mod tests {
             agent: id("alice"),
             t_start: at(0),
             t_stop: at(1),
-            woken: Some(Woken::Queue),
             observed: None,
         }
         .into();

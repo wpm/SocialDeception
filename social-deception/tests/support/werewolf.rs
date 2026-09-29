@@ -1,6 +1,6 @@
 //! Werewolf's own invariants: what the log of a game of Werewolf
 //! satisfies beyond what [`super::actor::check`] asserts of any log of an
-//! [`actor`](social_deception::actor) runtime episode.
+//! actor runtime episode.
 //!
 //! The checks are written against the parsed lines, the way the runtime's own
 //! checks are, and read the game the way the transcript reader does: from the
@@ -483,6 +483,24 @@ impl<'a> Play<'a> {
     }
 
     /// Everyone not yet eliminated at the record on line `at`.
+    ///
+    /// This is the same predicate as [`all_the_living`], and deliberately not
+    /// the same code. That reading takes no roster: it learns the living from
+    /// the moderator's own `PhaseBegan` and `Eliminated` narrations, because
+    /// the live view's contract is that a reading of a log reproduces itself
+    /// from the log alone. This one builds the set from the configured roster
+    /// and the eliminations it found, which is setup input the live sink
+    /// refuses.
+    ///
+    /// The independence *is* the check. What the assertions below claim is
+    /// that the moderator narrated to exactly the living — and a moderator
+    /// that miscounted the living would narrate its miscount, so a check that
+    /// derived its answer from those same narrations would agree with the bug
+    /// and pass. Two derivations of one rule, from two sources, is what makes
+    /// the second an independent witness to the first rather than a restating
+    /// of it, and unifying them would cost exactly that.
+    ///
+    /// [`all_the_living`]: social_deception::werewolf::live
     fn living_at(&self, at: usize) -> BTreeSet<ActorId> {
         self.config
             .players

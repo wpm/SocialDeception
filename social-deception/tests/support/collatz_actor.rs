@@ -1,4 +1,4 @@
-//! The Collatz ring on the [`actor`](social_deception::actor) runtime: actors
+//! The Collatz ring on the actor runtime: actors
 //! pass a Collatz chain around a ring.
 //!
 //! The Collatz function takes a positive integer `n` to `n / 2` if `n` is even
@@ -34,13 +34,29 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Serialize;
-use social_deception::actor::{Action, Effect, Observation, Policy, Step as Stepping};
-use social_deception::{ActorId, Clock, Control};
+use social_deception::{
+    Action, ActorId, Clock, Control, Effect, Observation, Policy, Step as Stepping,
+};
 
-// The Collatz function itself is arithmetic: it names neither runtime's types,
-// so there is one of it and this ring calls the old ring's, which is where it
-// and its tests already live.
-pub use super::collatz::next;
+/// The Collatz function: `n / 2` for even `n`, `3n + 1` for odd `n`.
+///
+/// # Panics
+///
+/// If `n` is 0, which is not in the function's domain and would map to
+/// itself forever, or if `3n + 1` does not fit in a `u64`.
+pub fn next(n: u64) -> u64 {
+    assert!(
+        n > 0,
+        "the Collatz function is defined on positive integers"
+    );
+    if n % 2 == 0 {
+        n / 2
+    } else {
+        n.checked_mul(3)
+            .and_then(|m| m.checked_add(1))
+            .expect("3n + 1 does not fit in a u64")
+    }
+}
 
 /// What Collatz actors say.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
@@ -219,7 +235,7 @@ impl Referee {
     /// ring has already been stopped.
     ///
     /// **The environment stops itself.** That is how an episode of the
-    /// [`actor`](social_deception::actor) runtime ends: the episode holds no
+    /// actor runtime ends: the episode holds no
     /// view of what is in flight and stops nobody of its own accord until its
     /// time limit (ADR-0016).
     fn stop_if_done(&mut self) -> Vec<Effect<i32, Step>> {
@@ -449,5 +465,25 @@ mod tests {
             &mut environment,
             observation("a", ENVIRONMENT, Step::Pass { chain: 6, value: 3 }),
         );
+    }
+
+    #[test]
+    fn next_halves_even_and_triples_plus_one_odd() {
+        assert_eq!(next(6), 3);
+        assert_eq!(next(3), 10);
+        assert_eq!(next(2), 1);
+        assert_eq!(next(1), 4);
+    }
+
+    #[test]
+    #[should_panic(expected = "defined on positive integers")]
+    fn next_rejects_zero() {
+        let _ = next(0);
+    }
+
+    #[test]
+    #[should_panic(expected = "does not fit in a u64")]
+    fn next_is_loud_about_overflow() {
+        let _ = next(u64::MAX);
     }
 }

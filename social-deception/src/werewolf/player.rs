@@ -54,9 +54,9 @@ use super::knowledge::Knowledge;
 use super::message::{Message, Narration, Round, Select, SessionKind};
 use super::role::Role;
 use super::strategy::{Strategy, View};
-use crate::actor::{Action, Observation, Policy};
 use crate::clock::Clock;
 use crate::message::ActorId;
+use crate::{Action, Observation, Policy};
 
 /// A player in the episode: what it knows, the strategy that decides for it,
 /// and the moderator it addresses its selections to.
@@ -239,7 +239,7 @@ mod tests {
     use crate::testing::{ME, id, ids, narrated, observed, phase_began, target};
     use crate::werewolf::message::{Cause, Narration, Phase, Round, SessionKind};
 
-    use crate::actor::Action;
+    use crate::Action;
 
     const MODERATOR: &str = "moderator";
 

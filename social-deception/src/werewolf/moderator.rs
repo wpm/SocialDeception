@@ -128,7 +128,7 @@
 //!
 //! A game that never reaches an outcome is nobody's to notice here: the
 //! episode runs past its hard time limit and reports
-//! [`EpisodeError::Timeout`](crate::actor::EpisodeError).
+//! [`EpisodeError::Timeout`](crate::EpisodeError).
 
 use crossbeam_channel::Sender;
 
@@ -137,9 +137,9 @@ use std::time::{Duration, Instant};
 
 use super::game::{Directive, Game};
 use super::message::{Look, Message, Outcome};
-use crate::actor::{Action, Effect, Observation, Reminder, Step};
 use crate::clock::Clock;
 use crate::message::{ActorId, Control};
+use crate::{Action, Effect, Observation, Reminder, Step};
 
 /// The least time the moderator leaves between announcing the outcome and
 /// stopping everybody.

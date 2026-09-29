@@ -56,7 +56,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::message::{Cause, Message, Narration, Outcome, Phase, Round, SessionKind};
 use super::role::{Faction, Role};
-use crate::actor::Observation;
+use crate::Observation;
 use crate::clock::Clock;
 use crate::message::ActorId;
 
