@@ -1,26 +1,25 @@
-//! What travels on the wire: [`Message`], [`Control`] and the [`Delivery`]
-//! that carries either of them, and the [`Payload`] a game's messages
-//! carry.
+//! What travels on the wire: [`Message`] and [`Control`], and the
+//! [`Payload`] a game's messages carry.
 //!
-//! Two kinds of thing reach an agent, and the distinction is the one
-//! ADR-0007 draws. A [`Message`] is *in-domain* data: something an agent said
-//! to other agents, carrying a payload whose meaning belongs entirely to the
-//! game. A [`Control`] is *out-of-domain*: an instruction about the episode
-//! rather than a move within it. Handlers see the first and never the
-//! second, because a handler plays the game and the loop runs the episode.
+//! Two kinds of thing reach an actor, and the distinction is the one ADR-0007
+//! draws. A [`Message`] is *in-domain* data: something an actor said to other
+//! actors, carrying a payload whose meaning belongs entirely to the game. A
+//! [`Control`] is *out-of-domain*: an instruction about the episode rather
+//! than a move within it. Handlers see the first and never the second,
+//! because a handler plays the game and the runtime runs the episode.
 //!
-//! Both travel on one queue, so the thing actually sent is a [`Delivery`],
-//! which is one or the other (ADR-0009). The distinction survives the
-//! transport rather than being erased by it: the enum has two variants and
-//! the loop matches on them, so a control is never mistaken for something a
-//! handler should see.
+//! The two travel on **separate channels**, an inbox and a control channel,
+//! so the distinction is the transport's rather than a tag inside it
+//! (ADR-0016). That is what lets a [`Control::Stop`] take effect ahead of
+//! everything an actor has queued: the perception thread checks the control
+//! channel before it looks at the inbox at all.
 //!
-//! A `Message` is a struct rather than an enum because there is now only one
+//! A `Message` is a struct rather than an enum because there is only one
 //! thing it can be. It was an enum when it also had to carry controls and
-//! timer wake-ups; a wake-up is neither in-domain nor out-of-domain nor
-//! anything that traveled, so it is gone, and a deadline now calls the
-//! handler's own [`timeout`](crate::Handler::timeout) rather than pretending
-//! to be something observed.
+//! timer wake-ups; controls have their own channel, and a wake-up is now a
+//! [`Reminder`](crate::Reminder) the actor set for itself, delivered back as
+//! an ordinary message from itself, so there is no third kind of thing on the
+//! wire.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -38,14 +37,14 @@ impl<P: Serialize + Send + Clone + 'static> Payload for P {}
 
 /// The name of an actor within an episode.
 ///
-/// An actor is a thread-backed participant with an inbox; [`Agent`] and
-/// [`Environment`] are the two roles one plays (ADR-0016), and both are
-/// named by an id of this type.
+/// An actor is a participant with an inbox and two threads of its own; agent
+/// and environment are the two roles one plays, written as [`Policy`] and
+/// [`Step`] (ADR-0016), and both are named by an id of this type.
 ///
 /// Actor ids are strings. Application code addresses actors by id.
 ///
-/// [`Agent`]: crate::Agent
-/// [`Environment`]: crate::Environment
+/// [`Policy`]: crate::Policy
+/// [`Step`]: crate::Step
 ///
 /// An id serializes as its bare string, and deserializes from one that is
 /// not empty: an empty id names nobody, so a file that carries one is
@@ -99,18 +98,20 @@ impl From<String> for ActorId {
     }
 }
 
-/// An out-of-domain instruction to an agent about the episode itself.
+/// An out-of-domain instruction to an actor about the episode itself.
 ///
-/// A control is not a move in the game and no handler ever sees one. The
-/// loop logs it and acts on it: `Start` makes it call the handler's
-/// [`start`](crate::Handler::start) hook, `Stop` makes it exit after the
-/// cycle that popped it.
+/// A control is not a move in the game and no handler ever sees one. It
+/// travels on the actor's control channel rather than its inbox, and the
+/// perception thread logs it and acts on it: `Start` calls the handler's
+/// `start` hook, and `Stop` takes effect at once, ahead of anything in the
+/// inbox (ADR-0016).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Control {
-    /// The episode has started; the agent may begin acting.
+    /// The episode has started; the actor may begin acting.
     Start,
-    /// The episode is over; the agent's loop exits after this cycle.
+    /// The episode is over. The actor forwards nothing more, and its handler
+    /// thread ends once the call in progress returns.
     Stop,
 }
 
@@ -282,41 +283,6 @@ impl<'de, P: Deserialize<'de>> Deserialize<'de> for Envelope<P> {
     }
 }
 
-/// One thing on an agent's queue: a message, or a control and when it was
-/// sent.
-///
-/// An agent has **one** queue, and it carries both kinds, so the type the
-/// queue carries has to be able to be either. That is an enum, and ADR-0009
-/// reinstates the one ADR-0007 had for exactly this. ADR-0007's objection was
-/// to a single type that *meant* three unlike things at once — in-domain
-/// data, an instruction, a timer wake-up — which made every handler ask what
-/// it had been given before it could act. This is not that. It is a transport
-/// carrying two things that stay clearly separate: the loop matches on the
-/// variant and nothing else ever holds a `Delivery`, so an [`Observation`] is
-/// still only ever a message and a control is still never observed.
-///
-/// One queue rather than two because the reasons for two are gone
-/// (ADR-0009). A control no longer preempts anything, so there is nothing
-/// for it to reach the agent ahead of, and a cycle handles one observation
-/// (ADR-0008), so there is no batch for it to be queued behind. What is
-/// left is a FIFO whose order is the order things were sent, which is the
-/// order an agent handles them in.
-///
-/// Neither variant carries a time. Nothing on the wire does (ADR-0017): a
-/// control's record says when the agent popped it, which is the one instant
-/// about it that agent knows.
-///
-/// [`Observation`]: crate::Observation
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Delivery<P: Payload> {
-    /// In-domain data: what becomes the recipient's [`Observation`].
-    ///
-    /// [`Observation`]: crate::Observation
-    Message(Message<P>),
-    /// An out-of-domain instruction about the episode.
-    Control(Control),
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -351,31 +317,6 @@ mod tests {
             message,
             Message::new("a", ["b"], 8, TestPayload::Step(7)),
             "two messages of one sender differ by their sequence number"
-        );
-    }
-
-    #[test]
-    fn a_delivery_is_one_kind_or_the_other_and_says_which() {
-        // The whole point of the enum: one queue carries both, and what
-        // came off it is still unambiguously a message or a control.
-        let message = Message::<TestPayload>::new("a", ["b"], 0, TestPayload::Step(7));
-        let carried = Delivery::Message(message.clone());
-        let Delivery::Message(back) = &carried else {
-            panic!("a message delivery is a message: {carried:?}");
-        };
-        assert_eq!(back, &message);
-        assert_eq!(carried, Delivery::Message(message));
-
-        // A control is itself and nothing beside it: nothing on the wire
-        // carries a time.
-        let stop = Delivery::<TestPayload>::Control(Control::Stop);
-        let Delivery::Control(control) = stop else {
-            panic!("a control delivery is a control: {stop:?}");
-        };
-        assert_eq!(control, Control::Stop);
-        assert_ne!(
-            Delivery::<TestPayload>::Control(Control::Stop),
-            Delivery::Control(Control::Start)
         );
     }
 

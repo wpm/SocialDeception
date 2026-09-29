@@ -1,30 +1,134 @@
-//! The invariants the log of an [`actor`](social_deception::actor) runtime
-//! episode satisfies, whatever the game.
+//! The invariants the log of an episode satisfies, whatever the game.
 //!
-//! These are the new runtime's counterpart to [`super::check`], and they are a
-//! separate set rather than a widening of that one because several of the old
-//! runtime's invariants are false here on purpose (ADR-0016):
+//! These are properties of the log, not of any game, so they run unchanged
+//! against episodes where no independent check on the content is available.
+//! What a game adds on top of them is in [`super::werewolf`].
 //!
-//! | The old runtime said | Here |
-//! |---|---|
-//! | every cycle says what woke it | a cycle is one handler call and says nothing |
-//! | everything a cycle popped was popped at its `t_start` | a cycle's observation *is* its `t_start`, and there is nothing else it popped |
-//! | every action is sent within its cycle's window | still true, but a lazy iterator's actions may reach the writer before the cycle record |
-//! | a message has recipients | a send may be addressed to nobody |
-//! | an agent does not observe what it sent | a reminder is the actor's own message to itself |
-//! | every action has an observation per recipient | a `Stop` may have preempted it, and then the log says `undelivered` |
+//! Stated positively, and each one a consequence of ADR-0016:
 //!
-//! What is unchanged is the shape of the join: an observation in one actor's
-//! records matches the action in its sender's with the same `(from, seq)`, and
-//! **one send to five recipients is one message and one number** (ADR-0017).
+//! - a **cycle is one handler call**: a window, and at most the one
+//!   observation the call was made with. It says nothing about what woke it,
+//!   because a handler thread runs a cycle when an observation reaches it and
+//!   a reminder arrives as one of those rather than as a wake-up of its own;
+//! - a cycle's observation **is** its `t_start`, which is the instant the
+//!   message arrived rather than the instant the call began. One actor's
+//!   windows can therefore overlap, and nothing here may assume they are
+//!   ordered;
+//! - every action lies in the window of one of its actor's cycles, though a
+//!   lazy iterator's actions may reach the writer *before* the cycle record
+//!   that closes the call that yielded them;
+//! - a send **may be addressed to nobody**: an action need not be directed at
+//!   anyone, and one addressed to no one is still logged;
+//! - only a **reminder** has its sender among its recipients. It is the one
+//!   way a message reaches the actor that sent it;
+//! - every action's recipient either observed it or has it logged
+//!   `undelivered`, because a `Stop` takes effect ahead of anything queued and
+//!   what it preempted is accounted for rather than lost.
+//!
+//! The join is what makes the log one object rather than a pile of per-actor
+//! logs: an observation in one actor's records matches the action in its
+//! sender's with the same `(from, seq)`, and **one send to five recipients is
+//! one message and one number** (ADR-0017).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde_json::Value;
 
-use super::{
-    agent, check_reward, check_rewards_precede_their_stop, check_the_header, message, seq, time,
-};
+use super::{agent, seq, time};
+
+/// The log opens with the `episode` header and never mentions it again.
+///
+/// The header's `start_unix_ns` is the one wall-clock time anywhere in the
+/// log, so it is checked for its presence and its type and never for its
+/// value: it is different on every run by construction (ADR-0017).
+fn check_the_header(lines: &[Value]) {
+    let header = lines.first().expect("a log has at least its header");
+    assert_eq!(header["type"], "episode", "the first line is the header");
+    assert!(
+        header["start_unix_ns"].is_u64(),
+        "the header anchors the episode to the wall clock: {header}"
+    );
+    assert!(
+        header["agent"].is_null(),
+        "the header is nobody's record: {header}"
+    );
+    for line in &lines[1..] {
+        assert_ne!(line["type"], "episode", "one header per log: {line}");
+    }
+}
+
+/// A reward names the agent it belongs to, says when it was logged and what
+/// it is worth, and carries neither a sequence number nor a message.
+///
+/// The two absences are the point. A reward has no `seq` because a sequence
+/// number is a message's and a reward is not a message, and no message
+/// because it is logged rather than said.
+fn check_reward(line: &Value) {
+    agent(line);
+    time(line, "t");
+    assert!(
+        line["value"].is_number(),
+        "a reward says what it is worth: {line}"
+    );
+    assert!(
+        line["seq"].is_null(),
+        "a reward is not a message and carries no sequence number: {line}"
+    );
+    assert!(
+        line["message"].is_null(),
+        "a reward carries no message: {line}"
+    );
+}
+
+/// Every reward is logged before the episode ends, which is the last `Stop`
+/// in the run.
+///
+/// A reward may *not* precede the stop of the agent it belongs to. An
+/// environment may stop one agent while the others run on — Werewolf stops
+/// a player in the cycle its death is announced (ADR-0012) — and rewards
+/// are handed out when the episode ends, so an agent that left early is
+/// paid after its own records have closed. That is sound because a reward
+/// is logged rather than sent (ADR-0007): the agent does not have to be
+/// there to receive it, and its value is the episode's to decide once the
+/// episode is over.
+///
+/// What still holds is the outer bound. A reward logged after the last stop
+/// would be scoring a run that had finished for everybody, with no episode
+/// left to have produced it. The check is on the times and not on file
+/// order, because a reward is written by the environment's thread and its
+/// line lands wherever the writer took it.
+fn check_rewards_precede_their_stop(lines: &[Value]) {
+    let Some(end) = lines
+        .iter()
+        .filter(|line| line["type"] == "control" && line["control"] == "stop")
+        .map(|line| time(line, "t"))
+        .max()
+    else {
+        return;
+    };
+    for line in lines.iter().filter(|line| line["type"] == "reward") {
+        assert!(
+            time(line, "t") <= end,
+            "a reward is logged before the episode's last stop: {line}"
+        );
+    }
+}
+
+/// What a record says about the message it carries: its sender, its
+/// recipients and its payload, which together with the key are what an
+/// observation and its action must agree on.
+fn message(line: &Value) -> (&str, Vec<&Value>, &Value) {
+    let message = &line["message"];
+    let sender = message["sender"]
+        .as_str()
+        .expect("a message names its sender");
+    let recipients: Vec<&Value> = message["recipients"]
+        .as_array()
+        .expect("a message lists its recipients")
+        .iter()
+        .collect();
+    (sender, recipients, &message["payload"])
+}
 
 /// Every record kind an actor-runtime log holds.
 const KINDS: [&str; 8] = [
@@ -92,6 +196,11 @@ pub fn check(lines: &[Value]) {
 /// It says nothing about what woke it, because there is nothing to say: a
 /// handler thread runs a cycle when an observation reaches it, and a reminder
 /// arrives as one of those rather than as a wake-up of its own (ADR-0016).
+///
+/// `CycleRecord` has had no field for it since issue #117, so no log this
+/// crate writes can carry one. The check stays because this validates a log as
+/// *JSON*, against files it did not necessarily write, and the absence is part
+/// of the shape a reader may rely on.
 fn check_cycle(cycle: &Value) {
     let (t_start, t_stop) = (time(cycle, "t_start"), time(cycle, "t_stop"));
     assert!(

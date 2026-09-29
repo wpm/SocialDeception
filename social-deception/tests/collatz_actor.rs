@@ -1,5 +1,5 @@
 //! Runs the Collatz ring end to end on the
-//! [`actor`](social_deception::actor) runtime.
+//! actor runtime.
 //!
 //! Each test constructs an [`Episode`] with a [`Referee`], runs it to the
 //! environment's `Stop` with the log going to a file, reads the file back, and
@@ -19,7 +19,7 @@ use std::fs;
 use std::time::Duration;
 
 use serde_json::Value;
-use social_deception::actor::Episode;
+use social_deception::Episode;
 use support::TempDir;
 use support::collatz_actor::{Collatz, Referee, Step};
 

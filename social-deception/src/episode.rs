@@ -1,95 +1,88 @@
-//! An episode: one run of a game with a fixed roster of agents and one
-//! [`Environment`], from coordinated startup to coordinated shutdown.
+//! The episode: the owner of one run.
 //!
-//! The episode constructs the roster, wires each agent's queues, dispatch
-//! channel and record channel, spawns one thread per agent, and then hands
-//! the episode over: it starts the **environment** and nobody else, and
-//! routes what everybody sends until the environment has stopped every
-//! agent. A [`Control`] is how anyone says start and stop, and whoever
-//! sends one stamps it with the instant it was sent, so that an agent's
-//! record of popping it says how long it waited.
+//! It owns the wiring, the threads, the log writer, a hard time limit, and
+//! turning panics into errors. **Routing is not its business any more**: a
+//! handler thread sends straight to its recipients' inboxes, so there is no
+//! central loop and no count of deliveries in flight (ADR-0016).
 //!
-//! # The environment controls the episode
+//! # One clock, and it cannot be two
 //!
-//! The environment is an agent like any other, with one power: its handler
-//! returns [`Effect`](crate::Effect)s, and an effect may be a control
-//! (ADR-0007). So the sequence is:
+//! An episode's log and its actors must share one origin, or record offsets
+//! refer to two different zeroes. Here that is **enforced by construction**,
+//! two ways:
 //!
-//! 1. the episode delivers `Start` to the environment alone;
-//! 2. the environment's `start` returns `Start` for the agents it wants
-//!    playing, along with whatever it opens with;
-//! 3. the game runs, the episode routing messages and the controls the
-//!    environment asks for, the second always after the first of the same
-//!    cycle, so that an agent stopped in the same breath as it is spoken to
-//!    hears the words first;
-//! 4. the environment ends the episode by sending `Stop` to every agent.
-//!    Once every agent has been sent one and its thread has ended, the
-//!    episode sends `Stop` to the environment and joins it.
+//! - [`Episode::new`] takes the log's [`Sink`]s rather than a
+//!   a [`Writer`] and a [`Clock`]. It starts the clock
+//!   itself, spawns the writer with it, and hands a copy of the same clock to
+//!   every actor's `start` hook. **There is no clock argument to get wrong.**
+//! - The two functions that start an actor's threads are crate-private, so an
+//!   episode is the only thing that can start one. A caller cannot assemble a
+//!   roster of its own around a second origin.
 //!
-//! An agent the environment never starts is spawned, blocked on its queues
-//! and silent; it is stopped and joined with everyone else. That is a bug
-//! in the environment, not a state the episode has to rescue.
+//! The order is the one ADR-0017 asks for: capture the clock, build every inbox
+//! and control channel, build the [`Router`] from the senders, start the
+//! writer, and only then start any actor, each with a copy of the same clock.
 //!
-//! # Quiescence, which is now how a stall is detected
+//! [`Episode::clock`] is what makes the invariant testable from outside. It is
+//! the one reason anything but the episode needs to see a clock at all.
 //!
-//! The episode is the only component that sees both halves of the work in
-//! progress: the deliveries it has routed and the cycles the agents have
-//! reported. It keeps one count, of deliveries routed and not yet reported
-//! handled. A cycle in progress is exactly a set of deliveries taken off a
-//! queue and not yet reported, and an agent dispatches a cycle's deliveries
-//! and its outputs together, so the count never reads zero while a cycle
-//! that might still send is under way.
+//! # Start and end
 //!
-//! The count reaching zero used to be how an episode ended. Now that the
-//! environment ends it, a count of zero while some agent has not been sent
-//! `Stop` means nobody will ever speak again and nobody has declared the
-//! episode over: the run is **stalled**, and that is
-//! [`EpisodeError::Stalled`]. The episode stops everyone and joins, so the
-//! log is complete up to the stall, and returns the error. In
-//! Werewolf a stall is a player that did not answer a request.
+//! The episode starts **only the environment**. The environment starts the
+//! agents with a [`Command`](crate::Effect::Command) of [`Control::Start`],
+//! and it **ends the episode by stopping every actor, itself included**.
 //!
-//! In-flight work is counted in **deliveries, not messages**: one message
-//! addressed to six agents is six handles that have not happened yet.
+//! Every actor's threads report on a completion channel when they end, and
+//! [`Episode::run`] waits on it with a hard time limit:
 //!
-//! # An agent that wakes on its own is not a stall
+//! - every actor reports after being sent `Stop`: join, and return `Ok`;
+//! - the limit passes first: the episode sends `Stop` to every actor itself,
+//!   since it holds every control sender, joins, and returns
+//!   [`EpisodeError::Timeout`];
+//! - an actor ends without having been sent `Stop`: stop the rest, join, and
+//!   return [`EpisodeError::Departed`].
 //!
-//! A count of zero is only "nobody will ever speak again" if nobody is
-//! waiting on a clock. An agent that set a deadline (ADR-0010) runs another
-//! cycle when its instant arrives whether or not anything is said to it, so
-//! each cycle reports whether it left one pending
-//! ([`CycleDispatch::waking`]) and the episode holds the stall while any
-//! agent is waiting.
+//! Stall detection by quiescence is gone, because it depended on the episode
+//! seeing every delivery. Under timed phases a stall can only be an
+//! environment bug, and an episode that runs past its limit fails with a
+//! timeout rather than hanging.
 //!
-//! Werewolf needs this: the moderator's sessions close on their clocks
-//! (ADR-0011), so a night where every player has already selected is
-//! quiescent by the count and yet has three sessions still to close. A
-//! stall now means what it always meant, that nobody will speak again, and
-//! in Werewolf it is a player that never answered a request *and* a
-//! moderator with no clock left to wake for.
+//! # A roster can mix handler types
+//!
+//! [`Policy`] and [`Step`] return `impl IntoIterator` and so cannot be used as
+//! `dyn`. So [`Episode::add`] **erases the handler's type** into a boxed
+//! closure that, given what every actor shares, starts that actor, and `run`
+//! calls each
+//! closure. An LLM player and scripted players can share an episode without
+//! generics reaching the episode.
 
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
+use std::io;
 use std::panic::{self, AssertUnwindSafe};
-use std::time::Instant;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use crossbeam_channel::{Receiver, Sender, select, unbounded};
+use crossbeam_channel::{Receiver, Sender, unbounded};
 use serde::Serialize;
 
-use crate::agent::{self, Action, Agent, CycleDispatch, Handler, Observation, Wiring};
 use crate::clock::Clock;
-use crate::environment::{Adapter, Commanded, Environment, Refusal, Rewarded};
-use crate::log::Record;
-use crate::message::{ActorId, Control, Delivery, Payload};
-use crate::router::{Queues, RouteError, Router};
+use crate::contract::{Policy, Step};
+use crate::log::{Policy as SinkPolicy, Record, Sink, Sinks, Writer};
+use crate::message::{ActorId, Control, Payload};
+use crate::router::{RouteError, Router, Seat};
+use crate::thread::{self, Actor, ActorError, Ended, UnstartedActor};
+use crate::timer::Timer;
 
-/// Why an agent's thread did not end cleanly.
+/// Why an actor's threads did not end cleanly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Failure {
-    /// The loop stopped because a channel it depends on went away.
-    Error(agent::Error),
-    /// The thread panicked, in the handler or elsewhere, with this message.
+    /// A thread stopped because something it depends on refused it or went
+    /// away.
+    Error(ActorError),
+    /// A thread panicked, in the handler or elsewhere, with this message.
     Panicked(String),
 }
 
@@ -103,83 +96,56 @@ impl fmt::Display for Failure {
 }
 
 /// Why an episode could not be built or did not run cleanly.
-///
-/// An episode that ends in any of these but [`Stalled`](Self::Stalled) was
-/// abandoned rather than finished: the episode stops whoever is left so
-/// that the log is complete up to the failure, and it cannot wait
-/// for quiescence to do it, so that `Stop` lands behind messages the agent
-/// has not reached yet. Such a log may therefore end with an agent
-/// answering for an episode that had already failed, and with observations
-/// nobody made — the messages still behind the stop when it was popped
-/// (ADR-0009). A `Stalled` episode is quiescent by definition, so its
-/// shutdown is orderly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EpisodeError {
-    /// An id was added to the roster twice.
+    /// An id was added to the roster twice, or is the environment's.
     DuplicateAgent(ActorId),
-    /// A control could not be delivered.
+    /// A control the episode itself sent could not be delivered.
     Control(RouteError),
-    /// The router refused a message this agent sent. That is a bug in the
-    /// agent's handler, and the episode stops rather than carrying on
-    /// without the message.
-    Route {
-        /// The agent that sent it.
-        agent: ActorId,
-        /// What was wrong with it.
-        error: RouteError,
-    },
-    /// Nothing is in flight and the environment has not stopped these
-    /// agents, so nobody will ever speak again and nobody has declared the
-    /// episode over. See the [module documentation](self).
-    Stalled {
-        /// The agents still running when everything went quiet, in order.
+    /// The environment never stopped everybody within the episode's time
+    /// limit.
+    ///
+    /// This replaces the old runtime's `Stalled`. The episode no longer sees
+    /// what is in flight, so it cannot tell a quiet roster from a busy one;
+    /// what it can do is refuse to run forever.
+    Timeout {
+        /// How long the episode was given.
+        limit: Duration,
+        /// The actors that had not reported when it ran out, in order.
         running: BTreeSet<ActorId>,
     },
-    /// An agent's thread ended, or its channel to the episode closed, while
-    /// the episode was still running it.
+    /// An actor's threads ended without having been sent a `Stop`.
     ///
-    /// The episode was abandoned where it stood: the environment never
-    /// reached the shutdown it was going to ask for, so no agent was
-    /// stopped in the ordinary way and the log ends mid-run. Whether
-    /// the thread that went away left a [`Failure`] behind is a separate
-    /// question — [`Agents`](Self::Agents) reports that when it did, and
-    /// this reports the departure when it did not.
+    /// The episode was abandoned where it stood. Whether the thread that went
+    /// away left a [`Failure`] behind is a separate question:
+    /// [`Agents`](Self::Agents) reports that when it did, and this reports the
+    /// departure when it did not.
     Departed,
-    /// The environment assigned a reward that would not serialize, so
-    /// there was no record to write for the agent named.
+    /// Some actors' threads did not end cleanly, and why.
     ///
-    /// The reward type is the game's, and one the log cannot hold makes
-    /// every reward of that type unloggable, so the episode fails rather
-    /// than finishing with a log that is silently missing them.
-    Reward(ActorId),
-    /// Some agents' threads did not end cleanly, and why.
+    /// A send the router refused is one of these: it is a bug in the sending
+    /// actor, so it fails that actor's thread and surfaces here.
     Agents(Vec<(ActorId, Failure)>),
 }
 
 impl fmt::Display for EpisodeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::DuplicateAgent(id) => write!(f, "agent {id} is in the roster twice"),
+            Self::DuplicateAgent(id) => write!(f, "actor {id} is in the roster twice"),
             Self::Control(error) => write!(f, "could not deliver a control: {error}"),
-            Self::Reward(agent) => {
-                write!(f, "the reward for {agent} could not be serialized")
-            }
-            Self::Route { agent, error } => {
+            Self::Timeout { limit, running } => {
                 write!(
                     f,
-                    "agent {agent} sent a message that could not be routed: {error}"
-                )
-            }
-            Self::Stalled { running } => {
-                f.write_str("the episode stalled with these agents still running:")?;
+                    "the episode ran past its limit of {limit:?} with these actors still running:"
+                )?;
                 for id in running {
                     write!(f, " {id}")?;
                 }
                 Ok(())
             }
-            Self::Departed => f.write_str("an agent left while the episode was still running it"),
+            Self::Departed => f.write_str("an actor left while the episode was still running it"),
             Self::Agents(failures) => {
-                f.write_str("agents failed:")?;
+                f.write_str("actors failed:")?;
                 for (id, failure) in failures {
                     write!(f, " [{id}: {failure}]")?;
                 }
@@ -192,28 +158,66 @@ impl fmt::Display for EpisodeError {
 impl Error for EpisodeError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Control(error) | Self::Route { error, .. } => Some(error),
-            Self::DuplicateAgent(_)
-            | Self::Stalled { .. }
-            | Self::Departed
-            | Self::Reward(_)
-            | Self::Agents(_) => None,
+            Self::Control(error) => Some(error),
+            Self::DuplicateAgent(_) | Self::Timeout { .. } | Self::Departed | Self::Agents(_) => {
+                None
+            }
         }
     }
+}
+
+/// What starting one actor takes, once the inboxes and the router exist: the
+/// router, where records go, the episode's clock, and where the actor reports
+/// when it ends.
+///
+/// It is the episode's alone, and every actor gets the same one: it exists so
+/// that the closures below take one argument rather than four.
+struct Shared<P: Payload> {
+    router: Arc<Router<P>>,
+    records: Sender<Record<P>>,
+    clock: Clock,
+    done: Sender<Ended>,
+}
+
+/// A handler whose type has been erased: a closure that, given what every
+/// actor shares, starts that actor.
+///
+/// This is what lets one roster mix handler types. It returns a
+/// [`Started`], which is the actor with its `join` erased too, since
+/// the handler types differ and the episode does not want them back.
+type Start<P> = Box<dyn FnOnce(UnstartedActor<P>, &Shared<P>) -> Started + Send>;
+
+/// A running actor as the episode holds it: its id, its control sender, and a
+/// closure that joins its threads.
+///
+/// The handler is dropped inside the closure rather than given back, because
+/// the handler types in one roster differ and the episode has nothing to do
+/// with any of them. An application that wants a handler back keeps its state
+/// somewhere it can reach, which is what a channel or a shared counter is for.
+struct Started {
+    id: ActorId,
+    control: Sender<Control>,
+    join: Box<dyn FnOnce() -> Result<(), ActorError> + Send>,
 }
 
 /// A roster of handlers, an environment, and everything needed to run them
 /// once.
 ///
-/// Build it with [`Episode::new`], which takes the environment, add agents
-/// with [`Episode::add`], then [`Episode::run`] it. The roster is fixed
-/// from the moment `run` starts.
+/// Build it with [`Episode::new`], which takes the environment and the log's
+/// sinks, add agents with [`Episode::add`], then [`Episode::run`] it. The
+/// roster is fixed from the moment `run` starts.
 pub struct Episode<W, P: Payload> {
-    roster: BTreeMap<ActorId, Box<dyn Handler<P> + Send>>,
+    roster: BTreeMap<ActorId, Start<P>>,
     environment_id: ActorId,
-    environment: Box<dyn Environment<W, P> + Send>,
-    records: Sender<Record<P>>,
+    environment: Option<Start<P>>,
     clock: Clock,
+    records: Sender<Record<P>>,
+    writer: Writer,
+    limit: Duration,
+    /// The reward type is the environment's alone, and the environment has
+    /// already been erased into a closure by the time it is stored, so nothing
+    /// left in this struct mentions `W`.
+    reward: std::marker::PhantomData<fn() -> W>,
 }
 
 impl<W, P: Payload> fmt::Debug for Episode<W, P> {
@@ -221,55 +225,118 @@ impl<W, P: Payload> fmt::Debug for Episode<W, P> {
         f.debug_struct("Episode")
             .field("environment", &self.environment_id)
             .field("roster", &self.roster.keys().collect::<Vec<_>>())
+            .field("limit", &self.limit)
             .finish_non_exhaustive()
     }
 }
 
-impl<W: Serialize + Copy + Send + 'static, P: Payload> Episode<W, P> {
+/// How long an episode runs before it stops everybody itself.
+///
+/// Generous, because the limit is a backstop against an environment that never
+/// ends its episode and not a schedule anything is meant to meet: a handler
+/// making model calls may legitimately take minutes. A run with a schedule of
+/// its own sets its own with [`Episode::within`].
+pub const DEFAULT_LIMIT: Duration = Duration::from_secs(600);
+
+impl<W: Serialize + Send + 'static, P: Payload> Episode<W, P> {
     /// An episode of `environment`, seated under `environment_id`, with no
-    /// agents yet, whose records go to `records` and whose origin is
-    /// `clock`'s.
+    /// agents yet, whose log goes to `sinks`.
     ///
-    /// **One clock, captured before anything that measures time.** `clock` is
-    /// the same one the [`Writer`](crate::log::Writer) behind `records` was
-    /// given, and every actor this episode spawns gets a copy of it, so
-    /// everything anybody measures from the start of the episode and every
-    /// offset in the log are on one timeline (ADR-0017). The writer is made
-    /// by whoever makes `records`, which is why the clock comes in rather
-    /// than being started here: an origin taken after the writer's would put
-    /// the log and the actors on two.
-    #[must_use]
+    /// **The clock is started here**, before the writer and before any actor,
+    /// and every one of them is given a copy of it. That is the whole of the
+    /// shared-origin invariant, and it is not something a caller can get
+    /// wrong: there is no clock argument.
     pub fn new(
-        records: Sender<Record<P>>,
+        sinks: Sinks<P>,
         environment_id: impl Into<ActorId>,
-        environment: impl Environment<W, P> + Send + 'static,
-        clock: Clock,
+        environment: impl Step<W, P> + Send + 'static,
     ) -> Self {
+        // One origin for the episode, captured before anything that measures
+        // time (ADR-0017).
+        let clock = Clock::start();
+        let (records, writer) = Writer::spawn(sinks, clock);
+        let environment_id = environment_id.into();
         Self {
             roster: BTreeMap::new(),
-            environment_id: environment_id.into(),
-            environment: Box::new(environment),
-            records,
+            environment_id,
+            environment: Some(Box::new(|unstarted, shared| {
+                started(thread::spawn_environment::<W, _, _>(
+                    unstarted,
+                    environment,
+                    Arc::clone(&shared.router),
+                    shared.records.clone(),
+                    shared.clock,
+                    Timer::real(),
+                    shared.done.clone(),
+                ))
+            })),
             clock,
+            records,
+            writer,
+            limit: DEFAULT_LIMIT,
+            reward: std::marker::PhantomData,
         }
     }
 
-    /// Adds an agent to the roster.
+    /// An episode whose log is one JSON Lines file, created (or truncated) at
+    /// `path`, as a run whose log is that file requires.
     ///
     /// # Errors
     ///
-    /// [`EpisodeError::DuplicateAgent`] if `id` is already in the roster,
-    /// or is the environment's.
-    pub fn add(
+    /// Whatever `File::create` returns.
+    pub fn to_file(
+        path: impl AsRef<std::path::Path>,
+        environment_id: impl Into<ActorId>,
+        environment: impl Step<W, P> + Send + 'static,
+    ) -> io::Result<Self> {
+        let sink: Box<dyn Sink<P>> =
+            Box::new(crate::log::JsonLines::new(std::fs::File::create(path)?));
+        Ok(Self::new(
+            vec![(sink, SinkPolicy::Required)],
+            environment_id,
+            environment,
+        ))
+    }
+
+    /// The same episode with a time limit of `limit`.
+    ///
+    /// Past it the episode stops every actor itself and fails with
+    /// [`EpisodeError::Timeout`]. See [`DEFAULT_LIMIT`].
+    #[must_use]
+    pub const fn within(mut self, limit: Duration) -> Self {
+        self.limit = limit;
+        self
+    }
+
+    /// Adds an agent to the roster, erasing its handler's type.
+    ///
+    /// # Errors
+    ///
+    /// [`EpisodeError::DuplicateAgent`] if `id` is already in the roster, or is
+    /// the environment's.
+    pub fn add<H: Policy<P> + Send + 'static>(
         &mut self,
         id: impl Into<ActorId>,
-        handler: impl Handler<P> + Send + 'static,
+        handler: H,
     ) -> Result<(), EpisodeError> {
         let id = id.into();
         if id == self.environment_id || self.roster.contains_key(&id) {
             return Err(EpisodeError::DuplicateAgent(id));
         }
-        self.roster.insert(id, Box::new(handler));
+        self.roster.insert(
+            id,
+            Box::new(|unstarted, shared| {
+                started(thread::spawn_agent(
+                    unstarted,
+                    handler,
+                    Arc::clone(&shared.router),
+                    shared.records.clone(),
+                    shared.clock,
+                    Timer::real(),
+                    shared.done.clone(),
+                ))
+            }),
+        );
         Ok(())
     }
 
@@ -290,448 +357,212 @@ impl<W: Serialize + Copy + Send + 'static, P: Payload> Episode<W, P> {
 
     /// The episode's clock: the origin every actor in it shares with the log
     /// writer.
+    ///
+    /// It is here so that the shared-origin invariant is testable from
+    /// outside, which is the only reason anything but the episode needs to see
+    /// a clock.
     #[must_use]
     pub const fn clock(&self) -> Clock {
         self.clock
     }
 
-    /// Runs the episode to completion: starts the environment, routes what
-    /// everybody sends and the controls the environment asks for until every
-    /// agent has been stopped, then stops the environment and joins every
-    /// thread.
-    ///
-    /// The episode's own sender to the log writer is dropped on the
-    /// way, so once this returns the writer has no senders left and can be
-    /// joined for the complete log.
+    /// The episode's time limit.
+    #[must_use]
+    pub const fn limit(&self) -> Duration {
+        self.limit
+    }
+
+    /// Runs the episode: starts the environment, waits for every actor to
+    /// report, joins every thread, and finishes the log.
     ///
     /// # Errors
     ///
-    /// If a control could not be delivered, an agent sent a message or asked
-    /// for a control the router refused, the episode stalled
-    /// ([`EpisodeError::Stalled`]), or a thread ended with an error or a
-    /// panic. In every case the agents that were running have been stopped
-    /// and joined before this returns, so the log is complete up to
-    /// the failure.
+    /// [`EpisodeError::Control`] if the environment could not be started,
+    /// [`EpisodeError::Timeout`] if the environment never stopped everybody,
+    /// [`EpisodeError::Departed`] if an actor left unbidden, and
+    /// [`EpisodeError::Agents`] if a thread ended with an error or a panic. In
+    /// every case every actor has been stopped and joined before this returns,
+    /// so the log is complete up to the failure.
+    ///
+    /// The log's writer is joined here too, and an error from a required sink
+    /// surfaces as the actors' [`ActorError::WriterClosed`].
+    ///
+    /// # Panics
+    ///
+    /// If a thread panicked, the panic is propagated once every other thread
+    /// has been joined, so that a panicking handler does not leave an episode
+    /// half torn down.
     pub fn run(self) -> Result<(), EpisodeError> {
         let Self {
             roster,
             environment_id,
             environment,
+            clock,
+            records,
+            writer,
+            limit,
+            reward: _,
+        } = self;
+        // An episode keeps its environment until it runs, and this is the only
+        // thing that takes it, so the option is `Some` here by construction.
+        // It is an option at all because the closure has to move out of the
+        // struct the rest of this destructuring is still using.
+        let environment = environment.expect("an episode keeps its environment until it runs");
+
+        // The wiring, in the one order that keeps the invariants: every inbox
+        // and control channel first, so the router is complete before anybody
+        // can send; then the router; and only then the threads.
+        let mut unstarted = Vec::with_capacity(roster.len() + 1);
+        let mut seats = BTreeMap::new();
+        let mut starts: Vec<(ActorId, Start<P>)> = Vec::with_capacity(roster.len() + 1);
+        for (id, start) in roster
+            .into_iter()
+            .chain([(environment_id.clone(), environment)])
+        {
+            let (channels, inbox, control) = UnstartedActor::new(id.clone());
+            seats.insert(id.clone(), Seat { inbox, control });
+            unstarted.push(channels);
+            starts.push((id, start));
+        }
+        let router = Arc::new(Router::new(seats, environment_id.clone()));
+        let (report, done) = unbounded();
+        let shared = Shared {
+            router: Arc::clone(&router),
             records,
             clock,
-        } = self;
-        let ids: BTreeSet<ActorId> = roster
-            .keys()
-            .cloned()
-            .chain([environment_id.clone()])
-            .collect();
-        let (dispatch, dispatches) = unbounded();
-        let (obituary, obituaries) = unbounded();
-        let (asked_for, commands) = unbounded();
-        let (paid, rewards) = unbounded();
-        let mut handlers: BTreeMap<ActorId, Box<dyn Handler<P> + Send>> = roster;
-        handlers.insert(
-            environment_id.clone(),
-            Box::new(Adapter::new(
-                environment,
-                ids.iter()
-                    .filter(|id| **id != environment_id)
-                    .cloned()
-                    .collect(),
-                asked_for,
-                paid,
-                records.clone(),
-            )),
-        );
-        let Spawned {
-            queues,
-            held,
-            agents,
-        } = spawn(handlers, &ids, &dispatch, &obituary, &records, clock);
-        drop((dispatch, obituary, records));
-        let mut router = Router::new(queues, environment_id.clone());
-
-        let environment_only = BTreeSet::from([environment_id.clone()]);
-        let mut running = router.agents();
-        let seat = Seat {
-            id: environment_id.clone(),
-            commanded: commands,
-            rewarded: rewards,
+            done: report,
         };
+        let mut actors: Vec<Started> = Vec::with_capacity(starts.len());
+        for (channels, (_, start)) in unstarted.into_iter().zip(starts) {
+            actors.push(start(channels, &shared));
+        }
+        // The episode's own senders go before it waits, so the writer has only
+        // the actors' senders left and the completion channel only theirs. That
+        // is what lets a disconnected channel mean "every thread has ended"
+        // rather than "the episode is still holding one". Dropping the whole
+        // `Shared` drops both, and the router clone with them.
+        drop(shared);
+
         let outcome = router
-            .control(&environment_only, Control::Start)
-            .map_err(|error| Halt::Error(EpisodeError::Control(error)))
-            .and_then(|in_flight| {
-                drive(
-                    &mut router,
-                    &seat,
-                    &dispatches,
-                    &obituaries,
-                    in_flight,
-                    &mut running,
-                )
-            });
-        // Whatever happened, everybody is stopped, and nobody twice: an
-        // agent the environment already stopped is not in `running`, and a
-        // second `Stop` would put a second one in its records, claiming
-        // it was told to stop after it had stopped.
-        //
-        // The environment's own `Stop` comes last, once the agents it was
-        // running have ended, because until then the episode is not over
-        // for it: a cycle it is still in the middle of may yet have
-        // something to say, and its records should say so.
-        let (environment_agent, agents) = split(agents, &environment_id);
-        let stopped = router
-            .control(&running, Control::Stop)
-            .map_err(EpisodeError::Control);
-        let mut failures = join(agents);
-        let stopped = stopped.and_then(|_| {
-            router
-                .control(&environment_only, Control::Stop)
-                .map_err(EpisodeError::Control)
-        });
-        failures.extend(join(environment_agent));
-        failures.sort_by(|(one, _), (other, _)| one.cmp(other));
-        drop(held);
+            .command_as_episode(&[environment_id], Control::Start)
+            .map_err(EpisodeError::Control)
+            .and_then(|()| wait(&done, &actors, &router, limit));
+        let failures = join(actors);
+        // Every sender to the writer has gone with the threads that held them,
+        // so the writer can be joined for the complete log. A failed required
+        // sink shows up as every actor's `WriterClosed`, which the failures
+        // below already report, so there is nothing to add here; what matters
+        // is that the writer is joined before this returns.
+        drop(writer.join());
 
-        match (outcome, stopped) {
-            (Err(Departure), _) | (Ok(()), Ok(_)) if !failures.is_empty() => {
-                Err(EpisodeError::Agents(failures))
-            }
-            // A departure with nothing to report is still a departure: the
-            // episode was abandoned where it stood rather than finished,
-            // and a caller told `Ok(())` would take a run that never
-            // reached its shutdown for a clean one.
-            (Err(Departure), _) => Err(EpisodeError::Departed),
-            (Ok(()), Ok(_)) => Ok(()),
-            (Err(Halt::Error(error)), _) | (Ok(()), Err(error)) => Err(error),
+        // A thread that did not end cleanly is the most specific thing the
+        // episode can say, so it is said first: a timeout whose cause was a
+        // panicking handler is reported as the panic.
+        if !failures.is_empty() {
+            return Err(EpisodeError::Agents(failures));
         }
+        outcome
     }
 }
 
-/// The running agents of an episode: its environment's thread and every
-/// other.
-type Threads<P> = Vec<Agent<Watched<P>>>;
-
-/// What spawning an episode's threads leaves the episode holding.
-struct Spawned<P: Payload> {
-    /// Where to address each agent, which is what the router is built from.
-    queues: BTreeMap<ActorId, Queues<P>>,
-    /// A receiving half of every queue, kept alive until every thread has
-    /// been joined, so that a message to an agent that has already stopped
-    /// is delivered and never read rather than failing its sender.
-    held: Vec<Receiver<Delivery<P>>>,
-    /// The threads themselves.
-    agents: Threads<P>,
-}
-
-/// Wires and spawns one thread per handler, in roster order.
-fn spawn<P: Payload>(
-    handlers: BTreeMap<ActorId, Box<dyn Handler<P> + Send>>,
-    ids: &BTreeSet<ActorId>,
-    dispatch: &Sender<CycleDispatch<P>>,
-    obituary: &Sender<ActorId>,
-    records: &Sender<Record<P>>,
-    clock: Clock,
-) -> Spawned<P> {
-    let mut queues = BTreeMap::new();
-    let mut held = Vec::with_capacity(ids.len());
-    let mut agents = Vec::with_capacity(ids.len());
-    for (id, handler) in handlers {
-        let (sender, queue) = unbounded();
-        held.push(queue.clone());
-        queues.insert(id.clone(), Queues { queue: sender });
-        let wiring = Wiring {
-            id: id.clone(),
-            clock,
-            queue,
-            dispatches: dispatch.clone(),
-            records: records.clone(),
-            timeout: None,
-        };
-        let watched = Watched {
-            id,
-            handler,
-            obituary: obituary.clone(),
-        };
-        agents.push(Agent::spawn(wiring, watched, clock));
-    }
-    Spawned {
-        queues,
-        held,
-        agents,
+/// Wraps a started actor in the erased form the episode holds.
+fn started<H: Send + 'static>(actor: Actor<H>) -> Started {
+    let (id, control) = (actor.id().clone(), actor.control().clone());
+    Started {
+        id,
+        control,
+        join: Box::new(move || actor.join().map(|_handler| ())),
     }
 }
 
-/// Splits the environment's agent out of the roster's, so that the two can
-/// be stopped and joined in their own order.
-fn split<P: Payload>(agents: Threads<P>, environment: &ActorId) -> (Threads<P>, Threads<P>) {
-    agents
-        .into_iter()
-        .partition(|agent| agent.id() == environment)
-}
-
-/// The environment's seat in the episode: who it is, and the two channels
-/// it asks for things on.
+/// Waits for every actor's threads to report, within `limit`.
 ///
-/// The three travel together because they are one thing — what the episode
-/// knows about its environment that it knows about nobody else — and
-/// because a control and a reward are both drained at the same moment, just
-/// after a dispatch of the environment's.
-struct Seat {
-    /// The environment's id.
-    id: ActorId,
-    /// The controls it has asked for and the episode has not yet issued.
-    commanded: Receiver<Commanded>,
-    /// The agents it has rewarded and the episode has not yet checked. The
-    /// records are already written; see
-    /// [`Adapter`].
-    rewarded: Receiver<Rewarded>,
-}
-
-/// Why routing stopped.
-enum Halt {
-    /// An agent's thread has ended, or every agent's has; joining them says
-    /// why.
-    Departure,
-    /// A control or a message could not be routed, or the episode stalled.
-    Error(EpisodeError),
-}
-
-use Halt::Departure;
-
-/// Routes what the agents send, and the controls the environment asks for,
-/// until every agent has been stopped.
+/// Two threads per actor, so two reports per actor, and each report says
+/// whether that actor had been stopped when its thread ended. Those three
+/// outcomes are the three the episode distinguishes (ADR-0016):
 ///
-/// `in_flight` is the number of deliveries already made and not yet reported
-/// handled. Each dispatch takes a cycle's deliveries off the count and puts
-/// the deliveries its outputs cause onto it, in that order but as one step,
-/// so the count reads zero only when no agent has anything left to handle or
-/// send.
-///
-/// # When a control the environment asked for is issued
-///
-/// The environment queues a cycle's controls while its handler is running,
-/// which is strictly before its loop sends the dispatch, so by the time a
-/// dispatch of the environment's is in hand every control of that cycle is
-/// already on `commanded` waiting to be drained (see
-/// [`environment::Adapter`](Adapter)). What is left is
-/// *when* to issue each, and the two controls want opposite answers.
-///
-/// A [`Start`](Control::Start) is issued **before** the cycle's messages, so
-/// that an agent logs its start before its first observation. The
-/// environment that starts an agent and speaks to it in the same breath
-/// means the start first.
-///
-/// A [`Stop`](Control::Stop) is issued **once nothing is in flight**, which
-/// is to say once everything already said has been handled. It has to be,
-/// and not merely after the cycle's messages. An agent has one queue, so a
-/// `Stop` sent early either waits behind work the agent has not reached or,
-/// once popped, leaves the rest of that queue unobserved — an agent that
-/// has stopped did not observe it (see [`agent`]) — and which
-/// of the two depends on the scheduler. Holding the stop back until the
-/// count reads zero means there is nothing for it to land behind, which
-/// makes "an agent hears everything said to it before it is told to stop" a
-/// guarantee rather than a hope, and it is what lets the moderator narrate
-/// an outcome and end the episode in one cycle.
-///
-/// Nothing in flight, no stop waiting to be issued, and some agent still
-/// running is a stall; see the [module documentation](self).
-fn drive<P: Payload>(
-    router: &mut Router<P>,
-    environment: &Seat,
-    dispatches: &Receiver<CycleDispatch<P>>,
-    obituaries: &Receiver<ActorId>,
-    mut in_flight: usize,
-    running: &mut BTreeSet<ActorId>,
-) -> Result<(), Halt> {
-    let Seat {
-        id: environment,
-        commanded,
-        rewarded,
-    } = environment;
-    let mut held: Vec<BTreeSet<ActorId>> = Vec::new();
-    // Whoever reported a deadline pending on its last cycle. Such an agent
-    // will run another cycle when its instant arrives, whatever anybody
-    // says to it, so the roster is waiting rather than stalled.
-    let mut waking: BTreeSet<ActorId> = BTreeSet::new();
-    while !running.is_empty() {
-        if in_flight == 0 && waking.is_empty() {
-            if held.is_empty() {
-                return Err(Halt::Error(EpisodeError::Stalled {
-                    running: running.clone(),
-                }));
-            }
-            for to in held.drain(..) {
-                // Only whoever is still running. An agent stopped in an
-                // earlier cycle has ended its thread, but its queue is held
-                // open until the episode joins it, so a second `Stop` would
-                // be delivered and counted and then never reported handled:
-                // the in-flight count would not come back to zero and the
-                // episode would wait on a dispatch that is never coming.
-                let to: BTreeSet<ActorId> = to.intersection(running).cloned().collect();
-                if to.is_empty() {
-                    continue;
+/// - every actor reports having been stopped: the environment ended the
+///   episode, and this returns `Ok`;
+/// - an actor reports **without having been stopped**: it left unbidden, so the
+///   episode stops the rest and returns [`EpisodeError::Departed`];
+/// - the limit passes first: the episode sends `Stop` to every actor itself,
+///   since it holds every control sender, and returns
+///   [`EpisodeError::Timeout`].
+fn wait<P: Payload>(
+    done: &Receiver<Ended>,
+    actors: &[Started],
+    router: &Router<P>,
+    limit: Duration,
+) -> Result<(), EpisodeError> {
+    let deadline = Instant::now() + limit;
+    // Two threads apiece. An actor whose second thread has reported is
+    // finished; until then the episode is still waiting on it.
+    let mut outstanding: BTreeMap<ActorId, usize> =
+        actors.iter().map(|actor| (actor.id.clone(), 2)).collect();
+    let everybody: Vec<ActorId> = actors.iter().map(|actor| actor.id.clone()).collect();
+    while !outstanding.is_empty() {
+        match done.recv_deadline(deadline) {
+            Ok(Ended { who, stopped }) => {
+                if !stopped {
+                    // Nobody told it to stop, so the episode was abandoned
+                    // where it stood. The rest are stopped so that the log is
+                    // complete up to the departure.
+                    router
+                        .command_as_episode(&everybody, Control::Stop)
+                        .map_err(EpisodeError::Control)?;
+                    return Err(EpisodeError::Departed);
                 }
-                in_flight += router
-                    .command(environment, &to, Control::Stop)
-                    .map_err(|error| {
-                        Halt::Error(EpisodeError::Route {
-                            agent: environment.clone(),
-                            error,
-                        })
-                    })?;
-                running.retain(|id| !to.contains(id));
-            }
-            continue;
-        }
-        let dispatch = select! {
-            recv(dispatches) -> dispatch => dispatch.map_err(|_| Departure)?,
-            recv(obituaries) -> _ => return Err(Departure),
-        };
-        in_flight = in_flight
-            .checked_sub(dispatch.deliveries)
-            .expect("an agent reported more deliveries than were routed to it");
-        // What this agent said about its own next cycle replaces whatever
-        // it said before.
-        if dispatch.waking {
-            waking.insert(dispatch.agent.clone());
-        } else {
-            waking.remove(&dispatch.agent);
-        }
-        let refused = |error| {
-            Halt::Error(EpisodeError::Route {
-                agent: dispatch.agent.clone(),
-                error,
-            })
-        };
-        if dispatch.agent == *environment {
-            // The rewards of this cycle, checked but not routed: a reward
-            // is already in the log and is not a delivery, so
-            // nothing here adds to the in-flight count. What is left is
-            // whether the environment produced a reward that could become
-            // a record. Only a refusal arrives here: the adapter writes a
-            // reward it accepts and says nothing. A name it would not
-            // write the router turns into the error it would give for
-            // addressing that name; a value it could not serialize is the
-            // reward type's fault rather than the name's, and says so.
-            while let Ok(Rewarded { agent, refusal }) = rewarded.try_recv() {
-                match refusal {
-                    Refusal::NotRewardable => {
-                        router.rewardable(environment, &agent).map_err(refused)?;
-                    }
-                    Refusal::Unserializable => {
-                        return Err(Halt::Error(EpisodeError::Reward(agent)));
+                if let Some(left) = outstanding.get_mut(&who) {
+                    *left -= 1;
+                    if *left == 0 {
+                        outstanding.remove(&who);
                     }
                 }
             }
-            while let Ok(Commanded { to, control }) = commanded.try_recv() {
-                match control {
-                    Control::Start => {
-                        in_flight += router
-                            .command(&dispatch.agent, &to, control)
-                            .map_err(refused)?;
-                    }
-                    // A `Stop` asked for while others are still running
-                    // goes out at once, and only the end-of-episode stop
-                    // is held for quiescence (ADR-0012). Holding this one
-                    // would defeat its purpose: the point of stopping a
-                    // dead player mid-game is that it does *not* hear what
-                    // comes next, and during a phase there is always
-                    // something in flight, so a held stop might never go.
-                    Control::Stop => {
-                        router.validate(&dispatch.agent, &to).map_err(refused)?;
-                        let to: BTreeSet<ActorId> = to.intersection(running).cloned().collect();
-                        if to.is_empty() {
-                            continue;
-                        }
-                        // The stop that ends the episode is held for
-                        // quiescence, so that every agent hears what was
-                        // said to it before it stops (ADR-0009). A stop
-                        // for *some* of the running agents goes out at
-                        // once: the point of stopping a dead player
-                        // mid-game is that it does not hear what comes
-                        // next, and during a phase there is always
-                        // something in flight, so holding it might never
-                        // let it go (ADR-0012).
-                        if to == *running {
-                            held.push(to);
-                            continue;
-                        }
-                        in_flight += router
-                            .command(&dispatch.agent, &to, Control::Stop)
-                            .map_err(refused)?;
-                        // Nothing further is routed to them, and the
-                        // episode no longer waits on them.
-                        for who in &to {
-                            router.stopped(who);
-                        }
-                        running.retain(|id| !to.contains(id));
-                        waking.retain(|id| !to.contains(id));
-                    }
-                }
+            // Every actor still holds a sender, so a disconnected channel means
+            // every thread has ended, reports and all.
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                let running = outstanding.keys().cloned().collect();
+                router
+                    .command_as_episode(&everybody, Control::Stop)
+                    .map_err(EpisodeError::Control)?;
+                return Err(EpisodeError::Timeout { limit, running });
             }
-        }
-        for message in &dispatch.sent {
-            in_flight += router.route(message).map_err(refused)?;
         }
     }
     Ok(())
 }
 
-/// An agent's handler, wrapped so that the episode hears when the agent's
-/// thread ends.
+/// Joins every actor's threads and collects the ones that did not end cleanly.
 ///
-/// The agent loop keeps its handler until it returns, so this is dropped,
-/// and the obituary sent, exactly when the thread is ending: by a panic, by
-/// an error, or, after shutdown, by the episode joining it and dropping the
-/// handler it gets back. Before shutdown an obituary can only mean the
-/// first two, and it is what keeps the episode from waiting forever for a
-/// cycle that will never be reported.
-struct Watched<P: Payload> {
-    id: ActorId,
-    handler: Box<dyn Handler<P> + Send>,
-    obituary: Sender<ActorId>,
-}
-
-impl<P: Payload> Handler<P> for Watched<P> {
-    fn start(&mut self, now: Instant) -> Vec<Action<P>> {
-        self.handler.start(now)
+/// Every actor is sent a `Stop` first, on the episode's own control sender for
+/// it, and **before any of them is joined**. That is what makes joining
+/// terminate at all: a perception thread waits on channels the [`Router`] holds
+/// senders for, and the router is shared by every handler thread, so dropping
+/// the episode's own senders frees nothing while any actor is alive. A `Stop`
+/// is what ends a perception thread, so the episode sends one to everybody.
+///
+/// An actor already stopped no longer has a receiver, so the send fails and is
+/// ignored: it cannot be stopped twice, because its perception thread has
+/// already gone and there is nobody to write a second record.
+fn join(actors: Vec<Started>) -> Vec<(ActorId, Failure)> {
+    for actor in &actors {
+        let _ = actor.control.send(Control::Stop);
     }
-
-    fn handle(&mut self, observation: &Observation<P>) -> Vec<Action<P>> {
-        self.handler.handle(observation)
-    }
-
-    fn timeout(&mut self, now: Instant) -> Vec<Action<P>> {
-        self.handler.timeout(now)
-    }
-
-    fn deadline(&self) -> Option<Instant> {
-        self.handler.deadline()
-    }
-}
-
-impl<P: Payload> Drop for Watched<P> {
-    fn drop(&mut self) {
-        // After shutdown nobody is listening, and that is fine.
-        let _ = self.obituary.send(self.id.clone());
-    }
-}
-
-/// Joins every thread and collects the ones that did not end cleanly.
-fn join<P: Payload>(agents: Vec<Agent<Watched<P>>>) -> Vec<(ActorId, Failure)> {
-    agents
+    let mut failures: Vec<(ActorId, Failure)> = actors
         .into_iter()
-        .filter_map(|agent| {
-            let id = agent.id().clone();
-            match panic::catch_unwind(AssertUnwindSafe(|| agent.join())) {
-                Ok(Ok(_handler)) => None,
+        .filter_map(|Started { id, control, join }| {
+            drop(control);
+            match panic::catch_unwind(AssertUnwindSafe(join)) {
+                Ok(Ok(())) => None,
                 Ok(Err(error)) => Some((id, Failure::Error(error))),
                 Err(payload) => Some((id, Failure::Panicked(panic_message(payload.as_ref())))),
             }
         })
-        .collect()
+        .collect();
+    failures.sort_by(|(one, _), (other, _)| one.cmp(other));
+    failures
 }
 
 fn panic_message(payload: &(dyn Any + Send)) -> String {
@@ -746,890 +577,396 @@ fn panic_message(payload: &(dyn Any + Send)) -> String {
 
 #[cfg(test)]
 mod tests {
-    use serde::Serialize;
     use serde_json::Value;
 
     use super::*;
-    use crate::environment::Effect;
-    use crate::log::Writer;
-    use crate::testing::{Shared, header_anchor, joined, parse_lines, recording};
+    use crate::contract::{Action, Effect, Observation};
+    use crate::router::Seat;
+    use crate::testing::{Shared, TestPayload, parse_lines, sinking};
 
-    /// What the agents of the counting games below say.
-    ///
-    /// `Done` is how an agent tells the environment it has nothing more to
-    /// send. Quiescence is no longer how an episode ends, so a purely
-    /// reactive roster needs some way to say that it has finished, and
-    /// saying so in the domain is the way a game does it; Collatz's
-    /// `Finished` is the same idea.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-    enum Count {
-        /// A number, which is all these agents ever say to each other.
-        Say(u64),
-        /// Nothing more is coming from this agent.
-        Done,
+    const ENVIRONMENT: &str = "environment";
+
+    /// An episode whose log a test can read back.
+    fn episode<W: Serialize + Send + 'static>(
+        environment: impl Step<W, TestPayload> + Send + 'static,
+    ) -> (Episode<W, TestPayload>, Shared) {
+        let (sinks, log) = sinking();
+        (Episode::new(sinks, ENVIRONMENT, environment), log)
     }
 
-    use Count::{Done, Say};
-
-    /// The environment of the counting games: it starts the agents it was
-    /// built with and stops them all once each has said [`Done`].
-    ///
-    /// It is the whole of what an environment must do — start the episode
-    /// and end it — and nothing else, which is what makes it the stand-in
-    /// for a game the runtime knows nothing about.
-    struct Referee {
-        agents: BTreeSet<ActorId>,
-        working: BTreeSet<ActorId>,
-    }
-
-    impl Referee {
-        /// A referee over these agents.
-        fn over<const N: usize>(agents: [&str; N]) -> Self {
-            let agents: BTreeSet<ActorId> = agents.map(ActorId::new).into();
-            Self {
-                working: agents.clone(),
-                agents,
-            }
-        }
-    }
-
-    impl Environment<i32, Count> for Referee {
-        fn start(&mut self, _now: Instant) -> Vec<Effect<i32, Count>> {
-            vec![Effect::control(self.agents.clone(), Control::Start)]
-        }
-
-        fn handle(&mut self, observation: &Observation<Count>) -> Vec<Effect<i32, Count>> {
-            if observation.message.payload == Done {
-                self.working.remove(&observation.message.sender);
-            }
-            if self.working.is_empty() && !self.agents.is_empty() {
-                let agents = std::mem::take(&mut self.agents);
-                vec![Effect::control(agents, Control::Stop)]
-            } else {
-                Vec::new()
-            }
-        }
-    }
-
-    /// An environment that starts two agents, pays `to` whatever `value`
-    /// is, and stops everybody, all in its opening cycle.
-    ///
-    /// It is the smallest thing that logs a reward: enough to see the
-    /// record the runtime writes, and to point `to` at somebody who is not
-    /// there.
-    struct Paymaster {
-        to: ActorId,
-        value: i32,
-    }
-
-    impl Paymaster {
-        fn paying(to: &str, value: i32) -> Self {
-            Self {
-                to: ActorId::new(to),
-                value,
-            }
-        }
-    }
-
-    impl Environment<i32, Count> for Paymaster {
-        fn start(&mut self, _now: Instant) -> Vec<Effect<i32, Count>> {
-            vec![
-                Effect::control(["a", "b"], Control::Start),
-                Effect::reward(self.to.clone(), self.value),
-                Effect::control(["a", "b"], Control::Stop),
-            ]
-        }
-
-        fn handle(&mut self, _: &Observation<Count>) -> Vec<Effect<i32, Count>> {
-            Vec::new()
-        }
-    }
-
-    /// An episode of a [`Paymaster`] over two mute agents, and its writer.
-    fn paid(to: &str, value: i32) -> (Episode<i32, Count>, Writer, Shared) {
-        let clock = Clock::start();
-        let (records, writer, bytes) = recording(clock);
-        let mut episode = Episode::new(records, REFEREE, Paymaster::paying(to, value), clock);
-        episode.add("a", Mute).unwrap();
-        episode.add("b", Mute).unwrap();
-        (episode, writer, bytes)
-    }
-
-    #[test]
-    fn a_reward_is_logged_to_the_agent_it_names_and_routed_nowhere() {
-        let (episode, writer, bytes) = paid("a", 7);
-        episode.run().unwrap();
-        let lines = parse_lines(&joined(writer, &bytes));
-        let rewards: Vec<&Value> = lines
-            .iter()
-            .filter(|line| line["type"] == "reward")
-            .collect();
-        assert_eq!(rewards.len(), 1, "{lines:?}");
-        let reward = rewards[0];
-        assert_eq!(reward["agent"], "a", "the agent rewarded, not the payer");
-        assert_eq!(reward["value"], 7);
-        assert!(
-            reward["seq"].is_null(),
-            "a reward carries no sequence number: {reward}"
-        );
-        assert!(
-            reward["message"].is_null(),
-            "a reward is logged, never sent: {reward}"
-        );
-        assert!(reward["t"].is_u64(), "{reward}");
-        // Nobody observed it: a reward is not a delivery, so it never
-        // touched the in-flight count and never reached a queue.
-        assert_eq!(
-            lines
-                .iter()
-                .filter(|line| line["type"] == "observation")
-                .count(),
-            0
-        );
-        // And it was logged before the stop it precedes.
-        let stop = lines
-            .iter()
-            .find(|line| {
-                line["agent"] == "a" && line["type"] == "control" && line["control"] == "stop"
-            })
-            .expect("a was stopped");
-        assert!(reward["t"].as_u64() <= stop["t"].as_u64());
-    }
-
-    #[test]
-    fn a_reward_for_an_agent_not_in_the_roster_fails_the_episode() {
-        // The router rejects it the way it rejects a control addressed to
-        // a stranger: the episode stops and says whose bug it is.
-        let (episode, _writer, _bytes) = paid("nobody", 1);
-        assert_eq!(
-            episode.run().unwrap_err(),
-            EpisodeError::Route {
-                agent: ActorId::new(REFEREE),
-                error: RouteError::UnknownAgent(ActorId::new("nobody")),
-            }
-        );
-    }
-
-    #[test]
-    fn an_environment_that_rewards_itself_fails_the_episode() {
-        // The environment runs the game rather than playing it, so there
-        // is nothing its own behavior could be worth.
-        let (episode, _writer, _bytes) = paid(REFEREE, 1);
-        assert_eq!(
-            episode.run().unwrap_err(),
-            EpisodeError::Route {
-                agent: ActorId::new(REFEREE),
-                error: RouteError::Loopback(ActorId::new(REFEREE)),
-            }
-        );
-    }
-
-    /// A reward type that no JSON document can hold: a map whose keys are
-    /// not strings, which `serde_json` refuses rather than inventing a
-    /// spelling for.
-    ///
-    /// Contrived, because every reward type in the tree is an integer. What
-    /// it stands for is any reward a game might name whose values the log
-    /// cannot carry, which the episode has to report rather than quietly
-    /// leave out.
-    #[derive(Debug, Clone, Copy, PartialEq)]
-    struct Unwritable;
-
-    impl Serialize for Unwritable {
-        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-            use serde::ser::SerializeMap;
-            // A pair, which has no spelling as a JSON object key; an
-            // integer key would be coerced to a string and serialize.
-            let mut map = serializer.serialize_map(Some(1))?;
-            map.serialize_entry(&(0u8, 0u8), &0u8)?;
-            map.end()
-        }
-    }
-
-    /// An environment that pays one agent in a currency the log cannot
-    /// hold.
-    struct Counterfeiter;
-
-    impl Environment<Unwritable, Count> for Counterfeiter {
-        fn start(&mut self, _now: Instant) -> Vec<Effect<Unwritable, Count>> {
-            vec![
-                Effect::control(["a", "b"], Control::Start),
-                Effect::reward("a", Unwritable),
-                Effect::control(["a", "b"], Control::Stop),
-            ]
-        }
-
-        fn handle(&mut self, _: &Observation<Count>) -> Vec<Effect<Unwritable, Count>> {
-            Vec::new()
-        }
-    }
-
-    #[test]
-    fn a_reward_that_will_not_serialize_fails_the_episode_and_is_not_written() {
-        // The neighboring refusal — a reward for somebody outside the
-        // roster — fails the episode, and this fails it for the same
-        // reason: a log that quietly lacks a reward the environment
-        // assigned is evidence of nothing. The error names the agent and
-        // says the reward, not the name, was the problem.
-        let clock = Clock::start();
-        let (records, writer, bytes) = recording(clock);
-        let mut episode = Episode::new(records, REFEREE, Counterfeiter, clock);
-        episode.add("a", Mute).unwrap();
-        episode.add("b", Mute).unwrap();
-        assert_eq!(
-            episode.run().unwrap_err(),
-            EpisodeError::Reward(ActorId::new("a"))
-        );
-        let written = joined(writer, &bytes);
-        let lines = parse_lines(&written);
-        assert!(
-            lines.iter().all(|line| line["type"] != "reward"),
-            "the reward that could not be written is not in the log"
-        );
-    }
-
-    /// An environment that starts its agents and never stops them, so that
-    /// whatever they do the episode ends by stalling.
-    struct Absent<const N: usize>([&'static str; N]);
-
-    impl<const N: usize> Environment<i32, Count> for Absent<N> {
-        fn start(&mut self, _now: Instant) -> Vec<Effect<i32, Count>> {
-            vec![Effect::control(self.0, Control::Start)]
-        }
-
-        fn handle(&mut self, _: &Observation<Count>) -> Vec<Effect<i32, Count>> {
-            Vec::new()
-        }
-    }
-
-    /// The name the counting games' environment goes by.
-    const REFEREE: &str = "referee";
-
-    /// The number an observation carries, if it is one: everything a
-    /// counting agent hears that is not a [`Done`].
-    fn count(observation: &Observation<Count>) -> Option<u64> {
-        match observation.message.payload {
-            Say(n) => Some(n),
-            Done => None,
-        }
-    }
-
-    /// An agent's way of telling the environment it has finished.
-    fn done() -> Action<Count> {
-        Action::to([REFEREE], Done)
-    }
-
-    /// Volleys a count back and forth with `partner` until it reaches
-    /// `limit`, then tells the environment it is done. The one that
-    /// `serves` opens the rally.
-    ///
-    /// Each side is done when it has seen the limit, whether it volleyed it
-    /// or was volleyed it: the side that sends the limit hears nothing back,
-    /// so waiting to be spoken to again would leave it running forever.
-    struct Rally {
-        partner: ActorId,
-        serves: bool,
-        limit: u64,
-    }
-
-    impl Rally {
-        fn to_partner(&self, n: u64) -> Action<Count> {
-            Action::to([self.partner.clone()], Say(n))
-        }
-    }
-
-    impl Handler<Count> for Rally {
-        fn start(&mut self, _now: Instant) -> Vec<Action<Count>> {
-            if self.serves {
-                vec![self.to_partner(1)]
-            } else {
-                Vec::new()
-            }
-        }
-
-        fn handle(&mut self, observation: &Observation<Count>) -> Vec<Action<Count>> {
-            let Some(heard) = count(observation) else {
-                return Vec::new();
-            };
-            let mut actions = Vec::new();
-            if heard < self.limit {
-                actions.push(self.to_partner(heard + 1));
-            }
-            if heard + 1 >= self.limit {
-                actions.push(done());
-            }
-            actions
-        }
-    }
-
-    /// Names the spokes and the environment at once when it starts, then
-    /// waits to hear back from every spoke before declaring itself done.
-    ///
-    /// It addresses one more agent than it hears from: the environment is
-    /// told what the spokes are told and says nothing back.
-    struct Hub {
-        spokes: BTreeSet<ActorId>,
+    /// An environment that starts everybody, waits for one message from each,
+    /// and then stops everybody, itself included.
+    struct Counting {
+        agents: Vec<ActorId>,
         heard: usize,
     }
 
-    impl Hub {
-        fn addressing<I, A>(spokes: I) -> Self
-        where
-            I: IntoIterator<Item = A>,
-            A: Into<ActorId>,
-        {
+    impl Counting {
+        fn new<const N: usize>(agents: [&str; N]) -> Self {
             Self {
-                spokes: spokes.into_iter().map(Into::into).collect(),
+                agents: agents.iter().map(|id| ActorId::new(*id)).collect(),
                 heard: 0,
             }
         }
+
+        /// Everybody, the environment included: what ends an episode.
+        fn everybody(&self) -> Vec<ActorId> {
+            let mut all = self.agents.clone();
+            all.push(ActorId::new(ENVIRONMENT));
+            all
+        }
     }
 
-    impl Handler<Count> for Hub {
-        fn start(&mut self, _now: Instant) -> Vec<Action<Count>> {
-            let everybody = self.spokes.iter().cloned().chain([ActorId::new(REFEREE)]);
-            vec![Action::to(everybody, Say(0))]
+    impl Step<i32, TestPayload> for Counting {
+        fn start(&mut self, _clock: Clock) -> impl IntoIterator<Item = Effect<i32, TestPayload>> {
+            let mut effects = vec![Effect::command(self.agents.clone(), Control::Start)];
+            if self.agents.is_empty() {
+                effects.push(Effect::command(self.everybody(), Control::Stop));
+            }
+            effects
         }
 
-        fn handle(&mut self, observation: &Observation<Count>) -> Vec<Action<Count>> {
-            if count(observation).is_some() {
-                self.heard += 1;
-            }
-            if self.heard >= self.spokes.len() {
-                vec![done()]
+        fn step(
+            &mut self,
+            _observation: Observation<TestPayload>,
+        ) -> impl IntoIterator<Item = Effect<i32, TestPayload>> {
+            self.heard += 1;
+            if self.heard == self.agents.len() {
+                vec![Effect::command(self.everybody(), Control::Stop)]
             } else {
                 Vec::new()
             }
         }
     }
 
-    /// Replies once to whoever sends it a number, and is then done.
-    struct Spoke;
+    /// An agent that greets the environment when it starts and says nothing
+    /// else.
+    struct Greeting;
 
-    impl Handler<Count> for Spoke {
-        fn handle(&mut self, observation: &Observation<Count>) -> Vec<Action<Count>> {
-            if count(observation).is_none() {
-                return Vec::new();
-            }
-            vec![
-                Action::to([observation.message.sender.clone()], Say(1)),
-                done(),
-            ]
-        }
-    }
-
-    /// Sends one message to `to` when it starts, whoever that is.
-    struct Addresses(&'static str);
-
-    impl Handler<Count> for Addresses {
-        fn start(&mut self, _now: Instant) -> Vec<Action<Count>> {
-            vec![Action::to([self.0], Say(1))]
+    impl Policy<TestPayload> for Greeting {
+        fn start(&mut self, _clock: Clock) -> impl IntoIterator<Item = Action<TestPayload>> {
+            [Action::to([ENVIRONMENT], TestPayload::Step(0))]
         }
 
-        fn handle(&mut self, _: &Observation<Count>) -> Vec<Action<Count>> {
-            Vec::new()
+        fn policy(
+            &mut self,
+            _observation: Observation<TestPayload>,
+        ) -> impl IntoIterator<Item = Action<TestPayload>> {
+            []
         }
-    }
-
-    /// Says nothing, ever, so an episode of it stalls.
-    struct Mute;
-
-    impl Handler<Count> for Mute {
-        fn handle(&mut self, _: &Observation<Count>) -> Vec<Action<Count>> {
-            Vec::new()
-        }
-    }
-
-    struct Panics;
-
-    impl Handler<Count> for Panics {
-        fn start(&mut self, _now: Instant) -> Vec<Action<Count>> {
-            panic!("the handler is broken")
-        }
-
-        fn handle(&mut self, _: &Observation<Count>) -> Vec<Action<Count>> {
-            panic!("the handler is broken")
-        }
-    }
-
-    fn of<'a>(lines: &'a [Value], agent: &str) -> impl Iterator<Item = &'a Value> {
-        lines.iter().filter(move |line| line["agent"] == agent)
-    }
-
-    /// The controls in `lines`, in order. With an `agent`, that agent's;
-    /// without one, the whole log's. Every agent's reads
-    /// `["start", "stop"]`: the environment starts it and stops it, and
-    /// nothing else is a control.
-    fn controls_of<'a>(lines: &'a [Value], agent: Option<&str>) -> Vec<&'a Value> {
-        lines
-            .iter()
-            .filter(|line| agent.is_none_or(|agent| line["agent"] == agent))
-            .filter(|line| line["type"] == "control")
-            .map(|line| &line["control"])
-            .collect()
-    }
-
-    /// An episode refereed over the named agents, whose log goes to
-    /// the writer returned beside it.
-    fn refereed<const N: usize>(agents: [&str; N]) -> (Episode<i32, Count>, Writer, Shared) {
-        let clock = Clock::start();
-        let (records, writer, bytes) = recording(clock);
-        (
-            Episode::new(records, REFEREE, Referee::over(agents), clock),
-            writer,
-            bytes,
-        )
-    }
-
-    fn rally(limit: u64) -> (Episode<i32, Count>, Writer, Shared) {
-        let (mut episode, writer, bytes) = refereed(["a", "b"]);
-        for (me, partner, serves) in [("a", "b", true), ("b", "a", false)] {
-            episode
-                .add(
-                    me,
-                    Rally {
-                        partner: ActorId::new(partner),
-                        serves,
-                        limit,
-                    },
-                )
-                .unwrap();
-        }
-        (episode, writer, bytes)
     }
 
     #[test]
-    fn one_send_to_three_recipients_writes_one_action_and_three_observations() {
-        // The whole of the join (ADR-0017). One send is one message and one
-        // sequence number, whatever its recipients, so the sender writes one
-        // action record and each recipient writes an observation record
-        // carrying the same `(from, seq)`.
-        let clock = Clock::start();
-        let (records, writer, bytes) = recording(clock);
-        let spokes = ["a", "b", "c"];
-        let roster: BTreeSet<ActorId> = spokes
-            .iter()
-            .map(|who| ActorId::new(*who))
-            .chain([ActorId::new("hub")])
-            .collect();
-        let mut episode = Episode::new(
-            records,
-            REFEREE,
-            Referee {
-                working: roster.clone(),
-                agents: roster,
-            },
-            clock,
-        );
-        episode
-            .add(
-                "hub",
-                Hub::addressing(spokes.iter().map(|who| (*who).to_owned())),
-            )
-            .unwrap();
-        for who in spokes {
-            episode.add(who, Spoke).unwrap();
-        }
+    fn an_episode_runs_from_its_environments_start_to_its_stop() {
+        let (mut episode, log) = episode(Counting::new(["a", "b"]));
+        episode.add("a", Greeting).unwrap();
+        episode.add("b", Greeting).unwrap();
         episode.run().unwrap();
-        let lines = parse_lines(&joined(writer, &bytes));
-
-        // The hub's opening send, addressed to all three spokes and the
-        // referee at once.
-        let broadcast = lines
+        let lines = parse_lines(&log.bytes());
+        assert_eq!(lines[0]["type"], "episode", "the header is first");
+        let stops = lines
             .iter()
-            .find(|line| line["type"] == "action" && line["agent"] == "hub")
-            .expect("the hub opens by speaking");
-        let recipients: BTreeSet<&str> = broadcast["message"]["recipients"]
-            .as_array()
-            .expect("a message lists its recipients")
-            .iter()
-            .map(|who| who.as_str().expect("a recipient is an actor id"))
-            .collect();
-        assert_eq!(
-            recipients,
-            spokes.into_iter().chain([REFEREE]).collect::<BTreeSet<_>>(),
-            "one send to four recipients"
-        );
-        let seq = broadcast["seq"].as_u64().expect("an action is numbered");
-        assert_eq!(
-            lines
-                .iter()
-                .filter(|line| {
-                    line["type"] == "action" && line["agent"] == "hub" && line["seq"] == seq
-                })
-                .count(),
-            1,
-            "one send is one action record, whatever its recipients"
-        );
-
-        let observed: BTreeSet<&str> = lines
-            .iter()
-            .filter(|line| line["type"] == "observation")
-            .filter(|line| line["from"] == "hub" && line["seq"] == seq)
-            .map(|line| {
-                line["agent"]
-                    .as_str()
-                    .expect("an observation names its agent")
-            })
-            .collect();
-        assert_eq!(
-            observed, recipients,
-            "one action joins to an observation in each recipient's records"
-        );
+            .filter(|line| line["type"] == "control" && line["control"] == "stop")
+            .count();
+        assert_eq!(stops, 3, "the environment stops everybody, itself included");
     }
 
     #[test]
-    fn the_writer_and_every_agent_hold_the_same_origin() {
-        // One clock per episode, captured before the writer and before any
-        // actor, and copied to both (ADR-0017). It is the same value all the
-        // way through, which is what puts every offset in the log and
-        // anything an actor measures from the start of the episode on one
-        // timeline.
-        //
-        // The clock itself is `Copy` and private to the episode, so the claim
-        // is made where it is observable: the origin the episode reports is
-        // the one the writer measured every offset from.
-        let (episode, writer, bytes) = rally(4);
+    fn every_actor_and_the_writer_hold_the_same_origin() {
+        // The invariant is structural: `Episode::new` starts the clock, so
+        // there is no second origin to hand anybody. What this checks is that
+        // the one it started is the one the log's offsets are measured from,
+        // by way of every logged instant being at or after it.
+        /// An agent that reports the clock its start hook was given.
+        struct Reporting(Sender<Clock>);
+
+        impl Policy<TestPayload> for Reporting {
+            fn start(&mut self, clock: Clock) -> impl IntoIterator<Item = Action<TestPayload>> {
+                self.0.send(clock).unwrap();
+                [Action::to([ENVIRONMENT], TestPayload::Step(0))]
+            }
+
+            fn policy(
+                &mut self,
+                _observation: Observation<TestPayload>,
+            ) -> impl IntoIterator<Item = Action<TestPayload>> {
+                []
+            }
+        }
+
+        let (mut episode, log) = episode(Counting::new(["a", "b"]));
         let clock = episode.clock();
-        let origin = clock.origin();
+        let (told, clocks) = unbounded();
+        episode.add("a", Reporting(told.clone())).unwrap();
+        episode.add("b", Reporting(told)).unwrap();
         episode.run().unwrap();
-        // Everything the episode did happened after the origin and before
-        // now, so the whole run fits in that span.
-        let span = clock.offset(Instant::now());
-        let lines = parse_lines(&joined(writer, &bytes));
-
-        // Every offset the writer wrote was measured from that one origin,
-        // so every one of them lies in the span. A writer with an origin of
-        // its own, taken when it started, would put its offsets on a
-        // different timeline from the actors' — the very thing ADR-0017
-        // rejects — and the difference would show as an offset outside it.
-        for line in &lines[1..] {
-            for key in ["t", "t_start", "t_stop"] {
-                if let Some(at) = line[key].as_u64() {
-                    assert!(
-                        u128::from(at) <= span.as_nanos(),
-                        "{key} is an offset from the episode's origin: {line}"
-                    );
-                }
-            }
-        }
-        assert!(
-            origin <= Instant::now(),
-            "the origin is an instant off the same monotonic clock every actor reads"
-        );
-    }
-
-    #[test]
-    fn the_first_line_is_the_episode_header_and_the_rest_are_offsets() {
-        let (episode, writer, bytes) = rally(4);
-        let clock = episode.clock();
-        episode.run().unwrap();
-        let lines = parse_lines(&joined(writer, &bytes));
-        assert_eq!(
-            header_anchor(&lines[0]),
-            clock.start_unix_ns(),
-            "the header anchors the log to the episode's own origin"
-        );
-        // The one wall-clock time in the log.
-        assert!(
-            lines[1..]
-                .iter()
-                .all(|line| line["start_unix_ns"].is_null()),
-            "the header's wall clock appears nowhere else: {lines:?}"
-        );
-        // Every other record's times are offsets, which serialize as
-        // nonnegative integers: a log whose time ran backwards would be a
-        // record of something that did not happen.
-        for line in &lines[1..] {
-            let times: Vec<&Value> = ["t", "t_start", "t_stop"]
-                .iter()
-                .filter_map(|key| line.get(*key))
-                .collect();
-            assert!(!times.is_empty(), "every record says when: {line}");
-            for at in times {
-                assert!(at.is_u64(), "a time is a nonnegative offset: {line}");
-            }
-        }
-    }
-
-    #[test]
-    fn a_rally_runs_to_its_limit_and_the_writer_flushes() {
-        let (episode, writer, bytes) = rally(20);
-        assert_eq!(
-            episode.ids().collect::<Vec<_>>(),
-            [
-                &ActorId::new("a"),
-                &ActorId::new("b"),
-                &ActorId::new(REFEREE)
-            ]
-        );
-        assert_eq!(episode.environment(), &ActorId::new(REFEREE));
-        episode.run().unwrap();
-
-        // Every sender is gone, so the writer finishes on its own.
-        let lines = parse_lines(&joined(writer, &bytes));
-        // The file interleaves agents in whatever order their records reached
-        // the writer; only each agent's own order is promised.
-        let volleyed = |agent: &str| -> Vec<u64> {
-            of(&lines, agent)
-                .filter(|line| line["type"] == "action")
-                .filter_map(|line| line["message"]["payload"]["Say"].as_u64())
-                .collect()
-        };
-        assert_eq!(volleyed("a"), (1..=19).step_by(2).collect::<Vec<_>>());
-        assert_eq!(volleyed("b"), (2..=20).step_by(2).collect::<Vec<_>>());
-        for agent in ["a", "b", REFEREE] {
-            // A sequence number is a message's, so what is dense is each
-            // agent's own actions (ADR-0017).
-            let seqs: Vec<u64> = of(&lines, agent)
-                .filter(|line| line["type"] == "action")
-                .filter(|line| line["message"]["sender"] == agent)
-                .map(|line| line["seq"].as_u64().unwrap())
-                .collect();
-            assert_eq!(seqs, (0..seqs.len() as u64).collect::<Vec<_>>());
-            let controls = controls_of(&lines, Some(agent));
+        let reported: Vec<Clock> = clocks.try_iter().collect();
+        assert_eq!(reported.len(), 2, "both agents started");
+        for theirs in reported {
             assert_eq!(
-                controls,
-                ["start", "stop"],
-                "every agent's records, the environment's included, begin with a start and \
-                 end with a stop"
+                theirs.origin(),
+                clock.origin(),
+                "every actor's start hook is given the episode's clock"
             );
-            // No agent here has a timeout, so every cycle was woken by
-            // something on the queue and none is empty.
-            for line in of(&lines, agent).filter(|line| line["type"] == "cycle") {
-                assert_eq!(line["woken"], "queue", "{line}");
-            }
-            // Every action lies within the window of the cycle that sent it,
-            // and every observation and control was received at a t_start,
-            // with no exception: everything a cycle pops, it pops at its
-            // start (ADR-0009).
-            let starts: BTreeSet<u64> = of(&lines, agent)
-                .filter(|line| line["type"] == "cycle")
-                .map(|line| line["t_start"].as_u64().unwrap())
-                .collect();
-            for line in of(&lines, agent).filter(|line| line["type"] != "cycle") {
-                if line["type"] == "action" {
-                    continue;
-                }
-                let at = line["t"].as_u64().unwrap();
-                assert!(
-                    starts.contains(&at),
-                    "everything popped is popped at a cycle's start: {line}"
-                );
-            }
+            assert_eq!(theirs.start_unix_ns(), clock.start_unix_ns());
+        }
+        // Every offset in the log is measured from that origin, so none can
+        // be negative; `Elapsed` cannot hold a negative, so what a second
+        // origin would produce is a zero where a real offset belongs. The
+        // header's anchor is the clock's.
+        let lines = parse_lines(&log.bytes());
+        assert_eq!(
+            lines[0]["start_unix_ns"].as_u64(),
+            Some(clock.start_unix_ns()),
+            "the log's anchor is the episode's clock"
+        );
+    }
+
+    #[test]
+    fn an_episode_with_no_agents_runs_and_logs_only_the_environments_own() {
+        let (episode, log) = episode(Counting::new([]));
+        episode.run().unwrap();
+        let lines = parse_lines(&log.bytes());
+        for line in &lines[1..] {
+            assert_eq!(line["agent"], ENVIRONMENT, "{line}");
         }
     }
 
     #[test]
-    fn an_observation_joins_the_action_that_sent_it_by_sender_and_number() {
-        // The join a training pipeline makes: an observation in one agent's
-        // records and the action in its sender's are the same message, and
-        // nothing but `(from, seq)` links them (ADR-0017).
-        let (episode, writer, bytes) = rally(6);
-        episode.run().unwrap();
-        let lines = parse_lines(&joined(writer, &bytes));
+    fn a_roster_mixing_two_handler_types_runs() {
+        /// A second handler type, which returns a `Vec` where [`Greeting`]
+        /// returns an array, and keeps state besides. Two handler types in one
+        /// roster is what the erasure in `add` buys.
+        struct Chatty {
+            said: usize,
+        }
 
-        let actions: BTreeSet<(String, u64)> = lines
+        impl Policy<TestPayload> for Chatty {
+            fn start(&mut self, _clock: Clock) -> impl IntoIterator<Item = Action<TestPayload>> {
+                self.said += 1;
+                vec![Action::to([ENVIRONMENT], TestPayload::Step(1))]
+            }
+
+            fn policy(
+                &mut self,
+                _observation: Observation<TestPayload>,
+            ) -> impl IntoIterator<Item = Action<TestPayload>> {
+                Vec::new()
+            }
+        }
+
+        let (mut episode, log) = episode(Counting::new(["a", "b"]));
+        episode.add("a", Greeting).unwrap();
+        episode.add("b", Chatty { said: 0 }).unwrap();
+        episode.run().unwrap();
+        let lines = parse_lines(&log.bytes());
+        let said: Vec<&Value> = lines
             .iter()
             .filter(|line| line["type"] == "action")
-            .map(|line| {
-                (
-                    line["message"]["sender"].as_str().unwrap().to_owned(),
-                    line["seq"].as_u64().unwrap(),
-                )
-            })
             .collect();
-        let observations: Vec<&Value> = lines
-            .iter()
-            .filter(|line| line["type"] == "observation")
-            .collect();
-        assert!(!observations.is_empty());
-        for line in observations {
-            let key = (
-                line["from"].as_str().unwrap().to_owned(),
-                line["seq"].as_u64().unwrap(),
-            );
-            assert!(
-                actions.contains(&key),
-                "every observation joins an action by sender and creation time: {line}"
-            );
-        }
-    }
-
-    #[test]
-    fn in_flight_work_is_counted_in_deliveries_not_messages() {
-        let spokes: Vec<String> = (1..=6).map(|spoke| format!("spoke-{spoke}")).collect();
-        let clock = Clock::start();
-        let (records, writer, bytes) = recording(clock);
-        let roster: BTreeSet<ActorId> = spokes
-            .iter()
-            .map(ActorId::new)
-            .chain([ActorId::new("hub")])
-            .collect();
-        let mut episode = Episode::new(
-            records,
-            REFEREE,
-            Referee {
-                working: roster.clone(),
-                agents: roster,
-            },
-            clock,
-        );
-        episode
-            .add("hub", Hub::addressing(spokes.iter().cloned()))
-            .unwrap();
-        for spoke in &spokes {
-            episode.add(spoke.clone(), Spoke).unwrap();
-        }
-        episode.run().unwrap();
-
-        // Had the hub's one action counted as one delivery rather than the
-        // seven it made, the count could have reached zero after the first
-        // spoke's reply, and the episode would have called a run in
-        // progress a stall.
-        let lines = parse_lines(&joined(writer, &bytes));
-        let replies_seen_by_hub = of(&lines, "hub")
-            .filter(|line| line["type"] == "observation")
-            .count();
-        assert_eq!(replies_seen_by_hub, 6);
-        let opening = of(&lines, "hub")
-            .find(|line| line["type"] == "action")
-            .expect("the hub recorded its opening action");
-        assert_eq!(
-            opening["message"]["recipients"].as_array().unwrap().len(),
-            7,
-            "an action is recorded as everyone it named: the six spokes and \
-             the environment"
-        );
-    }
-
-    #[test]
-    fn an_environment_with_no_agents_runs_and_writes_only_its_own_controls() {
-        let clock = Clock::start();
-        let (records, writer, bytes) = recording(clock);
-        Episode::new(records, REFEREE, Referee::over([]), clock)
-            .run()
-            .unwrap();
-        let lines = parse_lines(&joined(writer, &bytes));
-        let controls = controls_of(&lines, None);
-        assert_eq!(controls, ["start", "stop"]);
-        // Everything but the header, which is nobody's record.
-        assert!(
-            lines[1..].iter().all(|line| line["agent"] == REFEREE),
-            "{lines:?}"
-        );
-    }
-
-    #[test]
-    fn an_episode_whose_environment_never_stops_anyone_stalls() {
-        // Nothing is in flight and no agent has been stopped: nobody will
-        // ever speak again and nobody has declared the episode over.
-        let clock = Clock::start();
-        let (records, writer, bytes) = recording(clock);
-        let mut episode = Episode::new(records, REFEREE, Absent(["a", "b"]), clock);
-        episode.add("a", Mute).unwrap();
-        episode.add("b", Mute).unwrap();
-        assert_eq!(
-            episode.run().unwrap_err(),
-            EpisodeError::Stalled {
-                running: [ActorId::new("a"), ActorId::new("b")].into()
-            }
-        );
-        // The log is complete up to the stall: everybody was started,
-        // and everybody, the environment last, was stopped and joined.
-        let lines = parse_lines(&joined(writer, &bytes));
-        for agent in ["a", "b", REFEREE] {
-            let controls = controls_of(&lines, Some(agent));
-            assert_eq!(controls, ["start", "stop"], "{agent}");
-        }
+        assert_eq!(said.len(), 2, "both handler types spoke: {lines:?}");
     }
 
     #[test]
     fn a_duplicate_id_is_rejected() {
-        let (mut episode, _writer, _bytes) = refereed(["a"]);
-        episode.add("a", Spoke).unwrap();
+        let (mut episode, _log) = episode(Counting::new(["a"]));
+        episode.add("a", Greeting).unwrap();
         assert_eq!(
-            episode.add("a", Spoke).unwrap_err(),
-            EpisodeError::DuplicateAgent(ActorId::new("a"))
+            episode.add("a", Greeting),
+            Err(EpisodeError::DuplicateAgent(ActorId::new("a")))
         );
         assert_eq!(
-            episode.add(REFEREE, Spoke).unwrap_err(),
-            EpisodeError::DuplicateAgent(ActorId::new(REFEREE)),
-            "the environment is in the roster, under its own id"
+            episode.add(ENVIRONMENT, Greeting),
+            Err(EpisodeError::DuplicateAgent(ActorId::new(ENVIRONMENT)))
         );
-        assert_eq!(episode.ids().count(), 2);
     }
 
     #[test]
-    fn a_panicking_handler_fails_the_episode_without_hanging_it() {
-        let (mut episode, writer, bytes) = refereed(["a", "b"]);
-        episode.add("a", Panics).unwrap();
-        episode.add("b", Spoke).unwrap();
-        let error = episode.run().unwrap_err();
+    fn the_roster_lists_every_actor_including_the_environment() {
+        let (mut episode, _log) = episode(Counting::new(["b", "a"]));
+        episode.add("b", Greeting).unwrap();
+        episode.add("a", Greeting).unwrap();
         assert_eq!(
-            error,
-            EpisodeError::Agents(vec![(
+            episode.ids().cloned().collect::<Vec<_>>(),
+            [
                 ActorId::new("a"),
-                Failure::Panicked("the handler is broken".into())
-            )])
+                ActorId::new("b"),
+                ActorId::new(ENVIRONMENT)
+            ]
         );
-        assert!(error.to_string().contains("the handler is broken"));
-        // The other agent, and the environment, were still stopped cleanly.
-        let lines = parse_lines(&joined(writer, &bytes));
-        for agent in ["b", REFEREE] {
-            assert!(
-                of(&lines, agent).any(|line| line["control"] == "stop"),
-                "{agent}"
-            );
+        assert_eq!(episode.environment(), &ActorId::new(ENVIRONMENT));
+    }
+
+    #[test]
+    fn an_episode_whose_environment_never_stops_anyone_times_out() {
+        /// An environment that starts everybody and never ends the episode.
+        struct Forgetful;
+
+        impl Step<i32, TestPayload> for Forgetful {
+            fn start(
+                &mut self,
+                _clock: Clock,
+            ) -> impl IntoIterator<Item = Effect<i32, TestPayload>> {
+                [Effect::command(["a"], Control::Start)]
+            }
+
+            fn step(
+                &mut self,
+                _observation: Observation<TestPayload>,
+            ) -> impl IntoIterator<Item = Effect<i32, TestPayload>> {
+                []
+            }
+        }
+
+        let (mut episode, log) = episode(Forgetful);
+        episode.add("a", Greeting).unwrap();
+        let limit = Duration::from_millis(200);
+        let episode = episode.within(limit);
+        assert_eq!(episode.limit(), limit);
+        match episode.run() {
+            Err(EpisodeError::Timeout { limit: given, .. }) => assert_eq!(given, limit),
+            other => panic!("an episode that never ends times out: {other:?}"),
+        }
+        // The episode stopped everybody itself, so the log is complete.
+        let lines = parse_lines(&log.bytes());
+        let stops = lines
+            .iter()
+            .filter(|line| line["type"] == "control" && line["control"] == "stop")
+            .count();
+        assert_eq!(stops, 2, "the episode stopped both actors: {lines:?}");
+    }
+
+    #[test]
+    fn an_actor_that_panics_mid_episode_is_reported_as_departed_or_failed() {
+        /// An agent that panics the first time it is observed.
+        struct Brittle;
+
+        impl Policy<TestPayload> for Brittle {
+            fn start(&mut self, _clock: Clock) -> impl IntoIterator<Item = Action<TestPayload>> {
+                [Action::to([ENVIRONMENT], TestPayload::Step(0))]
+            }
+
+            fn policy(
+                &mut self,
+                _observation: Observation<TestPayload>,
+            ) -> impl IntoIterator<Item = Action<TestPayload>> {
+                // A lazy iterator that panics on its first `next`. A bare
+                // `panic!` in the body would give the method the return type
+                // `!`, which is not an iterator, and a concrete `Vec` would
+                // refine the trait's `impl IntoIterator`; this is an iterator
+                // that happens never to yield.
+                std::iter::from_fn(|| panic!("brittle gave up"))
+            }
+        }
+
+        /// An environment that answers whoever greets it, which is what makes
+        /// the brittle agent's `policy` run, and never stops anybody.
+        struct Answering;
+
+        impl Step<i32, TestPayload> for Answering {
+            fn start(
+                &mut self,
+                _clock: Clock,
+            ) -> impl IntoIterator<Item = Effect<i32, TestPayload>> {
+                [Effect::command(["a"], Control::Start)]
+            }
+
+            fn step(
+                &mut self,
+                observation: Observation<TestPayload>,
+            ) -> impl IntoIterator<Item = Effect<i32, TestPayload>> {
+                [Effect::to(
+                    [observation.message.sender],
+                    TestPayload::Step(1),
+                )]
+            }
+        }
+
+        let (mut episode, _log) = episode(Answering);
+        episode.add("a", Brittle).unwrap();
+        let outcome = episode.within(Duration::from_secs(10)).run();
+        match outcome {
+            // The thread that panicked reported as it died, so the episode
+            // learns of it either as a failure it joined or as a departure it
+            // saw first; both are the episode being abandoned where it stood.
+            Err(EpisodeError::Agents(failures)) => {
+                assert!(
+                    failures.iter().any(|(id, failure)| id == &ActorId::new("a")
+                        && matches!(failure, Failure::Panicked(message) if message == "brittle gave up")),
+                    "the panic is reported: {failures:?}"
+                );
+            }
+            Err(EpisodeError::Departed) => {}
+            other => panic!("a panicking handler fails the episode: {other:?}"),
         }
     }
 
     #[test]
-    fn a_handler_that_addresses_itself_fails_the_episode() {
-        let (mut episode, _writer, _bytes) = refereed(["a", "b"]);
-        episode.add("a", Addresses("a")).unwrap();
-        episode.add("b", Spoke).unwrap();
+    fn an_actor_that_ends_unbidden_is_a_departure() {
+        // An actor's threads report as they end, and the report says whether
+        // the actor had been stopped. A report from an actor nobody stopped is
+        // a departure: the episode was abandoned where it stood, and waiting
+        // out the time limit on an actor that is already gone would tell the
+        // caller the wrong thing about the run.
+        //
+        // This is asserted of `wait` rather than of a whole episode because an
+        // actor's threads only end of their own accord by panicking or by
+        // failing, and then `run` reports the panic or the failure instead —
+        // which is more specific and so the better answer. What `wait` decides
+        // is the rule the issue states, and it is the rule under test.
+        let (report, done) = unbounded();
+        let (unstarted, inbox, control) = UnstartedActor::<TestPayload>::new("a");
+        let seats = BTreeMap::from([(ActorId::new("a"), Seat { inbox, control })]);
+        let router: Router<TestPayload> = Router::new(seats, ActorId::new("a"));
+        let actors = vec![Started {
+            id: ActorId::new("a"),
+            control: unstarted.control().clone(),
+            join: Box::new(|| Ok(())),
+        }];
+        report
+            .send(Ended {
+                who: ActorId::new("a"),
+                stopped: false,
+            })
+            .unwrap();
+        // A limit long enough that a timeout here would mean the departure went
+        // unnoticed rather than that the machine was slow.
         assert_eq!(
-            episode.run().unwrap_err(),
-            EpisodeError::Route {
-                agent: ActorId::new("a"),
-                error: RouteError::Loopback(ActorId::new("a")),
-            }
+            wait(&done, &actors, &router, Duration::from_secs(30)),
+            Err(EpisodeError::Departed)
+        );
+        // And the actor was stopped on the way out, so its log closes.
+        assert_eq!(
+            unstarted.controls().try_recv(),
+            Ok(Control::Stop),
+            "the episode stops whoever is left"
         );
     }
 
     #[test]
-    fn a_handler_that_addresses_a_stranger_fails_the_episode() {
-        let (mut episode, _writer, _bytes) = refereed(["a", "b"]);
-        episode.add("a", Addresses("nobody")).unwrap();
-        episode.add("b", Spoke).unwrap();
+    fn every_actor_reporting_a_stop_is_a_clean_run() {
+        // The other side of the same rule: two reports per actor, both saying
+        // it had been stopped, and `wait` is satisfied.
+        let (report, done) = unbounded();
+        let (unstarted, inbox, control) = UnstartedActor::<TestPayload>::new("a");
+        let seats = BTreeMap::from([(ActorId::new("a"), Seat { inbox, control })]);
+        let router: Router<TestPayload> = Router::new(seats, ActorId::new("a"));
+        let actors = vec![Started {
+            id: ActorId::new("a"),
+            control: unstarted.control().clone(),
+            join: Box::new(|| Ok(())),
+        }];
+        for _ in 0..2 {
+            report
+                .send(Ended {
+                    who: ActorId::new("a"),
+                    stopped: true,
+                })
+                .unwrap();
+        }
         assert_eq!(
-            episode.run().unwrap_err(),
-            EpisodeError::Route {
-                agent: ActorId::new("a"),
-                error: RouteError::UnknownAgent(ActorId::new("nobody")),
-            }
-        );
-    }
-
-    #[test]
-    fn a_vanished_writer_fails_the_episode_without_hanging_it() {
-        // Nobody is reading the records, so every agent's first record fails
-        // to send.
-        let (records, nobody) = unbounded();
-        let mut episode = Episode::new(records, REFEREE, Referee::over(["a", "b"]), Clock::start());
-        episode.add("a", Spoke).unwrap();
-        episode.add("b", Spoke).unwrap();
-        drop(nobody);
-        let error = episode.run().unwrap_err();
-        let EpisodeError::Agents(failures) = error else {
-            panic!("unexpected error: {error}");
-        };
-        assert!(!failures.is_empty());
-        assert!(
-            failures
-                .iter()
-                .all(|(_, failure)| *failure == Failure::Error(agent::Error::WriterClosed))
+            wait(&done, &actors, &router, Duration::from_secs(30)),
+            Ok(())
         );
     }
 
@@ -1637,58 +974,32 @@ mod tests {
     fn errors_explain_themselves() {
         assert_eq!(
             EpisodeError::DuplicateAgent(ActorId::new("a")).to_string(),
-            "agent a is in the roster twice"
+            "actor a is in the roster twice"
         );
         assert_eq!(
-            EpisodeError::Control(RouteError::QueueClosed(ActorId::new("a"))).to_string(),
-            "could not deliver a control: the queue of agent a is closed"
+            EpisodeError::Control(RouteError::Loopback(ActorId::new("a"))).to_string(),
+            "could not deliver a control: actor a addressed itself"
         );
         assert_eq!(
-            EpisodeError::Route {
-                agent: ActorId::new("a"),
-                error: RouteError::UnknownAgent(ActorId::new("z"))
-            }
+            EpisodeError::Departed.to_string(),
+            "an actor left while the episode was still running it"
+        );
+        let timed_out = EpisodeError::Timeout {
+            limit: Duration::from_secs(1),
+            running: BTreeSet::from([ActorId::new("a")]),
+        };
+        assert!(timed_out.to_string().ends_with(" a"), "{timed_out}");
+        assert_eq!(
+            EpisodeError::Agents(vec![(
+                ActorId::new("a"),
+                Failure::Panicked("oh no".to_string())
+            )])
             .to_string(),
-            "agent a sent a message that could not be routed: no agent z in the roster"
+            "actors failed: [a: panicked: oh no]"
         );
         assert_eq!(
-            EpisodeError::Stalled {
-                running: [ActorId::new("a"), ActorId::new("b")].into()
-            }
-            .to_string(),
-            "the episode stalled with these agents still running: a b"
-        );
-        assert_eq!(
-            EpisodeError::Agents(vec![
-                (
-                    ActorId::new("a"),
-                    Failure::Error(agent::Error::WriterClosed)
-                ),
-                (ActorId::new("b"), Failure::Panicked("boom".into())),
-            ])
-            .to_string(),
-            "agents failed: [a: the log writer has gone away] [b: panicked: boom]"
-        );
-        assert!(
-            EpisodeError::Control(RouteError::Loopback(ActorId::new("a")))
-                .source()
-                .is_some()
-        );
-        assert!(
-            EpisodeError::Stalled {
-                running: BTreeSet::new()
-            }
-            .source()
-            .is_none()
-        );
-        let clock = Clock::start();
-        let (records, _writer) = Writer::spawn::<Count>(Vec::new(), clock);
-        assert!(
-            format!(
-                "{:?}",
-                Episode::new(records, REFEREE, Referee::over([]), clock)
-            )
-            .starts_with("Episode")
+            Failure::Error(ActorError::WriterClosed).to_string(),
+            "the log writer has gone away"
         );
     }
 }

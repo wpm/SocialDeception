@@ -56,15 +56,15 @@ use crossbeam_channel::{Receiver, Sender, TryRecvError, bounded, select, unbound
 use serde::Serialize;
 use serde_json::Value;
 
-use super::contract::{Action, Effect, Observation, Policy, Reminder, Step};
-use super::router::{RouteError, Router};
-use super::timer::{Reminders, Timer};
 use crate::clock::Clock;
+use crate::contract::{Action, Effect, Observation, Policy, Reminder, Step};
 use crate::log::{
     ActionRecord, ControlRecord, CycleRecord, Key, ObservationRecord, Record, RewardRecord,
     UndeliveredRecord, UnsentRecord,
 };
 use crate::message::{ActorId, Control, Message, Payload};
+use crate::router::{RouteError, Router};
+use crate::timer::{Reminders, Timer};
 
 /// Why an actor's thread stopped before it was told to.
 ///
@@ -844,7 +844,6 @@ where
             agent: context.id.clone(),
             t_start,
             t_stop: Instant::now(),
-            woken: None,
             observed,
         }
         .into(),
@@ -857,14 +856,14 @@ where
 /// handler measuring time from the start of the game is on the log's timeline.
 ///
 /// It is crate-private, and that is what makes the shared origin structural:
-/// [`Episode`](super::Episode) is the only thing that can start an actor, and it
+/// [`Episode`](crate::Episode) is the only thing that can start an actor, and it
 /// starts the clock itself, so there is no way to hand one actor a different
 /// origin from another or from the log writer (ADR-0017).
 ///
 /// # Panics
 ///
 /// If the operating system refuses to create a thread.
-pub(super) fn spawn_agent<P, H>(
+pub(crate) fn spawn_agent<P, H>(
     unstarted: UnstartedActor<P>,
     handler: H,
     router: Arc<Router<P>>,
@@ -906,7 +905,7 @@ where
 /// # Panics
 ///
 /// If the operating system refuses to create a thread.
-pub(super) fn spawn_environment<W, P, H>(
+pub(crate) fn spawn_environment<W, P, H>(
     unstarted: UnstartedActor<P>,
     handler: H,
     router: Arc<Router<P>>,
@@ -1060,8 +1059,8 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::actor::router::Seat;
     use crate::log::Writer;
+    use crate::router::Seat;
     use crate::testing::{Shared, TestPayload, joined, parse_lines, recording};
 
     /// How long a test waits on a channel before giving up. Generous, because
@@ -1189,29 +1188,6 @@ mod tests {
             lines.iter().filter(|line| line["type"] == "cycle").count(),
             2
         );
-    }
-
-    #[test]
-    fn a_cycle_of_the_actor_runtime_says_nothing_about_what_woke_it() {
-        // There is nothing to say: a handler thread runs a cycle when an
-        // observation reaches it, and a reminder arrives as one of those.
-        let (unstarted, router, bench, report) = wired("a");
-        let actor = spawn_agent(
-            unstarted,
-            Passing,
-            router,
-            bench.records.clone(),
-            Clock::start(),
-            Timer::real(),
-            report,
-        );
-        actor.control().send(Control::Start).unwrap();
-        bench.heard();
-        actor.control().send(Control::Stop).unwrap();
-        actor.join().unwrap();
-        for cycle in bench.lines().iter().filter(|line| line["type"] == "cycle") {
-            assert!(cycle["woken"].is_null(), "{cycle}");
-        }
     }
 
     #[test]

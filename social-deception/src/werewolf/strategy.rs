@@ -50,11 +50,12 @@
 //! strategy owns its retries and holds a `RandomStrategy` for the case where
 //! no action in the space can be extracted from what the model said.
 //!
-//! A strategy may also block: an agent owns a thread (ADR-0001), so a
-//! strategy waiting on a model provider delays only its own agent — and its
-//! own agent's stop, because nothing interrupts a running handler (ADR-0009).
-//! A strategy that blocks for thirty seconds delays its episode's shutdown by
-//! thirty seconds, and nothing in the loop will shorten it.
+//! A strategy may also block: an agent has a handler thread of its own
+//! (ADR-0001, ADR-0016), so a strategy waiting on a model provider delays only
+//! its own agent's decisions — and its own agent's stop, because a call in
+//! progress is not interrupted (ADR-0016). A strategy that blocks for thirty
+//! seconds delays its episode's shutdown by thirty seconds, and nothing in the
+//! runtime will shorten it.
 //!
 //! So a model-backed strategy bounds its own call. It makes the call on its
 //! own thread, **streams** the response, and gives up on a deadline it
@@ -115,7 +116,7 @@ pub trait Strategy {
     ///
     /// Infallible, and free to block; the [module documentation](self) says
     /// why, and what a strategy that blocks owes its own deadline. Nothing
-    /// here can be interrupted (ADR-0009), so a strategy that blocks is the
+    /// here can be interrupted (ADR-0016), so a strategy that blocks is the
     /// only thing that can bound how long it blocks for.
     ///
     /// [`View`] is `Copy` and is passed by value, so a strategy that hands it

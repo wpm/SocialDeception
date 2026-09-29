@@ -430,9 +430,10 @@ impl Game {
     /// Closes every session whose time is up at `now`, and resolves what
     /// that finishes.
     ///
-    /// The moderator calls this whenever it wakes, and after every selection,
-    /// because a deadline that passed while an observation waited joins
-    /// that observation's cycle (ADR-0008).
+    /// The moderator calls this when one of its own reminders arrives, and
+    /// again after every selection: a session's limit may have passed while
+    /// that selection waited on the handler, and closing it in the same call
+    /// beats waiting for the reminder still on its way (ADR-0018).
     pub fn expire(&mut self, now: Instant) -> Vec<Directive> {
         if self.outcome.is_some() {
             return Vec::new();
@@ -465,7 +466,7 @@ impl Game {
     /// something, or `None` when no session is open.
     ///
     /// This is what the moderator sets its next
-    /// [`Reminder`](crate::actor::Reminder) for: the minimum over the open
+    /// [`Reminder`](crate::Reminder) for: the minimum over the open
     /// sessions of each one's hard limit and, for a night session whose
     /// members have all selected, the end of its quiet period. The moderator
     /// reads it after every observation, because any selection may have moved
@@ -1302,12 +1303,13 @@ mod tests {
 
     #[test]
     fn a_selection_that_arrives_on_the_deadline_is_forwarded_and_one_after_it_is_not() {
-        // Scenario 5. `Game::select` is called before `Game::expire` for
-        // one observation, because a deadline that passed while that
-        // observation waited joins its cycle (ADR-0008). So a selection
-        // received *at* the deadline is still in an open session, and one
-        // received after the session was expired is not. The boundary is
-        // asserted from both sides rather than assumed.
+        // Scenario 5. The moderator calls `Game::select` before
+        // `Game::expire` for one observation, so a session's limit that
+        // passed while that selection waited closes after it is counted
+        // (ADR-0018). A selection received *at* the limit is therefore still
+        // in an open session, and one received after the session was expired
+        // is not. The boundary is asserted from both sides rather than
+        // assumed.
         let mut game = game(village());
         game.begin(at(0));
         let deadline = game.next_deadline().expect("the night has a clock");

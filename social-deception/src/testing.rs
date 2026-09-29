@@ -14,7 +14,7 @@ use serde_json::Value;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
-use crate::actor::Observation;
+use crate::Observation;
 use crate::clock::Clock;
 use crate::log::{JsonLines, Policy, Record, Sink, Sinks, Writer};
 use crate::message::{ActorId, Envelope, Message, Payload};
@@ -26,32 +26,22 @@ pub(crate) use temp::TempDir;
 pub(crate) const ME: &str = "me";
 
 /// What a runtime unit test's agents say to each other: a counter, which is
-/// enough to tell one message from the next, or a relay of somebody's
-/// counter.
+/// enough to tell one message from the next.
 ///
-/// The relay is the framework's [`Envelope`](crate::Envelope) inside a
-/// payload, which is the only way a relay travels (ADR-0017). Which of its
-/// payloads carry one is a game's decision, and this enum is the runtime
-/// tests' game.
+/// It is an enum with one variant rather than a bare `u64` because a game's
+/// payload is an enum of the things that game says, and a test payload that
+/// serializes as `{"Step": 7}` is what the log's records are read against.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) enum TestPayload {
     /// A step, carrying its number.
     Step(u64),
-    /// One agent passing another's step on.
-    Relayed(Envelope<u64>),
 }
 
 impl TestPayload {
     /// The number a step carries.
-    ///
-    /// # Panics
-    ///
-    /// If it is a relay. A test that sends relays reads them by matching; the
-    /// ones that count steps never meet one.
     pub(crate) fn step(&self) -> u64 {
         match self {
             Self::Step(n) => *n,
-            Self::Relayed(envelope) => panic!("a relay of {} is not a step", envelope.from),
         }
     }
 }
@@ -107,10 +97,10 @@ pub(crate) fn recording<P: Payload>(clock: Clock) -> (Sender<Record<P>>, Writer,
 /// One required [`JsonLines`] sink over a buffer the test keeps, for a
 /// caller that hands its sinks to something that starts the writer itself.
 ///
-/// The [`actor`](crate::actor) runtime's `Episode` takes its sinks rather
-/// than a records channel, because starting the clock and the writer is what
-/// makes the shared-origin invariant structural (ADR-0017). So a test of it
-/// wants the sink and not the sender.
+/// [`Episode`](crate::Episode) takes its sinks rather than a records channel,
+/// because starting the clock and the writer itself is what makes the
+/// shared-origin invariant structural (ADR-0017). So a test of it wants the
+/// sink and not the sender.
 pub(crate) fn sinking<P: Payload>() -> (Sinks<P>, Shared) {
     let bytes = Shared::new();
     let sink: Box<dyn Sink<P>> = Box::new(JsonLines::new(bytes.clone()));
@@ -177,11 +167,6 @@ pub(crate) fn header_anchor(line: &Value) -> u64 {
 /// moderator's tests do, rather than waiting for a timer.
 pub(crate) static BASE: LazyLock<Instant> =
     LazyLock::new(|| Instant::now() + Duration::from_secs(3600));
-
-/// `nanos` after [`BASE`].
-pub(crate) fn at_nanos(nanos: u64) -> Instant {
-    *BASE + Duration::from_nanos(nanos)
-}
 
 /// `millis` after [`BASE`].
 pub(crate) fn at_millis(millis: u64) -> Instant {
