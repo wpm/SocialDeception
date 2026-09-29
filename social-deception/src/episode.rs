@@ -72,12 +72,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 use std::panic::{self, AssertUnwindSafe};
+use std::time::Instant;
 
 use crossbeam_channel::{Receiver, Sender, select, unbounded};
 use serde::Serialize;
 
 use crate::agent::{self, Action, Agent, CycleDispatch, Handler, Observation, Wiring};
-use crate::clock::{Clock, Timestamp};
+use crate::clock::Clock;
 use crate::environment::{Adapter, Commanded, Environment, Refusal, Rewarded};
 use crate::log::Record;
 use crate::message::{ActorId, Control, Delivery, Payload};
@@ -226,20 +227,19 @@ impl<W, P: Payload> fmt::Debug for Episode<W, P> {
 
 impl<W: Serialize + Copy + Send + 'static, P: Payload> Episode<W, P> {
     /// An episode of `environment`, seated under `environment_id`, with no
-    /// agents yet, whose records go to `records` and which is timed by
-    /// a [`Clock`] started now.
+    /// agents yet, whose records go to `records` and whose origin is
+    /// `clock`'s.
+    ///
+    /// **One clock, captured before anything that measures time.** `clock` is
+    /// the same one the [`Writer`](crate::log::Writer) behind `records` was
+    /// given, and every actor this episode spawns gets a copy of it, so
+    /// everything anybody measures from the start of the episode and every
+    /// offset in the log are on one timeline (ADR-0017). The writer is made
+    /// by whoever makes `records`, which is why the clock comes in rather
+    /// than being started here: an origin taken after the writer's would put
+    /// the log and the actors on two.
     #[must_use]
     pub fn new(
-        records: Sender<Record<P>>,
-        environment_id: impl Into<ActorId>,
-        environment: impl Environment<W, P> + Send + 'static,
-    ) -> Self {
-        Self::with_clock(records, environment_id, environment, Clock::start())
-    }
-
-    /// The same, timed by `clock`.
-    #[must_use]
-    pub fn with_clock(
         records: Sender<Record<P>>,
         environment_id: impl Into<ActorId>,
         environment: impl Environment<W, P> + Send + 'static,
@@ -288,6 +288,13 @@ impl<W: Serialize + Copy + Send + 'static, P: Payload> Episode<W, P> {
         &self.environment_id
     }
 
+    /// The episode's clock: the origin every actor in it shares with the log
+    /// writer.
+    #[must_use]
+    pub const fn clock(&self) -> Clock {
+        self.clock
+    }
+
     /// Runs the episode to completion: starts the environment, routes what
     /// everybody sends and the controls the environment asks for until every
     /// agent has been stopped, then stops the environment and joins every
@@ -334,7 +341,6 @@ impl<W: Serialize + Copy + Send + 'static, P: Payload> Episode<W, P> {
                 asked_for,
                 paid,
                 records.clone(),
-                clock,
             )),
         );
         let Spawned {
@@ -343,7 +349,7 @@ impl<W: Serialize + Copy + Send + 'static, P: Payload> Episode<W, P> {
             agents,
         } = spawn(handlers, &ids, &dispatch, &obituary, &records, clock);
         drop((dispatch, obituary, records));
-        let mut router = Router::new(queues, environment_id.clone(), clock);
+        let mut router = Router::new(queues, environment_id.clone());
 
         let environment_only = BTreeSet::from([environment_id.clone()]);
         let mut running = router.agents();
@@ -689,7 +695,7 @@ struct Watched<P: Payload> {
 }
 
 impl<P: Payload> Handler<P> for Watched<P> {
-    fn start(&mut self, now: Timestamp) -> Vec<Action<P>> {
+    fn start(&mut self, now: Instant) -> Vec<Action<P>> {
         self.handler.start(now)
     }
 
@@ -697,11 +703,11 @@ impl<P: Payload> Handler<P> for Watched<P> {
         self.handler.handle(observation)
     }
 
-    fn timeout(&mut self, now: Timestamp) -> Vec<Action<P>> {
+    fn timeout(&mut self, now: Instant) -> Vec<Action<P>> {
         self.handler.timeout(now)
     }
 
-    fn deadline(&self) -> Option<Timestamp> {
+    fn deadline(&self) -> Option<Instant> {
         self.handler.deadline()
     }
 }
@@ -746,7 +752,7 @@ mod tests {
     use super::*;
     use crate::environment::Effect;
     use crate::log::Writer;
-    use crate::testing::{Shared, joined, parse_lines, recording};
+    use crate::testing::{Shared, header_anchor, joined, parse_lines, recording};
 
     /// What the agents of the counting games below say.
     ///
@@ -788,7 +794,7 @@ mod tests {
     }
 
     impl Environment<i32, Count> for Referee {
-        fn start(&mut self, _now: Timestamp) -> Vec<Effect<i32, Count>> {
+        fn start(&mut self, _now: Instant) -> Vec<Effect<i32, Count>> {
             vec![Effect::control(self.agents.clone(), Control::Start)]
         }
 
@@ -826,7 +832,7 @@ mod tests {
     }
 
     impl Environment<i32, Count> for Paymaster {
-        fn start(&mut self, _now: Timestamp) -> Vec<Effect<i32, Count>> {
+        fn start(&mut self, _now: Instant) -> Vec<Effect<i32, Count>> {
             vec![
                 Effect::control(["a", "b"], Control::Start),
                 Effect::reward(self.to.clone(), self.value),
@@ -841,8 +847,9 @@ mod tests {
 
     /// An episode of a [`Paymaster`] over two mute agents, and its writer.
     fn paid(to: &str, value: i32) -> (Episode<i32, Count>, Writer, Shared) {
-        let (records, writer, bytes) = recording();
-        let mut episode = Episode::new(records, REFEREE, Paymaster::paying(to, value));
+        let clock = Clock::start();
+        let (records, writer, bytes) = recording(clock);
+        let mut episode = Episode::new(records, REFEREE, Paymaster::paying(to, value), clock);
         episode.add("a", Mute).unwrap();
         episode.add("b", Mute).unwrap();
         (episode, writer, bytes)
@@ -866,10 +873,10 @@ mod tests {
             "a reward carries no sequence number: {reward}"
         );
         assert!(
-            reward["received"].is_null(),
+            reward["message"].is_null(),
             "a reward is logged, never sent: {reward}"
         );
-        assert!(reward["created"].is_u64(), "{reward}");
+        assert!(reward["t"].is_u64(), "{reward}");
         // Nobody observed it: a reward is not a delivery, so it never
         // touched the in-flight count and never reached a queue.
         assert_eq!(
@@ -886,7 +893,7 @@ mod tests {
                 line["agent"] == "a" && line["type"] == "control" && line["control"] == "stop"
             })
             .expect("a was stopped");
-        assert!(reward["created"].as_u64() <= stop["created"].as_u64());
+        assert!(reward["t"].as_u64() <= stop["t"].as_u64());
     }
 
     #[test]
@@ -944,7 +951,7 @@ mod tests {
     struct Counterfeiter;
 
     impl Environment<Unwritable, Count> for Counterfeiter {
-        fn start(&mut self, _now: Timestamp) -> Vec<Effect<Unwritable, Count>> {
+        fn start(&mut self, _now: Instant) -> Vec<Effect<Unwritable, Count>> {
             vec![
                 Effect::control(["a", "b"], Control::Start),
                 Effect::reward("a", Unwritable),
@@ -964,8 +971,9 @@ mod tests {
         // reason: a log that quietly lacks a reward the environment
         // assigned is evidence of nothing. The error names the agent and
         // says the reward, not the name, was the problem.
-        let (records, writer, bytes) = recording();
-        let mut episode = Episode::new(records, REFEREE, Counterfeiter);
+        let clock = Clock::start();
+        let (records, writer, bytes) = recording(clock);
+        let mut episode = Episode::new(records, REFEREE, Counterfeiter, clock);
         episode.add("a", Mute).unwrap();
         episode.add("b", Mute).unwrap();
         assert_eq!(
@@ -985,7 +993,7 @@ mod tests {
     struct Absent<const N: usize>([&'static str; N]);
 
     impl<const N: usize> Environment<i32, Count> for Absent<N> {
-        fn start(&mut self, _now: Timestamp) -> Vec<Effect<i32, Count>> {
+        fn start(&mut self, _now: Instant) -> Vec<Effect<i32, Count>> {
             vec![Effect::control(self.0, Control::Start)]
         }
 
@@ -1031,7 +1039,7 @@ mod tests {
     }
 
     impl Handler<Count> for Rally {
-        fn start(&mut self, _now: Timestamp) -> Vec<Action<Count>> {
+        fn start(&mut self, _now: Instant) -> Vec<Action<Count>> {
             if self.serves {
                 vec![self.to_partner(1)]
             } else {
@@ -1078,7 +1086,7 @@ mod tests {
     }
 
     impl Handler<Count> for Hub {
-        fn start(&mut self, _now: Timestamp) -> Vec<Action<Count>> {
+        fn start(&mut self, _now: Instant) -> Vec<Action<Count>> {
             let everybody = self.spokes.iter().cloned().chain([ActorId::new(REFEREE)]);
             vec![Action::to(everybody, Say(0))]
         }
@@ -1114,7 +1122,7 @@ mod tests {
     struct Addresses(&'static str);
 
     impl Handler<Count> for Addresses {
-        fn start(&mut self, _now: Timestamp) -> Vec<Action<Count>> {
+        fn start(&mut self, _now: Instant) -> Vec<Action<Count>> {
             vec![Action::to([self.0], Say(1))]
         }
 
@@ -1135,7 +1143,7 @@ mod tests {
     struct Panics;
 
     impl Handler<Count> for Panics {
-        fn start(&mut self, _now: Timestamp) -> Vec<Action<Count>> {
+        fn start(&mut self, _now: Instant) -> Vec<Action<Count>> {
             panic!("the handler is broken")
         }
 
@@ -1164,9 +1172,10 @@ mod tests {
     /// An episode refereed over the named agents, whose log goes to
     /// the writer returned beside it.
     fn refereed<const N: usize>(agents: [&str; N]) -> (Episode<i32, Count>, Writer, Shared) {
-        let (records, writer, bytes) = recording();
+        let clock = Clock::start();
+        let (records, writer, bytes) = recording(clock);
         (
-            Episode::new(records, REFEREE, Referee::over(agents)),
+            Episode::new(records, REFEREE, Referee::over(agents), clock),
             writer,
             bytes,
         )
@@ -1187,6 +1196,160 @@ mod tests {
                 .unwrap();
         }
         (episode, writer, bytes)
+    }
+
+    #[test]
+    fn one_send_to_three_recipients_writes_one_action_and_three_observations() {
+        // The whole of the join (ADR-0017). One send is one message and one
+        // sequence number, whatever its recipients, so the sender writes one
+        // action record and each recipient writes an observation record
+        // carrying the same `(from, seq)`.
+        let clock = Clock::start();
+        let (records, writer, bytes) = recording(clock);
+        let spokes = ["a", "b", "c"];
+        let roster: BTreeSet<ActorId> = spokes
+            .iter()
+            .map(|who| ActorId::new(*who))
+            .chain([ActorId::new("hub")])
+            .collect();
+        let mut episode = Episode::new(
+            records,
+            REFEREE,
+            Referee {
+                working: roster.clone(),
+                agents: roster,
+            },
+            clock,
+        );
+        episode
+            .add(
+                "hub",
+                Hub::addressing(spokes.iter().map(|who| (*who).to_owned())),
+            )
+            .unwrap();
+        for who in spokes {
+            episode.add(who, Spoke).unwrap();
+        }
+        episode.run().unwrap();
+        let lines = parse_lines(&joined(writer, &bytes));
+
+        // The hub's opening send, addressed to all three spokes and the
+        // referee at once.
+        let broadcast = lines
+            .iter()
+            .find(|line| line["type"] == "action" && line["agent"] == "hub")
+            .expect("the hub opens by speaking");
+        let recipients: BTreeSet<&str> = broadcast["message"]["recipients"]
+            .as_array()
+            .expect("a message lists its recipients")
+            .iter()
+            .map(|who| who.as_str().expect("a recipient is an actor id"))
+            .collect();
+        assert_eq!(
+            recipients,
+            spokes.into_iter().chain([REFEREE]).collect::<BTreeSet<_>>(),
+            "one send to four recipients"
+        );
+        let seq = broadcast["seq"].as_u64().expect("an action is numbered");
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| {
+                    line["type"] == "action" && line["agent"] == "hub" && line["seq"] == seq
+                })
+                .count(),
+            1,
+            "one send is one action record, whatever its recipients"
+        );
+
+        let observed: BTreeSet<&str> = lines
+            .iter()
+            .filter(|line| line["type"] == "observation")
+            .filter(|line| line["from"] == "hub" && line["seq"] == seq)
+            .map(|line| {
+                line["agent"]
+                    .as_str()
+                    .expect("an observation names its agent")
+            })
+            .collect();
+        assert_eq!(
+            observed, recipients,
+            "one action joins to an observation in each recipient's records"
+        );
+    }
+
+    #[test]
+    fn the_writer_and_every_agent_hold_the_same_origin() {
+        // One clock per episode, captured before the writer and before any
+        // actor, and copied to both (ADR-0017). It is the same value all the
+        // way through, which is what puts every offset in the log and
+        // anything an actor measures from the start of the episode on one
+        // timeline.
+        //
+        // The clock itself is `Copy` and private to the episode, so the claim
+        // is made where it is observable: the origin the episode reports is
+        // the one the writer measured every offset from.
+        let (episode, writer, bytes) = rally(4);
+        let clock = episode.clock();
+        let origin = clock.origin();
+        episode.run().unwrap();
+        // Everything the episode did happened after the origin and before
+        // now, so the whole run fits in that span.
+        let span = clock.offset(Instant::now());
+        let lines = parse_lines(&joined(writer, &bytes));
+
+        // Every offset the writer wrote was measured from that one origin,
+        // so every one of them lies in the span. A writer with an origin of
+        // its own, taken when it started, would put its offsets on a
+        // different timeline from the actors' — the very thing ADR-0017
+        // rejects — and the difference would show as an offset outside it.
+        for line in &lines[1..] {
+            for key in ["t", "t_start", "t_stop"] {
+                if let Some(at) = line[key].as_u64() {
+                    assert!(
+                        u128::from(at) <= span.as_nanos(),
+                        "{key} is an offset from the episode's origin: {line}"
+                    );
+                }
+            }
+        }
+        assert!(
+            origin <= Instant::now(),
+            "the origin is an instant off the same monotonic clock every actor reads"
+        );
+    }
+
+    #[test]
+    fn the_first_line_is_the_episode_header_and_the_rest_are_offsets() {
+        let (episode, writer, bytes) = rally(4);
+        let clock = episode.clock();
+        episode.run().unwrap();
+        let lines = parse_lines(&joined(writer, &bytes));
+        assert_eq!(
+            header_anchor(&lines[0]),
+            clock.start_unix_ns(),
+            "the header anchors the log to the episode's own origin"
+        );
+        // The one wall-clock time in the log.
+        assert!(
+            lines[1..]
+                .iter()
+                .all(|line| line["start_unix_ns"].is_null()),
+            "the header's wall clock appears nowhere else: {lines:?}"
+        );
+        // Every other record's times are offsets, which serialize as
+        // nonnegative integers: a log whose time ran backwards would be a
+        // record of something that did not happen.
+        for line in &lines[1..] {
+            let times: Vec<&Value> = ["t", "t_start", "t_stop"]
+                .iter()
+                .filter_map(|key| line.get(*key))
+                .collect();
+            assert!(!times.is_empty(), "every record says when: {line}");
+            for at in times {
+                assert!(at.is_u64(), "a time is a nonnegative offset: {line}");
+            }
+        }
     }
 
     #[test]
@@ -1216,8 +1379,11 @@ mod tests {
         assert_eq!(volleyed("a"), (1..=19).step_by(2).collect::<Vec<_>>());
         assert_eq!(volleyed("b"), (2..=20).step_by(2).collect::<Vec<_>>());
         for agent in ["a", "b", REFEREE] {
+            // A sequence number is a message's, so what is dense is each
+            // agent's own actions (ADR-0017).
             let seqs: Vec<u64> = of(&lines, agent)
-                .filter(|line| line["type"] != "cycle")
+                .filter(|line| line["type"] == "action")
+                .filter(|line| line["message"]["sender"] == agent)
                 .map(|line| line["seq"].as_u64().unwrap())
                 .collect();
             assert_eq!(seqs, (0..seqs.len() as u64).collect::<Vec<_>>());
@@ -1232,10 +1398,6 @@ mod tests {
             // something on the queue and none is empty.
             for line in of(&lines, agent).filter(|line| line["type"] == "cycle") {
                 assert_eq!(line["woken"], "queue", "{line}");
-                assert!(
-                    !line["inputs"].as_array().unwrap().is_empty(),
-                    "no cycle popped nothing: {line}"
-                );
             }
             // Every action lies within the window of the cycle that sent it,
             // and every observation and control was received at a t_start,
@@ -1249,19 +1411,9 @@ mod tests {
                 if line["type"] == "action" {
                     continue;
                 }
-                let (created, received) = (
-                    line["created"].as_u64().unwrap(),
-                    line["received"].as_u64().unwrap(),
-                );
+                let at = line["t"].as_u64().unwrap();
                 assert!(
-                    created <= received,
-                    "nothing arrives before it was sent: {line}"
-                );
-                if line["control"] == "stop" {
-                    continue;
-                }
-                assert!(
-                    starts.contains(&received),
+                    starts.contains(&at),
                     "everything popped is popped at a cycle's start: {line}"
                 );
             }
@@ -1269,10 +1421,10 @@ mod tests {
     }
 
     #[test]
-    fn an_observation_carries_the_creation_time_of_the_action_that_sent_it() {
+    fn an_observation_joins_the_action_that_sent_it_by_sender_and_number() {
         // The join a training pipeline makes: an observation in one agent's
         // records and the action in its sender's are the same message, and
-        // nothing but the sender and the creation time links them.
+        // nothing but `(from, seq)` links them (ADR-0017).
         let (episode, writer, bytes) = rally(6);
         episode.run().unwrap();
         let lines = parse_lines(&joined(writer, &bytes));
@@ -1283,7 +1435,7 @@ mod tests {
             .map(|line| {
                 (
                     line["message"]["sender"].as_str().unwrap().to_owned(),
-                    line["created"].as_u64().unwrap(),
+                    line["seq"].as_u64().unwrap(),
                 )
             })
             .collect();
@@ -1294,8 +1446,8 @@ mod tests {
         assert!(!observations.is_empty());
         for line in observations {
             let key = (
-                line["message"]["sender"].as_str().unwrap().to_owned(),
-                line["created"].as_u64().unwrap(),
+                line["from"].as_str().unwrap().to_owned(),
+                line["seq"].as_u64().unwrap(),
             );
             assert!(
                 actions.contains(&key),
@@ -1307,7 +1459,8 @@ mod tests {
     #[test]
     fn in_flight_work_is_counted_in_deliveries_not_messages() {
         let spokes: Vec<String> = (1..=6).map(|spoke| format!("spoke-{spoke}")).collect();
-        let (records, writer, bytes) = recording();
+        let clock = Clock::start();
+        let (records, writer, bytes) = recording(clock);
         let roster: BTreeSet<ActorId> = spokes
             .iter()
             .map(ActorId::new)
@@ -1320,6 +1473,7 @@ mod tests {
                 working: roster.clone(),
                 agents: roster,
             },
+            clock,
         );
         episode
             .add("hub", Hub::addressing(spokes.iter().cloned()))
@@ -1351,22 +1505,28 @@ mod tests {
 
     #[test]
     fn an_environment_with_no_agents_runs_and_writes_only_its_own_controls() {
-        let (records, writer, bytes) = recording();
-        Episode::new(records, REFEREE, Referee::over([]))
+        let clock = Clock::start();
+        let (records, writer, bytes) = recording(clock);
+        Episode::new(records, REFEREE, Referee::over([]), clock)
             .run()
             .unwrap();
         let lines = parse_lines(&joined(writer, &bytes));
         let controls = controls_of(&lines, None);
         assert_eq!(controls, ["start", "stop"]);
-        assert!(lines.iter().all(|line| line["agent"] == REFEREE));
+        // Everything but the header, which is nobody's record.
+        assert!(
+            lines[1..].iter().all(|line| line["agent"] == REFEREE),
+            "{lines:?}"
+        );
     }
 
     #[test]
     fn an_episode_whose_environment_never_stops_anyone_stalls() {
         // Nothing is in flight and no agent has been stopped: nobody will
         // ever speak again and nobody has declared the episode over.
-        let (records, writer, bytes) = recording();
-        let mut episode = Episode::new(records, REFEREE, Absent(["a", "b"]));
+        let clock = Clock::start();
+        let (records, writer, bytes) = recording(clock);
+        let mut episode = Episode::new(records, REFEREE, Absent(["a", "b"]), clock);
         episode.add("a", Mute).unwrap();
         episode.add("b", Mute).unwrap();
         assert_eq!(
@@ -1457,7 +1617,7 @@ mod tests {
         // Nobody is reading the records, so every agent's first record fails
         // to send.
         let (records, nobody) = unbounded();
-        let mut episode = Episode::new(records, REFEREE, Referee::over(["a", "b"]));
+        let mut episode = Episode::new(records, REFEREE, Referee::over(["a", "b"]), Clock::start());
         episode.add("a", Spoke).unwrap();
         episode.add("b", Spoke).unwrap();
         drop(nobody);
@@ -1521,10 +1681,14 @@ mod tests {
             .source()
             .is_none()
         );
-        let (records, _writer) = Writer::spawn::<Count>(Vec::new());
+        let clock = Clock::start();
+        let (records, _writer) = Writer::spawn::<Count>(Vec::new(), clock);
         assert!(
-            format!("{:?}", Episode::new(records, REFEREE, Referee::over([])))
-                .starts_with("Episode")
+            format!(
+                "{:?}",
+                Episode::new(records, REFEREE, Referee::over([]), clock)
+            )
+            .starts_with("Episode")
         );
     }
 }

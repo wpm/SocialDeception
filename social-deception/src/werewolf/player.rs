@@ -193,8 +193,7 @@ impl<S: Strategy> Handler<Message> for Player<S> {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
-
-    use crate::clock::Timestamp;
+    use std::time::Instant;
 
     use super::*;
     use crate::testing::{ME, id, ids, narrated, observed, phase_began, target};
@@ -374,8 +373,8 @@ mod tests {
     fn a_player_opens_with_nothing() {
         // A player says nothing until the first phase begins, so the
         // default start hook is the right one for every role.
-        assert!(villager(First).start(Timestamp::default()).is_empty());
-        assert!(doctor(First).start(Timestamp::default()).is_empty());
+        assert!(villager(First).start(Instant::now()).is_empty());
+        assert!(doctor(First).start(Instant::now()).is_empty());
     }
 
     #[test]
@@ -384,7 +383,7 @@ mod tests {
         // calls `timeout`, not `handle`, and a player has nothing to say on
         // a deadline.
         let mut player = villager(Last);
-        assert!(player.timeout(Timestamp::default()).is_empty());
+        assert!(player.timeout(Instant::now()).is_empty());
     }
 
     #[test]

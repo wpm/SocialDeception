@@ -31,18 +31,30 @@
 //! recovered from one, and it is identified by its `type` rather than by
 //! whose records it sits in.
 //!
-//! A reward is also the one record here with no sequence number, so it is
-//! outside the contiguity check the moderator's records are held to. The
-//! moderator is the authoritative view: its `action` records are every
-//! narration it sent, and its `observation` records are every selection it
-//! received, each naming the player that made it as its sender. Which
-//! record type a line is *is* the direction, so the reader
-//! needs no direction of its own. Reassembling the game from the players'
-//! records would mean recovering hidden information from partial views,
-//! which is the thing the design prevents. Within one agent's records the
-//! runtime guarantees that sequence numbers are contiguous and increasing in
-//! file order, so the moderator's records in file order are the game in
-//! order, whatever the other agents' records do around them.
+//! The moderator is the authoritative view: its `action` records are every
+//! narration it sent and every selection it passed on, and its `observation`
+//! records are every selection it received, each naming the player that made
+//! it as its sender. Which record type a line is *is* the direction, so the
+//! reader needs no direction of its own. Reassembling the game from the
+//! players' records would mean recovering hidden information from partial
+//! views, which is the thing the design prevents.
+//!
+//! # File order, and the one thing checked about it
+//!
+//! Line order in a log carries no meaning: records arrive at the writer from
+//! as many threads as there are agents (ADR-0017). What holds for one agent
+//! is that its own records reach the writer in the order it wrote them, and
+//! since the moderator is one thread, its records in file order are the game
+//! in the order it played it. That is what this reader folds over.
+//!
+//! What it checks is the one thing the log can prove about that order: the
+//! moderator's **action** records carry its own sequence numbers, which are
+//! contiguous from zero in the order it sent them, so a gap means the file is
+//! missing one of its messages. A relayed selection is the exception and is
+//! skipped: the moderator forwards it under the player's own name and number,
+//! so it carries no number of the moderator's to be contiguous with. An
+//! observation carries the number of the *player* that sent it, and a control
+//! or a reward carries none at all, so neither is counted.
 //!
 //! # No game logic
 //!
@@ -177,7 +189,8 @@ pub enum TranscriptError {
         /// What the deserializer objected to.
         source: serde_json::Error,
     },
-    /// The moderator's sequence numbers are not contiguous.
+    /// The moderator's own messages are not contiguously numbered, so the
+    /// file is missing one of them.
     SeqGap {
         /// The line.
         line: usize,
@@ -293,20 +306,20 @@ enum Direction {
 
 /// One record the reader takes an interest in.
 ///
-/// A [`Numbered`](Line::Numbered) line is one of the moderator's, which
-/// carries a sequence number the reader checks. Its `direction` is `None`
-/// for a control, which must be counted but says nothing about the game and
-/// is not decoded.
+/// A [`Message`](Line::Message) line is one of the moderator's, going one way
+/// or the other. A [`Reward`](Line::Reward) line is anybody's: it belongs to
+/// the agent rewarded and is recognized by its `type`.
 ///
-/// A [`Reward`](Line::Reward) line is anybody's: it belongs to the agent
-/// rewarded, carries no sequence number, and is recognized by its `type`.
+/// A control of the moderator's is neither. It says nothing about the game
+/// and carries no number to keep count of, so the reader skips it like any
+/// other agent's record.
 enum Line<'a> {
-    /// One of the moderator's numbered records.
-    Numbered {
+    /// One of the moderator's message records.
+    Message {
         /// The record.
         record: &'a Map<String, Value>,
-        /// Which way its message went, or `None` if it carries no message.
-        direction: Option<Direction>,
+        /// Which way its message went.
+        direction: Direction,
     },
     /// A reward: the agent paid and what it was paid.
     Reward {
@@ -322,6 +335,9 @@ struct Record {
     line: usize,
     direction: Direction,
     sender: ActorId,
+    /// Which of `sender`'s messages it is: the second half of the key a
+    /// reader joins an observation to its action by (ADR-0017).
+    seq: u64,
     recipients: BTreeSet<ActorId>,
     message: Message,
 }
@@ -410,28 +426,29 @@ impl Transcript {
             let line = index + 1;
             match read_line(value, line, moderator)? {
                 None => {}
-                // A reward belongs to the agent it names, whoever wrote it,
-                // and has no sequence number to check.
+                // A reward belongs to the agent it names, whoever wrote it.
                 Some(Line::Reward { agent, value }) => {
                     rewards.insert(agent, value);
                 }
-                Some(Line::Numbered { record, direction }) => {
-                    // The moderator's controls are counted but not read:
-                    // they carry a sequence number, so skipping them
-                    // without counting would look like a gap, and they say
-                    // nothing about the game.
-                    let seq = integer(record, "seq", line)?;
-                    if seq != next_seq {
-                        return Err(TranscriptError::SeqGap {
-                            line,
-                            expected: next_seq,
-                            found: seq,
-                        });
+                Some(Line::Message { record, direction }) => {
+                    let record = message(record, direction, line)?;
+                    // The moderator's own messages are numbered from zero
+                    // in the order it sent them, so a gap is a missing
+                    // record. A relay carries the player's number instead
+                    // and is not counted; an observation carries the
+                    // sender's, which is nothing to count either.
+                    if direction == Direction::Sent && record.sender == *moderator {
+                        let seq = record.seq;
+                        if seq != next_seq {
+                            return Err(TranscriptError::SeqGap {
+                                line,
+                                expected: next_seq,
+                                found: seq,
+                            });
+                        }
+                        next_seq += 1;
                     }
-                    next_seq += 1;
-                    if let Some(direction) = direction {
-                        reader.fold(message(record, direction, line)?)?;
-                    }
+                    reader.fold(record)?;
                 }
             }
         }
@@ -453,11 +470,7 @@ impl Transcript {
 /// the ones nothing is read from, so that a file with something else in it
 /// is not silently read as a game.
 ///
-/// The direction is `None` for the moderator's own controls. They say
-/// nothing about the game, but they carry sequence numbers, so the caller
-/// must count them or the numbers look full of gaps.
-/// A reward is the one kind read whoever wrote it, and the one with no
-/// sequence number to count.
+/// A reward is the one kind read whoever wrote it.
 fn read_line<'a>(
     value: &'a Value,
     line: usize,
@@ -467,12 +480,8 @@ fn read_line<'a>(
         .as_object()
         .ok_or(TranscriptError::NotAnObject { line })?;
     let direction = match record.get("type").and_then(Value::as_str) {
-        Some("action") => Some(Direction::Sent),
-        Some("observation") => Some(Direction::Received),
-        // A control carries a sequence number and says nothing about the
-        // game, being out-of-domain. Counted, not read, so that skipping
-        // it does not look like a gap.
-        Some("control") => None,
+        Some("action") => Direction::Sent,
+        Some("observation") => Direction::Received,
         Some("reward") => {
             let agent: ActorId = decode(record, "agent", line)?;
             let value = record
@@ -482,7 +491,11 @@ fn read_line<'a>(
                 .ok_or_else(|| malformed(line, "no value"))?;
             return Ok(Some(Line::Reward { agent, value }));
         }
-        Some("cycle") => return Ok(None),
+        // Nothing the reader has any use for. A control is out-of-domain
+        // and says nothing about the game; a cycle is the loop's own
+        // bookkeeping; the header anchors the episode to the wall clock.
+        // None of them carries a sequence number to keep count of either.
+        Some("control" | "cycle" | "episode") => return Ok(None),
         found => {
             return Err(TranscriptError::UnknownRecordType {
                 line,
@@ -491,15 +504,21 @@ fn read_line<'a>(
         }
     };
     let agent = string(record, "agent", line)?;
-    Ok((agent == moderator.as_str()).then_some(Line::Numbered { record, direction }))
+    Ok((agent == moderator.as_str()).then_some(Line::Message { record, direction }))
 }
 
-/// Decodes a message record's envelope and payload.
+/// Decodes a message record's envelope, its key and its payload.
+///
+/// The sender is the message's own, from inside the envelope, which is what
+/// makes a relay read as the player's message rather than the moderator's.
+/// The sequence number is beside it at the top level, where the record
+/// carries it once (ADR-0017).
 fn message(
     record: &Map<String, Value>,
     direction: Direction,
     line: usize,
 ) -> Result<Record, TranscriptError> {
+    let seq = integer(record, "seq", line)?;
     let envelope = record
         .get("message")
         .and_then(Value::as_object)
@@ -515,6 +534,7 @@ fn message(
         line,
         direction,
         sender,
+        seq,
         recipients,
         message,
     })
@@ -599,6 +619,7 @@ impl Reader {
             line,
             direction,
             sender,
+            seq: _,
             recipients,
             message,
         } = record;
@@ -865,9 +886,8 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
-    use crate::clock::Timestamp;
     use crate::testing::{fast, id, ids, village};
     use crate::werewolf::assignment::Assignment;
     use crate::werewolf::game::{Directive, Game};
@@ -1285,12 +1305,12 @@ mod tests {
         }
     }
 
-    /// The fixture with every timestamp rewritten and the agents' records
+    /// The fixture with every time rewritten and the agents' records
     /// interleaved differently: the same game as a different file.
     fn rewritten() -> Vec<Value> {
         let mut lines = fixture();
         for (offset, line) in lines.iter_mut().enumerate() {
-            for key in ["created", "received", "t_start", "t_stop"] {
+            for key in ["t", "t_start", "t_stop", "start_unix_ns"] {
                 if let Some(time) = line.get_mut(key) {
                     *time = json!(1_000_000 + offset);
                 }
@@ -1298,14 +1318,82 @@ mod tests {
         }
         // A stable sort by agent keeps each agent's records in order, which
         // is the one ordering the runtime guarantees, and otherwise changes
-        // the interleaving completely.
-        lines.sort_by_key(|line| line["agent"].as_str().unwrap().to_owned());
+        // the interleaving completely. The header has no agent, so it sorts
+        // to the front, where it belongs.
+        lines.sort_by_key(|line| line["agent"].as_str().unwrap_or("").to_owned());
         assert_ne!(lines, fixture());
         lines
     }
 
     #[test]
-    fn a_transcript_has_no_timestamps_and_no_interleaving() {
+    fn every_observation_joins_the_action_it_came_from_by_from_and_seq() {
+        // What replaced the join by sender and creation time (ADR-0017). The
+        // moderator's `observation` records are the selections it took in,
+        // and each names the player that sent it and which of that player's
+        // messages it was; the player's own `action` record carries the same
+        // pair, and nothing else links the two.
+        //
+        // A forward joins the same way, since the moderator sends it under
+        // the player's own name and number: that is what makes it the same
+        // message rather than a second one.
+        let lines = fixture();
+        let sent: BTreeSet<(String, u64)> = lines
+            .iter()
+            .filter(|line| line["type"] == "action")
+            .filter(|line| line["message"]["sender"] == line["agent"])
+            .map(|line| {
+                (
+                    line["agent"]
+                        .as_str()
+                        .expect("a record names its agent")
+                        .to_owned(),
+                    line["seq"].as_u64().expect("a message record is numbered"),
+                )
+            })
+            .collect();
+        let observations: Vec<&Value> = lines
+            .iter()
+            .filter(|line| line["type"] == "observation")
+            .collect();
+        assert!(!observations.is_empty(), "the fixture has observations");
+        for line in &observations {
+            let key = (
+                line["from"]
+                    .as_str()
+                    .expect("an observation names its sender")
+                    .to_owned(),
+                line["seq"].as_u64().expect("a message record is numbered"),
+            );
+            assert!(
+                sent.contains(&key),
+                "an observation joins the action it came from by (from, seq): {line}"
+            );
+        }
+        // And the moderator's forwards join back the same way, to the
+        // player's own action and not to one of the moderator's.
+        let forwards: Vec<&Value> = lines
+            .iter()
+            .filter(|line| line["type"] == "action" && line["agent"] == MODERATOR)
+            .filter(|line| line["message"]["sender"] != MODERATOR)
+            .collect();
+        assert!(!forwards.is_empty(), "the fixture exercises forwarding");
+        for line in &forwards {
+            let key = (
+                line["message"]["sender"]
+                    .as_str()
+                    .expect("a message names its sender")
+                    .to_owned(),
+                line["seq"].as_u64().expect("a message record is numbered"),
+            );
+            assert!(
+                sent.contains(&key),
+                "a forward joins the action it passes on by (from, seq): {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_transcript_has_no_times_and_no_interleaving() {
         assert_eq!(read(&rewritten()).unwrap(), read(&fixture()).unwrap());
     }
 
@@ -1425,8 +1513,8 @@ mod tests {
 
     #[test]
     fn a_control_record_says_nothing_about_the_game_and_is_skipped() {
-        // The moderator's own start and stop are in the file and count
-        // toward its sequence numbers, and the reader steps over them
+        // The moderator's own start and stop are in the file, carry no
+        // sequence number of their own, and the reader steps over them
         // without taking them for messages.
         let lines = fixture();
         let controls = lines
@@ -1453,8 +1541,12 @@ mod tests {
 
     #[test]
     fn a_gap_in_the_moderators_sequence_numbers_is_an_error() {
+        // The moderator's own messages are numbered from zero in the order
+        // it sent them, so a gap means the file is missing one. Only its
+        // own: a narration it sent, not an observation or a forward, whose
+        // numbers are the players'.
         let mut lines = fixture();
-        let index = moderator_record(&lines, is_selection);
+        let index = moderator_record(&lines, |payload| !payload["Narration"].is_null());
         lines[index]["seq"] = json!(lines[index]["seq"].as_u64().unwrap() + 1);
         let error = read(&lines).unwrap_err();
         assert!(
@@ -1663,7 +1755,8 @@ mod tests {
         let mut lines = fixture();
         let index = moderator_record(&lines, |payload| !payload["Narration"].is_null());
         lines[index]["type"] = json!("observation");
-        lines[index]["received"] = lines[index]["created"].clone();
+        // An observation names the sender at the top level as well.
+        lines[index]["from"] = lines[index]["message"]["sender"].clone();
         let error = read(&lines).unwrap_err();
         assert!(
             matches!(error, TranscriptError::Misdirected { line } if line == index + 1),
@@ -1703,37 +1796,54 @@ mod tests {
     /// would record, with nobody else's records and made-up stamps.
     struct Scribe {
         lines: Vec<Value>,
+        /// The next sequence number for each sender, so that every message
+        /// carries its own sender's, as the runtime numbers them.
+        next: BTreeMap<String, u64>,
     }
 
     impl Scribe {
         fn new() -> Self {
-            Self { lines: Vec::new() }
+            Self {
+                lines: Vec::new(),
+                next: BTreeMap::new(),
+            }
         }
 
-        /// One record of the moderator's, of the given type, with stamps
-        /// invented from the sequence number: every record needs a
-        /// `created`, and an `observation` a `received` as well.
+        /// The next number in `sender`'s sequence.
+        fn next_seq(&mut self, sender: &str) -> u64 {
+            let seq = self.next.entry(sender.to_owned()).or_default();
+            let taken = *seq;
+            *seq += 1;
+            taken
+        }
+
+        /// One record of the moderator's, of the given type, carrying
+        /// `sender`'s sequence number and a time invented from the line
+        /// count.
         fn record(
             &mut self,
             kind: &str,
             sender: &str,
+            seq: u64,
             recipients: &BTreeSet<ActorId>,
             payload: &Message,
         ) {
-            let seq = self.lines.len();
+            let t = self.lines.len() * 10;
             let mut line = json!({
                 "type": kind,
                 "agent": MODERATOR,
+                "t": t,
                 "seq": seq,
-                "created": seq * 10,
                 "message": {
                     "sender": sender,
                     "recipients": recipients,
                     "payload": payload,
                 },
             });
+            // An observation's `agent` is the receiver, so it names the
+            // sender beside the number.
             if kind == "observation" {
-                line["received"] = json!(seq * 10 + 1);
+                line["from"] = json!(sender);
             }
             self.lines.push(line);
         }
@@ -1742,33 +1852,45 @@ mod tests {
             for directive in directives {
                 let (to, payload) = match directive {
                     Directive::Narrate { to, narration } => (to, Message::Narration(narration)),
-                    // A forwarded selection is recorded as the player that
-                    // made it, not as the moderator, so the scribe writes
-                    // it under that name rather than its own.
+                    // A forwarded selection keeps the player's own name and
+                    // number, not the moderator's: that is what makes the
+                    // relay join back to the player's own action.
                     Directive::Forward {
                         from,
+                        seq,
                         to,
                         selection,
-                        ..
                     } => {
-                        self.record("action", from.as_str(), &to, &Message::Select(selection));
+                        self.record(
+                            "action",
+                            from.as_str(),
+                            seq,
+                            &to,
+                            &Message::Select(selection),
+                        );
                         continue;
                     }
                     // A stop is a control, and `Transcript::read` skips
                     // control records: they say nothing about the game.
                     Directive::Stop { .. } => continue,
                 };
-                self.record("action", MODERATOR, &to, &payload);
+                let seq = self.next_seq(MODERATOR);
+                self.record("action", MODERATOR, seq, &to, &payload);
             }
         }
 
-        fn select(&mut self, from: &str, selection: Select) {
+        /// Records a selection arriving from `from`, and returns the number
+        /// it was sent under, which the forward will carry.
+        fn select(&mut self, from: &str, selection: Select) -> u64 {
+            let seq = self.next_seq(from);
             self.record(
                 "observation",
                 from,
+                seq,
                 &ids([MODERATOR]),
                 &Message::Select(selection),
             );
+            seq
         }
     }
 
@@ -1781,9 +1903,10 @@ mod tests {
         let mut scribe = Scribe::new();
         let roles = assignment.clone();
         let mut game = Game::new(assignment, 1, fast());
-        scribe.directives(game.begin(Timestamp::default()));
+        let origin = Instant::now();
+        scribe.directives(game.begin(origin));
         for (index, answers) in script.iter().enumerate() {
-            let now = Timestamp::from(Duration::from_millis((index as u64 + 1) * STEP));
+            let now = origin + Duration::from_millis((index as u64 + 1) * STEP);
             // Taken before any selection is recorded: a day ends on the selection
             // that makes a majority, so selecting alone may finish it.
             let phase = game.phase_now();
@@ -1824,8 +1947,8 @@ mod tests {
                     target: chosen.clone(),
                     seen_by,
                 };
-                scribe.select(who, selection.clone());
-                scribe.directives(game.select(&id(who), &selection, now, now));
+                let seq = scribe.select(who, selection.clone());
+                scribe.directives(game.select(&id(who), &selection, seq, now));
             }
             // Close this phase and no more. Expiring at the earliest
             // deadline open, and stopping as soon as the phase moves,

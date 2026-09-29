@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs;
 
 use serde_json::Value;
-use social_deception::{Episode, Writer};
+use social_deception::{Clock, Episode, Writer};
 use support::TempDir;
 use support::collatz::{Collatz, CollatzEnvironment};
 
@@ -71,12 +71,14 @@ fn expected_chains(ring: &Ring) -> BTreeMap<u64, Vec<u64>> {
 fn run(ring: &Ring) -> Vec<Value> {
     let dir = TempDir::new();
     let file = dir.join("collatz.jsonl");
-    let (records, writer) = Writer::create(&file).unwrap();
+    // One clock for the episode, captured before the writer or any actor.
+    let clock = Clock::start();
+    let (records, writer) = Writer::create(&file, clock).unwrap();
     let environment = CollatzEnvironment::new(
         ring.iter().map(|(name, _)| *name),
         ring.iter().flat_map(|(_, opens)| opens.iter().copied()),
     );
-    let mut episode = Episode::new(records, ENVIRONMENT, environment);
+    let mut episode = Episode::new(records, ENVIRONMENT, environment, clock);
     for (i, (name, opens)) in ring.iter().enumerate() {
         let agent = opens.iter().fold(
             Collatz::new(passes_to(ring, i), ENVIRONMENT),
@@ -108,15 +110,12 @@ fn of<'a>(lines: &'a [Value], kind: &'a str) -> impl Iterator<Item = &'a Value> 
     lines.iter().filter(move |line| line["type"] == kind)
 }
 
-fn cycles(lines: &[Value]) -> impl Iterator<Item = &Value> {
-    of(lines, "cycle")
-}
-
 /// The steps a cycle sent, in order, leaving out its reports to the
 /// environment, which are not steps of any chain.
-fn outputs(cycle: &Value, records: &HashMap<(&str, u64), &Value>) -> Vec<(u64, u64)> {
-    support::seqs(cycle, "outputs")
-        .map(|seq| records[&(support::agent(cycle), seq)])
+fn outputs(records: &[&Value]) -> Vec<(u64, u64)> {
+    records
+        .iter()
+        .filter(|record| record["type"] == "action")
         .filter_map(|output| {
             step(output).or_else(|| {
                 assert!(
@@ -160,11 +159,14 @@ fn reports(lines: &[Value]) -> Vec<u64> {
 /// what it does with what it hears is asserted elsewhere.
 fn every_hop_follows_the_rule(lines: &[Value], ring: &Ring) {
     let opens: HashMap<&str, &[u64]> = ring.iter().copied().collect();
-    let records = support::records(lines);
-    for cycle in cycles(lines).filter(|cycle| support::agent(cycle) != ENVIRONMENT) {
+    for (cycle, records) in support::cycles(lines) {
         let agent = support::agent(cycle);
-        let inputs: Vec<&Value> = support::seqs(cycle, "inputs")
-            .map(|seq| records[&(agent, seq)])
+        if agent == ENVIRONMENT {
+            continue;
+        }
+        let inputs: Vec<&&Value> = records
+            .iter()
+            .filter(|record| record["type"] != "action")
             .collect();
         let opened: Vec<(u64, u64)> = if inputs.iter().any(|input| input["control"] == "start") {
             opens[agent].iter().map(|&s| (s, s)).collect()
@@ -178,7 +180,7 @@ fn every_hop_follows_the_rule(lines: &[Value], ring: &Ring) {
                 Some((chain, n)) => vec![(chain, successor(n))],
             }))
             .collect();
-        assert_eq!(outputs(cycle, &records), expected, "the outputs of {cycle}");
+        assert_eq!(outputs(&records), expected, "the outputs of {cycle}");
     }
 }
 
@@ -189,24 +191,24 @@ fn every_hop_follows_the_rule(lines: &[Value], ring: &Ring) {
 /// and owes nothing to timestamps. A chain begins at the step that carries
 /// its name as its value, which is what its opener sends when it starts.
 fn chains(lines: &[Value]) -> BTreeMap<u64, Vec<u64>> {
-    let records = support::records(lines);
-    let mut arrivals: HashMap<(u64, u64), (&str, u64)> = HashMap::new();
-    for (&(agent, seq), record) in &records {
-        if record["type"] != "observation" {
-            continue;
-        }
-        if let Some(step) = step(record) {
-            assert!(
-                arrivals.insert(step, (agent, seq)).is_none(),
-                "a chain never carries the same value twice: {step:?}"
-            );
+    // Each step's arrival, as the cycle that observed it and everything that
+    // cycle wrote: a chain is followed from an observation to the outputs of
+    // the cycle that handled it, so the grouping is the hop.
+    let grouped = support::cycles(lines);
+    let mut arrivals: HashMap<(u64, u64), usize> = HashMap::new();
+    for (index, (_, records)) in grouped.iter().enumerate() {
+        for record in records {
+            if record["type"] != "observation" {
+                continue;
+            }
+            if let Some(step) = step(record) {
+                assert!(
+                    arrivals.insert(step, index).is_none(),
+                    "a chain never carries the same value twice: {step:?}"
+                );
+            }
         }
     }
-    let handled_by: HashMap<(&str, u64), &Value> = cycles(lines)
-        .flat_map(|cycle| {
-            support::seqs(cycle, "inputs").map(move |seq| ((support::agent(cycle), seq), cycle))
-        })
-        .collect();
     let names: Vec<u64> = arrivals
         .keys()
         .filter(|(chain, value)| chain == value)
@@ -218,8 +220,8 @@ fn chains(lines: &[Value]) -> BTreeMap<u64, Vec<u64>> {
         let mut values = vec![chain];
         loop {
             let current = *values.last().unwrap();
-            let handled = handled_by[&arrivals[&(chain, current)]];
-            let next: Vec<u64> = outputs(handled, &records)
+            let (handled, records) = &grouped[arrivals[&(chain, current)]];
+            let next: Vec<u64> = outputs(records)
                 .into_iter()
                 .filter(|(name, _)| *name == chain)
                 .map(|(_, value)| value)
@@ -335,75 +337,79 @@ fn chains_that_share_a_value_stay_apart() {
 /// and `b` after the last step they exchanged, which is the ordering the
 /// episode guarantees.
 fn interleaved_chains() -> Vec<Value> {
-    let control = |agent: &str, seq: u64, created: u64, received: u64, control: &str| {
-        serde_json::json!({"type": "control", "agent": agent, "seq": seq, "created": created,
-                           "received": received, "control": control})
-    };
-    // An action and the observation of it carry the same `created`: they are
-    // the same message from its two ends, and that is what joins them.
-    let action = |agent: &str, seq: u64, created: u64, chain: u64, value: u64| {
+    let control = |agent: &str, t: u64, control: &str| serde_json::json!({"type": "control", "agent": agent, "t": t, "control": control});
+    // An action and the observation of it carry the same `(from, seq)`: they
+    // are the same message from its two ends, and that is what joins them
+    // (ADR-0017). The numbers are each sender's own, dense over the messages
+    // it sent.
+    let action = |agent: &str, t: u64, seq: u64, chain: u64, value: u64| {
         let other = if agent == "a" { "b" } else { "a" };
-        serde_json::json!({"type": "action", "agent": agent, "seq": seq, "created": created,
+        serde_json::json!({"type": "action", "agent": agent, "t": t, "seq": seq,
                            "message": {"sender": agent, "recipients": [other],
                                      "payload": {"Step": {"chain": chain, "value": value}}}})
     };
-    let observation =
-        |agent: &str, seq: u64, created: u64, received: u64, chain: u64, value: u64| {
-            let other = if agent == "a" { "b" } else { "a" };
-            serde_json::json!({"type": "observation", "agent": agent, "seq": seq,
-                               "created": created, "received": received,
-                               "message": {"sender": other, "recipients": [agent],
-                                         "payload": {"Step": {"chain": chain, "value": value}}}})
-        };
-    let reported = |agent: &str, seq: u64, created: u64, chain: u64| {
-        serde_json::json!({"type": "action", "agent": agent, "seq": seq, "created": created,
+    let observation = |agent: &str, t: u64, seq: u64, chain: u64, value: u64| {
+        let other = if agent == "a" { "b" } else { "a" };
+        serde_json::json!({"type": "observation", "agent": agent, "t": t,
+                           "from": other, "seq": seq,
+                           "message": {"sender": other, "recipients": [agent],
+                                     "payload": {"Step": {"chain": chain, "value": value}}}})
+    };
+    let reported = |agent: &str, t: u64, seq: u64, chain: u64| {
+        serde_json::json!({"type": "action", "agent": agent, "t": t, "seq": seq,
                            "message": {"sender": agent, "recipients": [ENVIRONMENT],
                                      "payload": {"Finished": {"chain": chain}}}})
     };
-    let heard = |seq: u64, created: u64, received: u64, from: &str, chain: u64| {
-        serde_json::json!({"type": "observation", "agent": ENVIRONMENT, "seq": seq,
-                           "created": created, "received": received,
+    let heard = |t: u64, from: &str, seq: u64, chain: u64| {
+        serde_json::json!({"type": "observation", "agent": ENVIRONMENT, "t": t,
+                           "from": from, "seq": seq,
                            "message": {"sender": from, "recipients": [ENVIRONMENT],
                                      "payload": {"Finished": {"chain": chain}}}})
     };
-    let cycle = |agent: &str, t_start: u64, t_stop: u64, inputs: &[u64], outputs: &[u64]| {
-        serde_json::json!({"type": "cycle", "agent": agent, "t_start": t_start, "t_stop": t_stop,
-                           "woken": "queue", "inputs": inputs, "outputs": outputs})
+    let cycle = |agent: &str, t_start: u64, t_stop: u64, observed: Option<(&str, u64)>| {
+        let mut line = serde_json::json!({"type": "cycle", "agent": agent,
+                           "t_start": t_start, "t_stop": t_stop, "woken": "queue"});
+        if let Some((from, seq)) = observed {
+            line["from"] = serde_json::json!(from);
+            line["seq"] = serde_json::json!(seq);
+        }
+        line
     };
     vec![
-        control(ENVIRONMENT, 0, 5, 8, "start"),
-        cycle(ENVIRONMENT, 8, 9, &[0], &[]),
-        control("a", 0, 10, 15, "start"),
-        action("a", 1, 20, 4, 4),
-        action("a", 2, 21, 2, 2),
-        cycle("a", 15, 25, &[0], &[1, 2]),
-        control("b", 0, 10, 30, "start"),
-        cycle("b", 30, 31, &[0], &[]),
-        observation("b", 1, 20, 32, 4, 4),
-        action("b", 2, 40, 4, 2),
-        cycle("b", 32, 42, &[1], &[2]),
-        observation("b", 3, 21, 43, 2, 2),
-        action("b", 4, 44, 2, 1),
-        cycle("b", 43, 45, &[3], &[4]),
-        observation("a", 3, 40, 50, 4, 2),
-        action("a", 4, 60, 4, 1),
-        cycle("a", 50, 62, &[3], &[4]),
-        observation("a", 5, 44, 63, 2, 1),
-        reported("a", 6, 64, 2),
-        cycle("a", 63, 65, &[5], &[6]),
-        observation("b", 5, 60, 70, 4, 1),
-        reported("b", 6, 71, 4),
-        cycle("b", 70, 75, &[5], &[6]),
-        heard(1, 64, 80, "a", 2),
-        cycle(ENVIRONMENT, 80, 81, &[1], &[]),
-        heard(2, 71, 85, "b", 4),
-        cycle(ENVIRONMENT, 85, 86, &[2], &[]),
-        control("a", 7, 90, 95, "stop"),
-        cycle("a", 95, 96, &[7], &[]),
-        control("b", 7, 90, 95, "stop"),
-        cycle("b", 95, 96, &[7], &[]),
-        control(ENVIRONMENT, 3, 100, 105, "stop"),
-        cycle(ENVIRONMENT, 105, 106, &[3], &[]),
+        support::header(),
+        control(ENVIRONMENT, 8, "start"),
+        cycle(ENVIRONMENT, 8, 9, None),
+        control("a", 15, "start"),
+        action("a", 20, 0, 4, 4),
+        action("a", 21, 1, 2, 2),
+        cycle("a", 15, 25, None),
+        control("b", 30, "start"),
+        cycle("b", 30, 31, None),
+        observation("b", 32, 0, 4, 4),
+        action("b", 40, 0, 4, 2),
+        cycle("b", 32, 42, Some(("a", 0))),
+        observation("b", 43, 1, 2, 2),
+        action("b", 44, 1, 2, 1),
+        cycle("b", 43, 45, Some(("a", 1))),
+        observation("a", 50, 0, 4, 2),
+        action("a", 60, 2, 4, 1),
+        cycle("a", 50, 62, Some(("b", 0))),
+        observation("a", 63, 1, 2, 1),
+        reported("a", 64, 3, 2),
+        cycle("a", 63, 65, Some(("b", 1))),
+        observation("b", 70, 2, 4, 1),
+        reported("b", 71, 2, 4),
+        cycle("b", 70, 75, Some(("a", 2))),
+        heard(80, "a", 3, 2),
+        cycle(ENVIRONMENT, 80, 81, Some(("a", 3))),
+        heard(85, "b", 2, 4),
+        cycle(ENVIRONMENT, 85, 86, Some(("b", 2))),
+        control("a", 95, "stop"),
+        cycle("a", 95, 96, None),
+        control("b", 95, "stop"),
+        cycle("b", 95, 96, None),
+        control(ENVIRONMENT, 105, "stop"),
+        cycle(ENVIRONMENT, 105, 106, None),
     ]
 }
 
@@ -422,10 +428,11 @@ fn two_chains_in_flight_at_once_are_told_apart() {
 #[should_panic(expected = "the outputs of")]
 fn a_step_sent_on_the_wrong_chain_is_caught() {
     let mut lines = interleaved_chains();
-    // b's reply to chain 4's step is filed under chain 2.
+    // b's reply to chain 4's step is filed under chain 2. It is b's first
+    // message, so it carries b's sequence number zero.
     let wrong = lines
         .iter()
-        .position(|line| line["agent"] == "b" && line["seq"] == 2)
+        .position(|line| line["type"] == "action" && line["agent"] == "b" && line["seq"] == 0)
         .unwrap();
     lines[wrong]["message"]["payload"]["Step"]["chain"] = serde_json::json!(2);
     let ring: &Ring = &[("a", &[4, 2]), ("b", &[])];

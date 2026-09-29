@@ -82,11 +82,11 @@
 use crossbeam_channel::Sender;
 
 use std::collections::BTreeSet;
+use std::time::Instant;
 
 use super::game::{Directive, Game};
 use super::message::{Message, Outcome};
 use crate::agent::{Action, Observation};
-use crate::clock::Timestamp;
 use crate::environment::{Effect, Environment};
 use crate::message::{ActorId, Control};
 
@@ -122,15 +122,16 @@ impl Moderator {
     /// If a player sends the moderator a narration.
     fn fold(&mut self, observation: &Observation<Message>) -> Vec<Directive> {
         let sender = &observation.message.sender;
-        let now = observation.received;
+        let now = observation.at;
         let mut directives = match &observation.message.payload {
-            // Two instants, and the difference matters. `created` is when
-            // the player selected, and a forwarded selection carries it so the
-            // relay costs latency and nothing else. `now` is when the
-            // moderator got it, which is what the session clocks run on.
+            // The message's own sequence number goes in as well as the
+            // arrival: a forwarded selection carries the player's
+            // `(sender, seq)` so the relay joins back to the player's
+            // action, while `now` is when the moderator got it, which is
+            // what the session clocks run on.
             Message::Select(selection) => {
                 self.game
-                    .select(sender, selection, observation.message.created, now)
+                    .select(sender, selection, observation.message.seq, now)
             }
             Message::Narration(_) => panic!("{sender} sent the moderator a narration"),
         };
@@ -188,10 +189,10 @@ fn send(directive: Directive) -> Effect<i32, Message> {
         // observed had the player addressed it directly (ADR-0014).
         Directive::Forward {
             from,
-            created,
+            seq,
             to,
             selection,
-        } => Effect::Act(Action::relay(from, created, to, Message::Select(selection))),
+        } => Effect::Act(Action::relay(from, seq, to, Message::Select(selection))),
         Directive::Stop { who } => Effect::control([who], Control::Stop),
     }
 }
@@ -205,7 +206,7 @@ impl Environment<i32, Message> for Moderator {
     /// cycle's messages before its controls either way, so what a player
     /// actually sees is its `Start` — controls are popped first — and then
     /// the opening narrations.
-    fn start(&mut self, now: Timestamp) -> Vec<Effect<i32, Message>> {
+    fn start(&mut self, now: Instant) -> Vec<Effect<i32, Message>> {
         let opening = self.game.begin(now);
         let mut effects = vec![Effect::control(self.players(), Control::Start)];
         effects.extend(self.say(opening));
@@ -243,7 +244,7 @@ impl Environment<i32, Message> for Moderator {
     /// narrated to nobody (ADR-0015); what its members hear is what the
     /// phase came to, and the last of a night's sessions resolves the
     /// night.
-    fn timeout(&mut self, now: Timestamp) -> Vec<Effect<i32, Message>> {
+    fn timeout(&mut self, now: Instant) -> Vec<Effect<i32, Message>> {
         if self.game.outcome().is_some() {
             return Vec::new();
         }
@@ -253,7 +254,7 @@ impl Environment<i32, Message> for Moderator {
 
     /// The earliest instant a session could close, or `None` once the game
     /// is over (ADR-0010, ADR-0011).
-    fn deadline(&self) -> Option<Timestamp> {
+    fn deadline(&self) -> Option<Instant> {
         self.game.next_deadline()
     }
 }
@@ -265,7 +266,6 @@ mod tests {
     use crossbeam_channel::{Receiver, TryRecvError, unbounded};
 
     use super::*;
-    use std::time::Duration;
 
     use crate::message::ActorId;
     use crate::testing::{fast, id, ids, observed, town, village};
@@ -286,15 +286,10 @@ mod tests {
     }
 
     /// A message from a player to the moderator, as the moderator observes
-    /// it. The creation time plays no part in the fold, so one stand-in
-    /// serves every test here.
+    /// it. Which of that player's messages it is plays no part in the fold
+    /// here, so one stand-in number serves every test.
     fn from_player(who: &str, payload: Message) -> Observation<Message> {
-        observed(crate::Message::new(
-            who,
-            [MODERATOR],
-            Timestamp::default(),
-            payload,
-        ))
+        observed(crate::Message::new(who, [MODERATOR], 0, payload))
     }
 
     fn response(
@@ -456,10 +451,9 @@ mod tests {
         produced
     }
 
-    /// An instant, in milliseconds from the start of the episode.
-    fn at(millis: u64) -> Timestamp {
-        Timestamp::from(Duration::from_millis(millis))
-    }
+    /// The instants these tests name, offset from the one fixed base every
+    /// test module in the crate shares; see [`testing::BASE`](crate::testing).
+    use crate::testing::at_millis as at;
 
     /// A game played out: its assignment, how the game says it ended, the
     /// receiver of its outcome, every message the moderator sent, every
@@ -530,7 +524,7 @@ mod tests {
     fn starting_the_moderator_starts_the_players_and_begins_the_game() {
         let everyone = ["alice", "bob", "carol", "dave", "erin"];
         let (mut moderator, _receiver) = moderator(village());
-        let opening = moderator.start(Timestamp::default());
+        let opening = moderator.start(at(0));
         assert_eq!(
             controls(&opening),
             [(ids(everyone), Control::Start)],
@@ -564,8 +558,8 @@ mod tests {
         // say on a deadline. Controls never reach it either, so there is
         // nothing a cycle can hold that it must ignore.
         let (mut moderator, _receiver) = moderator(village());
-        moderator.start(Timestamp::default());
-        assert_eq!(moderator.timeout(Timestamp::default()), []);
+        moderator.start(at(0));
+        assert_eq!(moderator.timeout(at(0)), []);
     }
 
     #[test]
@@ -847,7 +841,7 @@ mod tests {
     #[should_panic(expected = "erin sent the moderator a narration")]
     fn a_narration_from_a_player_panics() {
         let (mut moderator, _receiver) = moderator(village());
-        moderator.start(Timestamp::default());
+        moderator.start(at(0));
         moderator.handle(&from_player(
             "erin",
             Message::Narration(Narration::NoDeath {

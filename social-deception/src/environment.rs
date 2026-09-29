@@ -56,12 +56,12 @@
 
 use std::collections::BTreeSet;
 use std::marker::PhantomData;
+use std::time::Instant;
 
 use crossbeam_channel::Sender;
 use serde::Serialize;
 
 use crate::agent::{Action, Handler, Observation};
-use crate::clock::{Clock, Timestamp};
 use crate::log::{Record, RewardRecord};
 use crate::message::{ActorId, Control, Payload};
 
@@ -137,7 +137,7 @@ pub trait Environment<W, P: Payload> {
     ///
     /// Opening effects are decided from nothing, for the reason
     /// [`Handler::start`]'s are.
-    fn start(&mut self, now: Timestamp) -> Vec<Effect<W, P>>;
+    fn start(&mut self, now: Instant) -> Vec<Effect<W, P>>;
 
     /// Folds one observation into the environment's state and says what to
     /// send, whom to control, and whom to reward.
@@ -158,7 +158,7 @@ pub trait Environment<W, P: Payload> {
     /// deadline is not observing anything. The default does nothing, which
     /// is what both of the environments in the tree want — neither is
     /// configured with a timeout at all.
-    fn timeout(&mut self, _now: Timestamp) -> Vec<Effect<W, P>> {
+    fn timeout(&mut self, _now: Instant) -> Vec<Effect<W, P>> {
         Vec::new()
     }
 
@@ -168,7 +168,7 @@ pub trait Environment<W, P: Payload> {
     /// forwards this to: an absolute instant on the agent's clock, replacing
     /// whatever was pending, with a past one firing at once. Neither
     /// environment in the tree sets one.
-    fn deadline(&self) -> Option<Timestamp> {
+    fn deadline(&self) -> Option<Instant> {
         None
     }
 }
@@ -178,7 +178,7 @@ pub trait Environment<W, P: Payload> {
 ///
 /// [`Episode`]: crate::Episode
 impl<W, P: Payload, E: Environment<W, P> + ?Sized> Environment<W, P> for Box<E> {
-    fn start(&mut self, now: Timestamp) -> Vec<Effect<W, P>> {
+    fn start(&mut self, now: Instant) -> Vec<Effect<W, P>> {
         (**self).start(now)
     }
 
@@ -186,11 +186,11 @@ impl<W, P: Payload, E: Environment<W, P> + ?Sized> Environment<W, P> for Box<E> 
         (**self).handle(observation)
     }
 
-    fn timeout(&mut self, now: Timestamp) -> Vec<Effect<W, P>> {
+    fn timeout(&mut self, now: Instant) -> Vec<Effect<W, P>> {
         (**self).timeout(now)
     }
 
-    fn deadline(&self) -> Option<Timestamp> {
+    fn deadline(&self) -> Option<Instant> {
         (**self).deadline()
     }
 }
@@ -293,20 +293,18 @@ pub struct Adapter<W, P: Payload, E> {
     commands: Sender<Commanded>,
     rewards: Sender<Rewarded>,
     records: Sender<Record<P>>,
-    clock: Clock,
 }
 
 impl<W: Serialize + Copy + Send + 'static, P: Payload, E: Environment<W, P>> Adapter<W, P, E> {
     /// Wraps `environment`, sending the controls it asks for on `commands`,
-    /// writing the rewards it assigns to `records` stamped by `clock`, and
-    /// naming each rewarded agent on `rewards` for the episode to check.
+    /// writing the rewards it assigns to `records`, and naming each rewarded
+    /// agent on `rewards` for the episode to check.
     pub const fn new(
         environment: E,
         rewardable: BTreeSet<ActorId>,
         commands: Sender<Commanded>,
         rewards: Sender<Rewarded>,
         records: Sender<Record<P>>,
-        clock: Clock,
     ) -> Self {
         Self {
             environment,
@@ -315,7 +313,6 @@ impl<W: Serialize + Copy + Send + 'static, P: Payload, E: Environment<W, P>> Ada
             commands,
             rewards,
             records,
-            clock,
         }
     }
 
@@ -367,12 +364,13 @@ impl<W: Serialize + Copy + Send + 'static, P: Payload, E: Environment<W, P>> Ada
                         });
                         continue;
                     };
-                    // Stamped now, so that `created` is the instant the
-                    // reward was decided rather than the instant anybody
-                    // got around to it.
+                    // Stamped now, so that `t` is the instant the reward was
+                    // decided rather than the instant anybody got around to
+                    // it. The instant goes on unconverted; the writer is
+                    // what measures it from the episode's origin.
                     let record = RewardRecord {
                         agent,
-                        created: self.clock.now(),
+                        t: Instant::now(),
                         value,
                     };
                     let _ = self.records.send(record.into());
@@ -386,7 +384,7 @@ impl<W: Serialize + Copy + Send + 'static, P: Payload, E: Environment<W, P>> Ada
 impl<W: Serialize + Copy + Send + 'static, P: Payload, E: Environment<W, P>> Handler<P>
     for Adapter<W, P, E>
 {
-    fn start(&mut self, now: Timestamp) -> Vec<Action<P>> {
+    fn start(&mut self, now: Instant) -> Vec<Action<P>> {
         let effects = self.environment.start(now);
         self.split(effects)
     }
@@ -396,12 +394,12 @@ impl<W: Serialize + Copy + Send + 'static, P: Payload, E: Environment<W, P>> Han
         self.split(effects)
     }
 
-    fn timeout(&mut self, now: Timestamp) -> Vec<Action<P>> {
+    fn timeout(&mut self, now: Instant) -> Vec<Action<P>> {
         let effects = self.environment.timeout(now);
         self.split(effects)
     }
 
-    fn deadline(&self) -> Option<Timestamp> {
+    fn deadline(&self) -> Option<Instant> {
         self.environment.deadline()
     }
 }
@@ -414,7 +412,6 @@ impl<W, P: Payload, E> std::fmt::Debug for Adapter<W, P, E> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
 
     use crossbeam_channel::{Receiver, unbounded};
 
@@ -427,13 +424,8 @@ mod tests {
     /// three effects, and these tests are about where each effect goes.
     fn observation() -> Observation<TestPayload> {
         Observation {
-            message: Message::new(
-                "a",
-                ["environment"],
-                Timestamp::default(),
-                TestPayload::Step(1),
-            ),
-            received: Timestamp::default(),
+            message: Message::new("a", ["environment"], 0, TestPayload::Step(1)),
+            at: Instant::now(),
         }
     }
 
@@ -442,7 +434,7 @@ mod tests {
     struct Opener;
 
     impl Environment<i32, TestPayload> for Opener {
-        fn start(&mut self, _now: Timestamp) -> Vec<Effect<i32, TestPayload>> {
+        fn start(&mut self, _now: Instant) -> Vec<Effect<i32, TestPayload>> {
             vec![
                 Effect::control(["a", "b"], Control::Start),
                 Effect::Act(Action::to(["a"], TestPayload::Step(1))),
@@ -470,14 +462,7 @@ mod tests {
         let (paid, rewarded) = unbounded();
         let (recorder, records) = unbounded();
         Rig {
-            adapter: Adapter::new(
-                Opener,
-                ids(["a", "b"]),
-                commands,
-                paid,
-                recorder,
-                Clock::start(),
-            ),
+            adapter: Adapter::new(Opener, ids(["a", "b"]), commands, paid, recorder),
             commanded,
             rewarded,
             records,
@@ -488,7 +473,7 @@ mod tests {
     fn the_adapter_hands_the_loop_the_actions_and_the_episode_the_controls() {
         let mut rig = rig();
         assert_eq!(
-            rig.adapter.start(Timestamp::default()),
+            rig.adapter.start(at(0)),
             [Action::to(["a"], TestPayload::Step(1))],
             "the loop sees an action and nothing else"
         );
@@ -516,7 +501,7 @@ mod tests {
         // rewarded and not the environment that decided it, and the loop
         // is handed nothing to send on its account.
         let mut rig = rig();
-        rig.adapter.start(Timestamp::default());
+        rig.adapter.start(at(0));
         assert!(rig.records.try_recv().is_err(), "the start rewards nobody");
         let actions = rig.adapter.handle(&observation());
         assert!(actions.is_empty(), "a reward is not an action: {actions:?}");
@@ -542,7 +527,7 @@ mod tests {
     struct Scorer;
 
     impl Environment<f64, TestPayload> for Scorer {
-        fn start(&mut self, _now: Timestamp) -> Vec<Effect<f64, TestPayload>> {
+        fn start(&mut self, _now: Instant) -> Vec<Effect<f64, TestPayload>> {
             vec![Effect::reward("a", 0.5)]
         }
 
@@ -559,9 +544,8 @@ mod tests {
         let (commands, _commanded) = unbounded();
         let (paid, _rewarded) = unbounded();
         let (recorder, records) = unbounded::<Record<TestPayload>>();
-        let mut adapter =
-            Adapter::new(Scorer, ids(["a"]), commands, paid, recorder, Clock::start());
-        assert!(adapter.start(Timestamp::default()).is_empty());
+        let mut adapter = Adapter::new(Scorer, ids(["a"]), commands, paid, recorder);
+        assert!(adapter.start(at(0)).is_empty());
         let Record::Reward(record) = records.try_recv().unwrap() else {
             panic!("a reward is written as a reward record");
         };
@@ -572,7 +556,7 @@ mod tests {
     struct Stranger;
 
     impl Environment<i32, TestPayload> for Stranger {
-        fn start(&mut self, _now: Timestamp) -> Vec<Effect<i32, TestPayload>> {
+        fn start(&mut self, _now: Instant) -> Vec<Effect<i32, TestPayload>> {
             vec![Effect::reward("nobody", 1)]
         }
 
@@ -589,15 +573,8 @@ mod tests {
         let (commands, _commanded) = unbounded();
         let (paid, rewarded) = unbounded();
         let (recorder, records) = unbounded::<Record<TestPayload>>();
-        let mut adapter = Adapter::new(
-            Stranger,
-            ids(["a", "b"]),
-            commands,
-            paid,
-            recorder,
-            Clock::start(),
-        );
-        assert!(adapter.start(Timestamp::default()).is_empty());
+        let mut adapter = Adapter::new(Stranger, ids(["a", "b"]), commands, paid, recorder);
+        assert!(adapter.start(at(0)).is_empty());
         assert_eq!(
             rewarded.try_recv(),
             Ok(Rewarded {
@@ -618,7 +595,7 @@ mod tests {
         drop(rig.rewarded);
         drop(rig.records);
         assert_eq!(
-            rig.adapter.start(Timestamp::default()),
+            rig.adapter.start(at(0)),
             [Action::to(["a"], TestPayload::Step(1))]
         );
         assert!(rig.adapter.handle(&observation()).is_empty());
@@ -660,12 +637,12 @@ mod tests {
     /// An environment that wants waking at an instant of its own, and
     /// remembers the `now` of each hook it is given.
     struct Punctual {
-        deadline: Option<Timestamp>,
-        readings: Vec<Timestamp>,
+        deadline: Option<Instant>,
+        readings: Vec<Instant>,
     }
 
     impl Environment<i32, TestPayload> for Punctual {
-        fn start(&mut self, now: Timestamp) -> Vec<Effect<i32, TestPayload>> {
+        fn start(&mut self, now: Instant) -> Vec<Effect<i32, TestPayload>> {
             self.readings.push(now);
             Vec::new()
         }
@@ -674,20 +651,19 @@ mod tests {
             Vec::new()
         }
 
-        fn timeout(&mut self, now: Timestamp) -> Vec<Effect<i32, TestPayload>> {
+        fn timeout(&mut self, now: Instant) -> Vec<Effect<i32, TestPayload>> {
             self.readings.push(now);
             Vec::new()
         }
 
-        fn deadline(&self) -> Option<Timestamp> {
+        fn deadline(&self) -> Option<Instant> {
             self.deadline
         }
     }
 
-    /// An instant, the way every other test module in the crate spells one.
-    fn at(nanos: u64) -> Timestamp {
-        Timestamp::from(Duration::from_nanos(nanos))
-    }
+    /// The instants these tests name, offset from the one fixed base every
+    /// test module in the crate shares; see [`testing::BASE`](crate::testing).
+    use crate::testing::at_nanos as at;
 
     #[test]
     fn the_adapter_forwards_the_environments_deadline_and_the_time() {
@@ -706,7 +682,6 @@ mod tests {
             commands,
             paid,
             recorder,
-            Clock::start(),
         );
         assert_eq!(Handler::deadline(&adapter), Some(wanted));
 

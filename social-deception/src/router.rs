@@ -49,7 +49,6 @@ use std::fmt;
 
 use crossbeam_channel::Sender;
 
-use crate::clock::Clock;
 use crate::message::{ActorId, Control, Delivery, Message, Payload};
 
 /// Why a message could not be routed.
@@ -117,20 +116,17 @@ pub struct Router<P: Payload> {
     /// is not a queue that broke (ADR-0012).
     stopped: BTreeSet<ActorId>,
     environment: ActorId,
-    clock: Clock,
 }
 
 impl<P: Payload> Router<P> {
     /// A router over the given queues, whose `environment` is the one agent
-    /// allowed to [`command`](Router::command), stamping every control it
-    /// sends with `clock`.
+    /// allowed to [`command`](Router::command).
     #[must_use]
-    pub fn new(queues: BTreeMap<ActorId, Queues<P>>, environment: ActorId, clock: Clock) -> Self {
+    pub fn new(queues: BTreeMap<ActorId, Queues<P>>, environment: ActorId) -> Self {
         Self {
             queues,
             stopped: BTreeSet::new(),
             environment,
-            clock,
         }
     }
 
@@ -247,7 +243,7 @@ impl<P: Payload> Router<P> {
         for id in to {
             self.queues_of(id)?
                 .queue
-                .send(Delivery::control(control, self.clock.now()))
+                .send(Delivery::Control(control))
                 .map_err(|_| RouteError::QueueClosed(id.clone()))?;
             deliveries += 1;
         }
@@ -351,7 +347,6 @@ mod tests {
     use crossbeam_channel::{Receiver, unbounded};
 
     use super::*;
-    use crate::clock::Timestamp;
     use crate::testing::{TestPayload, id};
 
     /// The receiving end of one agent's queue: what an agent's loop would
@@ -368,17 +363,14 @@ mod tests {
             queues.insert(ActorId::new(*name), Queues { queue: sender });
             ends.insert(ActorId::new(*name), receiver);
         }
-        (
-            Router::new(queues, ActorId::new(names[0]), Clock::start()),
-            ends,
-        )
+        (Router::new(queues, ActorId::new(names[0])), ends)
     }
 
     /// The message of a delivery, or a panic saying what it was instead.
     fn as_message(delivery: &Delivery<TestPayload>) -> &Message<TestPayload> {
         match delivery {
             Delivery::Message(message) => message,
-            other @ Delivery::Control { .. } => panic!("expected a message: {other:?}"),
+            other @ Delivery::Control(_) => panic!("expected a message: {other:?}"),
         }
     }
 
@@ -388,19 +380,14 @@ mod tests {
         names.iter().map(|name| ActorId::new(*name)).collect()
     }
 
-    /// A message from `sender` to `recipients`, created at a time the router
+    /// A message from `sender` to `recipients`, numbered as the router
     /// neither reads nor changes.
     fn message<const N: usize>(
         sender: &str,
         recipients: [&str; N],
         n: u64,
     ) -> Message<TestPayload> {
-        Message::new(
-            sender,
-            recipients,
-            Timestamp::default(),
-            TestPayload::Step(n),
-        )
+        Message::new(sender, recipients, 0, TestPayload::Step(n))
     }
 
     #[test]
@@ -423,15 +410,18 @@ mod tests {
     }
 
     #[test]
-    fn routing_leaves_the_senders_creation_time_alone() {
-        // The message was created when its sender sent it; the router carries
-        // it, and nothing about delivery changes when that was.
-        let (router, queues) = world(&["a", "b"]);
-        let created = Timestamp::from(std::time::Duration::from_nanos(40));
-        let sent = Message::new("a", ["b"], created, TestPayload::Step(1));
+    fn routing_leaves_the_senders_sequence_number_alone() {
+        // The number was the sender's when it sent it; the router carries the
+        // message and nothing about delivery renumbers it. One send to two
+        // recipients is one message and one number, so both copies read the
+        // same.
+        let (router, queues) = world(&["a", "b", "c"]);
+        let sent = Message::new("a", ["b", "c"], 40, TestPayload::Step(1));
         router.route(&sent).unwrap();
-        let delivered = queues[&id("b")].try_recv().unwrap();
-        assert_eq!(as_message(&delivered).created, created);
+        for who in ["b", "c"] {
+            let delivered = queues[&id(who)].try_recv().unwrap();
+            assert_eq!(as_message(&delivered).seq, 40);
+        }
     }
 
     #[test]
@@ -465,21 +455,18 @@ mod tests {
     }
 
     #[test]
-    fn a_control_goes_to_everyone_stamped_with_when_it_was_sent() {
+    fn a_control_goes_to_everyone_and_carries_no_time() {
+        // Nothing on the wire carries a time. When a control reached an agent
+        // is in that agent's own control record, which is written when it
+        // pops it.
         let (router, queues) = world(&["a", "b", "c"]);
-        let before = router.clock.now();
         assert_eq!(
             router.control(&all(&["a", "b", "c"]), Control::Start),
             Ok(3)
         );
-        let after = router.clock.now();
         for ends in queues.values() {
             let delivered = ends.try_recv().expect("a control was delivered");
-            let Delivery::Control { control, created } = delivered else {
-                panic!("a control is delivered as a control: {delivered:?}");
-            };
-            assert_eq!(control, Control::Start);
-            assert!(before <= created && created <= after);
+            assert_eq!(delivered, Delivery::Control(Control::Start));
             assert!(ends.try_recv().is_err(), "one control each, and no more");
         }
         assert_eq!(
@@ -552,15 +539,10 @@ mod tests {
         );
         for name in ["a", "b"] {
             let delivered = queues[&id(name)].try_recv().unwrap();
-            assert!(
-                matches!(
-                    delivered,
-                    Delivery::Control {
-                        control: Control::Stop,
-                        ..
-                    }
-                ),
-                "a stop was delivered to {name}: {delivered:?}"
+            assert_eq!(
+                delivered,
+                Delivery::Control(Control::Stop),
+                "a stop was delivered to {name}"
             );
         }
         assert_eq!(router.agents(), all(&["a", "b"]));
@@ -598,14 +580,9 @@ mod tests {
         let delivered: Vec<Delivery<TestPayload>> = queues[&id("b")].try_iter().collect();
         assert_eq!(delivered.len(), 3);
         assert_eq!(as_message(&delivered[0]).payload, TestPayload::Step(1));
-        assert!(
-            matches!(
-                delivered[1],
-                Delivery::Control {
-                    control: Control::Stop,
-                    ..
-                }
-            ),
+        assert_eq!(
+            delivered[1],
+            Delivery::Control(Control::Stop),
             "the stop is second, where it was sent: {delivered:?}"
         );
         assert_eq!(as_message(&delivered[2]).payload, TestPayload::Step(2));
