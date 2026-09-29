@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# Pre-commit hook: the same checks CI runs, so a commit that passes here is
-# very unlikely to fail there.
+# Pre-push hook: the same checks CI runs, so a push that passes here is very
+# unlikely to fail there. Running at push time rather than on every commit
+# keeps the full suite off the path of each individual commit, and a push
+# that publishes no commits skips the suite entirely.
 #
 # Wire it up once per clone with:
 #
@@ -12,6 +14,30 @@
 set -euo pipefail
 
 cd "$(git rev-parse --show-toplevel)"
+
+# Git describes the push on stdin, one line per ref:
+#
+#     <local ref> <local sha> <remote ref> <remote sha>
+#
+# Two shapes mean nothing is being published. No lines at all is an
+# up-to-date push, and an all-zero local sha is a branch deletion. Neither
+# puts new commits on the remote, so the suite would have nothing to say
+# about them. Anything else is real work arriving and earns the full run.
+publishes_commits() {
+    local local_ref local_sha remote_ref remote_sha
+    while read -r local_ref local_sha remote_ref remote_sha; do
+        [ -n "${local_sha:-}" ] || continue
+        case "$local_sha" in
+            *[!0]*) return 0 ;;
+        esac
+    done
+    return 1
+}
+
+if ! publishes_commits; then
+    printf 'Nothing to push; skipping the pre-push checks.\n'
+    exit 0
+fi
 
 step() {
     printf '\n==> %s\n' "$*"
@@ -48,4 +74,4 @@ else
     printf '   Install with: cargo install --locked typos-cli\n'
 fi
 
-printf '\nAll pre-commit checks passed.\n'
+printf '\nAll pre-push checks passed.\n'
