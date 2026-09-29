@@ -24,9 +24,9 @@ moment, and under
 also the one that stops a player at its death, with a stop that now takes
 effect ahead of anything queued.
 
-Selections already go through the moderator. A player sends its point to
+Selections already go through the moderator. A player sends its selection to
 the moderator alone, and the moderator forwards it to the players who
-should see it, dropping points that arrive after their session closed. But
+should see it, dropping selections that arrive after their session closed. But
 it forwards by **impersonation**: `Action::relay` carries an `Origin`, and
 the router stamps the forwarded event with the original player as sender
 and the original creation time, so the log never records that a relay
@@ -46,9 +46,8 @@ players without the environment having produced it.
 **A Werewolf player addresses every action to the moderator and nobody else.
 The moderator decides who observes it and sends it on.**
 
-- During the day, the moderator sends each player's `TypingStarted`, `Say`
-  and `TypingEnded` to every living player except the speaker, who already
-  knows what it said.
+- During the day, the moderator sends each player's speech to every living
+  player except the speaker, who already knows what it said.
 - The message the moderator sends on is its own message, with its own
   sequence number. Its payload carries an `Envelope` of the speaker's
   message ([ADR-0016](0016-actors-perceive-on-one-thread-and-decide-on-another.md)),
@@ -56,14 +55,14 @@ The moderator decides who observes it and sends it on.**
   speaker's action by the envelope's sender and sequence number.
 - Selections are relayed the same way. `Origin` and `Action::relay` go: a
   forwarded selection is the moderator's own message, its envelope names
-  the player who pointed, and `Knowledge` reads the actor from the envelope
+  the player who selected, and `Knowledge` reads the actor from the envelope
   rather than from the message's sender.
 - Players no longer compute recipients for speech. A player's `Knowledge`
   still records what it heard, in the order it observed it.
 - The moderator relays with the same determinism rule as everything else it
   does ([ADR-0016](0016-actors-perceive-on-one-thread-and-decide-on-another.md)):
   it applies its rules after each observation, never waiting for a lull, so the
-  point that reaches a majority ends the day even if a switch arrived right
+  selection that reaches a majority ends the day even if a switch arrived right
   behind it.
 - A `debug_assert!` in the player's code checks that every action is
   addressed to the moderator alone. Players cooperate with the moderator and
@@ -146,10 +145,10 @@ does today.
 **`RequestKind` becomes `SessionKind`.** The `Request` message it was named
 for was removed by
 [ADR-0014](0014-events-carry-information-controls-carry-instruction.md); what
-it names now is the kind of pointing session a phase opens.
+it names now is the kind of selection session a phase opens.
 
 **`Player` implements `Policy`, and `Moderator` implements `Step`.** `Player`
-folds each observation into `Knowledge` and returns its point, if any, as an
+folds each observation into `Knowledge` and returns its selection, if any, as an
 action. The moderator's effects become `Effect`s returned from `step`, and
 its opening move comes from `start`.
 
@@ -158,7 +157,7 @@ after each observation and never waits for a lull, so a seeded game still decide
 each phase the same way. Its random generator is drawn from once per
 decision, never once per call.
 
-**Pointing sessions time points by arrival.** A session stamps each point
+**Selection sessions time selections by arrival.** A session stamps each selection
 with `observation.at`, not with the time `step` runs, and closes on a
 reminder the moderator sets for itself at the session's limit and again on
 each restart of the quiet period. A reminder that arrives for a limit that

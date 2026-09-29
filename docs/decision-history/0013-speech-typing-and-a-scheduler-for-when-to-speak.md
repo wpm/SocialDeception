@@ -1,13 +1,14 @@
 # ADR-0013: Speech and typing are events, and a scheduler decides when to speak
 
-**Status:** Accepted
+**Status:** Superseded by [ADR-0019](0019-speech-streams-and-nobody-announces-typing.md)
 **Date:** 2026-09-26
 **Deciders:** Bill McNeill
 **Amends:** [ADR-0005](0005-policy-separates-decisions-from-rules.md)
 **Depends on:** [ADR-0010](0010-a-handler-sets-its-own-deadline.md),
 [ADR-0011](0011-werewolf-phases-are-timed-pointing-sessions.md),
 [ADR-0012](0012-a-dead-player-stops.md)
-**Amended by:** [ADR-0018](0018-werewolf-speech-goes-through-the-moderator.md), under which speech goes to the moderator, which relays it to the living, and [ADR-0016](0016-actors-perceive-on-one-thread-and-decide-on-another.md) lets a policy yield `TypingStarted` before its model call
+**Amended by:** [ADR-0018](0018-werewolf-speech-goes-through-the-moderator.md), under which speech goes to the moderator, which relays it to the living
+**Superseded by:** [ADR-0019](0019-speech-streams-and-nobody-announces-typing.md), under which speech streams as it is generated in numbered pieces of an utterance, there are no typing events, and when a player considers speaking is part of the player's own state rather than a separate scheduler
 
 ## Context
 
