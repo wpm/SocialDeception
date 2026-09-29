@@ -132,10 +132,15 @@ use crate::werewolf::seed::{TIES, pick, seed_for};
 
 /// What the game wants said, in the order it wants it said.
 ///
-/// Every directive names its recipients, and none names nobody: the choice
-/// of recipients is the whole hidden-information mechanism, and the one
+/// Every directive names its recipients: the choice of recipients is the
+/// whole hidden-information mechanism, and the one
 /// exception ADR-0004 made for the [`Outcome`] is withdrawn (ADR-0007),
 /// which is why the outcome is a `Narrate` to the living like any other.
+///
+/// None of them names nobody. The runtime allows an action addressed to
+/// nobody, so that is a property of how this game is built rather than one
+/// anything enforces; `every_action_names_somebody` in
+/// [`moderator`](super::moderator) is what holds it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Directive {
     /// To exactly these agents.

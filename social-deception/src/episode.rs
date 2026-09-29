@@ -978,26 +978,24 @@ mod tests {
         }
     }
 
-    /// Names everybody at once when it starts, then waits to hear from
-    /// everybody it expects to answer before declaring itself done.
+    /// Names the spokes and the environment at once when it starts, then
+    /// waits to hear back from every spoke before declaring itself done.
     ///
-    /// It addresses more agents than it expects to hear from: the
-    /// environment is told what the spokes are told and says nothing back.
+    /// It addresses one more agent than it hears from: the environment is
+    /// told what the spokes are told and says nothing back.
     struct Hub {
-        peers: BTreeSet<ActorId>,
-        expects: usize,
+        spokes: BTreeSet<ActorId>,
         heard: usize,
     }
 
     impl Hub {
-        fn addressing<I, A>(peers: I, expects: usize) -> Self
+        fn addressing<I, A>(spokes: I) -> Self
         where
             I: IntoIterator<Item = A>,
             A: Into<ActorId>,
         {
             Self {
-                peers: peers.into_iter().map(Into::into).collect(),
-                expects,
+                spokes: spokes.into_iter().map(Into::into).collect(),
                 heard: 0,
             }
         }
@@ -1005,14 +1003,15 @@ mod tests {
 
     impl Handler<Counting> for Hub {
         fn start(&mut self, _now: Timestamp) -> Vec<Action<Counting>> {
-            vec![Action::to(self.peers.clone(), Say(0))]
+            let everybody = self.spokes.iter().cloned().chain([ActorId::new(REFEREE)]);
+            vec![Action::to(everybody, Say(0))]
         }
 
         fn handle(&mut self, observation: &Observation<Counting>) -> Vec<Action<Counting>> {
             if count(observation).is_some() {
                 self.heard += 1;
             }
-            if self.heard >= self.expects {
+            if self.heard >= self.spokes.len() {
                 vec![done()]
             } else {
                 Vec::new()
@@ -1247,10 +1246,7 @@ mod tests {
             },
         );
         episode
-            .add(
-                "hub",
-                Hub::addressing(spokes.iter().cloned().chain([REFEREE.to_owned()]), 6),
-            )
+            .add("hub", Hub::addressing(spokes.iter().cloned()))
             .unwrap();
         for spoke in &spokes {
             episode.add(spoke.clone(), Spoke).unwrap();
@@ -1414,10 +1410,10 @@ mod tests {
         assert_eq!(
             EpisodeError::Route {
                 agent: ActorId::new("a"),
-                error: RouteError::Loopback(ActorId::new("a"))
+                error: RouteError::UnknownAgent(ActorId::new("z"))
             }
             .to_string(),
-            "agent a sent a message that could not be routed: agent a addressed itself"
+            "agent a sent a message that could not be routed: no agent z in the roster"
         );
         assert_eq!(
             EpisodeError::Stalled {

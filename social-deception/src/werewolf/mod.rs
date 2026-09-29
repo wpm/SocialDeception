@@ -69,10 +69,8 @@
 //!
 //! # Every message names its recipients
 //!
-//! The runtime allows an action addressed to nobody, but this game never
-//! sends one: every message here is said to somebody in particular, because
-//! that is the sender's decision. A narration goes to one player, to the
-//! living, or to the pack,
+//! Every message here names its recipients, because that is the sender's
+//! decision: a narration goes to one player, to the living, or to the pack,
 //! and that choice of recipients is the whole hidden-information mechanism
 //! (see ADR-0004). A player acts on observing that a phase has begun,
 //! which is what gives an agent in a turnless runtime its decision points:

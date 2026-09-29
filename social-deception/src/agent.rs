@@ -327,8 +327,8 @@ impl Received for Instruction {
 /// `Debug`, `Clone` and equality are written out for the same reason
 /// [`Message`]'s are.
 pub struct Action<D: Domain> {
-    /// The agents to send it to. It may be empty: an action need not be
-    /// directed at anyone, and one addressed to nobody is still logged.
+    /// The agents to send it to, possibly none. The set never contains the
+    /// sender; the router enforces that.
     pub recipients: BTreeSet<ActorId>,
     /// What to say.
     pub payload: D::Payload,
@@ -1402,28 +1402,16 @@ mod tests {
         }
     }
 
-    /// Names both of its peers a step when it starts.
-    struct Town;
+    /// Says one step to the agents it was built with when it starts, and
+    /// nothing after that.
+    ///
+    /// Built with nobody it is a soliloquist: an action need not be directed
+    /// at anyone, and what one addressed to nobody is for is the log.
+    struct Town(&'static [&'static str]);
 
     impl Handler<TestDomain> for Town {
         fn start(&mut self, _now: Timestamp) -> Vec<Action<TestDomain>> {
-            vec![Action::to(["b", "c"], TestPayload::Step(0))]
-        }
-
-        fn handle(&mut self, _: &Observation<TestDomain>) -> Vec<Action<TestDomain>> {
-            Vec::new()
-        }
-    }
-
-    /// Says one thing to nobody when it starts.
-    ///
-    /// An action need not be directed at anyone. What it is for is the log:
-    /// the agent went on the record, and nobody heard it.
-    struct Soliloquist;
-
-    impl Handler<TestDomain> for Soliloquist {
-        fn start(&mut self, _now: Timestamp) -> Vec<Action<TestDomain>> {
-            vec![Action::to(Vec::<ActorId>::new(), TestPayload::Step(0))]
+            vec![Action::to(self.0.iter().copied(), TestPayload::Step(0))]
         }
 
         fn handle(&mut self, _: &Observation<TestDomain>) -> Vec<Action<TestDomain>> {
@@ -2280,7 +2268,7 @@ mod tests {
 
     #[test]
     fn an_action_is_sent_and_recorded_as_the_agents_it_names() {
-        let rig = rig(Town, None);
+        let rig = rig(Town(&["b", "c"]), None);
         rig.start();
         let sent = rig.dispatch().sent;
         assert_eq!(sent.len(), 1);
@@ -2300,7 +2288,7 @@ mod tests {
 
     #[test]
     fn an_action_addressed_to_nobody_is_still_stamped_and_logged() {
-        let rig = rig(Soliloquist, None);
+        let rig = rig(Town(&[]), None);
         rig.start();
         let sent = rig.dispatch().sent;
         assert_eq!(sent.len(), 1, "the action is sent like any other");
@@ -2553,7 +2541,7 @@ mod tests {
         let wires = wires(None);
         wires.control(Control::Start);
         wires.send(step("b", 1));
-        let agent = Agent::spawn(wires.wiring, Town, Clock::start());
+        let agent = Agent::spawn(wires.wiring, Town(&["b", "c"]), Clock::start());
         drop(wires.queue);
         agent.join().unwrap();
 

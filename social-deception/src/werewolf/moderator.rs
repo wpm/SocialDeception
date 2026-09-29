@@ -181,11 +181,9 @@ impl Moderator {
 /// player out of it, which is a control rather than a message (ADR-0012).
 fn send(directive: Directive) -> Effect<WerewolfDomain> {
     match directive {
-        Directive::Narrate { to, narration } => Effect::Act(Action {
-            recipients: to,
-            payload: Message::Narration(narration),
-            origin: None,
-        }),
+        Directive::Narrate { to, narration } => {
+            Effect::Act(Action::to(to, Message::Narration(narration)))
+        }
         // A forwarded selection is sent as the player that made it, not as the
         // moderator: what a recipient observes is what it would have
         // observed had the player addressed it directly (ADR-0014).
@@ -506,12 +504,10 @@ mod tests {
     /// to.
     fn announced_outcome(sent: &[Action<WerewolfDomain>]) -> (&BTreeSet<ActorId>, &Outcome) {
         sent.iter()
-            .find_map(|action| match action {
-                Action {
-                    recipients: to,
-                    payload: Message::Narration(Narration::Outcome(outcome)),
-                    ..
-                } => Some((to, outcome)),
+            .find_map(|action| match &action.payload {
+                Message::Narration(Narration::Outcome(outcome)) => {
+                    Some((&action.recipients, outcome))
+                }
                 _ => None,
             })
             .expect("no outcome was announced")
@@ -734,10 +730,10 @@ mod tests {
     #[test]
     fn every_action_names_somebody() {
         // Routing is the whole hidden-information mechanism, and there is
-        // no longer an exception for the outcome: every message the
-        // moderator sends names its recipients. The runtime allows an
-        // action addressed to nobody; this game never sends one, because
-        // everything it says is said to somebody in particular.
+        // no longer an exception for the outcome: everything the moderator
+        // says is said to somebody in particular. The runtime would carry
+        // an action addressed to nobody; this game never sends one, and
+        // this is where that is held.
         for Played { sent, .. } in played_games() {
             for action in &sent {
                 assert!(
