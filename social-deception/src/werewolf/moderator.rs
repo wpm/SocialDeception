@@ -119,21 +119,25 @@ impl Moderator {
     ///
     /// # Panics
     ///
-    /// If a player sends the moderator a narration.
+    /// If a player sends the moderator a narration or a relay: both are the
+    /// moderator's to send, so either is a player claiming to be it.
     fn fold(&mut self, observation: &Observation<Message>) -> Vec<Directive> {
         let sender = &observation.message.sender;
         let now = observation.at;
         let mut directives = match &observation.message.payload {
             // The message's own sequence number goes in as well as the
-            // arrival: a forwarded selection carries the player's
-            // `(sender, seq)` so the relay joins back to the player's
-            // action, while `now` is when the moderator got it, which is
-            // what the session clocks run on.
+            // arrival: the relay's envelope carries the player's `(sender,
+            // seq)` so it joins back to the player's action, while `now` is
+            // when the moderator got it, which is what the session clocks
+            // run on.
             Message::Select(selection) => {
                 self.game
                     .select(sender, selection, observation.message.seq, now)
             }
             Message::Narration(_) => panic!("{sender} sent the moderator a narration"),
+            // Relaying is the moderator's own move, so a player sending one
+            // is a player claiming to be the moderator.
+            Message::Relayed(_) => panic!("{sender} sent the moderator a relay"),
         };
         // A deadline that passed while this observation waited joins its
         // cycle (ADR-0008), so a session whose time is up closes here
@@ -184,15 +188,13 @@ fn send(directive: Directive) -> Effect<i32, Message> {
         Directive::Narrate { to, narration } => {
             Effect::Act(Action::to(to, Message::Narration(narration)))
         }
-        // A forwarded selection is sent as the player that made it, not as the
-        // moderator: what a recipient observes is what it would have
-        // observed had the player addressed it directly (ADR-0014).
-        Directive::Forward {
-            from,
-            seq,
-            to,
-            selection,
-        } => Effect::Act(Action::relay(from, seq, to, Message::Select(selection))),
+        // A relayed selection is the moderator's own message, numbered among
+        // the moderator's, and the envelope inside it names the player whose
+        // selection it is (ADR-0018). No message claims a sender other than
+        // the actor that sent it.
+        Directive::Forward { envelope, to } => {
+            Effect::Act(Action::to(to, Message::Relayed(envelope)))
+        }
         Directive::Stop { who } => Effect::control([who], Control::Stop),
     }
 }
@@ -220,8 +222,8 @@ impl Environment<i32, Message> for Moderator {
     ///
     /// # Panics
     ///
-    /// If a player sends the moderator a narration, or if a selection is one
-    /// the game cannot accept; see [`Game::select`].
+    /// If a player sends the moderator a narration or a relay, or if a
+    /// selection is one the game cannot accept; see [`Game::select`].
     fn handle(&mut self, observation: &Observation<Message>) -> Vec<Effect<i32, Message>> {
         // Whether the game is over is the game's to say, and it is asked
         // before every observation, so the one that ends it is the last
@@ -267,7 +269,7 @@ mod tests {
 
     use super::*;
 
-    use crate::message::ActorId;
+    use crate::message::{ActorId, Envelope};
     use crate::testing::{fast, id, ids, observed, town, village};
     use crate::werewolf::assignment::Assignment;
     use crate::werewolf::message::{Narration, Phase, Round, Select, SessionKind};
@@ -735,6 +737,49 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_relayed_selection_is_the_moderators_own_message_naming_the_player() {
+        // The moderator no longer impersonates anybody (ADR-0017). A
+        // selection it passes on is a message of its own, carrying a
+        // `Relayed` whose
+        // envelope names the player who made it and which of that player's
+        // messages it was. The players never see a bare `Select`, and the
+        // moderator's own name never appears in an envelope.
+        //
+        // The pack's night session is the smallest case: bob and frank are
+        // the pack, so bob's devour names frank as the one who should see it
+        // and the moderator has somebody to relay it to.
+        let assignment = town();
+        let (mut moderator, _receiver) = moderator(assignment.clone());
+        moderator.start(at(0));
+        let selection = Select {
+            round: Round::FIRST,
+            kind: SessionKind::Devour,
+            target: id("alice"),
+            seen_by: ids(["frank"]),
+        };
+        let observed = observed(crate::Message::new(
+            "bob",
+            [MODERATOR],
+            7,
+            Message::Select(selection.clone()),
+        ));
+        let sent = actions(&moderator.handle(&observed));
+        let [relay] = sent.as_slice() else {
+            panic!("accepting the devour relays it and nothing else: {sent:?}");
+        };
+        assert_eq!(
+            relay.payload,
+            Message::Relayed(Envelope::new("bob", 7, selection)),
+            "the envelope names bob and bob's message 7"
+        );
+        assert_eq!(
+            relay.recipients,
+            ids(["frank"]),
+            "and it goes to exactly the audience the selection named"
+        );
     }
 
     #[test]

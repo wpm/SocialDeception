@@ -255,10 +255,17 @@ pub struct Instruction {
 
 /// What an agent sends: to whom, and what.
 ///
-/// No sender and no sequence number, unless the action is a relay. An action
-/// is not numbered until it is sent, and the handler cannot know its number,
-/// so the loop stamps both as it hands the action to the router; the stamped
-/// value is the [`Message`] on the wire and what the `action` record logs.
+/// No sender and no sequence number. An action is not numbered until it is
+/// sent, and the handler cannot know its number, so the loop stamps both as
+/// it hands the action to the router; the stamped value is the [`Message`] on
+/// the wire and what the `action` record logs.
+///
+/// **Every message an agent sends is its own.** There is no way to name
+/// another sender, so no record ever claims a sender other than the agent
+/// that wrote it. An agent passing another's message on sends a message of
+/// its own whose payload carries an [`Envelope`](crate::Envelope) of what it
+/// received (ADR-0017): the relay is a fact the log records rather than one
+/// it hides.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Action<P: Payload> {
     /// The agents to send it to, possibly none. The set never contains the
@@ -266,15 +273,6 @@ pub struct Action<P: Payload> {
     pub recipients: BTreeSet<ActorId>,
     /// What to say.
     pub payload: P,
-    /// Which message this one passes on, when this action is one agent
-    /// relaying another's.
-    ///
-    /// `None` for the ordinary case: the action is the sender's own and the
-    /// loop stamps it with the sender's own name and next number. `Some` is
-    /// a **relay**, and the stamp keeps the key that is here instead, so the
-    /// recipient sees the message the original actor would have sent it
-    /// directly. See [`Action::relay`].
-    pub origin: Option<Key>,
 }
 
 impl<P: Payload> Action<P> {
@@ -287,32 +285,6 @@ impl<P: Payload> Action<P> {
         Self {
             recipients: recipients.into_iter().map(Into::into).collect(),
             payload,
-            origin: None,
-        }
-    }
-
-    /// One agent passing on another's message, addressed to `recipients`.
-    ///
-    /// The message the recipients observe carries the original `(sender,
-    /// seq)`, not the relaying agent's name and not a number of the relaying
-    /// agent's. What a recipient sees is therefore exactly what it would
-    /// have seen had the original actor addressed it directly, and it joins
-    /// to the original actor's action record like any other observation.
-    ///
-    /// The relaying agent's own numbering is untouched: a sequence number is
-    /// per sender, and this message is not the relaying agent's to number.
-    pub fn relay<I, A>(sender: impl Into<ActorId>, seq: u64, recipients: I, payload: P) -> Self
-    where
-        I: IntoIterator<Item = A>,
-        A: Into<ActorId>,
-    {
-        Self {
-            recipients: recipients.into_iter().map(Into::into).collect(),
-            payload,
-            origin: Some(Key {
-                from: sender.into(),
-                seq,
-            }),
         }
     }
 }
@@ -609,8 +581,7 @@ struct Loop<P: Payload, H, T> {
     /// The next number in this agent's message sequence.
     ///
     /// One per message sent, so the numbers are dense in the messages this
-    /// agent sent and mean nothing for anything else it logs. A relayed
-    /// message takes none: it is not this agent's to number.
+    /// agent sent and mean nothing for anything else it logs.
     next_seq: u64,
 
     /// Whether the agent has been started. A second `Start` is a bug in
@@ -951,30 +922,19 @@ where
     /// hundred nanoseconds apart are already distinct, whatever the clock's
     /// resolution says.
     ///
-    /// # A relay is stamped with whose message it is
-    ///
-    /// An action carrying an origin is one agent passing on another's
-    /// message, and it keeps the original sender and sequence number
-    /// ([`Action::relay`]). This agent's own numbering is left alone: a
-    /// sequence number is per sender, and a relayed message is not this
-    /// agent's to number. Taking one for it would leave a gap in the numbers
-    /// of the messages this agent really sent.
+    /// Every message gets a number of this agent's, relays included: a
+    /// message an agent sends is its own however it came by what it carries,
+    /// so the numbers are dense over everything it sent and there is no
+    /// send that skips one (ADR-0017).
     fn stamp(&mut self, action: Action<P>) -> Message<P> {
         let Action {
             recipients,
             payload,
-            origin,
         } = action;
-        let Key { from, seq } = origin.unwrap_or_else(|| {
-            let seq = self.next_seq;
-            self.next_seq += 1;
-            Key {
-                from: self.wiring.id.clone(),
-                seq,
-            }
-        });
+        let seq = self.next_seq;
+        self.next_seq += 1;
         Message {
-            sender: from,
+            sender: self.wiring.id.clone(),
             recipients,
             seq,
             payload,
@@ -1033,6 +993,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::message::Envelope;
     use crate::testing::{TestPayload, joined, parse_lines, recording};
     use crate::timer::{ManualTimer, ManualTimerControl};
 
@@ -1090,7 +1051,7 @@ mod tests {
         }
 
         fn handle(&mut self, observation: &Observation<TestPayload>) -> Vec<Action<TestPayload>> {
-            let TestPayload::Step(n) = observation.message.payload;
+            let n = observation.message.payload.step();
             self.seen.push(observation.message.payload.clone());
             vec![Action::to(
                 [observation.message.sender.clone()],
@@ -1234,35 +1195,24 @@ mod tests {
         }
     }
 
-    /// Passes on whatever it observes, to `to`, as the agent that sent it.
+    /// Passes on what it observes, to `to`, in an envelope, and then says
+    /// something of its own.
     ///
-    /// The stand-in for an environment that relays one agent's action to
-    /// another: what it emits is not its own action but somebody else's,
-    /// carried on.
-    struct Relays(&'static str);
-
-    impl Handler<TestPayload> for Relays {
-        fn handle(&mut self, observation: &Observation<TestPayload>) -> Vec<Action<TestPayload>> {
-            vec![Action::relay(
-                observation.message.sender.clone(),
-                observation.message.seq,
-                [self.0],
-                observation.message.payload.clone(),
-            )]
-        }
-    }
-
-    /// Relays what it observes to `to`, then says something of its own.
+    /// The stand-in for an environment that relays one agent's message to
+    /// another. What it sends is **its own** message either way: relaying is
+    /// carrying somebody else's words, not borrowing their name (ADR-0017).
     struct RelaysThenSpeaks(&'static str);
 
     impl Handler<TestPayload> for RelaysThenSpeaks {
         fn handle(&mut self, observation: &Observation<TestPayload>) -> Vec<Action<TestPayload>> {
             vec![
-                Action::relay(
-                    observation.message.sender.clone(),
-                    observation.message.seq,
+                Action::to(
                     [self.0],
-                    observation.message.payload.clone(),
+                    TestPayload::Relayed(Envelope::new(
+                        observation.message.sender.clone(),
+                        observation.message.seq,
+                        observation.message.payload.step(),
+                    )),
                 ),
                 Action::to([self.0], TestPayload::Step(42)),
             ]
@@ -2088,30 +2038,12 @@ mod tests {
     }
 
     #[test]
-    fn a_relayed_action_keeps_the_original_senders_key() {
-        // What `c` observes must be indistinguishable from what `b` would
-        // have sent it directly, and it joins back to `b`'s own action
-        // record by `(b, seq)`.
-        let rig = rig(Relays("c"), None);
-        rig.start();
-        rig.cycle();
-        rig.dispatch();
-        rig.send(step_at("b", 1, 7));
-        let dispatch = rig.dispatch();
-        assert_eq!(dispatch.sent.len(), 1);
-        let sent = &dispatch.sent[0];
-        assert_eq!(sent.sender, ActorId::new("b"), "whose message it is");
-        assert_eq!(sent.seq, 7, "and which of that agent's");
-        assert_eq!(sent.recipients, ["c"].map(ActorId::new).into());
-        rig.stop();
-        rig.agent.join().unwrap();
-    }
-
-    #[test]
-    fn relaying_does_not_advance_the_relaying_agents_own_numbering() {
-        // A sequence number is per sender. A relayed message is not this
-        // agent's to number, so taking one for it would leave a gap in the
-        // numbers of the messages this agent really sent.
+    fn a_relay_is_the_relaying_agents_own_message_and_takes_its_own_number() {
+        // No message claims a sender other than the agent that sent it
+        // (ADR-0017). A relay is `a`'s message, numbered among `a`'s, and
+        // what says whose words it carries is the envelope in its payload.
+        // So the numbers stay dense over everything `a` sent: the relay
+        // takes zero and the message after it takes one.
         let rig = rig(RelaysThenSpeaks("c"), None);
         rig.start();
         rig.cycle();
@@ -2121,11 +2053,16 @@ mod tests {
         let [relayed, own] = dispatch.sent.as_slice() else {
             panic!("the cycle relays and then speaks: {:?}", dispatch.sent);
         };
-        assert_eq!((relayed.sender.as_str(), relayed.seq), ("b", 99));
+        assert_eq!((relayed.sender.as_str(), relayed.seq), ("a", 0));
+        assert_eq!(
+            relayed.payload,
+            TestPayload::Relayed(Envelope::new("b", 99, 1)),
+            "the envelope names the agent whose message it passes on"
+        );
         assert_eq!(
             (own.sender.as_str(), own.seq),
-            ("a", 0),
-            "its own first message is its own number zero"
+            ("a", 1),
+            "and the message after it is numbered next, with no gap"
         );
         rig.stop();
         rig.agent.join().unwrap();

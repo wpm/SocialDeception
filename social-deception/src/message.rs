@@ -172,6 +172,116 @@ impl<P: Payload> Message<P> {
     }
 }
 
+/// A received message's origin and payload, packaged so that an environment
+/// can pass it on without losing who said it.
+///
+/// A relay is the relaying actor's **own** message, with its own sequence
+/// number, and what it carries in its payload is one of these: the original
+/// sender, the original sequence number, and what was said (ADR-0017). So a
+/// recipient of a relay knows who spoke, and a reader of the log joins the
+/// relay back to the speaker's own action record on the envelope's `(from,
+/// seq)` while the outer record joins on the relayer's.
+///
+/// # One shape everywhere
+///
+/// An envelope sits inside a game's payload, where the framework never
+/// looks. So that a parser can follow relays without knowing any game's
+/// payload format, it serializes the same way in every application and
+/// wherever in a payload it appears:
+///
+/// ```json
+/// {"envelope":{"from":"alice","seq":7,"payload":{...}}}
+/// ```
+///
+/// The single key `envelope` is what marks it. The framework still reads
+/// nothing inside a payload; it only fixes how its own type is written, so
+/// that any tool can find relays by shape.
+///
+/// Which payloads carry one is a game's decision, not the framework's: a
+/// game that relays gives one of its payload variants an `Envelope`, and a
+/// game whose actors talk directly has none anywhere.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Envelope<P> {
+    /// The actor that sent the message being passed on.
+    pub from: ActorId,
+    /// Which of that actor's messages it was.
+    pub seq: u64,
+    /// What it said.
+    pub payload: P,
+}
+
+impl<P> Envelope<P> {
+    /// An envelope naming `from` and `seq` around `payload`.
+    ///
+    /// `payload` is whatever a game puts in an envelope, which need not be
+    /// its whole payload type: a game whose payload is an enum relays one
+    /// variant of it, and that variant's contents are what travels.
+    pub fn new(from: impl Into<ActorId>, seq: u64, payload: P) -> Self {
+        Self {
+            from: from.into(),
+            seq,
+            payload,
+        }
+    }
+}
+
+/// The one shape an envelope has everywhere: a single `envelope` key around
+/// `from`, `seq` and `payload` (ADR-0017).
+///
+/// Both directions go through this one type, so the shape is written down
+/// once and reading cannot drift from writing. It is generic over how it
+/// holds the origin and the payload so that writing can borrow them
+/// (`Shape<&ActorId, &P>`) while reading owns them (`Shape<ActorId, P>`).
+///
+/// `deny_unknown_fields` is what makes the single key a check rather than a
+/// convention: a payload that merely has a `from` and a `seq` of its own is
+/// not an envelope, and neither is an envelope with anything else beside
+/// them.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Shape<F, P> {
+    envelope: Body<F, P>,
+}
+
+/// The body an envelope's one key holds.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Body<F, P> {
+    from: F,
+    seq: u64,
+    payload: P,
+}
+
+impl<P: Serialize> Serialize for Envelope<P> {
+    /// Writes the shape above, borrowing rather than cloning.
+    ///
+    /// Written out rather than derived on `Envelope` itself because the shape
+    /// is a promise to every reader of a log, whatever `P` is, and deriving
+    /// it on the public type would leave the promise a consequence of which
+    /// serde attributes happened to sit there.
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        Shape {
+            envelope: Body {
+                from: &self.from,
+                seq: self.seq,
+                payload: &self.payload,
+            },
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de, P: Deserialize<'de>> Deserialize<'de> for Envelope<P> {
+    /// Reads back exactly what [`serialize`](Envelope::serialize) writes, so
+    /// that a game's payload type round trips through the log.
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let Shape {
+            envelope: Body { from, seq, payload },
+        } = Shape::<ActorId, P>::deserialize(deserializer)?;
+        Ok(Self { from, seq, payload })
+    }
+}
+
 /// One thing on an agent's queue: a message, or a control and when it was
 /// sent.
 ///
@@ -211,7 +321,7 @@ pub enum Delivery<P: Payload> {
 mod tests {
     use super::*;
 
-    #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     enum TestPayload {
         Step(u64),
     }
@@ -273,6 +383,76 @@ mod tests {
     fn a_control_serializes_as_its_name() {
         assert_eq!(json(&Control::Start), serde_json::json!("start"));
         assert_eq!(json(&Control::Stop), serde_json::json!("stop"));
+    }
+
+    #[test]
+    fn an_envelope_has_one_shape_whatever_it_carries() {
+        // The promise ADR-0017 makes to every reader of a log: one
+        // `envelope` key, and `from`, `seq` and `payload` under it. The
+        // payload's own type is the game's business and changes nothing
+        // about the envelope around it, so the shape is asserted over
+        // payloads that serialize as unlike things: a struct variant, a bare
+        // integer, a string and a null.
+        let shape = |payload: serde_json::Value| serde_json::json!({"envelope": {"from": "alice", "seq": 7, "payload": payload}});
+        assert_eq!(
+            json(&Envelope::new("alice", 7, TestPayload::Step(3))),
+            shape(serde_json::json!({"Step": 3}))
+        );
+        assert_eq!(
+            json(&Envelope::new("alice", 7, 3_u64)),
+            shape(serde_json::json!(3))
+        );
+        assert_eq!(
+            json(&Envelope::new("alice", 7, "spoken")),
+            shape(serde_json::json!("spoken"))
+        );
+        assert_eq!(
+            json(&Envelope::<Option<u8>>::new("alice", 7, None)),
+            shape(serde_json::Value::Null)
+        );
+    }
+
+    #[test]
+    fn an_envelope_says_who_spoke_and_nothing_of_the_relayers_own() {
+        // The sender, the number and what was said. Whom alice addressed is
+        // alice's action record's business, so the recipients are not in it;
+        // neither is anything of the actor doing the relaying.
+        let envelope = Envelope::new("alice", 7, TestPayload::Step(3));
+        assert_eq!(envelope.from, ActorId::new("alice"));
+        assert_eq!(envelope.seq, 7);
+        assert_eq!(envelope.payload, TestPayload::Step(3));
+        assert_eq!(
+            json(&envelope),
+            serde_json::json!(
+                {"envelope": {"from": "alice", "seq": 7, "payload": {"Step": 3}}}
+            )
+        );
+    }
+
+    #[test]
+    fn an_envelope_round_trips() {
+        let envelope = Envelope::new("alice", 7, TestPayload::Step(3));
+        let back: Envelope<TestPayload> = serde_json::from_value(json(&envelope)).unwrap();
+        assert_eq!(back, envelope);
+    }
+
+    #[test]
+    fn something_that_is_not_an_envelope_does_not_deserialize_as_one() {
+        // The single key is what marks an envelope, so a payload that
+        // happens to have a `from` and a `seq` at the top level is not one.
+        let bare = serde_json::json!({"from": "alice", "seq": 7, "payload": {"Step": 3}});
+        assert!(serde_json::from_value::<Envelope<TestPayload>>(bare).is_err());
+        // Nor is an envelope with anything else beside its three fields, or
+        // one missing any of them.
+        let extra = serde_json::json!(
+            {"envelope": {"from": "alice", "seq": 7, "payload": null, "to": "bob"}}
+        );
+        assert!(serde_json::from_value::<Envelope<TestPayload>>(extra).is_err());
+        let short = serde_json::json!({"envelope": {"from": "alice", "seq": 7}});
+        assert!(serde_json::from_value::<Envelope<TestPayload>>(short).is_err());
+        // And an envelope names nobody unless its `from` is an actor id.
+        let empty = serde_json::json!({"envelope": {"from": "", "seq": 7, "payload": {"Step": 3}}});
+        assert!(serde_json::from_value::<Envelope<TestPayload>>(empty).is_err());
     }
 
     #[test]

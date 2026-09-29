@@ -202,8 +202,8 @@ fn message(line: &Value) -> Message {
         .unwrap_or_else(|error| panic!("a payload is a werewolf message ({error}): {line}"))
 }
 
-/// The sender named inside a message record's envelope, which for a relay is
-/// the player whose message it is rather than the agent that sent it on.
+/// The sender named inside a message record's wire shape, which is always the
+/// agent that sent it: nothing an actor sends claims another (ADR-0017).
 fn sender_of(line: &Value) -> ActorId {
     ActorId::deserialize(&line["message"]["sender"]).expect("a message names its sender")
 }
@@ -233,8 +233,8 @@ fn recipients(line: &Value) -> BTreeSet<ActorId> {
 /// thread, so its own records reach the writer in the order it wrote them,
 /// and for the moderator that is the order it played the game in. A sequence
 /// number will not do: it belongs to the *message*, so the moderator's
-/// observations carry the players' numbers and a forward carries the
-/// forwarded player's.
+/// observations carry the players' numbers, which are dense over each
+/// player's records and not over the moderator's.
 fn records_of<'a>(
     lines: &'a [Value],
     agent: &'a ActorId,
@@ -246,32 +246,41 @@ fn records_of<'a>(
         .filter(move |(_, line)| line["type"] == kind && super::agent(line) == agent.as_str())
 }
 
-/// The selections the moderator passed on for a player: those among its
-/// actions stamped with that player as sender (ADR-0014).
+/// The selections the moderator passed on for a player: the
+/// [`Message::Relayed`] among its actions (ADR-0018).
 ///
-/// A forward is what says the moderator accepted the selection, so the checks
-/// read what a session decided off these (ADR-0015).
+/// A relay is what says the moderator accepted the selection, so the checks
+/// read what a session decided off these (ADR-0015). The player it belongs to
+/// is the envelope's sender, not the message's: the message is the
+/// moderator's own.
 fn forwards_of<'a>(
     lines: &'a [Value],
     config: &'a Config,
     players: &BTreeSet<&ActorId>,
 ) -> Vec<Forwarded<'a>> {
     records_of(lines, &config.moderator, "action")
-        .filter(|(_, line)| line["message"]["sender"] != config.moderator.as_str())
-        .map(|(at, line)| {
-            let Message::Select(selection) = message(line) else {
-                panic!("the moderator passes on only selections: {line}");
-            };
-            let from = ActorId::deserialize(&line["message"]["sender"]).unwrap();
+        .filter_map(|(at, line)| match message(line) {
+            Message::Relayed(envelope) => Some((at, line, envelope)),
+            Message::Narration(_) => None,
+            Message::Select(_) => {
+                panic!("the moderator relays a selection rather than sending one: {line}")
+            }
+        })
+        .map(|(at, line, envelope)| {
+            assert_eq!(
+                sender_of(line),
+                config.moderator,
+                "a relay is the moderator's own message: {line}"
+            );
             assert!(
-                players.contains(&from),
+                players.contains(&envelope.from),
                 "the moderator passes on a selection of a player's: {line}"
             );
             Forwarded {
                 at,
-                from,
+                from: envelope.from,
                 to: recipients(line),
-                selection,
+                selection: envelope.payload,
                 line,
             }
         })
@@ -321,15 +330,15 @@ impl<'a> Play<'a> {
         let forwarded = forwards_of(lines, config, &players);
         let said: Vec<Said> = records_of(lines, &config.moderator, "action")
             // What the moderator says for itself, which is every narration
-            // and nothing else: the forwards above are the players'
-            // actions, read from the same records.
-            .filter(|(_, line)| line["message"]["sender"] == config.moderator.as_str())
-            .map(|(at, line)| {
-                let message = message(line);
-                assert!(
-                    !matches!(message, Message::Select(_)),
-                    "the moderator narrates what it says for itself: {line}"
-                );
+            // and nothing else: the relays above carry the players'
+            // selections, read from the same records, and a bare selection is
+            // not the moderator's to send at all — `forwards_of` has already
+            // caught one.
+            .filter_map(|(at, line)| match message(line) {
+                Message::Narration(narration) => Some((at, line, narration)),
+                Message::Relayed(_) | Message::Select(_) => None,
+            })
+            .map(|(at, line, narration)| {
                 let to = recipients(line);
                 assert!(
                     to.iter().all(|who| players.contains(who)),
@@ -338,7 +347,7 @@ impl<'a> Play<'a> {
                 Said {
                     at,
                     to,
-                    message,
+                    message: Message::Narration(narration),
                     line,
                 }
             })
@@ -690,8 +699,8 @@ impl<'a> Play<'a> {
                     );
                     outcomes += 1;
                 }
-                Message::Select(_) => {
-                    unreachable!("a forwarded selection is not among the moderator's own words")
+                Message::Select(_) | Message::Relayed(_) => {
+                    unreachable!("a relayed selection is not among the moderator's own words")
                 }
             }
         }
@@ -814,7 +823,9 @@ impl<'a> Play<'a> {
                     living,
                 }) => phases.began(said, *round, *phase, living),
                 Message::Narration(narration) => phases.narrated(said, narration),
-                Message::Select(_) => unreachable!("the moderator sends no selections"),
+                Message::Select(_) | Message::Relayed(_) => {
+                    unreachable!("`said` is the moderator's narrations alone")
+                }
             }
         }
         phases.counts.close(phases.current);
@@ -1393,10 +1404,12 @@ mod tests {
         }
     }
 
-    /// A selection of the given round and session kind.
-    fn selection_in(round: u32, kind: &str) -> impl Fn(&Value) -> bool + '_ {
+    /// A **relayed** selection of the given round and session kind: what the
+    /// moderator sends, whose payload is the envelope rather than the
+    /// selection itself (ADR-0018).
+    fn relay_in(round: u32, kind: &str) -> impl Fn(&Value) -> bool + '_ {
         move |payload| {
-            let selection = &payload["Select"];
+            let selection = &payload["Relayed"]["envelope"]["payload"];
             selection["round"] == round && selection["kind"] == kind
         }
     }
@@ -1541,6 +1554,12 @@ mod tests {
 
     fn sender(line: &mut Value, from: &str) {
         line["message"]["sender"] = json!(from);
+    }
+
+    /// Rewrites who a relay says selected, which is the envelope's sender and
+    /// not the message's: the message is the moderator's own.
+    fn selected_by(line: &mut Value, from: &str) {
+        line["message"]["payload"]["Relayed"]["envelope"]["from"] = json!(from);
     }
 
     fn target(line: &mut Value, whom: &str) {
@@ -1723,12 +1742,12 @@ mod tests {
     #[should_panic(expected = "a devour goes to the rest of the living pack")]
     fn a_devour_passed_on_to_a_villager_is_caught() {
         // What a night session leaks is where its selections go, and since
-        // ADR-0015 a forward is the only thing the moderator says about
-        // one. dave and erin are the pack; alice is a villager, and a
-        // devour passed on to her tells her both that somebody is being
-        // eaten and, by who sent it, that dave is a wolf.
+        // ADR-0015 a relay is the only thing the moderator says about one.
+        // dave and erin are the pack; alice is a villager, and a devour
+        // passed on to her tells her both that somebody is being eaten and,
+        // by the envelope, that dave is a wolf.
         let mut lines = fixture();
-        let index = find(&lines, "moderator", "action", selection_in(1, "Devour"));
+        let index = find(&lines, "moderator", "action", relay_in(1, "Devour"));
         recipients(&mut lines[index], &["alice", "erin"]);
         check(&lines, &config());
     }
@@ -1803,8 +1822,8 @@ mod tests {
         // the living pack, so that it is who made the selection that trips
         // the check rather than where it went.
         let mut lines = fixture();
-        let index = find(&lines, "moderator", "action", selection_in(1, "Devour"));
-        sender(&mut lines[index], "alice");
+        let index = find(&lines, "moderator", "action", relay_in(1, "Devour"));
+        selected_by(&mut lines[index], "alice");
         recipients(&mut lines[index], &["dave", "erin"]);
         check(&lines, &config());
     }
@@ -2019,8 +2038,7 @@ mod tests {
         // has to put the leak after that moment rather than after an
         // announcement carol never received.
         let mut lines = fixture();
-        let mut leaked =
-            lines[find(&lines, "bob", "observation", selection_in(2, "Nominate"))].clone();
+        let mut leaked = lines[find(&lines, "bob", "observation", relay_in(2, "Nominate"))].clone();
         leaked["agent"] = json!("carol");
         let stop = lines
             .iter()

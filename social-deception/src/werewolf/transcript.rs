@@ -34,10 +34,11 @@
 //! The moderator is the authoritative view: its `action` records are every
 //! narration it sent and every selection it passed on, and its `observation`
 //! records are every selection it received, each naming the player that made
-//! it as its sender. Which record type a line is *is* the direction, so the
-//! reader needs no direction of its own. Reassembling the game from the
-//! players' records would mean recovering hidden information from partial
-//! views, which is the thing the design prevents.
+//! it as its sender. A relay names the player in its envelope instead, since
+//! the moderator is what sent it. Which record type a line is *is* the
+//! direction, so the reader needs no direction of its own. Reassembling the
+//! game from the players' records would mean recovering hidden information
+//! from partial views, which is the thing the design prevents.
 //!
 //! # File order, and the one thing checked about it
 //!
@@ -50,11 +51,12 @@
 //! What it checks is the one thing the log can prove about that order: the
 //! moderator's **action** records carry its own sequence numbers, which are
 //! contiguous from zero in the order it sent them, so a gap means the file is
-//! missing one of its messages. A relayed selection is the exception and is
-//! skipped: the moderator forwards it under the player's own name and number,
-//! so it carries no number of the moderator's to be contiguous with. An
-//! observation carries the number of the *player* that sent it, and a control
-//! or a reward carries none at all, so neither is counted.
+//! missing one of its messages. Every action of the moderator's is counted,
+//! relays included: a relay is the moderator's own message and takes a number
+//! of the moderator's (ADR-0017), and the player it passes on is named by the
+//! envelope inside it. An observation carries the number of the *player* that
+//! sent it, and a control or a reward carries none at all, so neither is
+//! counted.
 //!
 //! # No game logic
 //!
@@ -434,10 +436,10 @@ impl Transcript {
                     let record = message(record, direction, line)?;
                     // The moderator's own messages are numbered from zero
                     // in the order it sent them, so a gap is a missing
-                    // record. A relay carries the player's number instead
-                    // and is not counted; an observation carries the
-                    // sender's, which is nothing to count either.
-                    if direction == Direction::Sent && record.sender == *moderator {
+                    // record. A relay is one of them and is counted like the
+                    // rest; an observation carries the *sender's* number,
+                    // which is nothing to count here.
+                    if direction == Direction::Sent {
                         let seq = record.seq;
                         if seq != next_seq {
                             return Err(TranscriptError::SeqGap {
@@ -507,12 +509,14 @@ fn read_line<'a>(
     Ok((agent == moderator.as_str()).then_some(Line::Message { record, direction }))
 }
 
-/// Decodes a message record's envelope, its key and its payload.
+/// Decodes a message record's wire shape, its key and its payload.
 ///
-/// The sender is the message's own, from inside the envelope, which is what
-/// makes a relay read as the player's message rather than the moderator's.
-/// The sequence number is beside it at the top level, where the record
-/// carries it once (ADR-0017).
+/// The sender is the message's own, which is now always the agent that wrote
+/// the record: nothing an actor sends claims another (ADR-0017). Whose
+/// selection a relay passes on is inside the payload, in the
+/// [`Envelope`](crate::Envelope) the `Relayed` variant carries, and the fold
+/// reads it from there. The sequence number is beside the message at the top
+/// level, where the record carries it once.
 fn message(
     record: &Map<String, Value>,
     direction: Direction,
@@ -599,13 +603,13 @@ struct Reader {
     /// The player that made the latest nomination the moderator passed
     /// on, and which is therefore still a candidate for the hammer.
     ///
-    /// The moderator forwards each nomination it accepts as it accepts
-    /// it, and the selection that completes a majority is forwarded before
-    /// the lynching it causes is narrated. So the sender of the last
-    /// forward before an `Eliminated { cause: Lynched }` is the player
-    /// whose selection ended the day, and no narration has to say so
-    /// (ADR-0015). Cleared when a phase begins, so that a lynching can
-    /// never take its hammer from the day before.
+    /// The moderator relays each nomination it accepts as it accepts it, and
+    /// the selection that completes a majority is relayed before the lynching
+    /// it causes is narrated. So the player named in the envelope of the last
+    /// relay before an `Eliminated { cause: Lynched }` is the one whose
+    /// selection ended the day, and no narration has to say so (ADR-0015).
+    /// Cleared when a phase begins, so that a lynching can never take its
+    /// hammer from the day before.
     latest_nomination: Option<ActorId>,
     /// How the game ended, once the moderator has announced it. `None`
     /// until then, and still `None` at the end of a truncated transcript,
@@ -630,16 +634,18 @@ impl Reader {
             (Direction::Received, Message::Select(selection)) => {
                 self.answered(line, sender, selection)
             }
-            // A selection the moderator sent is one it is passing on to the
-            // players who should see it (ADR-0014). It is stamped with the
-            // player that made it, so it is the same selection this reader
-            // already folded when the moderator received it, and folding
-            // it twice would count one vote as two. What it does say, and
-            // the received selection does not, is that the moderator accepted
-            // it: that is where the hammer comes from (ADR-0015).
-            (Direction::Sent, Message::Select(selection)) => {
-                if selection.kind == SessionKind::Nominate {
-                    self.latest_nomination = Some(sender);
+            // A relay is the moderator passing a selection on to the players
+            // who should see it (ADR-0018). The envelope names the player who
+            // made it and which of that player's messages it was, which is
+            // how this record joins back to the player's own action; here it
+            // is the player that matters. It is the same selection this
+            // reader already folded when the moderator received it, so
+            // folding it again would count one vote as two. What it does say,
+            // and the received selection does not, is that the moderator
+            // accepted it: that is where the hammer comes from (ADR-0015).
+            (Direction::Sent, Message::Relayed(envelope)) => {
+                if envelope.payload.kind == SessionKind::Nominate {
+                    self.latest_nomination = Some(envelope.from);
                 }
                 Ok(())
             }
@@ -1333,20 +1339,20 @@ mod tests {
         // messages it was; the player's own `action` record carries the same
         // pair, and nothing else links the two.
         //
-        // A forward joins the same way, since the moderator sends it under
-        // the player's own name and number: that is what makes it the same
-        // message rather than a second one.
+        // Every action is its own agent's message, relays included, so the
+        // join is total on the sending side and nothing is exempt.
         let lines = fixture();
         let sent: BTreeSet<(String, u64)> = lines
             .iter()
             .filter(|line| line["type"] == "action")
-            .filter(|line| line["message"]["sender"] == line["agent"])
             .map(|line| {
+                let agent = line["agent"].as_str().expect("a record names its agent");
+                assert_eq!(
+                    line["message"]["sender"], *agent,
+                    "an action is a message of its agent's: {line}"
+                );
                 (
-                    line["agent"]
-                        .as_str()
-                        .expect("a record names its agent")
-                        .to_owned(),
+                    agent.to_owned(),
                     line["seq"].as_u64().expect("a message record is numbered"),
                 )
             })
@@ -1369,27 +1375,109 @@ mod tests {
                 "an observation joins the action it came from by (from, seq): {line}"
             );
         }
-        // And the moderator's forwards join back the same way, to the
-        // player's own action and not to one of the moderator's.
-        let forwards: Vec<&Value> = lines
-            .iter()
-            .filter(|line| line["type"] == "action" && line["agent"] == MODERATOR)
-            .filter(|line| line["message"]["sender"] != MODERATOR)
-            .collect();
-        assert!(!forwards.is_empty(), "the fixture exercises forwarding");
-        for line in &forwards {
-            let key = (
-                line["message"]["sender"]
+    }
+
+    #[test]
+    fn a_relay_is_the_moderators_action_and_reaches_the_player_through_its_envelope() {
+        // Scenario 10, inverted (ADR-0017). A forwarded selection used to be
+        // recorded under the player's own name and number, so the relay was
+        // invisible and a listener's observation joined straight to the
+        // player's action. Now the relay is the **moderator's** action, under
+        // a number of the moderator's, and the envelope inside it names the
+        // player and the player's number. Following one relayed selection
+        // therefore takes both keys, and this walks both.
+        let lines = fixture();
+        let moderator = json!(MODERATOR);
+        // One pass over the file, so the walk below is lookups rather than
+        // scans: every action by the key an observation of it names, the
+        // relays among them, the keys of the selections the moderator took
+        // in, and each observation of a message of the moderator's by its
+        // number.
+        let mut sent: BTreeMap<(&str, u64), &Value> = BTreeMap::new();
+        let mut relays: Vec<&Value> = Vec::new();
+        let mut heard: BTreeSet<(&str, u64)> = BTreeSet::new();
+        let mut listened: BTreeMap<u64, Vec<&Value>> = BTreeMap::new();
+        for line in &lines {
+            let seq = || line["seq"].as_u64().expect("a message record is numbered");
+            match line["type"].as_str() {
+                Some("action") => {
+                    let agent = line["agent"].as_str().expect("a record names its agent");
+                    sent.insert((agent, seq()), line);
+                    if !line["message"]["payload"]["Relayed"].is_null() {
+                        relays.push(line);
+                    }
+                }
+                Some("observation") => {
+                    let from = line["from"]
+                        .as_str()
+                        .expect("an observation names its sender");
+                    if !line["message"]["payload"]["Select"].is_null() {
+                        heard.insert((from, seq()));
+                    }
+                    if line["from"] == moderator {
+                        listened.entry(seq()).or_default().push(line);
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            !relays.is_empty(),
+            "the fixture exercises relaying, or this proves nothing"
+        );
+        let mut followed = 0;
+        for relay in &relays {
+            assert_eq!(
+                relay["agent"], moderator,
+                "a relay is the moderator's action: {relay}"
+            );
+            assert_eq!(
+                relay["message"]["sender"], moderator,
+                "with the moderator as its sender: {relay}"
+            );
+            let envelope = &relay["message"]["payload"]["Relayed"]["envelope"];
+            let origin = (
+                envelope["from"]
                     .as_str()
-                    .expect("a message names its sender")
-                    .to_owned(),
-                line["seq"].as_u64().expect("a message record is numbered"),
+                    .expect("an envelope names a player"),
+                envelope["seq"].as_u64().expect("and one of its messages"),
+            );
+            // The envelope names the player and the player's number, so the
+            // player's own action record is there to be found, and it is a
+            // selection the moderator really took in.
+            let original = sent
+                .get(&origin)
+                .unwrap_or_else(|| panic!("a relay's envelope names a real action: {relay}"));
+            assert_eq!(
+                original["message"]["payload"]["Select"], envelope["payload"],
+                "and the relay carries what the player selected: {relay} against {original}"
             );
             assert!(
-                sent.contains(&key),
-                "a forward joins the action it passes on by (from, seq): {line}"
+                heard.contains(&origin),
+                "and the moderator heard it from the player: {relay}"
             );
+
+            // And the walk starts from any listener too: a listener's
+            // observation names `(moderator, seq)`, which is how `listened`
+            // keyed it and which found this relay, and the envelope it
+            // carries is this one — so the envelope's key finds the player's
+            // action from the listener's side as well.
+            for observation in listened
+                .get(&relay["seq"].as_u64().unwrap())
+                .into_iter()
+                .flatten()
+            {
+                assert_eq!(
+                    &observation["message"]["payload"]["Relayed"]["envelope"], envelope,
+                    "a listener sees the envelope the moderator sent: {observation}"
+                );
+                followed += 1;
+            }
         }
+        assert!(
+            followed > 0,
+            "some listener observed a relay, or the walk was never taken"
+        );
     }
 
     #[test]
@@ -1766,29 +1854,13 @@ mod tests {
     }
 
     #[test]
-    fn a_selection_the_moderator_sent_is_one_it_forwarded() {
+    fn a_selection_the_moderator_sent_is_one_it_relayed() {
         // The moderator both receives a selection and sends it on to the
-        // players who should see it (ADR-0014), so a selection among its
-        // actions is no error: the fixture contains both, and it reads.
-        let lines = fixture();
-        let forwarded = lines.iter().filter(|line| {
-            line["type"] == "action" && !line["message"]["payload"]["Select"].is_null()
-        });
-        let forwarded: Vec<&Value> = forwarded.collect();
-        assert!(
-            !forwarded.is_empty(),
-            "the fixture exercises forwarding, or this proves nothing"
-        );
-        // Each is stamped with the player that made it, never with the
-        // moderator: that is what makes the relay invisible.
-        for line in forwarded {
-            assert_ne!(
-                line["message"]["sender"],
-                json!(MODERATOR),
-                "a forwarded selection is sent as the player that made it: {line}"
-            );
-        }
-        read(&lines).expect("a log with forwarded selections reads");
+        // players who should see it (ADR-0018), so a relay among its actions
+        // is no error: the fixture contains both, and it reads. What a relay
+        // looks like, and what it joins back to, is the next test's claim
+        // rather than this one's.
+        read(&fixture()).expect("a log with relayed selections reads");
     }
 
     /// Writes the moderator's records of a game played through [`Game`]
@@ -1852,24 +1924,10 @@ mod tests {
             for directive in directives {
                 let (to, payload) = match directive {
                     Directive::Narrate { to, narration } => (to, Message::Narration(narration)),
-                    // A forwarded selection keeps the player's own name and
-                    // number, not the moderator's: that is what makes the
-                    // relay join back to the player's own action.
-                    Directive::Forward {
-                        from,
-                        seq,
-                        to,
-                        selection,
-                    } => {
-                        self.record(
-                            "action",
-                            from.as_str(),
-                            seq,
-                            &to,
-                            &Message::Select(selection),
-                        );
-                        continue;
-                    }
+                    // A relay is the moderator's own message, numbered among
+                    // the moderator's; the envelope inside it is what names
+                    // the player and joins it back to the player's action.
+                    Directive::Forward { envelope, to } => (to, Message::Relayed(envelope)),
                     // A stop is a control, and `Transcript::read` skips
                     // control records: they say nothing about the game.
                     Directive::Stop { .. } => continue,
@@ -1880,7 +1938,7 @@ mod tests {
         }
 
         /// Records a selection arriving from `from`, and returns the number
-        /// it was sent under, which the forward will carry.
+        /// it was sent under, which the relay's envelope will carry.
         fn select(&mut self, from: &str, selection: Select) -> u64 {
             let seq = self.next_seq(from);
             self.record(
