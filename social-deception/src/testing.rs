@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use crate::agent::Observation;
 use crate::clock::Clock;
 use crate::log::{JsonLines, Policy, Record, Sink, Writer};
-use crate::message::{ActorId, Message, Payload};
+use crate::message::{ActorId, Envelope, Message, Payload};
 use crate::werewolf::{self, Assignment, Faction, Knowledge, Narration, Phase, Role, Round};
 
 pub(crate) use temp::TempDir;
@@ -26,11 +26,34 @@ pub(crate) use temp::TempDir;
 pub(crate) const ME: &str = "me";
 
 /// What a runtime unit test's agents say to each other: a counter, which is
-/// enough to tell one message from the next.
+/// enough to tell one message from the next, or a relay of somebody's
+/// counter.
+///
+/// The relay is the framework's [`Envelope`](crate::Envelope) inside a
+/// payload, which is the only way a relay travels (ADR-0017). Which of its
+/// payloads carry one is a game's decision, and this enum is the runtime
+/// tests' game.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) enum TestPayload {
     /// A step, carrying its number.
     Step(u64),
+    /// One agent passing another's step on.
+    Relayed(Envelope<u64>),
+}
+
+impl TestPayload {
+    /// The number a step carries.
+    ///
+    /// # Panics
+    ///
+    /// If it is a relay. A test that sends relays reads them by matching; the
+    /// ones that count steps never meet one.
+    pub(crate) fn step(&self) -> u64 {
+        match self {
+            Self::Step(n) => *n,
+            Self::Relayed(envelope) => panic!("a relay of {} is not a step", envelope.from),
+        }
+    }
 }
 
 /// A destination a test can read back after the writer has taken ownership
@@ -229,6 +252,23 @@ pub(crate) fn observed(message: Message<werewolf::Message>) -> Observation<werew
 /// A narration from the moderator to [`ME`].
 pub(crate) fn narrated(narration: Narration) -> Message<werewolf::Message> {
     from("moderator", werewolf::Message::Narration(narration))
+}
+
+/// The moderator relaying `who`'s selection to [`ME`], as its `seq`th
+/// message.
+///
+/// A player addresses the moderator alone, so this is the only shape in which
+/// another player's selection reaches [`ME`] (ADR-0018): the moderator's own
+/// message, with the envelope inside it naming who selected.
+pub(crate) fn relayed(
+    who: &str,
+    seq: u64,
+    selection: werewolf::Select,
+) -> Message<werewolf::Message> {
+    from(
+        "moderator",
+        werewolf::Message::Relayed(Envelope::new(who, seq, selection)),
+    )
 }
 
 /// The moderator announcing a phase to [`ME`].

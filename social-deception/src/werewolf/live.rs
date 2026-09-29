@@ -99,6 +99,14 @@ impl fmt::Display for Message {
         match self {
             Self::Narration(narration) => narration.fmt(f),
             Self::Select(selection) => selection.fmt(f),
+            // The sender column is the actor that sent the message, on every
+            // line, which for a relay is the moderator. So the player whose
+            // selection it is goes here, where a reader sees both that a
+            // relay happened and whose move it passes on (ADR-0018) — the
+            // same two facts the log record carries, and neither hidden.
+            Self::Relayed(envelope) => {
+                write!(f, "Relayed({}: {})", envelope.from, envelope.payload)
+            }
         }
     }
 }
@@ -242,7 +250,7 @@ mod tests {
 
     use super::*;
     use crate::log::{ControlRecord, CycleRecord, Key, ObservationRecord, RewardRecord, Woken};
-    use crate::message::Control;
+    use crate::message::{Control, Envelope};
     use crate::testing::{Shared, id, ids};
     use crate::werewolf::message::{Outcome, Round, SessionKind};
     use crate::werewolf::role::{Faction, Role};
@@ -409,6 +417,30 @@ mod tests {
                 seen_by: BTreeSet::new(),
             })),
             "Select(Nominate: frank)"
+        );
+    }
+
+    #[test]
+    fn a_relayed_selection_names_the_player_whose_selection_it_is() {
+        // The moderator sent it, so the moderator is in the sender column,
+        // as on every line. What the payload column adds is whose move it
+        // passes on, which is the envelope's (ADR-0018): both facts the log
+        // record carries, and neither hidden.
+        let selection = Select {
+            round: Round::new(2),
+            kind: SessionKind::Nominate,
+            target: id("frank"),
+            seen_by: ids(["carol", "frank"]),
+        };
+        let record = action(
+            "moderator",
+            ["carol", "frank"],
+            0,
+            Message::Relayed(Envelope::new("bob", 3, selection)),
+        );
+        assert_eq!(
+            line(&record, 9).unwrap(),
+            "0:00.000 moderator  \u{2192} carol, frank  Relayed(bob: Select(Nominate: frank))"
         );
     }
 

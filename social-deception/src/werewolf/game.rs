@@ -121,7 +121,7 @@ use std::time::{Duration, Instant};
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 
-use crate::message::ActorId;
+use crate::message::{ActorId, Envelope};
 use crate::werewolf::assignment::Assignment;
 use crate::werewolf::config::Timing;
 use crate::werewolf::message::{Cause, Narration, Outcome, Phase, Round, Select, SessionKind};
@@ -150,26 +150,25 @@ pub enum Directive {
     },
     /// Pass a player's selection on to the other players who should see it.
     ///
-    /// The moderator is the only agent a player addresses, so this is how
-    /// a selection reaches anybody else (ADR-0014). The forwarded message
-    /// carries the player's own name and sequence number, so a recipient
-    /// cannot tell the selection came by way of the moderator and the
-    /// forward joins back to the player's own action record; see
-    /// [`Action::relay`](crate::agent::Action::relay).
+    /// The moderator is the only agent a player addresses, so this is how a
+    /// selection reaches anybody else (ADR-0018). What the moderator sends is
+    /// **its own message**, with a sequence number of its own, and the
+    /// envelope is what names the player whose selection it is: a recipient
+    /// reads the player from there, and a reader of the log joins the relay
+    /// back to the player's own action record on the envelope's `(from,
+    /// seq)`. No message claims a sender other than the actor that sent it
+    /// (ADR-0017).
     ///
-    /// Only a selection the game accepted is forwarded. One whose session has
+    /// Only a selection the game accepted is relayed. One whose session has
     /// closed is dropped here, which is the whole reason a selection goes
     /// through the moderator at all: it is the only agent that knows
     /// whether the session is still open.
     Forward {
-        /// The player whose selection it is.
-        from: ActorId,
-        /// Which of that player's messages it was.
-        seq: u64,
+        /// The player's selection, in the envelope that names who made it
+        /// and which of that player's messages it was.
+        envelope: Envelope<Select>,
         /// The other players who should see it, never empty.
         to: BTreeSet<ActorId>,
-        /// The selection itself, exactly as it was sent.
-        selection: Select,
     },
     /// Stop this agent: it is out of the game (ADR-0012).
     ///
@@ -403,15 +402,13 @@ impl Game {
 
         // Accepted, so the players who should see it are told, in the
         // order the moderator accepted the selections rather than in whatever
-        // order a queue happened to deliver them (ADR-0014). This is the
+        // order a queue happened to deliver them (ADR-0018). This is the
         // only way a selection reaches another player.
         let mut directives = Vec::new();
         if !selection.seen_by.is_empty() {
             directives.push(Directive::Forward {
-                from: from.clone(),
-                seq,
+                envelope: Envelope::new(from.clone(), seq, selection.clone()),
                 to: selection.seen_by.clone(),
-                selection: selection.clone(),
             });
         }
 
@@ -419,7 +416,7 @@ impl Game {
         // selection that made it is the hammer. Everything else waits for a
         // clock.
         //
-        // The forward comes first: a player learns of the selection that
+        // The relay comes first: a player learns of the selection that
         // lynched somebody before it learns of the lynch, which is the
         // order the messages happened in.
         if kind == SessionKind::Nominate && self.majority().is_some() {
@@ -1078,10 +1075,11 @@ mod tests {
     }
 
     /// Selections as a player really would, naming the audience the moderator
-    /// should forward to, at the instants a caller chooses.
+    /// should relay to, at the instants a caller chooses.
     ///
     /// `when` is the player's sequence number for the selection and the
-    /// instant the moderator received it: the two a forward turns on, and
+    /// instant the moderator received it: the number goes in the envelope of
+    /// the relay, and the instant is what the session clocks run on, which is
     /// the reason this takes both.
     fn selections_seen_by<const N: usize>(
         game: &mut Game,
@@ -1102,17 +1100,14 @@ mod tests {
         game.select(&id(from), &selection, seq, at)
     }
 
-    /// The forwards among some directives: who is told of whose selection.
+    /// The relays among some directives: who is told of whose selection.
     fn forwards(directives: &[Directive]) -> Vec<(&ActorId, &BTreeSet<ActorId>, &Select)> {
         directives
             .iter()
             .filter_map(|directive| match directive {
-                Directive::Forward {
-                    from,
-                    to,
-                    selection,
-                    ..
-                } => Some((from, to, selection)),
+                Directive::Forward { envelope, to } => {
+                    Some((&envelope.from, to, &envelope.payload))
+                }
                 _ => None,
             })
             .collect()
@@ -2209,7 +2204,8 @@ mod tests {
                     // A forwarded selection is an observation like any
                     // other, so the same rule holds: the dead are told
                     // nothing, a selection included.
-                    Directive::Forward { from, to, .. } => {
+                    Directive::Forward { envelope, to } => {
+                        let from = &envelope.from;
                         for who in to {
                             assert!(
                                 !dead.contains(who),

@@ -6,7 +6,7 @@ use std::collections::BTreeSet;
 use std::num::NonZero;
 
 use super::role::{Faction, Role};
-use crate::message::ActorId;
+use crate::message::{ActorId, Envelope};
 
 /// A round of the game, counted from 1. Each round is a night then a day.
 ///
@@ -77,10 +77,21 @@ pub enum Phase {
 pub enum Message {
     /// Moderator to chosen players: something they now observe.
     Narration(Narration),
-    /// Player to the moderator and to whoever else may see it: a target
-    /// selected. A player may send more than one in the same session;
-    /// its latest is its vote (ADR-0011).
+    /// Player to the moderator and to nobody else: a target selected. A
+    /// player may send more than one in the same session; its latest is its
+    /// vote (ADR-0011).
     Select(Select),
+    /// Moderator to the players who should see it: a selection a player made,
+    /// in the envelope that names who made it.
+    ///
+    /// A player addresses the moderator alone, so this is the only way a
+    /// selection reaches anybody else (ADR-0018). It is the moderator's own
+    /// message, with a sequence number of the moderator's, and the envelope
+    /// is what says whose selection it passes on: a listener reads the player
+    /// from there rather than from the message's sender, and a reader of the
+    /// log joins the relay back to the player's own action record on the
+    /// envelope's `(from, seq)`.
+    Relayed(Envelope<Select>),
 }
 
 /// A true statement from the moderator to the players it is addressed to.
@@ -206,9 +217,10 @@ impl SessionKind {
 ///
 /// A selection is addressed to the moderator and to nobody else. The other
 /// players who should see it are named in `seen_by`, and the moderator
-/// forwards it to them if the session it names is still open. A player
-/// never sends another player anything directly, so there is no path by
-/// which a selection can outlive its session in somebody else's queue.
+/// relays it to them, as a [`Message::Relayed`] of its own, if the session it
+/// names is still open. A player never sends another player anything
+/// directly, so there is no path by which a selection can outlive its session
+/// in somebody else's queue.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Select {
     /// The round the session belongs to.
@@ -218,7 +230,7 @@ pub struct Select {
     /// The player selected.
     pub target: ActorId,
     /// The other players who should see this selection, for the moderator to
-    /// forward it to.
+    /// relay it to.
     ///
     /// Empty for a selection that is nobody else's business: the seer's
     /// investigation and the doctor's protection are between that player

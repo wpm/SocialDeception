@@ -11,7 +11,7 @@ pub mod collatz;
 mod temp;
 pub mod werewolf;
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde_json::Value;
 pub use temp::TempDir;
@@ -44,6 +44,10 @@ pub fn parse(bytes: &[u8]) -> Vec<Value> {
 ///   message record carries one;
 /// - a cycle names at most one observation, and a cycle woken by the queue
 ///   popped something;
+/// - every action is a message of its own agent's: nothing claims a sender
+///   other than the actor that sent it, and an agent passing another's
+///   message on carries it in an `Envelope` inside its own payload
+///   (ADR-0017);
 /// - no message has its sender among its recipients; an observation lists the
 ///   agent that recorded it among the recipients, and its `from` is the
 ///   message's sender;
@@ -309,24 +313,19 @@ fn check_record(line: &Value, kind: &str) {
             // got it is in that recipient's own observation record.
             let (sender, recipients, _) = message(line);
             check_recipients(line, sender, &recipients);
-            if sender == agent(line) {
-                assert!(
-                    line["from"].is_null(),
-                    "an action's agent is its sender, so it needs no `from`: {line}"
-                );
-                return;
-            }
-            // Otherwise this agent is relaying somebody else's message. It
-            // keeps the original `(sender, seq)`, so a recipient cannot tell
-            // the difference and the relay joins back to the message it
-            // passes on (ADR-0014). Which agents may relay, and what, is
-            // the domain's rule and is checked there; what holds everywhere
-            // is that passing a message on does not address it to the agent
-            // doing the passing, which would be that agent observing what
-            // it had just sent.
+            // Every message an agent sends is its own: there is no way to
+            // name another sender, so no record claims one (ADR-0017). An
+            // agent passing another's message on sends a message of its own
+            // carrying an `Envelope` of what it received, which is inside the
+            // payload, where the framework never looks.
+            assert_eq!(
+                sender,
+                agent(line),
+                "an action is a message of its agent's: {line}"
+            );
             assert!(
-                !recipients.contains(&&Value::from(agent(line))),
-                "an agent does not forward a message to itself: {line}"
+                line["from"].is_null(),
+                "an action's agent is its sender, so it needs no `from`: {line}"
             );
         }
         // `check` matched the kind before calling; there is no other.
@@ -373,10 +372,6 @@ fn check_cycle(cycle: &Value) {
 /// property of the times rather than of lists the cycle carries. [`cycles`]
 /// recovers the grouping from file order; the windows here are what confirm
 /// it, so the two together are the claim that a cycle's records are its own.
-///
-/// A relayed action is sent inside the cycle that sent it like any other,
-/// even though the message is not the relaying agent's, so the window holds
-/// for it too.
 fn check_cycles_bracket_their_records(lines: &[Value]) {
     for (cycle, records) in cycles(lines) {
         let (t_start, t_stop) = (time(cycle, "t_start"), time(cycle, "t_stop"));
@@ -434,16 +429,15 @@ fn check_cycles_bracket_their_records(lines: &[Value]) {
 /// The numbers are **the messages'**, so this counts each sender's own
 /// action records and nothing else: a control, a reward and a cycle carry
 /// none, and an observation carries its *sender's* number, which that
-/// sender's own records are where the counting happens. A relayed action is
-/// skipped too, since its number is the original sender's.
+/// sender's own records are where the counting happens. Every message an
+/// agent sends is its own, relays included, so nothing is skipped and the
+/// numbers are dense over everything an agent sent (ADR-0017).
 fn check_sequence_numbers(lines: &[Value]) {
     let mut next: HashMap<&str, u64> = HashMap::new();
     for line in lines.iter().filter(|line| line["type"] == "action") {
-        let (sender, _, _) = message(line);
-        if sender != agent(line) {
-            continue;
-        }
-        let expected = next.entry(sender).or_insert(0);
+        // `check_record` has already held the two to be the same, so the
+        // record's agent is the sender its numbers belong to.
+        let expected = next.entry(agent(line)).or_insert(0);
         assert_eq!(
             seq(line),
             *expected,
@@ -507,47 +501,6 @@ fn check_nothing_follows_a_stop(lines: &[Value]) {
 /// and only for a message sent after the last message that recipient did
 /// observe. Up to that instant the agent was demonstrably taking delivery,
 /// so a gap there is a real failure and still fails here.
-/// Every relay passes on a message somebody really sent, and carries what
-/// was sent; returns which recipients each relayed message reached.
-///
-/// The original is in the relaying agent's own records under the same key,
-/// because a relay keeps the original `(sender, seq)`: that is what makes it
-/// the same message rather than a second one (ADR-0017). Without this an
-/// action misfiled under another agent would read as a relay of a message
-/// nobody sent.
-///
-/// The recipients come back separately because a relay delivers the message
-/// to agents its original was never addressed to, so the original's list
-/// cannot account for them. Whether each of them observed it is
-/// [`check_the_join`]'s to say, under the same ADR-0012 allowance it makes for
-/// a direct send: an agent that was stopped may miss what came after.
-fn check_the_relays<'a>(
-    relayed: &[&'a Value],
-    actions: &BTreeMap<(&'a str, u64), &'a Value>,
-) -> BTreeMap<(&'a str, u64), BTreeSet<&'a str>> {
-    let mut relayed_to: BTreeMap<(&str, u64), BTreeSet<&str>> = BTreeMap::new();
-    for line in relayed {
-        let (sender, recipients, payload) = message(line);
-        let at = (sender, seq(line));
-        let original = actions.get(&at).unwrap_or_else(|| {
-            panic!(
-                "a relayed message passes on one its sender really sent, \
-                 but none names the agent that sent it as its sender: {line}"
-            )
-        });
-        let (_, _, sent) = message(original);
-        assert_eq!(
-            payload, sent,
-            "a relayed message carries what was sent: {line} against {original}"
-        );
-        let to = relayed_to.entry(at).or_default();
-        for who in recipients {
-            to.insert(who.as_str().expect("a recipient is an actor id"));
-        }
-    }
-    relayed_to
-}
-
 fn check_the_join(lines: &[Value]) {
     // Which agents were stopped at all: being stopped is what licenses a
     // missing observation.
@@ -556,8 +509,21 @@ fn check_the_join(lines: &[Value]) {
         .filter(|line| line["type"] == "control" && line["control"] == "stop")
         .map(agent)
         .collect();
-    // When each agent last observed anything, which bounds what it may
-    // legitimately have missed.
+    // Keyed by the message: who sent it and which of theirs it is, which is
+    // exactly what an observation names. Every action is its agent's own
+    // message, so every one is under this key and the join is total on the
+    // sending side (ADR-0017).
+    let mut actions: BTreeMap<(&str, u64), &Value> = BTreeMap::new();
+    for line in lines.iter().filter(|line| line["type"] == "action") {
+        let at = (agent(line), seq(line));
+        assert!(
+            actions.insert(at, line).is_none(),
+            "a sender numbers each of its messages once, or no observation could \
+             name which: {line}"
+        );
+    }
+    // The latest message each agent observed, **by when it was sent**, which
+    // bounds what that agent may legitimately have missed.
     //
     // The bound cannot be read off the stop's own time. A stop and the
     // messages around it are one cycle's work: the environment returns a
@@ -565,37 +531,16 @@ fn check_the_join(lines: &[Value]) {
     // controls before routing its messages, so a message sent earlier in
     // the batch than the stop is still dropped for the agent the batch
     // stopped. What the log does show without guesswork is the last message
-    // the agent actually observed, and every message it missed reached it
-    // after that.
+    // the agent actually observed, and every message it missed was sent after
+    // that one.
+    //
+    // It is the *send* time, not the arrival, because that is what the other
+    // side of the comparison is: an action record says when its sender sent
+    // it. Arrival is later than sending by however long the message sat on a
+    // queue, so comparing a send against an arrival would call a message
+    // legitimately dropped only if it was sent after another had been popped,
+    // which under load is a different claim and a false failure.
     let mut last_observed: HashMap<&str, u64> = HashMap::new();
-    for line in lines.iter().filter(|line| line["type"] == "observation") {
-        let at = time(line, "t");
-        last_observed
-            .entry(agent(line))
-            .and_modify(|latest| *latest = (*latest).max(at))
-            .or_insert(at);
-    }
-    // Keyed by the message: who sent it and which of theirs it is, which is
-    // exactly what an observation names. A relayed action is the same
-    // message as the one it passes on, so it is not a second action under
-    // this key: it is collected separately and joined through the original
-    // below (ADR-0014).
-    let mut actions: BTreeMap<(&str, u64), &Value> = BTreeMap::new();
-    let mut relayed: Vec<&Value> = Vec::new();
-    for line in lines.iter().filter(|line| line["type"] == "action") {
-        let (sender, _, _) = message(line);
-        if sender != agent(line) {
-            relayed.push(line);
-            continue;
-        }
-        let at = (sender, seq(line));
-        assert!(
-            actions.insert(at, line).is_none(),
-            "a sender numbers each of its messages once, or no observation could \
-             name which: {line}"
-        );
-    }
-    let relayed_to = check_the_relays(&relayed, &actions);
     let mut observed: HashSet<((&str, u64), &str)> = HashSet::new();
     for line in lines.iter().filter(|line| line["type"] == "observation") {
         let (sender, recipients, payload) = message(line);
@@ -611,28 +556,23 @@ fn check_the_join(lines: &[Value]) {
         // The join above is what ties an observation to the agent that
         // really sent it: it is keyed on the sender and the number, against
         // the messages each agent sent, so an observation naming a sender
-        // that sent no such message panics there. That holds for a relayed
-        // message too, because it keeps the original key.
-        //
-        // What does not carry over is the recipient list, and it should
-        // not. Two sends carried one message: the actor addressed the
-        // moderator, and the moderator addressed the players it relayed
-        // to. Requiring the lists to match would be requiring the relay
-        // not to happen. Who observed the message is checked on the
-        // observation's own recipients, for every observation and with no
-        // exception for a relay — that it was addressed to its observer
-        // (`check_record`) and that every recipient observed it (below).
-        if sent_to.contains(&&Value::from(agent(line))) {
-            assert_eq!(
-                recipients, sent_to,
-                "an observation and its action name the same recipients: \
-                 {line} against {action}"
-            );
-        }
+        // that sent no such message panics there. A relay is no exception —
+        // it is the relaying agent's own message under its own key, and what
+        // it passes on is inside its payload.
+        assert_eq!(
+            recipients, sent_to,
+            "an observation and its action name the same recipients: \
+             {line} against {action}"
+        );
         assert!(
             observed.insert((at, agent(line))),
             "an agent observes a message once: {line}"
         );
+        let sent = time(action, "t");
+        last_observed
+            .entry(agent(line))
+            .and_modify(|latest| *latest = (*latest).max(sent))
+            .or_insert(sent);
     }
     for (at, action) in &actions {
         let (_, recipients, _) = message(action);
@@ -651,17 +591,6 @@ fn check_the_join(lines: &[Value]) {
                 dropped,
                 "every recipient of a message observes it unless it had stopped, but {who} \
                  did not: {action}"
-            );
-        }
-    }
-    // And the same for a relay's own recipients, which the original never
-    // named.
-    for (at, to) in &relayed_to {
-        for who in to {
-            assert!(
-                observed.contains(&(*at, who)) || stopped.contains(who),
-                "every recipient of a relayed message observes it unless it had \
-                 stopped, but {who} did not: {at:?}"
             );
         }
     }
@@ -705,10 +634,15 @@ mod tests {
 
     /// A log in which `r` relays `b`'s message to `c`.
     ///
-    /// `b` addresses `r` alone; `r` passes the message on, keeping `b`'s name
-    /// and `b`'s number, so `c` observes what `b` would have sent it directly
-    /// and the message joins back to `b`'s own action (ADR-0014).
+    /// `b` addresses `r` alone; `r` sends a message of **its own**, numbered
+    /// among `r`'s, whose payload carries an envelope naming `b` and `b`'s
+    /// number (ADR-0017). So `c`'s observation joins `r`'s action on
+    /// `(r, 0)`, and following the envelope from there reaches `b`'s own
+    /// action on `(b, 0)`. Nothing claims a sender it does not have.
     fn relayed() -> Vec<Value> {
+        let envelope = json!({"Relayed": {"envelope": {
+            "from": "b", "seq": 0, "payload": {"Step": 6},
+        }}});
         vec![
             header(),
             json!({"type": "control", "agent": "b", "t": 10, "control": "start"}),
@@ -726,9 +660,10 @@ mod tests {
                    "woken": "queue"}),
             json!({"type": "observation", "agent": "r", "t": 30, "from": "b", "seq": 0,
                    "message": {"sender": "b", "recipients": ["r"], "payload": {"Step": 6}}}),
-            // The relay: `r`'s own record, carrying `b`'s name and number.
+            // The relay: `r`'s own message, under `r`'s own number zero,
+            // carrying `b`'s in the envelope.
             json!({"type": "action", "agent": "r", "t": 35, "seq": 0,
-                   "message": {"sender": "b", "recipients": ["c"], "payload": {"Step": 6}}}),
+                   "message": {"sender": "r", "recipients": ["c"], "payload": envelope}}),
             json!({"type": "cycle", "agent": "r", "t_start": 30, "t_stop": 50, "woken": "queue",
                    "from": "b", "seq": 0}),
             json!({"type": "control", "agent": "r", "t": 95, "control": "stop"}),
@@ -737,10 +672,10 @@ mod tests {
             json!({"type": "control", "agent": "c", "t": 10, "control": "start"}),
             json!({"type": "cycle", "agent": "c", "t_start": 10, "t_stop": 11,
                    "woken": "queue"}),
-            json!({"type": "observation", "agent": "c", "t": 60, "from": "b", "seq": 0,
-                   "message": {"sender": "b", "recipients": ["c"], "payload": {"Step": 6}}}),
+            json!({"type": "observation", "agent": "c", "t": 60, "from": "r", "seq": 0,
+                   "message": {"sender": "r", "recipients": ["c"], "payload": envelope}}),
             json!({"type": "cycle", "agent": "c", "t_start": 60, "t_stop": 61, "woken": "queue",
-                   "from": "b", "seq": 0}),
+                   "from": "r", "seq": 0}),
             json!({"type": "control", "agent": "c", "t": 95, "control": "stop"}),
             json!({"type": "cycle", "agent": "c", "t_start": 95, "t_stop": 96,
                    "woken": "queue"}),
@@ -1045,27 +980,13 @@ mod tests {
     #[should_panic(expected = "every record belongs to a cycle")]
     fn an_action_recorded_by_somebody_other_than_its_sender_is_caught() {
         // Moving `a`'s action into `c`'s records, where no cycle of `c`'s
-        // closes it. An agent may relay somebody else's message, so a record
-        // whose sender is not its agent is no longer wrong on its face; a
-        // record no cycle of its agent's closes still is.
-        check(&edited(3, |line| line["agent"] = json!("c")));
-    }
-
-    #[test]
-    #[should_panic(expected = "but none names the agent that sent it as its sender")]
-    fn a_relay_of_a_message_nobody_sent_is_caught() {
-        // A relay must pass on something real. Here `r` forwards a message
-        // under a key at which nobody sent anything, which is what a
-        // misattributed message would otherwise look like.
-        let mut lines = relayed();
-        let relay = lines
-            .iter()
-            .position(|line| line["type"] == "action" && line["agent"] == "r")
-            .expect("the fixture has the relay");
-        lines[relay]["seq"] = json!(1);
-        lines[16]["seq"] = json!(1);
-        lines[17]["seq"] = json!(1);
-        check(&lines);
+        // closes it. `check_record` catches the sender first, so the record
+        // is relabeled as `c`'s message too: what is left is a record no
+        // cycle of its agent's closes.
+        check(&edited(3, |line| {
+            line["agent"] = json!("c");
+            line["message"]["sender"] = json!("c");
+        }));
     }
 
     #[test]
@@ -1094,48 +1015,68 @@ mod tests {
     }
 
     #[test]
-    fn a_relayed_message_reads_as_the_message_of_whoever_sent_it() {
-        // `c` observes `b`'s step although `r` was what sent it. Nothing
-        // records that the relay happened: `c`'s observation names `b` and
-        // carries `b`'s number, and the only trace is that it arrived at 60
-        // rather than at 30.
+    fn a_relay_is_the_relaying_agents_own_message_and_joins_like_any_other() {
+        // The relay is `r`'s message under `r`'s number zero, so `c`'s
+        // observation of it joins on `(r, 0)` like every other observation,
+        // and the envelope inside it is where `b` is named. Nothing about the
+        // log's own join treats a relay specially any more (ADR-0017).
         check(&relayed());
     }
 
     #[test]
-    #[should_panic(expected = "but none names the agent that sent it as its sender")]
-    fn an_observation_naming_a_sender_that_never_sent_is_caught() {
-        // Nothing may claim to carry a message its supposed author never
-        // sent. Relabeling both the relay and `c`'s observation of it as
-        // `a`'s is caught where the relay is held to a real original: `a`
-        // sent no message zero.
-        let mut lines = relayed();
-        for line in &mut lines {
-            let relabel = (line["type"] == "action" && line["agent"] == "r")
-                || (line["type"] == "observation" && line["agent"] == "c");
-            if relabel {
-                line["message"]["sender"] = json!("a");
-                if line["type"] == "observation" {
-                    line["from"] = json!("a");
-                }
-            }
-        }
-        check(&lines);
-    }
-
-    #[test]
-    #[should_panic(expected = "no message has its sender among its recipients")]
-    fn a_relay_back_to_its_own_author_is_caught() {
-        // Relaying somebody's message to that same somebody: it would be
-        // an agent observing what it sent, which no relay may manufacture.
-        // The relay keeps `b` as the sender, so naming `b` a recipient
-        // makes the message its own author's.
+    #[should_panic(expected = "an action is a message of its agent's")]
+    fn an_action_claiming_a_sender_other_than_its_agent_is_caught() {
+        // The impersonation ADR-0017 removes. `r` writes an action claiming
+        // `b` as its sender, which is what a relay used to look like and what
+        // nothing may look like now.
         let mut lines = relayed();
         let relay = lines
             .iter()
             .position(|line| line["type"] == "action" && line["agent"] == "r")
             .expect("the fixture has the relay");
-        lines[relay]["message"]["recipients"] = json!(["b"]);
+        lines[relay]["message"]["sender"] = json!("b");
+        check(&lines);
+    }
+
+    #[test]
+    #[should_panic(expected = "no message has its sender among its recipients")]
+    fn a_relay_back_to_the_agent_that_relayed_it_is_caught() {
+        // A relay is `r`'s own message, so naming `r` among its recipients
+        // would be `r` observing what it had just sent.
+        let mut lines = relayed();
+        let relay = lines
+            .iter()
+            .position(|line| line["type"] == "action" && line["agent"] == "r")
+            .expect("the fixture has the relay");
+        lines[relay]["message"]["recipients"] = json!(["r"]);
+        check(&lines);
+    }
+
+    #[test]
+    #[should_panic(expected = "every recipient of a message observes it")]
+    fn a_message_lost_to_a_stopped_agent_before_its_last_observation_is_caught() {
+        // Being stopped excuses only what came after. `c` was stopped, and
+        // the relay it observed was sent at 35, so a message to `c` sent
+        // before that and never observed is a real lost delivery: up to 35
+        // the agent was demonstrably taking delivery, and `stopped` is not a
+        // blanket excuse.
+        //
+        // Both sides of that comparison are *send* times, which is why
+        // `last_observed` is read off the action a recipient observed rather
+        // than off when the recipient popped it: an arrival is later than its
+        // send by however long the message waited, and comparing across the
+        // two would excuse a message sent inside that window.
+        let mut lines = relayed();
+        let cycle = lines
+            .iter()
+            .position(|line| line["type"] == "cycle" && line["agent"] == "b")
+            .expect("the fixture has b's first cycle");
+        lines.insert(
+            cycle,
+            json!({"type": "action", "agent": "b", "t": 21, "seq": 1,
+                   "message": {"sender": "b", "recipients": ["c"],
+                               "payload": {"Step": 9}}}),
+        );
         check(&lines);
     }
 

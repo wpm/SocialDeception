@@ -12,6 +12,7 @@
 //! | Term | Is |
 //! |---|---|
 //! | [`Message`] | in-domain data on the wire: sender, recipients, a per-sender sequence number and a payload |
+//! | [`Envelope`] | a received message's origin and payload, for an actor relaying it inside its own payload |
 //! | [`Control`] | out-of-domain data on the wire: start and stop |
 //! | [`Delivery`] | either of the two, which is what an agent's one queue carries |
 //! | [`Observation`] | a [`Message`] popped off an agent's queue |
@@ -36,8 +37,9 @@
 //! - [`clock`]: the episode [`Clock`], the one origin the log's offsets are
 //!   measured from;
 //! - [`message`]: the [`Payload`] a game's messages carry, the [`Message`]
-//!   and [`Control`] that travel on the wire, and the [`Delivery`] that
-//!   carries either of them to an agent;
+//!   and [`Control`] that travel on the wire, the [`Delivery`] that
+//!   carries either of them to an agent, and the [`Envelope`] a game puts in
+//!   its payload to relay one;
 //! - [`log`]: the records an agent's loop produces and the [`Writer`]
 //!   that hands each one to every [`Sink`] it was given;
 //! - [`timer`]: the [`TimerSource`] an agent's deadlines come from;
@@ -80,7 +82,7 @@ pub use agent::{Action, Agent, CycleDispatch, Error, Handler, Instruction, Obser
 pub use clock::Clock;
 pub use environment::{Effect, Environment, Refusal};
 pub use episode::{Episode, EpisodeError, Failure};
-pub use message::{ActorId, Control, Delivery, Message, Payload};
+pub use message::{ActorId, Control, Delivery, Envelope, Message, Payload};
 pub use router::{Queues, RouteError, Router};
 pub use timer::{ManualTimer, ManualTimerControl, TimerSource};
 // [`log::Policy`] is deliberately not re-exported here. The crate root is a

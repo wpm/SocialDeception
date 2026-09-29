@@ -181,9 +181,9 @@ impl Knowledge {
     /// Folds one observation into the state.
     ///
     /// Total: every observation has a defined effect, and most have none.
-    /// A narration changes the state, and so does a selection, which under
-    /// ADR-0011 another player may see. Nothing here is an error, so the
-    /// state stays a total function of whatever arrives.
+    /// A narration changes the state, and so does a relayed selection, which
+    /// under ADR-0011 another player may see. Nothing that can really arrive
+    /// is an error, so the state stays a total function of whatever does.
     ///
     /// Controls do not appear here at all: they are out-of-domain, the
     /// agent loop acts on them, and no handler ever sees one.
@@ -198,14 +198,31 @@ impl Knowledge {
     pub fn observe(&mut self, observation: &Observation<Message>) {
         match &observation.message.payload {
             Message::Narration(narration) => self.narrated(narration),
-            // The sender's latest selection, which replaces whatever it
-            // selected before. The session is not checked: a selection this
-            // agent was addressed at all is one the rules let it see, and
-            // the phase's own `PhaseBegan` is what clears the slate.
-            Message::Select(selection) => {
+            // Who selected is read from the **envelope**, not from the
+            // message's sender: the sender is the moderator, which relayed
+            // it, and the envelope is what names the player whose selection
+            // it is (ADR-0018). It replaces whatever that player selected
+            // before. The session is not checked: a selection this agent was
+            // addressed at all is one the rules let it see, and the phase's
+            // own `PhaseBegan` is what clears the slate.
+            Message::Relayed(envelope) => {
                 self.selections
-                    .insert(observation.message.sender.clone(), selection.target.clone());
+                    .insert(envelope.from.clone(), envelope.payload.target.clone());
             }
+            // A selection a player addressed to the moderator. No player is
+            // ever among its recipients — a selection reaches another player
+            // only as a relay — so nothing here should observe one. The
+            // check is a `debug_assert!` for the reason ADR-0018 gives for
+            // the player's own: players cooperate with the moderator and are
+            // not assumed to cheat, so this catches a wiring mistake rather
+            // than enforcing a rule. In release the fold stays total, and it
+            // leaves the state alone rather than pretending the sender
+            // selected in this agent's hearing.
+            Message::Select(selection) => debug_assert!(
+                false,
+                "{} was sent {}'s {:?} selection directly rather than relayed",
+                self.me, observation.message.sender, selection.kind
+            ),
         }
     }
 
@@ -296,11 +313,13 @@ impl Knowledge {
 mod tests {
     use super::*;
     // Two types are called `Message`: this module's payload, which
-    // `super::*` brings in, and the runtime envelope that carries it.
-    // The envelope is named more often than the payload here, so it is
-    // the one that gets a short name.
-    use crate::Message as Envelope;
-    use crate::testing::{ME, from, id, ids, narrated, observed, phase_began, target};
+    // `super::*` brings in, and the runtime message that carries it. The
+    // carrier is named more often than the payload here, so it is the one
+    // that gets a short name — and not `Envelope`, which is a type of its
+    // own and the thing a relay actually carries.
+    use crate::Message as Wire;
+    use crate::message::Envelope;
+    use crate::testing::{ME, from, id, ids, narrated, observed, phase_began, relayed, target};
     use crate::werewolf::message::Select;
 
     fn votes<const N: usize>(votes: [(&str, ActorId); N]) -> BTreeMap<ActorId, ActorId> {
@@ -310,18 +329,18 @@ mod tests {
             .collect()
     }
 
-    fn assigned(role: Role, pack: BTreeSet<ActorId>) -> Envelope<Message> {
+    fn assigned(role: Role, pack: BTreeSet<ActorId>) -> Wire<Message> {
         narrated(Narration::Assigned { role, pack })
     }
 
-    fn investigated(target: &str, faction: Faction) -> Envelope<Message> {
+    fn investigated(target: &str, faction: Faction) -> Wire<Message> {
         narrated(Narration::Investigated {
             target: id(target),
             faction,
         })
     }
 
-    fn eliminated(who: &str, role: Role, round: u32, cause: Cause) -> Envelope<Message> {
+    fn eliminated(who: &str, role: Role, round: u32, cause: Cause) -> Wire<Message> {
         narrated(Narration::Eliminated {
             who: id(who),
             role,
@@ -339,10 +358,7 @@ mod tests {
     }
 
     /// A fresh state for this agent with every message folded in, in order.
-    fn folded<'a>(
-        role: Role,
-        messages: impl IntoIterator<Item = &'a Envelope<Message>>,
-    ) -> Knowledge {
+    fn folded<'a>(role: Role, messages: impl IntoIterator<Item = &'a Wire<Message>>) -> Knowledge {
         let mut knowledge = Knowledge::new(id(ME), role);
         for message in messages {
             knowledge.observe(&observed(message.clone()));
@@ -360,22 +376,23 @@ mod tests {
         ])
     }
 
-    /// One player's nomination, forwarded by the moderator as the player
-    /// that made it (ADR-0014).
-    fn nominated(who: &str, whom: &str, round: u32) -> Envelope<Message> {
-        from(
+    /// One player's nomination, relayed by the moderator in the envelope
+    /// that names who made it (ADR-0018).
+    fn nominated(who: &str, whom: &str, round: u32) -> Wire<Message> {
+        relayed(
             who,
-            Message::Select(Select {
+            0,
+            Select {
                 round: Round::new(round),
                 kind: SessionKind::Nominate,
                 target: id(whom),
                 seen_by: BTreeSet::new(),
-            }),
+            },
         )
     }
 
     /// A seer's whole game, from the deal to the werewolves' win.
-    fn a_seers_game() -> Vec<Envelope<Message>> {
+    fn a_seers_game() -> Vec<Wire<Message>> {
         vec![
             assigned(Role::Seer, BTreeSet::new()),
             phase_began(
@@ -547,6 +564,77 @@ mod tests {
     }
 
     #[test]
+    fn who_selected_is_read_from_the_envelope_and_not_from_the_sender() {
+        // The whole point of the envelope (ADR-0018). Every relay is the
+        // moderator's own message, so a fold that read the sender would
+        // record the moderator as having voted for everybody in turn.
+        let mut knowledge = Knowledge::new(id(ME), Role::Villager);
+        let relay = relayed(
+            "alice",
+            4,
+            Select {
+                round: Round::FIRST,
+                kind: SessionKind::Nominate,
+                target: target("bob"),
+                seen_by: BTreeSet::new(),
+            },
+        );
+        assert_eq!(
+            relay.sender,
+            id("moderator"),
+            "the moderator is what sent it"
+        );
+        knowledge.observe(&observed(relay));
+        assert_eq!(knowledge.selections, votes([("alice", target("bob"))]));
+    }
+
+    #[test]
+    #[should_panic(expected = "directly rather than relayed")]
+    fn a_selection_sent_to_a_player_directly_is_a_wiring_bug() {
+        // A player addresses the moderator alone, so no player is ever among
+        // a selection's recipients: one arriving here means somebody wired
+        // the recipients wrong (ADR-0018). Caught in debug and, in release,
+        // left alone rather than recorded as the sender having selected in
+        // this agent's hearing.
+        let mut knowledge = Knowledge::new(id(ME), Role::Villager);
+        knowledge.observe(&observed(from(
+            "carol",
+            Message::Select(Select {
+                round: Round::FIRST,
+                kind: SessionKind::Nominate,
+                target: target("bob"),
+                seen_by: BTreeSet::new(),
+            }),
+        )));
+    }
+
+    #[test]
+    fn a_relay_carries_the_players_own_sequence_number() {
+        // The number in the envelope is the *player's*, which is what joins
+        // the relay back to the player's own action record (ADR-0017). The
+        // fold does not read it, so this is a claim about the message the
+        // moderator builds rather than about the state.
+        let Message::Relayed(envelope) = relayed(
+            "alice",
+            9,
+            Select {
+                round: Round::FIRST,
+                kind: SessionKind::Nominate,
+                target: target("bob"),
+                seen_by: BTreeSet::new(),
+            },
+        )
+        .payload
+        else {
+            panic!("a relay carries an envelope");
+        };
+        assert_eq!(
+            envelope,
+            Envelope::new("alice", 9, envelope.payload.clone())
+        );
+    }
+
+    #[test]
     fn a_protection_is_remembered_until_the_next_one() {
         let mut knowledge = Knowledge::new(id(ME), Role::Doctor);
         assert_eq!(knowledge.last_protected, None);
@@ -565,14 +653,15 @@ mod tests {
         // watching its vote form.
         let mut knowledge = Knowledge::new(id(ME), Role::Villager);
         let selecting = |who: &str, target: &str| {
-            from(
+            relayed(
                 who,
-                Message::Select(Select {
+                0,
+                Select {
                     round: Round::new(1),
                     kind: SessionKind::Nominate,
                     target: id(target),
                     seen_by: BTreeSet::new(),
-                }),
+                },
             )
         };
 

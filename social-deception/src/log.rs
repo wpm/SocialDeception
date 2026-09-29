@@ -221,9 +221,14 @@ impl Key {
 /// It is not a type of its own anywhere else. The number sits beside `agent`
 /// and `t` because it is half of what a reader joins on, and repeating it
 /// inside the message would be two places to read one number from.
-struct Envelope<'a, P: Payload>(&'a Message<P>);
+///
+/// It is not an [`Envelope`](crate::Envelope) either, which is a different
+/// thing: an envelope sits inside a game's payload and names the message
+/// somebody else sent, while this is the wire shape of the message this
+/// record is about.
+struct Wire<'a, P: Payload>(&'a Message<P>);
 
-impl<P: Payload> Serialize for Envelope<'_, P> {
+impl<P: Payload> Serialize for Wire<'_, P> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
         let mut message = serializer.serialize_struct("Message", 3)?;
@@ -291,7 +296,7 @@ impl<P: Payload> Serialize for ObservationRecord<P, Elapsed> {
         record.serialize_field("t", &self.t)?;
         record.serialize_field("from", &self.key.from)?;
         record.serialize_field("seq", &self.key.seq)?;
-        record.serialize_field("message", &Envelope(&self.message))?;
+        record.serialize_field("message", &Wire(&self.message))?;
         record.end()
     }
 }
@@ -309,8 +314,8 @@ impl<P: Payload> Serialize for ObservationRecord<P, Elapsed> {
 pub struct ActionRecord<P: Payload, T = Instant> {
     /// The agent this record belongs to: the one that sent the message.
     ///
-    /// For a relay it is the relaying agent, and the message's own sender is
-    /// the actor being relayed, so the two differ; the key is the message's.
+    /// Always the message's own sender: nothing an agent sends claims
+    /// another (ADR-0017), so the key's `from` would repeat it.
     pub agent: ActorId,
     /// When the loop sent it.
     pub t: T,
@@ -327,7 +332,7 @@ impl<P: Payload> Serialize for ActionRecord<P, Elapsed> {
         record.serialize_field("agent", &self.agent)?;
         record.serialize_field("t", &self.t)?;
         record.serialize_field("seq", &self.key.seq)?;
-        record.serialize_field("message", &Envelope(&self.message))?;
+        record.serialize_field("message", &Wire(&self.message))?;
         record.end()
     }
 }

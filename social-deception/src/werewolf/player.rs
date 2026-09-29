@@ -400,17 +400,18 @@ mod tests {
         // Every action, whatever it is, goes to the moderator and to
         // nobody else. A player never addresses another player, which is
         // what stops a selection outliving its session in a peer's queue
-        // (ADR-0014).
+        // (ADR-0018).
         for action in &actions {
             assert!(matches!(action.payload, Message::Select(_)), "{action:?}");
             assert_eq!(action.recipients, ids([MODERATOR]), "{action:?}");
         }
-        // What differs is the audience the moderator is asked to forward
-        // to: the protect is nobody else's business, the nomination is
-        // public.
+        // What differs is the audience the moderator is asked to relay to:
+        // the protect is nobody else's business, the nomination is public.
         let seen_by = |action: &Action<Message>| match &action.payload {
             Message::Select(selection) => selection.seen_by.clone(),
-            other @ Message::Narration(_) => panic!("a selection, not {other:?}"),
+            other @ (Message::Narration(_) | Message::Relayed(_)) => {
+                panic!("a selection, not {other:?}")
+            }
         };
         assert_eq!(seen_by(&actions[0]), BTreeSet::new());
         assert_eq!(seen_by(&actions[1]), ids(["alice", "bob", "carol"]));
