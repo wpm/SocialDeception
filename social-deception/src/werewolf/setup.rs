@@ -235,10 +235,7 @@ pub fn run(config: &Config, live: Option<Box<dyn Write + Send>>) -> Result<Outco
         sinks.push((Box::new(JsonLines::new(file)), Policy::Required));
     }
     if let Some(live) = live {
-        // The moderator is in the roster the column is sized to: it sends
-        // most of what a watcher sees.
-        let roster = config.players.iter().chain([&config.moderator]);
-        sinks.push((Box::new(Text::new(live, roster)), Policy::Optional));
+        sinks.push((Box::new(Text::new(live)), Policy::Optional));
     }
     // One clock for the run, captured before the writer or any actor, so the
     // log's offsets and everything an actor measures are on one timeline
