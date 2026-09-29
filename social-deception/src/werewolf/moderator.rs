@@ -68,7 +68,7 @@
 //! the trajectory it belongs to, which is the ordering a reader can then
 //! rely on.
 //!
-//! The episode routes a cycle's events before the controls it asked for, so
+//! The episode routes a cycle's messages before the controls it asked for, so
 //! a living player observes the outcome and *then* stops, rather than
 //! stopping with the outcome still on its queue and never seeing it. A dead
 //! player is sent no outcome and only the stop. The episode stops the
@@ -89,7 +89,7 @@ use super::message::{Message, Outcome};
 use crate::agent::{Action, Observation, Recipients};
 use crate::clock::Timestamp;
 use crate::environment::{Effect, Environment};
-use crate::event::{AgentId, Control};
+use crate::message::{ActorId, Control};
 
 /// The agent that runs a game of Werewolf: a [`Game`] behind an
 /// [`Environment`].
@@ -112,7 +112,7 @@ impl Moderator {
 
     /// Every player in the game, living and dead: whom the moderator starts
     /// and, when the game is over, stops.
-    fn players(&self) -> BTreeSet<AgentId> {
+    fn players(&self) -> BTreeSet<ActorId> {
         self.game.players().cloned().collect()
     }
 
@@ -122,16 +122,16 @@ impl Moderator {
     ///
     /// If a player sends the moderator a narration.
     fn fold(&mut self, observation: &Observation<WerewolfDomain>) -> Vec<Directive> {
-        let sender = &observation.event.sender;
+        let sender = &observation.message.sender;
         let now = observation.received;
-        let mut directives = match &observation.event.payload {
+        let mut directives = match &observation.message.payload {
             // Two instants, and the difference matters. `created` is when
             // the player selected, and a forwarded selection carries it so the
             // relay costs latency and nothing else. `now` is when the
             // moderator got it, which is what the session clocks run on.
             Message::Select(selection) => {
                 self.game
-                    .select(sender, selection, observation.event.created, now)
+                    .select(sender, selection, observation.message.created, now)
             }
             Message::Narration(_) => panic!("{sender} sent the moderator a narration"),
         };
@@ -205,7 +205,7 @@ impl Environment<WerewolfDomain> for Moderator {
     /// The players take it from there (ADR-0014).
     ///
     /// The `Start` comes first among the effects, but the episode routes a
-    /// cycle's events before its controls either way, so what a player
+    /// cycle's messages before its controls either way, so what a player
     /// actually sees is its `Start` — controls are popped first — and then
     /// the opening narrations.
     fn start(&mut self, now: Timestamp) -> Vec<Effect<WerewolfDomain>> {
@@ -271,7 +271,7 @@ mod tests {
     use std::time::Duration;
 
     use crate::agent::Recipients;
-    use crate::event::{AgentId, Event};
+    use crate::message::ActorId;
     use crate::testing::{fast, id, ids, observed, town, village};
     use crate::werewolf::assignment::Assignment;
     use crate::werewolf::message::{Narration, Phase, RequestKind, Round, Select};
@@ -289,18 +289,23 @@ mod tests {
         (Moderator::new(game, sender), receiver)
     }
 
-    /// An event from a player to the moderator, as the moderator observes
+    /// A message from a player to the moderator, as the moderator observes
     /// it. The creation time plays no part in the fold, so one stand-in
     /// serves every test here.
     fn from_player(who: &str, payload: Message) -> Observation<WerewolfDomain> {
-        observed(Event::new(who, [MODERATOR], Timestamp::default(), payload))
+        observed(crate::Message::new(
+            who,
+            [MODERATOR],
+            Timestamp::default(),
+            payload,
+        ))
     }
 
     fn response(
-        who: &AgentId,
+        who: &ActorId,
         round: Round,
         kind: RequestKind,
-        target: AgentId,
+        target: ActorId,
     ) -> Observation<WerewolfDomain> {
         from_player(
             who.as_str(),
@@ -319,21 +324,21 @@ mod tests {
     /// The space is the game's own, so a stub cannot select outside it; the
     /// doctor's "not last night's patient" in particular is the rules'
     /// business rather than every stub's.
-    type Policy = fn(RequestKind, &[AgentId]) -> AgentId;
+    type Policy = fn(RequestKind, &[ActorId]) -> ActorId;
 
     /// Selects the first target the rules permit.
-    fn first_other(_: RequestKind, space: &[AgentId]) -> AgentId {
+    fn first_other(_: RequestKind, space: &[ActorId]) -> ActorId {
         space.first().unwrap().clone()
     }
 
     /// Selects the last target the rules permit.
-    fn last_other(_: RequestKind, space: &[AgentId]) -> AgentId {
+    fn last_other(_: RequestKind, space: &[ActorId]) -> ActorId {
         space.last().unwrap().clone()
     }
 
     /// Selects the last permitted target by night and the first by day,
     /// so that the pack and the village disagree about whom to blame.
-    fn two_minded(kind: RequestKind, space: &[AgentId]) -> AgentId {
+    fn two_minded(kind: RequestKind, space: &[ActorId]) -> ActorId {
         match kind.phase() {
             Phase::Night => last_other(kind, space),
             Phase::Day => first_other(kind, space),
@@ -352,7 +357,7 @@ mod tests {
     }
 
     /// The controls among some effects, in order.
-    fn controls(effects: &[Effect<WerewolfDomain>]) -> Vec<(BTreeSet<AgentId>, Control)> {
+    fn controls(effects: &[Effect<WerewolfDomain>]) -> Vec<(BTreeSet<ActorId>, Control)> {
         effects
             .iter()
             .filter_map(|effect| match effect {
@@ -364,7 +369,7 @@ mod tests {
 
     /// The rewards among some effects, by the agent paid, in the order the
     /// moderator assigned them.
-    fn rewards(effects: &[Effect<WerewolfDomain>]) -> Vec<(AgentId, i32)> {
+    fn rewards(effects: &[Effect<WerewolfDomain>]) -> Vec<(ActorId, i32)> {
         effects
             .iter()
             .filter_map(|effect| match effect {
@@ -472,8 +477,8 @@ mod tests {
         outcome: Outcome,
         receiver: Receiver<Outcome>,
         sent: Vec<Action<WerewolfDomain>>,
-        commanded: Vec<(BTreeSet<AgentId>, Control)>,
-        paid: Vec<(AgentId, i32)>,
+        commanded: Vec<(BTreeSet<ActorId>, Control)>,
+        paid: Vec<(ActorId, i32)>,
         /// Every effect in the order the moderator produced it, which is
         /// what the shutdown's ordering is asserted against.
         effects: Vec<Effect<WerewolfDomain>>,
@@ -503,7 +508,7 @@ mod tests {
 
     /// The outcome announced among some actions, and whom it was announced
     /// to.
-    fn announced_outcome(sent: &[Action<WerewolfDomain>]) -> (&BTreeSet<AgentId>, &Outcome) {
+    fn announced_outcome(sent: &[Action<WerewolfDomain>]) -> (&BTreeSet<ActorId>, &Outcome) {
         sent.iter()
             .find_map(|action| match action {
                 Action {
@@ -584,7 +589,7 @@ mod tests {
             ..
         } in played_games()
         {
-            let expected: Vec<(AgentId, i32)> = assignment
+            let expected: Vec<(ActorId, i32)> = assignment
                 .players()
                 .map(|(who, role)| {
                     let value = if outcome.winner == Some(role.faction()) {
@@ -596,7 +601,7 @@ mod tests {
                 })
                 .collect();
             assert_eq!(paid, expected, "{outcome:?}");
-            let dead: Vec<&AgentId> = paid
+            let dead: Vec<&ActorId> = paid
                 .iter()
                 .map(|(who, _)| who)
                 .filter(|who| !outcome.living.contains(who))
@@ -665,7 +670,7 @@ mod tests {
             ..
         } in played_games()
         {
-            let everyone: BTreeSet<AgentId> =
+            let everyone: BTreeSet<ActorId> =
                 assignment.players().map(|(who, _)| who.clone()).collect();
             // The outcome is narrated to exactly the living, which is what
             // the outcome itself names.
@@ -682,7 +687,7 @@ mod tests {
             // was announced, and whoever is left at the end (ADR-0012).
             let (started, stops) = commanded.split_first().expect("a start");
             assert_eq!(*started, (everyone.clone(), Control::Start));
-            let mut stopped: Vec<AgentId> = Vec::new();
+            let mut stopped: Vec<ActorId> = Vec::new();
             for (to, control) in stops {
                 assert_eq!(*control, Control::Stop);
                 stopped.extend(to.iter().cloned());

@@ -8,7 +8,7 @@
 //! **Nobody asks it to.** On observing that a phase has begun, a living
 //! player asks its own role what that phase wants of it
 //! ([`Role::asked_in`](super::Role::asked_in)) and selects if the answer is
-//! something. That is ADR-0014: an event to an agent is a fact it
+//! something. That is ADR-0014: a message to an agent is a fact it
 //! conditions on, and an instruction telling a player what its own role
 //! already says is not one. In the live game nobody waits to be asked — the
 //! moderator says night has fallen and the werewolves select, because they
@@ -52,7 +52,7 @@ use super::knowledge::Knowledge;
 use super::message::{Message, Narration, RequestKind, Round, Select};
 use super::policy::{Policy, View};
 use crate::agent::{self, Handler, Observation};
-use crate::event::AgentId;
+use crate::message::ActorId;
 
 /// What a role contributes to a player: its state, and the moves the
 /// rules permit it.
@@ -80,28 +80,28 @@ pub trait Player {
     ///
     /// If the kind is one this role is never asked, which is a bug in the
     /// caller rather than a runtime condition.
-    fn action_space(&self, kind: RequestKind) -> Vec<AgentId>;
+    fn action_space(&self, kind: RequestKind) -> Vec<ActorId>;
 }
 
 /// A player as an agent in the episode: a role, the policy that decides for
 /// it, and the moderator it addresses its selections to.
 ///
 /// One type for every role, because the handler body is the same for all of
-/// them: fold each event into the role's state and, when a phase begins a
+/// them: fold each message into the role's state and, when a phase begins a
 /// session this role is a member of, selects where the policy chooses from
 /// the role's action space.
 #[derive(Debug, Clone)]
 pub struct Seat<R, P> {
     player: R,
     policy: P,
-    moderator: AgentId,
+    moderator: ActorId,
 }
 
 impl<R: Player, P: Policy> Seat<R, P> {
     /// A seat for `player`, deciding with `policy`, selecting to
     /// `moderator`.
     #[must_use]
-    pub const fn new(player: R, policy: P, moderator: AgentId) -> Self {
+    pub const fn new(player: R, policy: P, moderator: ActorId) -> Self {
         Self {
             player,
             policy,
@@ -152,7 +152,7 @@ impl<R: Player, P: Policy> Seat<R, P> {
     /// Always without itself: a player does not observe its own actions.
     /// The moderator is not named either, since it receives every selection
     /// directly and has no need to be forwarded one.
-    fn audience(&self, kind: RequestKind) -> BTreeSet<AgentId> {
+    fn audience(&self, kind: RequestKind) -> BTreeSet<ActorId> {
         let knowledge = self.player.knowledge();
         let me = &knowledge.me;
         let seen_by = match kind {
@@ -189,7 +189,7 @@ impl<R: Player, P: Policy> Handler<WerewolfDomain> for Seat<R, P> {
         observation: &Observation<WerewolfDomain>,
     ) -> Vec<agent::Action<WerewolfDomain>> {
         self.player.knowledge_mut().observe(observation);
-        match &observation.event.payload {
+        match &observation.message.payload {
             // A phase beginning is what makes a player act, and it acts
             // on its own role rather than on anybody's instruction
             // (ADR-0014). A player the phase asks nothing of, and one
@@ -219,7 +219,6 @@ mod tests {
 
     use super::*;
     use crate::agent::Recipients;
-    use crate::event::Event;
     use crate::testing::{ME, id, ids, narrated, observed, phase_began, target};
     use crate::werewolf::message::{Cause, Narration, Phase, RequestKind, Round};
     use crate::werewolf::role::Role;
@@ -233,7 +232,7 @@ mod tests {
     struct First;
 
     impl Policy for First {
-        fn choose(&mut self, view: View<'_>) -> Option<AgentId> {
+        fn choose(&mut self, view: View<'_>) -> Option<ActorId> {
             view.action_space.first().cloned()
         }
     }
@@ -242,7 +241,7 @@ mod tests {
     struct Last;
 
     impl Policy for Last {
-        fn choose(&mut self, view: View<'_>) -> Option<AgentId> {
+        fn choose(&mut self, view: View<'_>) -> Option<ActorId> {
             view.action_space.last().cloned()
         }
     }
@@ -251,7 +250,7 @@ mod tests {
     struct Outside;
 
     impl Policy for Outside {
-        fn choose(&mut self, _: View<'_>) -> Option<AgentId> {
+        fn choose(&mut self, _: View<'_>) -> Option<ActorId> {
             Some(target("nobody"))
         }
     }
@@ -260,12 +259,12 @@ mod tests {
     struct Nowhere;
 
     impl Policy for Nowhere {
-        fn choose(&mut self, _: View<'_>) -> Option<AgentId> {
+        fn choose(&mut self, _: View<'_>) -> Option<ActorId> {
             None
         }
     }
 
-    fn eliminated(who: &str, round: u32) -> Event<WerewolfDomain> {
+    fn eliminated(who: &str, round: u32) -> crate::Message<WerewolfDomain> {
         narrated(Narration::Eliminated {
             who: id(who),
             role: Role::Villager,
@@ -286,36 +285,36 @@ mod tests {
     fn selecting<const N: usize>(
         round: u32,
         kind: RequestKind,
-        target: AgentId,
+        target: ActorId,
         seen_by: [&str; N],
     ) -> Action<WerewolfDomain> {
         Action::to(
-            [AgentId::new(MODERATOR)],
+            [ActorId::new(MODERATOR)],
             Message::Select(Select {
                 round: Round::new(round),
                 kind,
                 target,
-                seen_by: seen_by.iter().map(|who| AgentId::new(*who)).collect(),
+                seen_by: seen_by.iter().map(|who| ActorId::new(*who)).collect(),
             }),
         )
     }
 
     /// A selection of a kind only the moderator sees: the seer's and the
     /// doctor's own business.
-    fn privately(round: u32, kind: RequestKind, target: AgentId) -> Action<WerewolfDomain> {
+    fn privately(round: u32, kind: RequestKind, target: ActorId) -> Action<WerewolfDomain> {
         selecting(round, kind, target, [])
     }
 
-    /// What a seat does with a run of events, each in a cycle of its own,
+    /// What a seat does with a run of messages, each in a cycle of its own,
     /// as the loop hands them over (ADR-0008): every action they produced,
     /// in order.
     fn handling<R: Player, P: Policy, const N: usize>(
         seat: &mut Seat<R, P>,
-        events: [Event<WerewolfDomain>; N],
+        messages: [crate::Message<WerewolfDomain>; N],
     ) -> Vec<Action<WerewolfDomain>> {
-        events
+        messages
             .into_iter()
-            .flat_map(|event| seat.handle(&observed(event)))
+            .flat_map(|message| seat.handle(&observed(message)))
             .collect()
     }
 
@@ -465,7 +464,7 @@ mod tests {
 
     #[test]
     #[should_panic(
-        expected = "me's policy chose AgentId(\"nobody\"), which is outside the action space"
+        expected = "me's policy chose ActorId(\"nobody\"), which is outside the action space"
     )]
     fn an_action_outside_the_action_space_panics() {
         let mut seat = villager(Outside);

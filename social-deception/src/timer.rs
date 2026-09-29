@@ -3,8 +3,8 @@
 //! An agent that has a deadline waits on its queues and on a wake channel at
 //! the same time, and the wake channel firing is what makes it run a cycle
 //! it was not given anything to observe: one that calls
-//! [`Handler::timeout`](crate::Handler::timeout), unless an event was
-//! waiting too, in which case the deadline joins that event's cycle and the
+//! [`Handler::timeout`](crate::Handler::timeout), unless a message was
+//! waiting too, in which case the deadline joins that message's cycle and the
 //! agent observes it as usual. A [`TimerSource`] is whatever hands out those
 //! wake channels. In production it is the episode [`Clock`], whose channels fire
 //! when the process's monotonic clock reaches the deadline. In tests it is a
@@ -12,7 +12,7 @@
 //! behavior can be exercised without sleeping.
 //!
 //! A wake channel is asked for with an absolute deadline, never with an
-//! interval. That is what keeps the deadline fixed while events arrive: an
+//! interval. That is what keeps the deadline fixed while messages arrive: an
 //! agent that is spoken to keeps waiting on the same channel, so its deadline
 //! is never pushed back.
 

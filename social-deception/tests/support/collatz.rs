@@ -34,7 +34,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Serialize;
 use social_deception::{
-    Action, AgentId, Control, Domain, Effect, Environment, Handler, Observation, Timestamp,
+    Action, ActorId, Control, Domain, Effect, Environment, Handler, Observation, Timestamp,
 };
 
 /// The Collatz environment as a [`Domain`].
@@ -97,15 +97,15 @@ pub fn next(n: u64) -> u64 {
 /// name and value travel with the message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Collatz {
-    to: AgentId,
-    environment: AgentId,
+    to: ActorId,
+    environment: ActorId,
     opens: Vec<u64>,
 }
 
 impl Collatz {
     /// An agent that passes every chain it receives on to `to`, reports a
     /// finished chain to `environment`, and opens none of its own.
-    pub fn new(to: impl Into<AgentId>, environment: impl Into<AgentId>) -> Self {
+    pub fn new(to: impl Into<ActorId>, environment: impl Into<ActorId>) -> Self {
         Self {
             to: to.into(),
             environment: environment.into(),
@@ -130,7 +130,7 @@ impl Collatz {
     }
 
     /// The agent this one passes to.
-    pub fn to(&self) -> &AgentId {
+    pub fn to(&self) -> &ActorId {
         &self.to
     }
 
@@ -148,7 +148,7 @@ impl Collatz {
     /// If the environment sends an agent a `Finished`, which is a message
     /// that only ever travels the other way.
     fn reply(&self, observation: &Observation<CollatzDomain>) -> Vec<Action<CollatzDomain>> {
-        match observation.event.payload {
+        match observation.message.payload {
             // A chain that has reached 1 is over, and the environment is
             // the one that needs to know.
             CollatzPayload::Step { chain, value: 1 } => vec![Action::to(
@@ -199,7 +199,7 @@ impl Handler<CollatzDomain> for Collatz {
 /// nothing more to do and the episode is over.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CollatzEnvironment {
-    agents: BTreeSet<AgentId>,
+    agents: BTreeSet<ActorId>,
     /// How many chains of each starting number are still running.
     outstanding: BTreeMap<u64, usize>,
     /// Whether the ring has been stopped, so that it is stopped once.
@@ -218,7 +218,7 @@ impl CollatzEnvironment {
     pub fn new<A, I>(agents: A, opens: I) -> Self
     where
         A: IntoIterator,
-        A::Item: Into<AgentId>,
+        A::Item: Into<ActorId>,
         I: IntoIterator<Item = u64>,
     {
         let mut outstanding: BTreeMap<u64, usize> = BTreeMap::new();
@@ -286,11 +286,11 @@ impl Environment<CollatzDomain> for CollatzEnvironment {
     /// If an agent sends the environment a step, which is a message that
     /// only ever travels around the ring.
     fn handle(&mut self, observation: &Observation<CollatzDomain>) -> Vec<Effect<CollatzDomain>> {
-        match observation.event.payload {
+        match observation.message.payload {
             CollatzPayload::Finished { chain } => self.finished(chain),
             CollatzPayload::Step { chain, value } => panic!(
                 "{} sent the environment step {value} of chain {chain}",
-                observation.event.sender
+                observation.message.sender
             ),
         }
         self.stop_if_done()
@@ -299,7 +299,7 @@ impl Environment<CollatzDomain> for CollatzEnvironment {
 
 #[cfg(test)]
 mod tests {
-    use social_deception::Event;
+    use social_deception::Message;
 
     use super::*;
 
@@ -312,14 +312,14 @@ mod tests {
         observation(sender, "a", CollatzPayload::Step { chain, value })
     }
 
-    /// An event from `sender` to `recipient`, as the recipient observes it.
+    /// A message from `sender` to `recipient`, as the recipient observes it.
     fn observation(
         sender: &str,
         recipient: &str,
         payload: CollatzPayload,
     ) -> Observation<CollatzDomain> {
         Observation {
-            event: Event::new(sender, [recipient], Timestamp::default(), payload),
+            message: Message::new(sender, [recipient], Timestamp::default(), payload),
             received: Timestamp::default(),
         }
     }
@@ -393,7 +393,7 @@ mod tests {
     fn chains_are_opened_at_the_start_in_order_and_named_by_their_start() {
         let mut opener = agent().opening(6).opening(7);
         assert_eq!(opener.opens(), [6, 7]);
-        assert_eq!(opener.to(), &AgentId::new("b"));
+        assert_eq!(opener.to(), &ActorId::new("b"));
         assert_eq!(opener.start(Timestamp::default()), [to_b(6, 6), to_b(7, 7)]);
         // An agent that opens nothing opens nothing.
         assert!(agent().start(Timestamp::default()).is_empty());

@@ -83,7 +83,7 @@ use super::knowledge::Knowledge;
 use super::message::RequestKind;
 use super::role::Role;
 use super::seed::{pick, seed_for};
-use crate::event::AgentId;
+use crate::message::ActorId;
 
 /// What a policy sees when it decides: the agent's state, the kind of
 /// session in front of it, and the action space.
@@ -98,7 +98,7 @@ pub struct View<'a> {
     /// Every target the rules permit, in canonical order: sorted agent
     /// order. May be empty, and a policy handed an empty one has nowhere to
     /// selection.
-    pub action_space: &'a [AgentId],
+    pub action_space: &'a [ActorId],
 }
 
 /// How an agent picks an action from the action space.
@@ -120,7 +120,7 @@ pub trait Policy {
     ///
     /// [`View`] is `Copy` and is passed by value, so a policy that hands it
     /// on does not have to thread a reference through.
-    fn choose(&mut self, view: View<'_>) -> Option<AgentId>;
+    fn choose(&mut self, view: View<'_>) -> Option<ActorId>;
 }
 
 /// The uniform random baseline: a policy that samples uniformly from its own
@@ -136,7 +136,7 @@ impl RandomPolicy {
     /// agent's own id, so that its actions depend on its own history and
     /// nothing else.
     #[must_use]
-    pub fn for_agent(master: u64, who: &AgentId) -> Self {
+    pub fn for_agent(master: u64, who: &ActorId) -> Self {
         Self::from_seed(seed_for(master, who.as_str()))
     }
 
@@ -154,7 +154,7 @@ impl Policy for RandomPolicy {
     /// own and the question the [module documentation](self) raises does
     /// not arise. That is also what keeps a deterministic episode
     /// deterministic: nothing about the draw depends on timing at all.
-    fn choose(&mut self, view: View<'_>) -> Option<AgentId> {
+    fn choose(&mut self, view: View<'_>) -> Option<ActorId> {
         let candidates = candidates(&view);
         // Nowhere to select: the doctor with nobody left it may protect.
         // Drawing from an empty list is the one thing sampling cannot do,
@@ -175,9 +175,9 @@ impl Policy for RandomPolicy {
 /// may protect. The heuristic never empties a non-empty space: when it
 /// would, the space itself is the fallback, and the draw is the same one
 /// the old `Abstain`-less path made.
-fn candidates<'a>(view: &View<'a>) -> Vec<&'a AgentId> {
+fn candidates<'a>(view: &View<'a>) -> Vec<&'a ActorId> {
     let space = view.action_space;
-    let targets: Vec<&AgentId> = space.iter().filter(|who| !excluded(view, who)).collect();
+    let targets: Vec<&ActorId> = space.iter().filter(|who| !excluded(view, who)).collect();
     if targets.is_empty() {
         return space.iter().collect();
     }
@@ -187,7 +187,7 @@ fn candidates<'a>(view: &View<'a>) -> Vec<&'a AgentId> {
 /// Whether the heuristic drops `who` as a target in this session: a
 /// werewolf's living packmates for `Devour` and `Nominate`, and the targets
 /// the seer has already investigated for `Investigate`.
-fn excluded(view: &View<'_>, who: &AgentId) -> bool {
+fn excluded(view: &View<'_>, who: &ActorId) -> bool {
     let knowledge = view.knowledge;
     match (knowledge.role, view.kind) {
         (Role::Werewolf, RequestKind::Devour | RequestKind::Nominate) => {
@@ -216,8 +216,8 @@ mod tests {
         policy: &mut RandomPolicy,
         knowledge: &Knowledge,
         kind: RequestKind,
-        space: &[AgentId],
-    ) -> Option<AgentId> {
+        space: &[ActorId],
+    ) -> Option<ActorId> {
         policy.choose(View {
             knowledge,
             kind,
@@ -227,7 +227,7 @@ mod tests {
 
     /// The first action a fresh policy under each of [`SEEDS`] takes for
     /// `kind`, in the action space the rules would hand it.
-    fn first_choices(knowledge: &Knowledge, kind: RequestKind) -> Vec<(u64, Option<AgentId>)> {
+    fn first_choices(knowledge: &Knowledge, kind: RequestKind) -> Vec<(u64, Option<ActorId>)> {
         let space = base_action_space(knowledge, kind);
         SEEDS
             .map(|seed| {
@@ -239,7 +239,7 @@ mod tests {
 
     /// The first `n` nominations a policy makes as a villager among
     /// [`OTHERS`], where no heuristic is in play.
-    fn nominations(mut policy: RandomPolicy, n: usize) -> Vec<Option<AgentId>> {
+    fn nominations(mut policy: RandomPolicy, n: usize) -> Vec<Option<ActorId>> {
         let knowledge = knowing(Role::Villager, OTHERS);
         let space = base_action_space(&knowledge, RequestKind::Nominate);
         (0..n)
@@ -320,7 +320,7 @@ mod tests {
         // A guard against an off-by-one that could never return the last
         // element, not a statistical test.
         let draws = 1000;
-        let mut counts: BTreeMap<Option<AgentId>, usize> = BTreeMap::new();
+        let mut counts: BTreeMap<Option<ActorId>, usize> = BTreeMap::new();
         for action in nominations(RandomPolicy::from_seed(MASTER), draws) {
             *counts.entry(action).or_default() += 1;
         }

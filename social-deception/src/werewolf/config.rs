@@ -35,7 +35,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use super::seed;
-use crate::event::AgentId;
+use crate::message::ActorId;
 
 /// The moderator's id when the file does not set one.
 pub const DEFAULT_MODERATOR: &str = "moderator";
@@ -55,16 +55,16 @@ pub struct Config {
     pub seed: u64,
     /// The players, in the order written. The order does not affect the
     /// deal, which sorts them first.
-    pub players: Vec<AgentId>,
+    pub players: Vec<ActorId>,
     /// How many of each special role to deal. The rest are villagers.
     pub roles: RoleCounts,
     /// Where to write the trajectory, if anywhere.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trajectory: Option<PathBuf>,
-    /// The moderator's agent id. The moderator is an agent in the same
+    /// The moderator's actor id. The moderator is an agent in the same
     /// roster as the players, so no player may have this id.
     #[serde(default = "default_moderator")]
-    pub moderator: AgentId,
+    pub moderator: ActorId,
     /// The clocks the game's selection sessions run on.
     #[serde(default)]
     pub timing: Timing,
@@ -92,8 +92,8 @@ impl RoleCounts {
     }
 }
 
-fn default_moderator() -> AgentId {
-    AgentId::new(DEFAULT_MODERATOR)
+fn default_moderator() -> ActorId {
+    ActorId::new(DEFAULT_MODERATOR)
 }
 
 /// The clocks a game's selection sessions run on (ADR-0011).
@@ -281,7 +281,7 @@ mod seconds {
 
 /// Why a configuration was rejected.
 ///
-/// An empty agent id is not among these: `AgentId` does not deserialize
+/// An empty actor id is not among these: `ActorId` does not deserialize
 /// from the empty string, so a file naming one fails to parse.
 #[derive(Debug)]
 pub enum ConfigError {
@@ -322,12 +322,12 @@ pub enum ConfigError {
     /// `roles.doctors` is more than one.
     TooManyDoctors(usize),
     /// A player id appears more than once.
-    DuplicatePlayer(AgentId),
+    DuplicatePlayer(ActorId),
     /// A player has the moderator's id.
-    PlayerIsModerator(AgentId),
+    PlayerIsModerator(ActorId),
     /// A player has the name of one of the seed streams that are not a
     /// player's, [`seed::RESERVED`], and would share its generator with it.
-    ReservedPlayer(AgentId),
+    ReservedPlayer(ActorId),
     /// A timing duration is zero. A session with no time cannot be selected
     /// in.
     TimingNotPositive {
@@ -605,8 +605,8 @@ mod tests {
         werewolves = 1
     "#;
 
-    fn ids<const N: usize>(names: [&str; N]) -> Vec<AgentId> {
-        names.map(AgentId::new).into()
+    fn ids<const N: usize>(names: [&str; N]) -> Vec<ActorId> {
+        names.map(ActorId::new).into()
     }
 
     /// A valid configuration to break one field of at a time.
@@ -627,7 +627,7 @@ mod tests {
                     doctors: 1,
                 },
                 trajectory: Some(PathBuf::from("werewolf.jsonl")),
-                moderator: AgentId::new("narrator"),
+                moderator: ActorId::new("narrator"),
                 timing: Timing {
                     day_cap: Some(5),
                     pack: NightTiming {
@@ -663,7 +663,7 @@ mod tests {
                     doctors: 0,
                 },
                 trajectory: None,
-                moderator: AgentId::new(DEFAULT_MODERATOR),
+                moderator: ActorId::new(DEFAULT_MODERATOR),
                 timing: Timing::default(),
             }
         );
@@ -747,7 +747,7 @@ mod tests {
         );
         assert!(error.to_string().contains("2 werewolves among 4 players"));
         // One more player and the check passes.
-        config.players.push(AgentId::new("erin"));
+        config.players.push(ActorId::new("erin"));
         config.validate().unwrap();
     }
 
@@ -803,7 +803,7 @@ mod tests {
         let text = FULL.replace("\"dave\"", "\"\"");
         let error = Config::parse(&text).unwrap_err();
         assert!(matches!(error, ConfigError::Parse(_)), "{error:?}");
-        assert!(error.to_string().contains("non-empty agent id"), "{error}");
+        assert!(error.to_string().contains("non-empty actor id"), "{error}");
     }
 
     #[test]
@@ -811,13 +811,13 @@ mod tests {
         let text = FULL.replace("\"narrator\"", "\"\"");
         let error = Config::parse(&text).unwrap_err();
         assert!(matches!(error, ConfigError::Parse(_)), "{error:?}");
-        assert!(error.to_string().contains("non-empty agent id"), "{error}");
+        assert!(error.to_string().contains("non-empty actor id"), "{error}");
     }
 
     #[test]
     fn duplicate_player() {
         let mut config = valid();
-        config.players[5] = AgentId::new("bob");
+        config.players[5] = ActorId::new("bob");
         let error = config.validate().unwrap_err();
         assert!(
             matches!(&error, ConfigError::DuplicatePlayer(who) if who.as_str() == "bob"),
@@ -829,7 +829,7 @@ mod tests {
     #[test]
     fn player_is_moderator() {
         let mut config = valid();
-        config.players[0] = AgentId::new("narrator");
+        config.players[0] = ActorId::new("narrator");
         let error = config.validate().unwrap_err();
         assert!(
             matches!(&error, ConfigError::PlayerIsModerator(who) if who.as_str() == "narrator"),
@@ -847,7 +847,7 @@ mod tests {
         // the moderator's, and the streams would not be independent.
         for reserved in seed::RESERVED {
             let mut config = valid();
-            config.players[2] = AgentId::new(reserved);
+            config.players[2] = ActorId::new(reserved);
             let error = config.validate().unwrap_err();
             assert!(
                 matches!(&error, ConfigError::ReservedPlayer(who) if who.as_str() == reserved),
@@ -862,7 +862,7 @@ mod tests {
         }
         // The moderator has no policy stream, so its name is free.
         let mut config = valid();
-        config.moderator = AgentId::new(seed::TIES);
+        config.moderator = ActorId::new(seed::TIES);
         config.validate().unwrap();
     }
 

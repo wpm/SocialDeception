@@ -75,7 +75,7 @@ impl Role {
     /// This is what a player calls on itself to decide whether to act.
     /// Nobody tells it to: on hearing that a phase has begun it asks its
     /// own role what that phase wants of it, and selects if the answer is
-    /// something. That is ADR-0014 — an event to an agent is a fact it
+    /// something. That is ADR-0014 — a message to an agent is a fact it
     /// conditions on, and an instruction telling a player what its own role
     /// already says is not one.
     ///

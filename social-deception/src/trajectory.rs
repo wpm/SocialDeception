@@ -15,7 +15,7 @@
 //! # Five record types
 //!
 //! An agent runs one cycle per wake-up: it pops the controls at the head of
-//! its queue and at most one event, hands that one observation to its
+//! its queue and at most one message, hands that one observation to its
 //! handler, and sends the actions that come back. Each cycle produces:
 //!
 //! - an [`ObservationRecord`] for the observation it popped, if it popped
@@ -34,7 +34,7 @@
 //! **environment**, and belongs to the agent it names rather than to the
 //! agent that wrote it; see [`RewardRecord`] and ADR-0007.
 //!
-//! An observation and an action record the same event from the two sides of
+//! An observation and an action record the same message from the two sides of
 //! it, which is what makes the trajectory joinable: an observation in one
 //! agent's trajectory matches the action in its sender's whose `created` and
 //! payload it carries. Nothing else links them, and nothing else needs to.
@@ -101,8 +101,8 @@
 //! ```json
 //! {"type":"control","agent":"alice","seq":0,"created":10,"received":12,"control":"start"}
 //! {"type":"cycle","agent":"alice","t_start":12,"t_stop":13,"woken":"queue","inputs":[0],"outputs":[]}
-//! {"type":"observation","agent":"alice","seq":1,"created":40,"received":55,"event":{"sender":"moderator","recipients":["alice"],"payload":{"Request":{}}}}
-//! {"type":"action","agent":"alice","seq":2,"created":90,"event":{"sender":"alice","recipients":["moderator"],"payload":{"Response":{}}}}
+//! {"type":"observation","agent":"alice","seq":1,"created":40,"received":55,"message":{"sender":"moderator","recipients":["alice"],"payload":{"Request":{}}}}
+//! {"type":"action","agent":"alice","seq":2,"created":90,"message":{"sender":"alice","recipients":["moderator"],"payload":{"Response":{}}}}
 //! {"type":"cycle","agent":"alice","t_start":55,"t_stop":90,"woken":"queue","inputs":[1],"outputs":[2]}
 //! {"type":"reward","agent":"alice","created":500,"value":1}
 //! ```
@@ -117,12 +117,12 @@ use crossbeam_channel::{Sender, unbounded};
 use serde::{Serialize, Serializer};
 
 use crate::clock::{Created, Timestamp};
-use crate::event::{AgentId, Control, Domain, Event};
+use crate::message::{ActorId, Control, Domain, Message};
 
 /// An agent's sequence number for one of its own records.
 ///
 /// Sequence numbers are assigned by the agent loop and are meaningful only
-/// together with the agent id: two agents both have a sequence number 0.
+/// together with the actor id: two agents both have a sequence number 0.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct Seq(pub u64);
@@ -138,7 +138,7 @@ pub enum Woken {
     /// It says when the cycle ran, not what it decided from. A deadline
     /// that passes while nothing is waiting runs a cycle that observes
     /// nothing and calls [`Handler::timeout`](crate::Handler::timeout); one
-    /// that passes while an event is waiting joins that event's cycle,
+    /// that passes while a message is waiting joins that message's cycle,
     /// which observes it and calls
     /// [`Handler::handle`](crate::Handler::handle) like any other. Either
     /// way the deadline is retired and the next is measured from this
@@ -146,41 +146,41 @@ pub enum Woken {
     Timeout,
 }
 
-/// The body of an `event` field: an event without its creation time, which
+/// The body of a `message` field: a message without its creation time, which
 /// the record carries at the top level instead.
 ///
 /// It is not a type of its own anywhere else. The creation time sits beside
 /// `agent` and `seq` because it is a property of the record's subject and a
-/// reader joins on it, and repeating it inside the event would be two places
-/// to read the same instant from.
-struct Envelope<'a, D: Domain>(&'a Event<D>);
+/// reader joins on it, and repeating it inside the message would be two
+/// places to read the same instant from.
+struct Envelope<'a, D: Domain>(&'a Message<D>);
 
 impl<D: Domain> Serialize for Envelope<'_, D> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut event = serializer.serialize_struct("Event", 3)?;
-        event.serialize_field("sender", &self.0.sender)?;
-        event.serialize_field("recipients", &self.0.recipients)?;
-        event.serialize_field("payload", &self.0.payload)?;
-        event.end()
+        let mut message = serializer.serialize_struct("Message", 3)?;
+        message.serialize_field("sender", &self.0.sender)?;
+        message.serialize_field("recipients", &self.0.recipients)?;
+        message.serialize_field("payload", &self.0.payload)?;
+        message.end()
     }
 }
 
-/// An event this agent popped off its queue.
+/// A message this agent popped off its queue.
 ///
 /// `Debug`, `Clone` and equality are written out rather than derived, for
-/// the reason [`Event`]'s are: a derive would ask them of `D`.
+/// the reason [`Message`]'s are: a derive would ask them of `D`.
 pub struct ObservationRecord<D: Domain> {
     /// The agent whose trajectory this record belongs to.
-    pub agent: AgentId,
+    pub agent: ActorId,
     /// The agent's sequence number for it.
     pub seq: Seq,
     /// When its sender sent it.
     pub created: Timestamp,
     /// When this agent popped it: its cycle's `t_start`.
     pub received: Timestamp,
-    /// The event.
-    pub event: Event<D>,
+    /// The message.
+    pub message: Message<D>,
 }
 
 impl<D: Domain> Serialize for ObservationRecord<D> {
@@ -191,12 +191,12 @@ impl<D: Domain> Serialize for ObservationRecord<D> {
         record.serialize_field("seq", &self.seq)?;
         record.serialize_field("created", &self.created)?;
         record.serialize_field("received", &self.received)?;
-        record.serialize_field("event", &Envelope(&self.event))?;
+        record.serialize_field("message", &Envelope(&self.message))?;
         record.end()
     }
 }
 
-/// An event this agent sent.
+/// A message this agent sent.
 ///
 /// `Debug`, `Clone` and equality are written out for the same reason
 /// [`ObservationRecord`]'s are.
@@ -206,13 +206,13 @@ impl<D: Domain> Serialize for ObservationRecord<D> {
 /// recipient's own observation record.
 pub struct ActionRecord<D: Domain> {
     /// The agent whose trajectory this record belongs to.
-    pub agent: AgentId,
+    pub agent: ActorId,
     /// The agent's sequence number for it.
     pub seq: Seq,
     /// When the loop sent it, which is the `created` on the wire.
     pub created: Timestamp,
-    /// The event as sent.
-    pub event: Event<D>,
+    /// The message as sent.
+    pub message: Message<D>,
 }
 
 impl<D: Domain> Serialize for ActionRecord<D> {
@@ -222,7 +222,7 @@ impl<D: Domain> Serialize for ActionRecord<D> {
         record.serialize_field("agent", &self.agent)?;
         record.serialize_field("seq", &self.seq)?;
         record.serialize_field("created", &self.created)?;
-        record.serialize_field("event", &Envelope(&self.event))?;
+        record.serialize_field("message", &Envelope(&self.message))?;
         record.end()
     }
 }
@@ -231,7 +231,7 @@ impl<D: Domain> Serialize for ActionRecord<D> {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ControlRecord {
     /// The agent whose trajectory this record belongs to.
-    pub agent: AgentId,
+    pub agent: ActorId,
     /// The agent's sequence number for it.
     pub seq: Seq,
     /// When the episode sent it.
@@ -248,7 +248,7 @@ pub struct ControlRecord {
 /// environment decides what an agent's behavior was worth, and `agent`
 /// names the agent **rewarded**, whose trajectory the record belongs to,
 /// not the environment that wrote it. Training joins a reward to that
-/// agent's trajectory by the agent id and the time (ADR-0007).
+/// agent's trajectory by the actor id and the time (ADR-0007).
 ///
 /// There is no `seq`. Sequence numbers are the agent loop's to assign, and
 /// this record was not written by that loop, so numbering it would either
@@ -262,7 +262,7 @@ pub struct ControlRecord {
 /// the marker type, when what has to have them is `D::Reward`.
 pub struct RewardRecord<D: Domain> {
     /// The agent rewarded, whose trajectory this record belongs to.
-    pub agent: AgentId,
+    pub agent: ActorId,
     /// When the environment logged it.
     pub created: Timestamp,
     /// What the agent's behavior was worth, in the game's own units.
@@ -290,7 +290,7 @@ impl<D: Domain> Created for RewardRecord<D> {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CycleRecord {
     /// The agent whose cycle this was.
-    pub agent: AgentId,
+    pub agent: ActorId,
     /// When the agent popped its queue, and so when everything it popped was
     /// received.
     pub t_start: Timestamp,
@@ -314,9 +314,9 @@ pub struct CycleRecord {
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", bound = "")]
 pub enum LogRecord<D: Domain> {
-    /// An event some agent popped.
+    /// A message some agent popped.
     Observation(ObservationRecord<D>),
-    /// An event some agent sent.
+    /// A message some agent sent.
     Action(ActionRecord<D>),
     /// A control some agent popped.
     Control(ControlRecord),
@@ -336,7 +336,7 @@ where
             .field("seq", &self.seq)
             .field("created", &self.created)
             .field("received", &self.received)
-            .field("event", &self.event)
+            .field("message", &self.message)
             .finish()
     }
 }
@@ -348,7 +348,7 @@ impl<D: Domain> Clone for ObservationRecord<D> {
             seq: self.seq,
             created: self.created,
             received: self.received,
-            event: self.event.clone(),
+            message: self.message.clone(),
         }
     }
 }
@@ -362,7 +362,7 @@ where
             && self.seq == other.seq
             && self.created == other.created
             && self.received == other.received
-            && self.event == other.event
+            && self.message == other.message
     }
 }
 
@@ -377,7 +377,7 @@ where
             .field("agent", &self.agent)
             .field("seq", &self.seq)
             .field("created", &self.created)
-            .field("event", &self.event)
+            .field("message", &self.message)
             .finish()
     }
 }
@@ -388,7 +388,7 @@ impl<D: Domain> Clone for ActionRecord<D> {
             agent: self.agent.clone(),
             seq: self.seq,
             created: self.created,
-            event: self.event.clone(),
+            message: self.message.clone(),
         }
     }
 }
@@ -401,7 +401,7 @@ where
         self.agent == other.agent
             && self.seq == other.seq
             && self.created == other.created
-            && self.event == other.event
+            && self.message == other.message
     }
 }
 
@@ -718,7 +718,7 @@ mod tests {
     /// A handful of records of every kind: agent `a` pops a start and a
     /// message in one cycle and replies to `b`.
     fn sample() -> Vec<LogRecord<TestDomain>> {
-        let a = AgentId::new("a");
+        let a = ActorId::new("a");
         vec![
             ControlRecord {
                 agent: a.clone(),
@@ -733,14 +733,14 @@ mod tests {
                 seq: Seq(1),
                 created: at(20),
                 received: at(30),
-                event: Event::new("b", ["a"], at(20), TestPayload::Step(6)),
+                message: Message::new("b", ["a"], at(20), TestPayload::Step(6)),
             }
             .into(),
             ActionRecord {
                 agent: a.clone(),
                 seq: Seq(2),
                 created: at(40),
-                event: Event::new("a", ["b"], at(40), TestPayload::Step(3)),
+                message: Message::new("a", ["b"], at(40), TestPayload::Step(3)),
             }
             .into(),
             CycleRecord {
@@ -760,9 +760,9 @@ mod tests {
             json!({"type": "control", "agent": "a", "seq": 0, "created": 10, "received": 30,
                    "control": "start"}),
             json!({"type": "observation", "agent": "a", "seq": 1, "created": 20, "received": 30,
-                   "event": {"sender": "b", "recipients": ["a"], "payload": {"Step": 6}}}),
+                   "message": {"sender": "b", "recipients": ["a"], "payload": {"Step": 6}}}),
             json!({"type": "action", "agent": "a", "seq": 2, "created": 40,
-                   "event": {"sender": "a", "recipients": ["b"], "payload": {"Step": 3}}}),
+                   "message": {"sender": "a", "recipients": ["b"], "payload": {"Step": 3}}}),
             json!({"type": "cycle", "agent": "a", "t_start": 30, "t_stop": 50, "woken": "queue",
                    "inputs": [0, 1], "outputs": [2]}),
         ]
@@ -779,19 +779,20 @@ mod tests {
     }
 
     #[test]
-    fn an_event_record_carries_its_creation_time_once_and_at_the_top() {
-        // The event body is the sender, the recipients and the payload; the
+    fn a_message_record_carries_its_creation_time_once_and_at_the_top() {
+        // The message body is the sender, the recipients and the payload; the
         // instant it was created sits beside `seq`, where a reader joins on
         // it, and nowhere else.
         let lines = expected_lines();
         for line in &lines[1..3] {
             assert!(line["created"].is_u64(), "{line}");
-            assert!(line["event"]["created"].is_null(), "{line}");
+            assert!(line["message"]["created"].is_null(), "{line}");
         }
         // And in the order written, which is what a reader sees on disk.
         let written = serde_json::to_string(&sample()[1]).unwrap();
         assert!(
-            written.ends_with(r#""event":{"sender":"b","recipients":["a"],"payload":{"Step":6}}}"#),
+            written
+                .ends_with(r#""message":{"sender":"b","recipients":["a"],"payload":{"Step":6}}}"#),
             "{written}"
         );
     }
@@ -803,7 +804,7 @@ mod tests {
         // `seq`, because the agent loop did not write it, and no
         // `received`, because nobody received it.
         let reward: LogRecord<TestDomain> = RewardRecord {
-            agent: AgentId::new("alice"),
+            agent: ActorId::new("alice"),
             created: at(500),
             value: 1,
         }
@@ -823,7 +824,7 @@ mod tests {
         // `Created` and not `Received`: a reward is logged, never sent,
         // so there is no instant at which anybody got it.
         let reward: RewardRecord<TestDomain> = RewardRecord {
-            agent: AgentId::new("alice"),
+            agent: ActorId::new("alice"),
             created: at(500),
             value: -1,
         };
@@ -845,7 +846,7 @@ mod tests {
     #[test]
     fn a_timeout_cycle_records_what_woke_it_and_no_inputs() {
         let cycle: LogRecord<TestDomain> = CycleRecord {
-            agent: AgentId::new("a"),
+            agent: ActorId::new("a"),
             t_start: at(60),
             t_stop: at(61),
             woken: Woken::Timeout,
@@ -888,7 +889,7 @@ mod tests {
             .map(|i| {
                 let sender = sender.clone();
                 thread::spawn(move || {
-                    let agent = AgentId::new(format!("agent-{i}"));
+                    let agent = ActorId::new(format!("agent-{i}"));
                     for seq in 0..10 {
                         let record: LogRecord<TestDomain> = ControlRecord {
                             agent: agent.clone(),
@@ -1027,7 +1028,7 @@ mod tests {
         let (sender, writer) = Writer::spawn(vec![(broken, Policy::Required)]);
         // A record small enough to sit in the buffer.
         let record: LogRecord<TestDomain> = CycleRecord {
-            agent: AgentId::new("a"),
+            agent: ActorId::new("a"),
             t_start: at(0),
             t_stop: at(1),
             woken: Woken::Queue,
@@ -1038,10 +1039,10 @@ mod tests {
         // A record larger than the buffer is written while the loop is still
         // running; the thread stops and drops its receiver at that point.
         let big: LogRecord<TestDomain> = ActionRecord {
-            agent: AgentId::new("a"),
+            agent: ActorId::new("a"),
             seq: Seq(0),
             created: at(0),
-            event: Event::new(
+            message: Message::new(
                 "a",
                 (0..20_000)
                     .map(|i| format!("agent-{i}"))
@@ -1058,7 +1059,7 @@ mod tests {
         let error = writer.join().unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::StorageFull);
         let late: LogRecord<TestDomain> = ControlRecord {
-            agent: AgentId::new("a"),
+            agent: ActorId::new("a"),
             seq: Seq(1),
             created: at(2),
             received: at(3),

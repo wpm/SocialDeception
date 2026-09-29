@@ -11,19 +11,19 @@
 //!
 //! | Term | Is |
 //! |---|---|
-//! | [`Event`] | in-domain data on the wire: sender, recipients, creation time and a payload |
+//! | [`Message`] | in-domain data on the wire: sender, recipients, creation time and a payload |
 //! | [`Control`] | out-of-domain data on the wire: start and stop |
 //! | [`Delivery`] | either of the two, which is what an agent's one queue carries |
-//! | [`Observation`] | an [`Event`] popped off an agent's queue |
+//! | [`Observation`] | a [`Message`] popped off an agent's queue |
 //! | [`Action`] | what a handler returns for the loop to send |
 //! | [`Domain`] | the types one game contributes: its payload and its reward |
 //! | cycle | one turn of an agent's loop: pop one observation, hand it to the handler, send |
 //! | [`Environment`] | the one agent per episode that starts and stops the others |
 //!
 //! [`Observation`] and [`Action`] are relative to an agent; on the wire
-//! there are only events and controls. The same [`Event`] is the sent action
-//! of its sender and an observation of each of its recipients, which is what
-//! lets a trajectory be joined across agents.
+//! there are only messages and controls. The same [`Message`] is the sent
+//! action of its sender and an observation of each of its recipients, which
+//! is what lets a trajectory be joined across agents.
 //!
 //! The runtime is generic over one parameter, a [`Domain`], rather than over
 //! each of a game's types separately.
@@ -33,16 +33,16 @@
 //! - [`clock`]: the episode [`Clock`] everything is timestamped with, and
 //!   the [`Created`] and [`Received`] traits that say what is known about
 //!   a thing's time;
-//! - [`event`]: the [`Domain`] a game names its types with, the [`Event`]
-//!   and [`Control`] that travel on the wire, and the [`Delivery`] that
-//!   carries either of them to an agent;
+//! - [`message`]: the [`Domain`] a game names its types with, the
+//!   [`Message`] and [`Control`] that travel on the wire, and the
+//!   [`Delivery`] that carries either of them to an agent;
 //! - [`trajectory`]: the records an agent's loop produces and the [`Writer`]
 //!   that hands each one to every [`Sink`] it was given;
 //! - [`timer`]: the [`TimerSource`] an agent's deadlines come from;
 //! - [`agent`]: the [`Agent`] thread that pops its queue, folds the
 //!   [`Observation`] it took through a [`Handler`], and records what it saw
 //!   and sent;
-//! - [`router`]: the [`Router`] from agent ids to their channels;
+//! - [`router`]: the [`Router`] from actor ids to their channels;
 //! - [`environment`]: the [`Environment`], the one agent per episode whose
 //!   cycle may produce a [`Control`] as well as an [`Action`];
 //! - [`episode`]: the [`Episode`] that runs a roster and its environment
@@ -50,8 +50,8 @@
 //!
 //! On top of that runtime sits one game, [`werewolf`], whose
 //! [`WerewolfDomain`](werewolf::WerewolfDomain) names its types: the roles,
-//! phases and the [`Message`](werewolf::Message) payload that travels over
-//! [`Event`] in a game of Werewolf, the [`Knowledge`](werewolf::Knowledge)
+//! phases and the [`werewolf::Message`] payload that a runtime [`Message`]
+//! carries in a game of Werewolf, the [`Knowledge`](werewolf::Knowledge)
 //! a player folds its observations into, the [`Policy`](werewolf::Policy)
 //! that picks its moves, the roles ([`werewolf::roles`]) whose rules say
 //! which moves it may pick from and the [`Seat`](werewolf::Seat) that plays
@@ -66,7 +66,7 @@ pub mod agent;
 pub mod clock;
 pub mod environment;
 pub mod episode;
-pub mod event;
+pub mod message;
 pub mod router;
 #[cfg(test)]
 mod testing;
@@ -80,7 +80,7 @@ pub use agent::{
 pub use clock::{Clock, Created, Received, Timestamp};
 pub use environment::{Effect, Environment};
 pub use episode::{Episode, EpisodeError, Failure};
-pub use event::{AgentId, Control, Delivery, Domain, Event, Payload};
+pub use message::{ActorId, Control, Delivery, Domain, Message, Payload};
 pub use router::{Queues, RouteError, Router};
 pub use timer::{ManualTimer, ManualTimerControl, TimerSource};
 // [`trajectory::Policy`] is deliberately not re-exported here. The crate

@@ -40,7 +40,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use social_deception::AgentId;
+use social_deception::ActorId;
 use social_deception::werewolf::transcript;
 use social_deception::werewolf::{self, Config, ConfigError, Outcome, Role, Transcript, config};
 
@@ -73,7 +73,7 @@ enum Command {
     Replay {
         /// The JSON Lines trajectory to read.
         trajectory: PathBuf,
-        /// The moderator's agent id, when the trajectory has no effective
+        /// The moderator's actor id, when the trajectory has no effective
         /// config beside it [default: moderator].
         #[arg(long)]
         moderator: Option<String>,
@@ -200,7 +200,7 @@ impl fmt::Display for Played {
             None => writeln!(f, "winner: none (stalemate)")?,
         }
         writeln!(f, "rounds: {}", self.outcome.rounds.number())?;
-        let survivors: Vec<&str> = self.outcome.living.iter().map(AgentId::as_str).collect();
+        let survivors: Vec<&str> = self.outcome.living.iter().map(ActorId::as_str).collect();
         writeln!(f, "survivors: {}", survivors.join(", "))?;
         match &self.config.trajectory {
             Some(trajectory) => {
@@ -222,7 +222,7 @@ struct Replay {
     /// The effective config found beside the trajectory, if there was one.
     effective: Option<Config>,
     /// The moderator whose records were read.
-    moderator: AgentId,
+    moderator: ActorId,
     /// The `--moderator` that was ignored because the effective config
     /// named someone else.
     overridden: Option<String>,
@@ -251,7 +251,7 @@ fn replay(trajectory: &Path, moderator: Option<&str>) -> Result<Replay, Box<dyn 
                 .map(str::to_owned),
         ),
         None => (
-            AgentId::new(moderator.unwrap_or(config::DEFAULT_MODERATOR)),
+            ActorId::new(moderator.unwrap_or(config::DEFAULT_MODERATOR)),
             None,
         ),
     };
@@ -614,7 +614,7 @@ mod tests {
     fn replay_with_the_effective_config_uses_its_seed_and_moderator() {
         let replayed = replay(&fixture(), None).unwrap();
         assert_eq!(seed(&replayed), Some(26));
-        assert_eq!(replayed.moderator, AgentId::new("moderator"));
+        assert_eq!(replayed.moderator, ActorId::new("moderator"));
         assert_eq!(replayed.overridden, None);
         assert_eq!(replayed.transcript.rounds.len(), 4);
         let golden = fs::read_to_string(fixture().with_extension("txt")).unwrap();
@@ -630,7 +630,7 @@ mod tests {
     fn the_effective_config_wins_over_a_disagreeing_moderator_flag() {
         let disagreeing = replay(&fixture(), Some("narrator")).unwrap();
         assert_eq!(seed(&disagreeing), Some(26));
-        assert_eq!(disagreeing.moderator, AgentId::new("moderator"));
+        assert_eq!(disagreeing.moderator, ActorId::new("moderator"));
         assert_eq!(disagreeing.overridden.as_deref(), Some("narrator"));
         assert_eq!(disagreeing.transcript.rounds.len(), 4);
         // The same flag, agreeing, is not overridden.
@@ -646,7 +646,7 @@ mod tests {
 
         let replayed = replay(&alone, None).unwrap();
         assert_eq!(seed(&replayed), None);
-        assert_eq!(replayed.moderator, AgentId::new("moderator"));
+        assert_eq!(replayed.moderator, ActorId::new("moderator"));
         assert_eq!(replayed.overridden, None);
         assert_eq!(replayed.transcript.rounds.len(), 4);
         assert!(
