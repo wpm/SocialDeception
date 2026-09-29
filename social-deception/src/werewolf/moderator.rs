@@ -35,7 +35,7 @@
 //! player, living and dead, because it was a dead player's terminal reward
 //! signal. A reward is now logged rather than said (ADR-0007), so the
 //! exception is withdrawn: the outcome is narrated to the living like any
-//! other narration, and a dead player's trajectory ends at the announcement
+//! other narration, and a dead player's records end at the announcement
 //! of its own elimination, then its `Stop`.
 //!
 //! # The outcome reaches the caller on a channel
@@ -64,8 +64,8 @@
 //! The rewards come before the stop because they are what the episode was
 //! for. They are logged rather than sent (ADR-0007), so their position
 //! among the effects changes nothing a player sees; what it does is put
-//! each reward in the trajectory ahead of the `Stop` control that closes
-//! the trajectory it belongs to, which is the ordering a reader can then
+//! each reward in the log ahead of the `Stop` control that closes the
+//! records it belongs to, which is the ordering a reader can then
 //! rely on.
 //!
 //! The episode routes a cycle's messages before the controls it asked for, so
@@ -166,7 +166,7 @@ impl Moderator {
             );
             // Only the living: a dead player was stopped in the cycle
             // its death was announced (ADR-0012), and stopping it again
-            // would claim in its trajectory that it was told to stop
+            // would claim in its records that it was told to stop
             // after it had already stopped.
             effects.push(Effect::control(self.game.living().clone(), Control::Stop));
         }

@@ -1,5 +1,5 @@
-//! Werewolf's own invariants: what every trajectory of a game of Werewolf
-//! satisfies beyond what [`super::check`] asserts of any trajectory.
+//! Werewolf's own invariants: what the log of a game of Werewolf
+//! satisfies beyond what [`super::check`] asserts of any log.
 //!
 //! The checks are written against the parsed lines, the way the runtime's own
 //! checks are, and read the game the way the transcript reader does: from the
@@ -9,7 +9,7 @@
 //! the moderator cannot vouch for, which is what actually reached each of
 //! them.
 //!
-//! Since ADR-0014 a trajectory holds no request at all. Nobody is told to
+//! Since ADR-0014 the log holds no request at all. Nobody is told to
 //! act: a player observes that a phase has begun, asks its own role what
 //! that phase wants of it, and selects. So a selection is no longer half of a
 //! pair to be joined up — it carries the round and the kind of the session
@@ -23,7 +23,7 @@
 //!   target inside the action space the rules allow it; the dead are never
 //!   heard from; players only ever address the moderator; and the
 //!   moderator's last word is the outcome. A
-//!   trajectory whose last narration is not an outcome is a game the
+//!   log whose last narration is not an outcome is a game the
 //!   moderator never ended, which the episode also catches as a stall;
 //! - **hidden information**: the realized observations stay inside each
 //!   role's observation space. Every message goes to exactly the players
@@ -32,14 +32,14 @@
 //!   seer alone, and a narration to the living goes to exactly the living.
 //!   Routing is the whole of the hidden-information mechanism, so these are
 //!   what the design exists to guarantee;
-//! - **the episode's shape**: every trajectory, the moderator's included,
+//! - **the episode's shape**: every agent's records, the moderator's included,
 //!   begins with a `Start` control and ends with a `Stop`, because the
 //!   moderator is the episode's environment and starting and stopping the
 //!   players is its doing. Nothing at all reaches a dead player from the
 //!   moment of its death: not its own death, which it is never told, not
 //!   a peer's selection, nothing. The victim is left out of the `Eliminated`
 //!   narration and its agent is stopped in the same cycle (ADR-0012), so
-//!   its trajectory simply ends where the game ended for it. No message
+//!   its records simply end where the game ended for it. No message
 //!   of this game is broadcast, and the outcome, which ADR-0004 once
 //!   excepted, is narrated to the living like everything else;
 //! - **the rewards**: every player has exactly one, +1 exactly when the
@@ -87,7 +87,7 @@ struct Heard<'a> {
 /// A selection the moderator passed on: one it accepted.
 ///
 /// The moderator forwards only a selection whose session was still open
-/// (ADR-0014), so a forward is the trajectory's record that a selection was
+/// (ADR-0014), so a forward is the log's record that a selection was
 /// counted. Since nothing summarizes a session any more (ADR-0015), it is
 /// also the only such record: what a session decided is read off these.
 struct Forwarded<'a> {
@@ -126,7 +126,7 @@ struct Play<'a> {
     outcome: Outcome,
 }
 
-/// Asserts everything a trajectory of a game played from `config` must
+/// Asserts everything the log of a game played from `config` must
 /// satisfy; see the [module documentation](self).
 ///
 /// Run [`super::check`] first: these checks assume the moderator's records
@@ -138,7 +138,7 @@ struct Play<'a> {
 pub fn check(lines: &[Value], config: &Config) {
     let play = Play::read(lines, config);
     // The phases first: a selection is placed by the phase it names
-    // (ADR-0014), so a trajectory whose phases are themselves wrong
+    // (ADR-0014), so a log whose phases are themselves wrong
     // should fail by that name rather than as a selection that cannot be
     // placed in them.
     play.check_phases();
@@ -150,17 +150,17 @@ pub fn check(lines: &[Value], config: &Config) {
     play.check_outcome();
     play.check_players(lines);
     // The episode's shape first: a reward is checked against the `Stop`
-    // that ends its agent's trajectory, so "everybody was stopped" should
+    // that ends its agent's records, so "everybody was stopped" should
     // fail by its own name rather than as a missing stop to compare with.
     check_episode(lines, config);
     play.check_rewards(lines);
 }
 
-/// Every agent's trajectory, the moderator's included, begins with a `Start`
+/// Every agent's records, the moderator's included, begin with a `Start`
 /// control and ends with a `Stop`, and nobody is started or stopped twice.
 ///
 /// It is the moderator that sends both, being the episode's environment, so
-/// this is the check that the game's own shutdown happened: a trajectory
+/// this is the check that the game's own shutdown happened: a log
 /// whose players were stopped by the episode picking up the pieces would
 /// look the same here, but one where somebody was never stopped at all
 /// would not.
@@ -180,7 +180,7 @@ fn check_episode(lines: &[Value], config: &Config) {
         assert_eq!(
             controls,
             ["start", "stop"],
-            "{who}'s trajectory begins with a start and ends with a stop"
+            "{who}'s records begin with a start and end with a stop"
         );
     }
     let agents: BTreeSet<ActorId> = lines
@@ -367,7 +367,7 @@ impl<'a> Play<'a> {
         let outcome = outcome(&last.message)
             .unwrap_or_else(|| {
                 panic!(
-                    "a trajectory without an outcome is a truncated game; the moderator's last \
+                    "a log without an outcome is a truncated game; the moderator's last \
                      word was {}",
                     last.line
                 )
@@ -456,7 +456,7 @@ impl<'a> Play<'a> {
     /// alive: the living players whose role is asked that kind in that
     /// phase and whom the rules leave somewhere to select.
     ///
-    /// Nobody is told this and nothing in the trajectory states it
+    /// Nobody is told this and nothing in the log states it
     /// (ADR-0014), so the check derives it the way the players and the
     /// moderator each derive it: from the roles. The non-empty action
     /// space matters — a doctor the rules leave nobody it may protect is
@@ -894,8 +894,8 @@ impl<'a> Play<'a> {
     /// from the player's own, because the victim is never told: the
     /// `Eliminated` narration goes to the living after the death, which no
     /// longer includes the victim, and the victim's agent is stopped in the
-    /// same cycle (ADR-0012). A dead player's trajectory therefore simply
-    /// ends where the game ended for it, with no announcement to mark the
+    /// same cycle (ADR-0012). A dead player's records therefore simply
+    /// end where the game ended for it, with no announcement to mark the
     /// spot.
     ///
     /// Who may see a selection is the kind's to say (ADR-0011): a `Devour`
@@ -993,7 +993,7 @@ impl<'a> Play<'a> {
     /// player's. Since ADR-0012 the victim is never told: the
     /// `Eliminated` narration goes to the living after the death, which
     /// no longer includes the victim, and its agent is stopped in the
-    /// same cycle. A dead player's trajectory simply stops, with no
+    /// same cycle. A dead player's records simply stop, with no
     /// announcement in it to mark the place.
     fn check_where_it_ended(&self, lines: &[Value], who: &ActorId, received: &[Message]) {
         // No player ever observes its own death, whatever else it saw.
@@ -1026,7 +1026,7 @@ impl<'a> Play<'a> {
         //
         // "After the death" is measured on the wall clock rather than on
         // sequence numbers, because the two sides of a message are
-        // numbered in different agents' trajectories. The eliminating
+        // numbered in different agents' records. The eliminating
         // narration's `created` stamp is the moment the game ended for
         // this player, and everything it observed was created before it.
         let died = self
@@ -1073,7 +1073,7 @@ impl<'p, 'a> Phases<'p, 'a> {
     ///
     /// Read from the selections the moderator *passed on*, which are the
     /// selections it accepted. Nothing summarizes a session any more
-    /// (ADR-0015), so a forward is the trajectory's record that a selection
+    /// (ADR-0015), so a forward is the log's record that a selection
     /// counted: a selection the moderator merely heard may have lost a race
     /// with its session's clock, and counting it would hold the
     /// moderator to a vote it never took.
@@ -1081,10 +1081,10 @@ impl<'p, 'a> Phases<'p, 'a> {
     /// A selection with nobody to see it is the exception. A lone werewolf's
     /// `Devour` names no audience, so there is nothing for the moderator
     /// to pass on and no forward is written however the race went; the
-    /// trajectory simply does not say whether that selection was accepted.
+    /// log simply does not say whether that selection was accepted.
     /// For those the check falls back to the selections the moderator heard
     /// *while the phase was still running*, which is as much as the
-    /// trajectory does say. Bounding it by the phase matters: an
+    /// log does say. Bounding it by the phase matters: an
     /// unforwarded selection heard after the phase ended certainly lost its
     /// race, and counting it would credit the session with a vote it
     /// never took.
@@ -1451,7 +1451,7 @@ mod tests {
     }
 
     /// Exchanges two players' names everywhere in `lines`, so that a
-    /// forgery that kills one in the other's place leaves a trajectory
+    /// forgery that kills one in the other's place leaves a log
     /// consistent about who is alive.
     fn swap(lines: &mut [Value], one: &str, other: &str) {
         fn rename(value: &mut Value, one: &str, other: &str) {
@@ -2047,7 +2047,7 @@ mod tests {
         // The bound is the episode's last stop and not the stop of the
         // agent being paid. Since ADR-0012 an agent may be stopped while
         // the others play on — a dead Werewolf player is — and it is
-        // still paid at the end, after its own trajectory has closed.
+        // still paid at the end, after its own records have closed.
         // That is sound because a reward is logged rather than sent
         // (ADR-0007): nobody has to be there to receive it. So the test
         // pushes the stamp past the *last* stop in the file, which is
@@ -2116,7 +2116,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "begins with a start and ends with a stop")]
+    #[should_panic(expected = "begin with a start and end with a stop")]
     fn an_agent_never_stopped_is_caught() {
         // The moderator ends the episode by stopping every player. One left
         // running is a game the moderator did not finish ending.
@@ -2130,9 +2130,9 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "begins with a start and ends with a stop")]
+    #[should_panic(expected = "begin with a start and end with a stop")]
     fn a_moderator_never_stopped_is_caught() {
-        // The environment's own trajectory has the same shape as everyone
+        // The environment's own records have the same shape as everyone
         // else's; the episode is what stops it, once the players have gone.
         let mut lines = fixture();
         let stop = lines

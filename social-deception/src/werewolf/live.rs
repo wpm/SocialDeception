@@ -1,7 +1,7 @@
 //! Watching a game as it plays: the [`Sink`] that renders Werewolf's
 //! records as legible text, a line at a time.
 //!
-//! The trajectory on disk is the record a reader joins and a training
+//! The log on disk is the record a reader joins and a training
 //! pipeline reads; it is not something to watch. This module is the other
 //! view of the same stream: one line per thing that happens, printed the
 //! instant it happens, so a game — especially the timed, talking games the
@@ -24,17 +24,17 @@
 //! # The order is the writer's
 //!
 //! Lines appear in the order the writer received the records, which
-//! interleaves agents arbitrarily (see [`trajectory`](crate::trajectory)). A
+//! interleaves agents arbitrarily (see [`log`](crate::log)). A
 //! player's selection can appear before the phase announcement that prompted
 //! it is rendered. That is expected of a live view of concurrent agents, and
-//! is the same interleaving the trajectory file records.
+//! is the same interleaving the log file records.
 
 use std::fmt;
 use std::io::{self, Write};
 
 use super::message::{Cause, Message, Narration, Phase, Select};
+use crate::log::{ActionRecord, Record, Sink};
 use crate::message::ActorId;
-use crate::trajectory::{ActionRecord, LogRecord, Sink};
 
 /// How wide the time column is, so that the columns line up for any game
 /// shorter than ten minutes and simply grow for a longer one.
@@ -53,8 +53,8 @@ const TIME_WIDTH: usize = 8;
 /// Only an action produces a line. Everything else is [`None`]; see the
 /// module documentation for why.
 #[must_use]
-pub fn line(record: &LogRecord<Message>, senders: usize) -> Option<String> {
-    let LogRecord::Action(action) = record else {
+pub fn line(record: &Record<Message>, senders: usize) -> Option<String> {
+    let Record::Action(action) = record else {
         return None;
     };
     Some(rendered(action, senders))
@@ -80,7 +80,7 @@ fn rendered(action: &ActionRecord<Message>, senders: usize) -> String {
 /// Minutes are not padded, so a game runs from `0:00.000` and a long one
 /// widens rather than wrapping. Sub-millisecond precision is dropped: a
 /// reader watching a game wants to see the shape of the timing, and the
-/// trajectory keeps the nanoseconds for anyone who wants them.
+/// log keeps the nanoseconds for anyone who wants them.
 struct Elapsed(u64);
 
 impl fmt::Display for Elapsed {
@@ -197,9 +197,9 @@ fn listed<'a>(who: impl IntoIterator<Item = &'a ActorId>) -> String {
 ///
 /// A run binds one of these to stdout, as [`Policy::Optional`]: a reader
 /// that closes the pipe drops the sink, and the game finishes with its
-/// trajectory complete.
+/// log complete.
 ///
-/// [`Policy::Optional`]: crate::trajectory::Policy::Optional
+/// [`Policy::Optional`]: crate::log::Policy::Optional
 #[derive(Debug)]
 pub struct Text<W: Write> {
     out: W,
@@ -223,7 +223,7 @@ impl<W: Write> Text<W> {
 }
 
 impl<W: Write + Send> Sink<Message> for Text<W> {
-    fn record(&mut self, record: &LogRecord<Message>) -> io::Result<()> {
+    fn record(&mut self, record: &Record<Message>) -> io::Result<()> {
         let Some(line) = line(record, self.senders) else {
             return Ok(());
         };
@@ -243,11 +243,9 @@ mod tests {
 
     use super::*;
     use crate::clock::Timestamp;
+    use crate::log::{ControlRecord, CycleRecord, ObservationRecord, RewardRecord, Seq, Woken};
     use crate::message::Control;
     use crate::testing::{Shared, id, ids};
-    use crate::trajectory::{
-        ControlRecord, CycleRecord, ObservationRecord, RewardRecord, Seq, Woken,
-    };
     use crate::werewolf::message::{Outcome, Round, SessionKind};
     use crate::werewolf::role::{Faction, Role};
 
@@ -262,7 +260,7 @@ mod tests {
         recipients: [&str; N],
         nanos: u64,
         payload: Message,
-    ) -> LogRecord<Message> {
+    ) -> Record<Message> {
         ActionRecord {
             agent: id(sender),
             seq: Seq(0),
@@ -273,7 +271,7 @@ mod tests {
     }
 
     /// The payload column of the one line `record` renders to.
-    fn payload(record: &LogRecord<Message>) -> String {
+    fn payload(record: &Record<Message>) -> String {
         let rendered = line(record, 0).unwrap();
         rendered
             .split_once("\u{2192} ")
@@ -490,7 +488,7 @@ mod tests {
                 round: Round::new(1),
             }),
         );
-        let records: Vec<LogRecord<Message>> = vec![
+        let records: Vec<Record<Message>> = vec![
             ObservationRecord {
                 agent: id("alice"),
                 seq: Seq(0),
@@ -545,7 +543,7 @@ mod tests {
                 round: Round::new(1),
             }),
         );
-        let cycle: LogRecord<Message> = CycleRecord {
+        let cycle: Record<Message> = CycleRecord {
             agent: id("alice"),
             t_start: at(0),
             t_stop: at(1),

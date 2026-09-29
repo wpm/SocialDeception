@@ -1,7 +1,7 @@
 //! Runs the Collatz ring end to end.
 //!
 //! Each test constructs an episode with a [`CollatzEnvironment`], runs it to
-//! the environment's `Stop` with the trajectory going to a file, reads the
+//! the environment's `Stop` with the log going to a file, reads the
 //! file back, and asserts on both the outcome and the log. The outcome is checked against Collatz sequences computed here,
 //! not by the library, so that the two cannot share a bug. The log is
 //! checked against the invariants in [`support`], which know nothing about
@@ -62,7 +62,7 @@ fn expected_chains(ring: &Ring) -> BTreeMap<u64, Vec<u64>> {
         .collect()
 }
 
-/// Runs one episode over `ring` and returns the trajectory it wrote, read
+/// Runs one episode over `ring` and returns the log it wrote, read
 /// back from disk.
 ///
 /// The log is checked against the invariants in [`support`] before it is
@@ -320,7 +320,7 @@ fn chains_that_share_a_value_stay_apart() {
     check_outcome(&lines, ring);
 }
 
-/// A hand-written trajectory of a ring of two in which `a` opens 4 and 2
+/// A hand-written log of a ring of two in which `a` opens 4 and 2
 /// in one cycle and the two chains then run side by side, a cycle per step.
 /// Two chains are in flight between the same pair of agents throughout, and
 /// nothing but the chain name tells a step of one from a step of the other.

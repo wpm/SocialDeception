@@ -233,7 +233,7 @@ impl<P: Payload> Router<P> {
     /// holding a `Stop` back until its count of routed-and-unhandled
     /// deliveries reads zero (ADR-0007). The episode's other `Stop`, the
     /// one it sends to abandon an episode that has already failed, does
-    /// not and cannot wait for that: the trajectory it leaves is a record
+    /// not and cannot wait for that: the log it leaves is a record
     /// of the failure, and the agent may answer messages queued ahead of the
     /// stop before it reaches it (ADR-0009).
     ///

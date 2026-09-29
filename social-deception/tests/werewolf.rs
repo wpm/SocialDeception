@@ -1,14 +1,14 @@
 //! Werewolf, end to end.
 //!
-//! Each test plays real episodes, with the trajectory going to a file, reads
+//! Each test plays real episodes, with the log going to a file, reads
 //! the file back, and checks it against two sets of invariants: the ones in
-//! [`support`] that every trajectory satisfies whatever the environment,
+//! [`support`] that every log satisfies whatever the environment,
 //! unchanged, and Werewolf's own in [`support::werewolf`]. The first set is
-//! run on every trajectory produced here; if it ever needed changing to
+//! run on every log produced here; if it ever needed changing to
 //! accommodate Werewolf, Werewolf would be doing something the runtime does
 //! not intend.
 //!
-//! The fixture trajectory under `tests/fixtures`, which the transcript
+//! The fixture log under `tests/fixtures`, which the transcript
 //! reader and the `werewolf replay` command are tested against, goes
 //! through both sets too, so that it cannot rot into something the runtime
 //! would never have written.
@@ -18,9 +18,9 @@
 //! For a fixed configuration and seed, the *logical transcript* (the role
 //! assignment, every selection, elimination and the outcome)
 //! is identical on every run. The *wall-clock timestamps* and the
-//! *interleaving of different agents' records* in the trajectory are not,
+//! *interleaving of different agents' records* in the log are not,
 //! and cannot be, because the agents are threads. So the determinism tests
-//! compare [`Transcript`]s, which are the trajectory with everything
+//! compare [`Transcript`]s, which are the log with everything
 //! non-reproducible projected out, and never the files.
 
 mod support;
@@ -61,7 +61,7 @@ const SEED: u64 = 20_260_918;
 const SEEDS: u64 = 120;
 
 /// A validated configuration for `players` with the given special roles,
-/// played from `seed`, writing no trajectory.
+/// played from `seed`, writing no log.
 /// Timing fast enough that a test does not spend real time waiting on a
 /// session's clock, and slow enough that a random player's one selection
 /// always lands inside it.
@@ -130,10 +130,10 @@ fn town(seed: u64) -> Config {
     )
 }
 
-/// Reads the trajectory at `path` back as the game it records, once it has
+/// Reads the log at `path` back as the game it records, once it has
 /// passed both sets of invariants: the ones in [`support`], which know
 /// nothing about Werewolf, and then Werewolf's own in
-/// [`support::werewolf`], so that a bad trajectory fails by the name of the
+/// [`support::werewolf`], so that a bad log fails by the name of the
 /// invariant it breaks.
 fn read(path: &Path, config: &Config) -> Transcript {
     let lines = support::parse(&fs::read(path).unwrap());
@@ -142,8 +142,8 @@ fn read(path: &Path, config: &Config) -> Transcript {
     Transcript::read(&lines, &config.moderator).unwrap()
 }
 
-/// Runs one episode of `config` with the trajectory going to a temp file,
-/// and returns the game the trajectory records, checked as [`read`] checks
+/// Runs one episode of `config` with the log going to a temp file,
+/// and returns the game the log records, checked as [`read`] checks
 /// it. The outcome the run reported on its channel is checked against the
 /// one the moderator announced in world: the announcement is the record of
 /// truth, and the channel must agree.
@@ -177,7 +177,7 @@ fn werewolf(args: &[&str]) -> String {
 }
 
 #[test]
-fn the_fixture_is_a_trajectory_the_runtime_could_have_written() {
+fn the_fixture_is_a_log_the_runtime_could_have_written() {
     let config = config::load(config::effective_path(Path::new(FIXTURE))).unwrap();
     read(Path::new(FIXTURE), &config);
 }
@@ -187,7 +187,7 @@ fn seven_players_with_two_werewolves_a_seer_and_a_doctor() {
     // Nothing to assert beyond the invariants: reaching an `Outcome` at
     // all is reaching a winner, now that a game cannot end without one,
     // and `run` checks the announcement against the channel and puts the
-    // trajectory through the full suite.
+    // log through the full suite.
     run(&town(SEED));
 }
 
@@ -250,7 +250,7 @@ fn the_same_seed_plays_the_same_game() {
     let config = town(SEED);
     assert_eq!(run(&config).verdicts(), run(&config).verdicts());
     // What is compared is the *verdicts*, not the whole transcript, and
-    // certainly not the trajectory files. Under ADR-0011 a phase is a
+    // certainly not the log files. Under ADR-0011 a phase is a
     // timed session: every death, every finding and the winner are the
     // same on every run of a seed, while the order selections arrived in, and
     // which late ones landed before a session closed, are facts about
@@ -288,7 +288,7 @@ fn a_dozen_runs_play_the_same_game() {
 fn a_run_is_reproduced_from_its_artifacts() {
     // Play the example with a seed override, so the file on disk is not the
     // whole recipe, then play the effective config the run wrote beside its
-    // trajectory. The second game must be the first: a run is reproducible
+    // log. The second game must be the first: a run is reproducible
     // from what it left behind, whatever flags produced it.
     let dir = TempDir::new();
     let original = dir.join("original.jsonl");
@@ -361,7 +361,7 @@ fn a_reader_that_stops_early_is_not_an_error() {
     assert_eq!(String::from_utf8_lossy(&output.stderr), "");
 }
 
-/// A five-player configuration file in `dir`, whose trajectory is beside
+/// A five-player configuration file in `dir`, whose log is beside
 /// it, for the tests that play a game through the binary.
 fn playable(dir: &TempDir) -> (std::path::PathBuf, std::path::PathBuf) {
     let trajectory = dir.join("played.jsonl");
@@ -434,10 +434,10 @@ fn quiet_prints_the_summary_alone() {
 }
 
 #[test]
-fn a_watcher_who_stops_reading_still_leaves_a_whole_trajectory() {
+fn a_watcher_who_stops_reading_still_leaves_a_whole_log() {
     // `werewolf play … | head` closes the pipe partway through the
     // narration. The text sink is optional, so it is dropped and the game
-    // plays on: the trajectory is complete and the run succeeds.
+    // plays on: the log is complete and the run succeeds.
     let dir = TempDir::new();
     let (config, trajectory) = playable(&dir);
     let mut child = Command::new(WEREWOLF)

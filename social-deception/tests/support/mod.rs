@@ -1,7 +1,7 @@
 //! Helpers shared by the integration tests: the [`collatz`] environment,
-//! a [`TempDir`] to write a trajectory in, reading a trajectory file back,
-//! checking the invariants every trajectory satisfies whatever the game,
-//! and, in [`werewolf`], the invariants a trajectory of Werewolf satisfies
+//! a [`TempDir`] to write a log in, reading a log file back,
+//! checking the invariants every log satisfies whatever the game,
+//! and, in [`werewolf`], the invariants the log of a game of Werewolf satisfies
 //! on top of them.
 //!
 //! The checks here are properties of the log, not of any game. They are
@@ -17,21 +17,21 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use serde_json::Value;
 pub use temp::TempDir;
 
-/// Parses a trajectory file into one JSON value per line.
+/// Parses a log file into one JSON value per line.
 ///
 /// # Panics
 ///
 /// If the bytes are not UTF-8, the text does not end with a newline, or any
 /// line is not a JSON value.
 pub fn parse(bytes: &[u8]) -> Vec<Value> {
-    let text = std::str::from_utf8(bytes).expect("a trajectory is UTF-8");
-    assert!(text.ends_with('\n'), "a trajectory ends with a newline");
+    let text = std::str::from_utf8(bytes).expect("a log is UTF-8");
+    assert!(text.ends_with('\n'), "a log ends with a newline");
     text.lines()
         .map(|line| serde_json::from_str(line).expect("every line is a JSON value"))
         .collect()
 }
 
-/// Asserts the invariants every trajectory satisfies:
+/// Asserts the invariants every log satisfies:
 ///
 /// - every observation and control was received at or after it was created,
 ///   and at exactly the `t_start` of the cycle that lists it, with no
@@ -47,7 +47,7 @@ pub fn parse(bytes: &[u8]) -> Vec<Value> {
 /// - no message has its sender among its recipients; an observation lists the
 ///   agent that recorded it among the recipients, and an action names it as
 ///   the sender;
-/// - nothing follows an agent's `Stop` in its trajectory but the end of the
+/// - nothing follows an agent's `Stop` in its records but the end of the
 ///   cycle that popped it;
 /// - a `reward` names an agent and a value, carries no sequence number and
 ///   no receipt, and belongs to no cycle;
@@ -66,7 +66,7 @@ pub fn parse(bytes: &[u8]) -> Vec<Value> {
 /// Werewolf player is (ADR-0012), is paid at the end like everybody else,
 /// which a logged reward allows and a sent one would not.
 ///
-/// The last is the one that makes a trajectory a single object rather than a
+/// The last is the one that makes the log a single object rather than a
 /// pile of per-agent logs: an observation and the action that produced it are
 /// the same message seen from its two ends, and nothing but the sender and
 /// the creation time links them. Every action a handler returns is sent, so
@@ -142,7 +142,7 @@ fn check_reward(line: &Value) {
 /// environment may stop one agent while the others run on — Werewolf stops
 /// a player in the cycle its death is announced (ADR-0012) — and rewards
 /// are handed out when the episode ends, so an agent that left early is
-/// paid after its own trajectory has closed. That is sound because a reward
+/// paid after its own records have closed. That is sound because a reward
 /// is logged rather than sent (ADR-0007): the agent does not have to be
 /// there to receive it, and its value is the episode's to decide once the
 /// episode is over.
@@ -393,7 +393,7 @@ fn check_sequence_numbers(lines: &[Value]) {
 /// Exactly, with nothing taken out: every record an agent writes within a
 /// cycle is either something it popped or something it sent, since
 /// everything a handler returns is sent (ADR-0009). That is the grouping
-/// every reader of a trajectory relies on.
+/// every reader of the log relies on.
 fn check_grouping(lines: &[Value]) {
     let mut pending: HashMap<&str, Vec<u64>> = HashMap::new();
     for line in lines {
@@ -423,10 +423,10 @@ fn check_grouping(lines: &[Value]) {
     }
 }
 
-/// Nothing follows an agent's `Stop` in its trajectory but the end of the
+/// Nothing follows an agent's `Stop` in its records but the end of the
 /// cycle that popped it.
 ///
-/// A `Stop` is the last thing an agent ever pops, so its trajectory ends
+/// A `Stop` is the last thing an agent ever pops, so its records end
 /// there: one cycle record to close the cycle, and nothing after it. An
 /// agent that wrote anything more either kept running after it was told to
 /// stop or was told twice, and the log would be claiming both.
@@ -445,7 +445,7 @@ fn check_nothing_follows_a_stop(lines: &[Value]) {
         let agent = agent(line);
         assert!(
             !closed.contains(agent),
-            "an agent's trajectory ends with the cycle that popped its stop: {line}"
+            "an agent's records end with the cycle that popped its stop: {line}"
         );
         if line["type"] == "cycle" {
             if stopped.contains(agent) {
@@ -466,9 +466,9 @@ fn check_nothing_follows_a_stop(lines: &[Value]) {
 /// An environment may stop one agent while the rest run on, and a message
 /// addressed to an agent that has stopped is dropped for that recipient and
 /// delivered to the others. So an action may name a recipient with no
-/// matching observation anywhere: a trace in the sender's trajectory and
+/// matching observation anywhere: a trace in the sender's records and
 /// none in the recipient's. That is correct for reinforcement learning —
-/// the recipient did not observe it, and its trajectory should not pretend
+/// the recipient did not observe it, and its records should not pretend
 /// otherwise — and anything joining the two sides of a message, replay
 /// included, has to allow for it.
 ///
@@ -495,7 +495,7 @@ fn check_the_join(lines: &[Value]) {
     // stamped when the router queues it, which is after the cycle that
     // asked for it has returned, so the stamp falls between cycles and
     // may fall after cycles later than the batch it came from. What the
-    // trajectory does show without guesswork is the last message the agent
+    // log does show without guesswork is the last message the agent
     // actually observed: the batch that stopped it produced nothing it
     // took in, so every message it missed was created after that instant.
     //
@@ -539,7 +539,7 @@ fn check_the_join(lines: &[Value]) {
         );
     }
     // A relay passes on an action somebody really took, so the original is
-    // in that agent's own trajectory, at the same instant and carrying the
+    // in that agent's own records, at the same instant and carrying the
     // same payload. Without this an action misfiled under another agent
     // would read as a forward of an action nobody made.
     for line in &relayed {
@@ -634,7 +634,7 @@ mod tests {
 
     use super::*;
 
-    /// A well-formed trajectory: agent `a` pops a start and a message from
+    /// A well-formed log: agent `a` pops a start and a message from
     /// `b` in one cycle and replies, then runs a cycle on its timeout, then
     /// pops a stop. `b`'s side is here too, because the join is between
     /// agents and cannot be checked from one alone.
@@ -665,7 +665,7 @@ mod tests {
         ]
     }
 
-    /// A trajectory in which `r` relays `b`'s action to `c`.
+    /// A log in which `r` relays `b`'s action to `c`.
     ///
     /// `b` addresses `r` alone; `r` passes the message on, keeping `b` as the
     /// sender and `b`'s creation instant, so `c` observes what `b` would
@@ -715,14 +715,14 @@ mod tests {
         ]
     }
 
-    /// The good trajectory with one edit applied to line `index`.
+    /// The good log with one edit applied to line `index`.
     fn edited(index: usize, edit: impl FnOnce(&mut Value)) -> Vec<Value> {
         let mut lines = good();
         edit(&mut lines[index]);
         lines
     }
 
-    /// A trajectory in which `a` reached a `Stop` that had been queued
+    /// A log in which `a` reached a `Stop` that had been queued
     /// behind a message: it observed the message, answered it, and popped the
     /// stop in the cycle after (ADR-0009). `b`'s side is here for the join.
     ///
@@ -761,7 +761,7 @@ mod tests {
     fn a_stop_reached_behind_a_message_passes() {
         // The answer to the message was sent, not withheld, and `b` observed
         // it: an agent stopped this way did the work queued ahead of the
-        // stop, and the trajectory says so on both sides.
+        // stop, and the log says so on both sides.
         check(&stopped_behind_a_message());
     }
 
@@ -785,7 +785,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "ends with the cycle that popped its stop")]
+    #[should_panic(expected = "end with the cycle that popped its stop")]
     fn a_cycle_after_an_agents_stop_is_caught() {
         // A whole cycle after the one that popped the stop: the agent kept
         // running after it was told to stop.
@@ -803,8 +803,8 @@ mod tests {
     fn an_agent_stopped_twice_is_caught() {
         // Both stops are popped in the same cycle, so nothing follows the
         // first one but the cycle it belongs to, and it is being told twice
-        // that the check has left to catch. The rest of the trajectory is
-        // dropped, since a trajectory that ends at the stop is what the
+        // that the check has left to catch. The rest of the log is
+        // dropped, since a log that ends at the stop is what the
         // other check already asserts.
         let mut lines = stopped_behind_a_message()[..2].to_vec();
         lines[0]["control"] = json!("stop");
@@ -817,7 +817,7 @@ mod tests {
         check(&lines);
     }
 
-    /// The good trajectory with a reward for `a`, logged before its stop,
+    /// The good log with a reward for `a`, logged before its stop,
     /// as an environment would have written it.
     fn rewarded() -> Vec<Value> {
         let mut lines = good();
@@ -828,7 +828,7 @@ mod tests {
     #[test]
     fn a_reward_passes_and_belongs_to_no_cycle() {
         // It carries no sequence number and closes no cycle, and its line
-        // sits after the cycle that ended `a`'s trajectory, because the
+        // sits after the cycle that ended `a`'s records, because the
         // environment wrote it on its own thread.
         check(&rewarded());
     }
@@ -895,7 +895,7 @@ mod tests {
     }
 
     #[test]
-    fn a_good_trajectory_passes() {
+    fn a_good_log_passes() {
         check(&good());
         let text = good()
             .iter()
@@ -1008,7 +1008,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "which has no record")]
     fn an_action_recorded_by_somebody_other_than_its_sender_is_caught() {
-        // Moving `a`'s action into `c`'s trajectory. Since an agent may
+        // Moving `a`'s action into `c`'s records. Since an agent may
         // pass on somebody else's action, a record whose sender is not its
         // agent is no longer wrong on its face; what still catches this is
         // that `a`'s cycle claimed an output it no longer has.

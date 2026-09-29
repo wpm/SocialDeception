@@ -266,7 +266,7 @@ impl Knowledge {
                     },
                 );
             }
-            // Still an observation, and still recorded in the trajectory;
+            // Still an observation, and still recorded in the log;
             // whether it means a save is for a strategy to infer.
             Narration::NoDeath { .. } | Narration::NoLynch { .. } => {}
             Narration::Outcome(outcome) => self.outcome = Some(outcome.clone()),

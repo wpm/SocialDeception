@@ -45,7 +45,7 @@
 //! `Stop` means nobody will ever speak again and nobody has declared the
 //! episode over: the run is **stalled**, and that is
 //! [`EpisodeError::Stalled`]. The episode stops everyone and joins, so the
-//! trajectory is complete up to the stall, and returns the error. In
+//! log is complete up to the stall, and returns the error. In
 //! Werewolf a stall is a player that did not answer a request.
 //!
 //! In-flight work is counted in **deliveries, not messages**: one message
@@ -79,9 +79,9 @@ use serde::Serialize;
 use crate::agent::{self, Action, Agent, CycleDispatch, Handler, Observation, Wiring};
 use crate::clock::{Clock, Timestamp};
 use crate::environment::{Adapter, Commanded, Environment, Refusal, Rewarded};
+use crate::log::Record;
 use crate::message::{ActorId, Control, Delivery, Payload};
 use crate::router::{Queues, RouteError, Router};
-use crate::trajectory::LogRecord;
 
 /// Why an agent's thread did not end cleanly.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,9 +105,9 @@ impl fmt::Display for Failure {
 ///
 /// An episode that ends in any of these but [`Stalled`](Self::Stalled) was
 /// abandoned rather than finished: the episode stops whoever is left so
-/// that the trajectory is complete up to the failure, and it cannot wait
+/// that the log is complete up to the failure, and it cannot wait
 /// for quiescence to do it, so that `Stop` lands behind messages the agent
-/// has not reached yet. Such a trajectory may therefore end with an agent
+/// has not reached yet. Such a log may therefore end with an agent
 /// answering for an episode that had already failed, and with observations
 /// nobody made — the messages still behind the stop when it was popped
 /// (ADR-0009). A `Stalled` episode is quiescent by definition, so its
@@ -139,7 +139,7 @@ pub enum EpisodeError {
     ///
     /// The episode was abandoned where it stood: the environment never
     /// reached the shutdown it was going to ask for, so no agent was
-    /// stopped in the ordinary way and the trajectory ends mid-run. Whether
+    /// stopped in the ordinary way and the log ends mid-run. Whether
     /// the thread that went away left a [`Failure`] behind is a separate
     /// question — [`Agents`](Self::Agents) reports that when it did, and
     /// this reports the departure when it did not.
@@ -149,7 +149,7 @@ pub enum EpisodeError {
     ///
     /// The reward type is the game's, and one the log cannot hold makes
     /// every reward of that type unloggable, so the episode fails rather
-    /// than finishing with a trajectory that is silently missing them.
+    /// than finishing with a log that is silently missing them.
     Reward(ActorId),
     /// Some agents' threads did not end cleanly, and why.
     Agents(Vec<(ActorId, Failure)>),
@@ -211,7 +211,7 @@ pub struct Episode<W, P: Payload> {
     roster: BTreeMap<ActorId, Box<dyn Handler<P> + Send>>,
     environment_id: ActorId,
     environment: Box<dyn Environment<W, P> + Send>,
-    records: Sender<LogRecord<P>>,
+    records: Sender<Record<P>>,
     clock: Clock,
 }
 
@@ -226,11 +226,11 @@ impl<W, P: Payload> fmt::Debug for Episode<W, P> {
 
 impl<W: Serialize + Copy + Send + 'static, P: Payload> Episode<W, P> {
     /// An episode of `environment`, seated under `environment_id`, with no
-    /// agents yet, whose trajectory goes to `records` and which is timed by
+    /// agents yet, whose records go to `records` and which is timed by
     /// a [`Clock`] started now.
     #[must_use]
     pub fn new(
-        records: Sender<LogRecord<P>>,
+        records: Sender<Record<P>>,
         environment_id: impl Into<ActorId>,
         environment: impl Environment<W, P> + Send + 'static,
     ) -> Self {
@@ -240,7 +240,7 @@ impl<W: Serialize + Copy + Send + 'static, P: Payload> Episode<W, P> {
     /// The same, timed by `clock`.
     #[must_use]
     pub fn with_clock(
-        records: Sender<LogRecord<P>>,
+        records: Sender<Record<P>>,
         environment_id: impl Into<ActorId>,
         environment: impl Environment<W, P> + Send + 'static,
         clock: Clock,
@@ -293,9 +293,9 @@ impl<W: Serialize + Copy + Send + 'static, P: Payload> Episode<W, P> {
     /// agent has been stopped, then stops the environment and joins every
     /// thread.
     ///
-    /// The episode's own sender to the trajectory writer is dropped on the
+    /// The episode's own sender to the log writer is dropped on the
     /// way, so once this returns the writer has no senders left and can be
-    /// joined for the complete trajectory.
+    /// joined for the complete log.
     ///
     /// # Errors
     ///
@@ -303,7 +303,7 @@ impl<W: Serialize + Copy + Send + 'static, P: Payload> Episode<W, P> {
     /// for a control the router refused, the episode stalled
     /// ([`EpisodeError::Stalled`]), or a thread ended with an error or a
     /// panic. In every case the agents that were running have been stopped
-    /// and joined before this returns, so the trajectory is complete up to
+    /// and joined before this returns, so the log is complete up to
     /// the failure.
     pub fn run(self) -> Result<(), EpisodeError> {
         let Self {
@@ -367,13 +367,13 @@ impl<W: Serialize + Copy + Send + 'static, P: Payload> Episode<W, P> {
             });
         // Whatever happened, everybody is stopped, and nobody twice: an
         // agent the environment already stopped is not in `running`, and a
-        // second `Stop` would put a second one in its trajectory, claiming
+        // second `Stop` would put a second one in its records, claiming
         // it was told to stop after it had stopped.
         //
         // The environment's own `Stop` comes last, once the agents it was
         // running have ended, because until then the episode is not over
         // for it: a cycle it is still in the middle of may yet have
-        // something to say, and its trajectory should say so.
+        // something to say, and its records should say so.
         let (environment_agent, agents) = split(agents, &environment_id);
         let stopped = router
             .control(&running, Control::Stop)
@@ -425,7 +425,7 @@ fn spawn<P: Payload>(
     ids: &BTreeSet<ActorId>,
     dispatch: &Sender<CycleDispatch<P>>,
     obituary: &Sender<ActorId>,
-    records: &Sender<LogRecord<P>>,
+    records: &Sender<Record<P>>,
     clock: Clock,
 ) -> Spawned<P> {
     let mut queues = BTreeMap::new();
@@ -601,7 +601,7 @@ fn drive<P: Payload>(
         };
         if dispatch.agent == *environment {
             // The rewards of this cycle, checked but not routed: a reward
-            // is already in the trajectory and is not a delivery, so
+            // is already in the log and is not a delivery, so
             // nothing here adds to the in-flight count. What is left is
             // whether the environment produced a reward that could become
             // a record. Only a refusal arrives here: the adapter writes a
@@ -745,8 +745,8 @@ mod tests {
 
     use super::*;
     use crate::environment::Effect;
+    use crate::log::Writer;
     use crate::testing::{Shared, joined, parse_lines, recording};
-    use crate::trajectory::Writer;
 
     /// What the agents of the counting games below say.
     ///
@@ -961,7 +961,7 @@ mod tests {
     fn a_reward_that_will_not_serialize_fails_the_episode_and_is_not_written() {
         // The neighboring refusal — a reward for somebody outside the
         // roster — fails the episode, and this fails it for the same
-        // reason: a trajectory that quietly lacks a reward the environment
+        // reason: a log that quietly lacks a reward the environment
         // assigned is evidence of nothing. The error names the agent and
         // says the reward, not the name, was the problem.
         let (records, writer, bytes) = recording();
@@ -976,7 +976,7 @@ mod tests {
         let lines = parse_lines(&written);
         assert!(
             lines.iter().all(|line| line["type"] != "reward"),
-            "the reward that could not be written is not in the trajectory"
+            "the reward that could not be written is not in the log"
         );
     }
 
@@ -1149,7 +1149,7 @@ mod tests {
     }
 
     /// The controls in `lines`, in order. With an `agent`, that agent's;
-    /// without one, the whole trajectory's. Every agent's reads
+    /// without one, the whole log's. Every agent's reads
     /// `["start", "stop"]`: the environment starts it and stops it, and
     /// nothing else is a control.
     fn controls_of<'a>(lines: &'a [Value], agent: Option<&str>) -> Vec<&'a Value> {
@@ -1161,7 +1161,7 @@ mod tests {
             .collect()
     }
 
-    /// An episode refereed over the named agents, whose trajectory goes to
+    /// An episode refereed over the named agents, whose log goes to
     /// the writer returned beside it.
     fn refereed<const N: usize>(agents: [&str; N]) -> (Episode<i32, Count>, Writer, Shared) {
         let (records, writer, bytes) = recording();
@@ -1225,8 +1225,8 @@ mod tests {
             assert_eq!(
                 controls,
                 ["start", "stop"],
-                "every trajectory, the environment's included, begins with a start and \
-                 ends with a stop"
+                "every agent's records, the environment's included, begin with a start and \
+                 end with a stop"
             );
             // No agent here has a timeout, so every cycle was woken by
             // something on the queue and none is empty.
@@ -1271,7 +1271,7 @@ mod tests {
     #[test]
     fn an_observation_carries_the_creation_time_of_the_action_that_sent_it() {
         // The join a training pipeline makes: an observation in one agent's
-        // trajectory and the action in its sender's are the same message, and
+        // records and the action in its sender's are the same message, and
         // nothing but the sender and the creation time links them.
         let (episode, writer, bytes) = rally(6);
         episode.run().unwrap();
@@ -1375,7 +1375,7 @@ mod tests {
                 running: [ActorId::new("a"), ActorId::new("b")].into()
             }
         );
-        // The trajectory is complete up to the stall: everybody was started,
+        // The log is complete up to the stall: everybody was started,
         // and everybody, the environment last, was stopped and joined.
         let lines = parse_lines(&joined(writer, &bytes));
         for agent in ["a", "b", REFEREE] {
@@ -1507,7 +1507,7 @@ mod tests {
                 (ActorId::new("b"), Failure::Panicked("boom".into())),
             ])
             .to_string(),
-            "agents failed: [a: the trajectory writer has gone away] [b: panicked: boom]"
+            "agents failed: [a: the log writer has gone away] [b: panicked: boom]"
         );
         assert!(
             EpisodeError::Control(RouteError::Loopback(ActorId::new("a")))

@@ -255,7 +255,7 @@ mod tests {
     ///
     /// There is no request to echo (ADR-0014), so a selection is identified
     /// by the round and the kind it was made in, which is what the reader of
-    /// a trajectory reads off it directly. And there is no player among the
+    /// the log reads off it directly. And there is no player among the
     /// recipients: a player addresses the moderator and nobody else, which is
     /// what keeps a selection from outliving its session in a peer's queue.
     fn selecting<const N: usize>(

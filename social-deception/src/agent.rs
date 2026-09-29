@@ -35,7 +35,7 @@
 //! observation in the same cycle, and the cycle record groups them.
 //!
 //! The handler returns what to send rather than sending it, so the loop sees
-//! everything that goes out and the trajectory it records is authoritative.
+//! everything that goes out and the log it records is authoritative.
 //! It also means a handler cannot speak as anybody but itself: the loop is
 //! what writes the sender.
 //!
@@ -63,7 +63,7 @@
 //! said has been handled (see [`episode`](crate::episode)). On the
 //! abandon-ship path it cannot wait, and then an agent may answer messages
 //! queued ahead of the stop for an episode that has already failed. That is
-//! accepted (ADR-0009): keeping a trajectory tidy through a failure is the
+//! accepted (ADR-0009): keeping a log tidy through a failure is the
 //! environment's job, since it decides when to stop whom.
 //!
 //! # Controls still come before messages within a cycle
@@ -74,7 +74,7 @@
 //! observes the message, in that order, rather than observing first. And once
 //! a `Stop` is in hand the message behind it is left where it is: this cycle
 //! is the agent's last, and a message the agent never popped is one it never
-//! observed, so it is never logged. A trajectory that said otherwise would
+//! observed, so it is never logged. A log that said otherwise would
 //! be claiming the agent saw something it did not.
 //!
 //! # The handler never sees a control
@@ -83,7 +83,7 @@
 //! than a move within the game, so the loop acts on it itself. [`Start`]
 //! makes it call [`Handler::start`], whose opening actions are sent like any
 //! others; [`Stop`] makes it exit after the cycle that popped it. Either way
-//! the control is logged, so a reader sees it in the trajectory even though
+//! the control is logged, so a reader sees it in the log even though
 //! no handler did.
 //!
 //! A `Start` that arrives after the agent has started is a bug in whoever
@@ -144,7 +144,7 @@
 //! # Example
 //!
 //! An agent that echoes each message back to its sender, wired to a router
-//! stand-in and a trajectory writer:
+//! stand-in and a log writer:
 //!
 //! ```
 //! use std::sync::{Arc, Mutex};
@@ -154,7 +154,7 @@
 //!     Action, ActorId, Agent, Clock, Control, CycleDispatch, Delivery, Handler,
 //!     JsonLines, Message, Observation, Sink, Wiring, Writer,
 //! };
-//! use social_deception::trajectory::Policy;
+//! use social_deception::log::Policy;
 //!
 //! // What this game's agents say to each other: a line of chat.
 //! type Chat = String;
@@ -173,10 +173,10 @@
 //! let clock = Clock::start();
 //! let (to_agent, queue) = unbounded();
 //! let (dispatches, from_agent) = unbounded();
-//! // The trajectory goes to a `JsonLines` sink over a buffer this example
+//! // The log goes to a `JsonLines` sink over a buffer this example
 //! // can read back; a run writes one over a file instead.
-//! let trajectory = Arc::new(Mutex::new(Vec::new()));
-//! let sink: Box<dyn Sink<Chat>> = Box::new(JsonLines::new(Recorded(trajectory.clone())));
+//! let log = Arc::new(Mutex::new(Vec::new()));
+//! let sink: Box<dyn Sink<Chat>> = Box::new(JsonLines::new(Recorded(log.clone())));
 //! let (records, writer) = Writer::spawn(vec![(sink, Policy::Required)]);
 //! let wiring =
 //!     Wiring { id: "echo".into(), clock, queue, dispatches, records, timeout: None };
@@ -197,7 +197,7 @@
 //! assert_eq!(sent[0].sender, ActorId::new("echo"));
 //! assert_eq!(sent[0].payload, "hello");
 //! writer.join().unwrap();
-//! assert!(!trajectory.lock().unwrap().is_empty());
+//! assert!(!log.lock().unwrap().is_empty());
 //!
 //! /// A destination whose bytes stay readable after the sink has taken it.
 //! struct Recorded(Arc<Mutex<Vec<u8>>>);
@@ -221,11 +221,9 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver, Sender, TryRecvError, never, select};
 
 use crate::clock::{Clock, Created, Received, Timestamp};
+use crate::log::{ActionRecord, ControlRecord, CycleRecord, ObservationRecord, Record, Seq, Woken};
 use crate::message::{ActorId, Control, Delivery, Message, Payload};
 use crate::timer::TimerSource;
-use crate::trajectory::{
-    ActionRecord, ControlRecord, CycleRecord, LogRecord, ObservationRecord, Seq, Woken,
-};
 
 /// A message this agent has popped off its queue: what it observed, and when.
 ///
@@ -497,8 +495,8 @@ pub struct Wiring<P: Payload> {
     pub queue: Receiver<Delivery<P>>,
     /// Where each cycle's dispatch goes.
     pub dispatches: Sender<CycleDispatch<P>>,
-    /// Where the agent's trajectory goes.
-    pub records: Sender<LogRecord<P>>,
+    /// Where the agent's records go.
+    pub records: Sender<Record<P>>,
     /// How long the agent waits before its deadline fires, or `None` for an
     /// agent that only ever reacts. A deadline that passes with nothing
     /// waiting runs a cycle that calls [`Handler::timeout`]; one that passes
@@ -519,7 +517,7 @@ impl<P: Payload> fmt::Debug for Wiring<P> {
 /// stop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Error {
-    /// A record could not be sent: the trajectory writer has gone away.
+    /// A record could not be sent: the log writer has gone away.
     WriterClosed,
     /// A dispatch could not be sent: the router has gone away.
     RouterClosed,
@@ -530,7 +528,7 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            Self::WriterClosed => "the trajectory writer has gone away",
+            Self::WriterClosed => "the log writer has gone away",
             Self::RouterClosed => "the router has gone away",
             Self::TimerClosed => "the timer source disconnected a wake channel",
         })
@@ -656,7 +654,7 @@ struct Loop<P: Payload, H, T> {
     next_seq: u64,
     /// The last `created` this agent stamped onto an action. Per agent, not
     /// per cycle: the join an observation makes is on the sender and the
-    /// instant over the whole trajectory, so two actions of one agent may
+    /// instant over the whole log, so two actions of one agent may
     /// not share an instant even across a cycle boundary.
     last_created: Option<Timestamp>,
 
@@ -755,7 +753,7 @@ where
     /// agent's last, and a message left on the queue is one the agent never
     /// popped, never observed and is never logged for: taking it only to
     /// observe it after the episode had ended would put a decision in the
-    /// trajectory that nobody asked for. The one message the wake-up may
+    /// log that nobody asked for. The one message the wake-up may
     /// already have taken ahead of a `Stop` cannot arise — the wake-up
     /// takes one thing and the pass stops at the stop it then finds — so
     /// the only thing forgotten is what was never taken.
@@ -899,8 +897,8 @@ where
                 // it. A second `Start` cannot be honored — the start hook
                 // has already run, and running it again would reopen an
                 // agent that has been playing — and recording it anyway
-                // would put a claim in the trajectory the loop did not act
-                // on. Whoever sent it has a bug the trajectory must not
+                // would put a claim in the log the loop did not act on.
+                // Whoever sent it has a bug the log must not
                 // paper over.
                 Control::Start => {
                     assert!(!self.started, "{} was started twice", self.wiring.id);
@@ -1087,7 +1085,7 @@ where
         Ok(seq)
     }
 
-    fn send_record(&self, record: LogRecord<P>) -> Result<(), Error> {
+    fn send_record(&self, record: Record<P>) -> Result<(), Error> {
         self.wiring
             .records
             .send(record)
@@ -1359,7 +1357,7 @@ mod tests {
         clock: Clock,
         queue: Sender<Delivery<TestPayload>>,
         dispatches: Receiver<CycleDispatch<TestPayload>>,
-        records: Receiver<LogRecord<TestPayload>>,
+        records: Receiver<Record<TestPayload>>,
         timer: ManualTimerControl,
     }
 
@@ -1368,7 +1366,7 @@ mod tests {
         wiring: Wiring<TestPayload>,
         queue: Sender<Delivery<TestPayload>>,
         dispatches: Receiver<CycleDispatch<TestPayload>>,
-        records: Receiver<LogRecord<TestPayload>>,
+        records: Receiver<Record<TestPayload>>,
     }
 
     impl Wires {
@@ -1445,11 +1443,11 @@ mod tests {
 
         /// The records of one cycle: everything it wrote, then its cycle
         /// record.
-        fn cycle(&self) -> (Vec<LogRecord<TestPayload>>, CycleRecord) {
+        fn cycle(&self) -> (Vec<Record<TestPayload>>, CycleRecord) {
             let mut records = Vec::new();
             loop {
                 match recv(&self.records) {
-                    LogRecord::Cycle(cycle) => return (records, cycle),
+                    Record::Cycle(cycle) => return (records, cycle),
                     record => records.push(record),
                 }
             }
@@ -1483,24 +1481,24 @@ mod tests {
 
     /// What kind of record this is, for a test that cares about the order
     /// of the kinds rather than their contents.
-    fn kind(record: &LogRecord<TestPayload>) -> &'static str {
+    fn kind(record: &Record<TestPayload>) -> &'static str {
         match record {
-            LogRecord::Observation(_) => "observation",
-            LogRecord::Action(_) => "action",
-            LogRecord::Control(_) => "control",
+            Record::Observation(_) => "observation",
+            Record::Action(_) => "action",
+            Record::Control(_) => "control",
             // An agent's loop never writes one: a reward is the
             // environment's, and it goes out through the adapter.
-            LogRecord::Reward(_) => "reward",
-            LogRecord::Cycle(_) => "cycle",
+            Record::Reward(_) => "reward",
+            Record::Cycle(_) => "cycle",
         }
     }
 
     /// The payloads of the action records among `records`, in order.
-    fn acted(records: &[LogRecord<TestPayload>]) -> Vec<TestPayload> {
+    fn acted(records: &[Record<TestPayload>]) -> Vec<TestPayload> {
         records
             .iter()
             .filter_map(|record| match record {
-                LogRecord::Action(record) => Some(record.message.payload.clone()),
+                Record::Action(record) => Some(record.message.payload.clone()),
                 _ => None,
             })
             .collect()
@@ -1713,7 +1711,7 @@ mod tests {
         let handler = rig.agent.join().unwrap();
         assert_eq!(handler.inner.timeouts, 1);
         // `now` is the cycle's `t_start`, on the same clock the records are
-        // stamped from, so a handler's deadlines and the trajectory share a
+        // stamped from, so a handler's deadlines and the log share a
         // timeline.
         assert_eq!(
             handler.inner.clock_readings,
@@ -2072,7 +2070,7 @@ mod tests {
         rig.cycle();
         rig.send(step_at("b", 1, at(7)));
         let (records, cycle) = rig.cycle();
-        let LogRecord::Observation(observation) = &records[0] else {
+        let Record::Observation(observation) = &records[0] else {
             panic!("the first record of the cycle is the observation: {records:?}");
         };
         assert_eq!(observation.created, at(7), "the sender's stamp is carried");
@@ -2089,13 +2087,13 @@ mod tests {
         let rig = rig(Recorder::default(), None);
         rig.start();
         let (first, cycle) = rig.cycle();
-        assert!(matches!(first.as_slice(), [LogRecord::Control(_)]));
+        assert!(matches!(first.as_slice(), [Record::Control(_)]));
         assert_eq!((cycle.inputs, cycle.outputs), (vec![Seq(0)], vec![]));
         rig.send(step("b", 1));
         let (second, cycle) = rig.cycle();
         assert!(matches!(
             second.as_slice(),
-            [LogRecord::Observation(_), LogRecord::Action(_)]
+            [Record::Observation(_), Record::Action(_)]
         ));
         assert_eq!((cycle.inputs, cycle.outputs), (vec![Seq(1)], vec![Seq(2)]));
         rig.stop();
@@ -2160,7 +2158,7 @@ mod tests {
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].recipients, ["b", "c"].map(ActorId::new).into());
         let (records, cycle) = rig.cycle();
-        let LogRecord::Action(action) = &records[1] else {
+        let Record::Action(action) = &records[1] else {
             panic!("the action is recorded as an action: {records:?}");
         };
         assert_eq!(
@@ -2181,7 +2179,7 @@ mod tests {
         assert!(sent[0].recipients.is_empty());
         assert_eq!(sent[0].sender, ActorId::new("a"));
         let (records, cycle) = rig.cycle();
-        let LogRecord::Action(action) = &records[1] else {
+        let Record::Action(action) = &records[1] else {
             panic!("the action addressed to nobody is logged: {records:?}");
         };
         assert!(
@@ -2220,7 +2218,7 @@ mod tests {
         let created: Vec<Timestamp> = records
             .iter()
             .filter_map(|record| match record {
-                LogRecord::Action(record) => Some(record.created),
+                Record::Action(record) => Some(record.created),
                 _ => None,
             })
             .collect();
@@ -2230,7 +2228,7 @@ mod tests {
             "every action of a cycle is stamped later than the one before it: {created:?}"
         );
         // And the stamps still lie inside the cycle's window, which is what
-        // the trajectory checker asserts of an output.
+        // the log checker asserts of an output.
         assert!(
             created
                 .iter()
@@ -2326,7 +2324,7 @@ mod tests {
         // second start cannot be honored — the start hook has already run,
         // and running it again would reopen an agent that has been playing
         // — and recording the agent as started anyway would put a claim in
-        // the trajectory the loop did not act on.
+        // the log the loop did not act on.
         let wires = wires(None);
         wires.control(Control::Start);
         wires.send(step("b", 1));
@@ -2362,11 +2360,11 @@ mod tests {
             handler.seen,
             steps(std::array::from_fn::<u64, 20, _>(|i| i as u64 + 1))
         );
-        let records: Vec<LogRecord<TestPayload>> = wires.records.try_iter().collect();
+        let records: Vec<Record<TestPayload>> = wires.records.try_iter().collect();
         let controls: Vec<Control> = records
             .iter()
             .filter_map(|record| match record {
-                LogRecord::Control(record) => Some(record.control),
+                Record::Control(record) => Some(record.control),
                 _ => None,
             })
             .collect();
@@ -2390,7 +2388,7 @@ mod tests {
         // The other half of the same fact. Once the stop is in hand the
         // cycle takes no message, and the messages still queued are never
         // popped: an agent that has stopped did not observe them, and a
-        // trajectory that logged them would be claiming it did.
+        // log that logged them would be claiming it did.
         let wires = wires(None);
         wires.control(Control::Start);
         wires.control(Control::Stop);
@@ -2403,11 +2401,11 @@ mod tests {
         let handler = agent.join().unwrap();
         assert_eq!(handler.started, 1);
         assert!(handler.seen.is_empty(), "{:?}", handler.seen);
-        let records: Vec<LogRecord<TestPayload>> = wires.records.try_iter().collect();
+        let records: Vec<Record<TestPayload>> = wires.records.try_iter().collect();
         assert!(
             !records
                 .iter()
-                .any(|record| matches!(record, LogRecord::Observation(_))),
+                .any(|record| matches!(record, Record::Observation(_))),
             "a message never popped is never logged as an observation: {records:?}"
         );
         // Only what was taken is counted: the two controls, and none of the
@@ -2431,7 +2429,7 @@ mod tests {
         drop(wires.queue);
         agent.join().unwrap();
 
-        let records: Vec<LogRecord<TestPayload>> = wires.records.try_iter().collect();
+        let records: Vec<Record<TestPayload>> = wires.records.try_iter().collect();
         let kinds: Vec<&str> = records.iter().map(kind).collect();
         // `Town` speaks when it starts and says nothing to an
         // observation, so the opening action between them is the start
@@ -2491,14 +2489,14 @@ mod tests {
         rig.stop();
         rig.agent.join().unwrap();
 
-        let records: Vec<LogRecord<TestPayload>> = rig.records.try_iter().collect();
+        let records: Vec<Record<TestPayload>> = rig.records.try_iter().collect();
         let mut cycles = 0;
         let mut received: Vec<Timestamp> = Vec::new();
         for record in &records {
             match record {
-                LogRecord::Control(record) => received.push(record.received),
-                LogRecord::Observation(record) => received.push(record.received),
-                LogRecord::Cycle(cycle) => {
+                Record::Control(record) => received.push(record.received),
+                Record::Observation(record) => received.push(record.received),
+                Record::Cycle(cycle) => {
                     cycles += 1;
                     assert!(
                         received.iter().all(|at| *at == cycle.t_start),

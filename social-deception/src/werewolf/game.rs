@@ -41,8 +41,8 @@
 //! session converge selection by selection, and a summary of where it landed
 //! would only repeat what that member observed (ADR-0015). What the moderator
 //! needs to remember about a session it keeps — it is the moderator that
-//! drops a selection arriving after the close — and a reader of the
-//! trajectory reconstructs a session from the selections, which are the
+//! drops a selection arriving after the close — and a reader of the log
+//! reconstructs a session from the selections, which are the
 //! primary record. What a member learns is the session's *outcome*, and that
 //! is announced anyway: the death, the finding, or the night that passed
 //! quietly.
@@ -550,7 +550,7 @@ impl Game {
     ///
     /// Being dead is not being out of the game. A villager the pack
     /// devoured in the first round wins with its faction, and the record
-    /// says so, because what a trajectory is being scored for is the
+    /// says so, because what a game is being scored for is the
     /// behavior that led to the result and not the length of the episode.
     #[must_use]
     pub fn rewards(&self) -> Option<BTreeMap<ActorId, i32>> {
@@ -689,7 +689,7 @@ impl Game {
     ///
     /// The hammer is the moderator's own: it is what names the player who
     /// dies, and it is never narrated. A reader recovers it from the
-    /// trajectory as the last selection forwarded before the lynching, and a
+    /// log as the last selection forwarded before the lynching, and a
     /// player that saw that selection saw the same thing (ADR-0015).
     fn close_day(&mut self, hammer: Option<&ActorId>, now: Timestamp) -> Vec<Directive> {
         let session = self.sessions.remove(0);
