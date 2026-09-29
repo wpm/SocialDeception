@@ -271,7 +271,7 @@ mod tests {
     use crate::message::ActorId;
     use crate::testing::{fast, id, ids, observed, town, village};
     use crate::werewolf::assignment::Assignment;
-    use crate::werewolf::message::{Narration, Phase, RequestKind, Round, Select};
+    use crate::werewolf::message::{Narration, Phase, Round, Select, SessionKind};
     use crate::werewolf::role::Faction;
     use crate::werewolf::role::Role::{self, Doctor, Seer, Villager, Werewolf};
 
@@ -301,7 +301,7 @@ mod tests {
     fn response(
         who: &ActorId,
         round: Round,
-        kind: RequestKind,
+        kind: SessionKind,
         target: ActorId,
     ) -> Observation<WerewolfDomain> {
         from_player(
@@ -321,21 +321,21 @@ mod tests {
     /// The space is the game's own, so a stub cannot select outside it; the
     /// doctor's "not last night's patient" in particular is the rules'
     /// business rather than every stub's.
-    type Policy = fn(RequestKind, &[ActorId]) -> ActorId;
+    type Strategy = fn(SessionKind, &[ActorId]) -> ActorId;
 
     /// Selects the first target the rules permit.
-    fn first_other(_: RequestKind, space: &[ActorId]) -> ActorId {
+    fn first_other(_: SessionKind, space: &[ActorId]) -> ActorId {
         space.first().unwrap().clone()
     }
 
     /// Selects the last target the rules permit.
-    fn last_other(_: RequestKind, space: &[ActorId]) -> ActorId {
+    fn last_other(_: SessionKind, space: &[ActorId]) -> ActorId {
         space.last().unwrap().clone()
     }
 
     /// Selects the last permitted target by night and the first by day,
     /// so that the pack and the village disagree about whom to blame.
-    fn two_minded(kind: RequestKind, space: &[ActorId]) -> ActorId {
+    fn two_minded(kind: SessionKind, space: &[ActorId]) -> ActorId {
         match kind.phase() {
             Phase::Night => last_other(kind, space),
             Phase::Day => first_other(kind, space),
@@ -376,10 +376,10 @@ mod tests {
             .collect()
     }
 
-    /// The selections stub players following `policy` make when a phase
+    /// The selections stub players following `strategy` make when a phase
     /// begins.
     ///
-    /// This is a stub of [`Seat`](super::Seat) and acts the way one does
+    /// This is a stub of [`Player`](super::Player) and acts the way one does
     /// (ADR-0014): a phase beginning is what makes a player select, and
     /// each recipient asks its own role what that phase wants of it
     /// rather than waiting to be told. Nothing among the actions is a
@@ -389,7 +389,7 @@ mod tests {
     /// the same thing the game means by leaving it out of the session.
     fn respond(
         actions: &[Action<WerewolfDomain>],
-        policy: Policy,
+        strategy: Strategy,
         game: &Game,
         roles: &Assignment,
     ) -> Vec<Observation<WerewolfDomain>> {
@@ -413,14 +413,14 @@ mod tests {
                     if space.is_empty() {
                         return None;
                     }
-                    Some(response(who, round, kind, policy(kind, &space)))
+                    Some(response(who, round, kind, strategy(kind, &space)))
                 })
             })
             .collect()
     }
 
-    /// Plays a whole game, with stub players following `policy`, and returns
-    /// every effect the moderator produced in order.
+    /// Plays a whole game, with stub players following `strategy`, and
+    /// returns every effect the moderator produced in order.
     ///
     /// The game opens with the start hook, as the agent loop opens it, and
     /// each response then arrives in a cycle of its own, as the loop hands
@@ -428,7 +428,7 @@ mod tests {
     /// moderator asks nothing more.
     fn play(
         moderator: &mut Moderator,
-        policy: Policy,
+        strategy: Strategy,
         roles: &Assignment,
     ) -> Vec<Effect<WerewolfDomain>> {
         /// Far enough apart that one phase's clocks never reach the next.
@@ -436,7 +436,7 @@ mod tests {
 
         let mut clock = 0;
         let mut produced = moderator.start(at(clock));
-        let mut pending = respond(&actions(&produced), policy, &moderator.game, roles);
+        let mut pending = respond(&actions(&produced), strategy, &moderator.game, roles);
         while moderator.game.outcome().is_none() {
             clock += STEP;
             let mut effects: Vec<Effect<WerewolfDomain>> = pending
@@ -447,7 +447,7 @@ mod tests {
             // running the clock out is what closes the phase (ADR-0011).
             clock += STEP;
             effects.extend(moderator.timeout(at(clock)));
-            pending = respond(&actions(&effects), policy, &moderator.game, roles);
+            pending = respond(&actions(&effects), strategy, &moderator.game, roles);
             produced.extend(effects);
             assert!(
                 clock < STEP * 200,
@@ -478,14 +478,14 @@ mod tests {
         effects: Vec<Effect<WerewolfDomain>>,
     }
 
-    /// Every combination of assignment and stub policy, played out.
+    /// Every combination of assignment and stub strategy, played out.
     fn played_games() -> Vec<Played> {
-        let policies: [Policy; 3] = [first_other, last_other, two_minded];
+        let strategies: [Strategy; 3] = [first_other, last_other, two_minded];
         let mut games = Vec::new();
         for assignment in [village(), town()] {
-            for policy in policies {
+            for strategy in strategies {
                 let (mut moderator, receiver) = moderator(assignment.clone());
-                let effects = play(&mut moderator, policy, &assignment);
+                let effects = play(&mut moderator, strategy, &assignment);
                 games.push(Played {
                     assignment: assignment.clone(),
                     outcome: moderator.game.outcome().unwrap().clone(),
@@ -801,7 +801,7 @@ mod tests {
         let late = response(
             &id("carol"),
             Round::new(1),
-            RequestKind::Nominate,
+            SessionKind::Nominate,
             id("bob"),
         );
         assert_eq!(moderator.handle(&late), []);

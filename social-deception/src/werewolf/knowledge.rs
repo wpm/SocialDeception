@@ -2,7 +2,7 @@
 //! observations it has received.
 //!
 //! In the vocabulary of ADR-0007, `Knowledge` is the *state*: a sufficient
-//! statistic of an agent's [`Observation`] history, and what a policy
+//! statistic of an agent's [`Observation`] history, and what a strategy
 //! conditions on. It is one type for every role, because every role needs
 //! the same public picture (the round and phase, who is living, who is dead
 //! and what they turned out to be, how the phases before this one selected)
@@ -22,12 +22,12 @@
 //!
 //! That holds because [`Knowledge::observe`] folds only moderator narration
 //! and never infers. A doctor that protected someone and then hears that
-//! nobody died may conclude it saved them; the conclusion is the policy's to
-//! draw, and this type records only that nobody died. Player-to-player
-//! dialogue, which may be false, and a role whose investigations can be wrong
-//! would each call for a separate type holding what a player believes. The
-//! line between that type and this one is drawn here, so that it can be added
-//! without touching this one.
+//! nobody died may conclude it saved them; the conclusion is the
+//! strategy's to draw, and this type records only that nobody died.
+//! Player-to-player dialogue, which may be false, and a role whose
+//! investigations can be wrong would each call for a separate type holding
+//! what a player believes. The line between that type and this one is
+//! drawn here, so that it can be added without touching this one.
 //!
 //! The one thing here that the moderator never said is what the agent itself
 //! did in secret. What a player has done is still knowledge, and it is true
@@ -49,13 +49,13 @@
 //! A `Knowledge` is a pure function of the observations folded into it. The
 //! same stream over a fresh value yields the same state on every run, and
 //! nothing else is consulted: no clock, no sender, no recipient list. That is
-//! the property a policy depends on, and what a prompt for a language-model
-//! policy is rendered from.
+//! the property a strategy depends on, and what a prompt for a language-model
+//! strategy is rendered from.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::WerewolfDomain;
-use super::message::{Cause, Message, Narration, Outcome, Phase, RequestKind, Round};
+use super::message::{Cause, Message, Narration, Outcome, Phase, Round, SessionKind};
 use super::role::{Faction, Role};
 use crate::agent::Observation;
 use crate::message::ActorId;
@@ -105,7 +105,7 @@ pub struct Knowledge {
     ///
     /// Nobody narrates this. It is the agent's own record of what it
     /// watched happen, kept because a phase's selections are cleared when the
-    /// next phase begins and a policy may still want the argument that
+    /// next phase begins and a strategy may still want the argument that
     /// went before (ADR-0015).
     pub history: Vec<Phased>,
     /// Set once the game is over.
@@ -172,9 +172,9 @@ impl Knowledge {
     /// `Protect` is also remembered on its own as
     /// [`last_protected`](Self::last_protected), because the rules ask for it
     /// by name the next night.
-    pub fn acted(&mut self, kind: RequestKind, chosen: &ActorId) {
+    pub fn acted(&mut self, kind: SessionKind, chosen: &ActorId) {
         self.selections.insert(self.me.clone(), chosen.clone());
-        if kind == RequestKind::Protect {
+        if kind == SessionKind::Protect {
             self.last_protected = Some(chosen.clone());
         }
     }
@@ -268,7 +268,7 @@ impl Knowledge {
                 );
             }
             // Still an observation, and still recorded in the trajectory;
-            // whether it means a save is for a policy to infer.
+            // whether it means a save is for a strategy to infer.
             Narration::NoDeath { .. } | Narration::NoLynch { .. } => {}
             Narration::Outcome(outcome) => self.outcome = Some(outcome.clone()),
         }
@@ -368,7 +368,7 @@ mod tests {
             who,
             Message::Select(Select {
                 round: Round::new(round),
-                kind: RequestKind::Nominate,
+                kind: SessionKind::Nominate,
                 target: id(whom),
                 seen_by: BTreeSet::new(),
             }),
@@ -552,10 +552,10 @@ mod tests {
         let mut knowledge = Knowledge::new(id(ME), Role::Doctor);
         assert_eq!(knowledge.last_protected, None);
 
-        knowledge.acted(RequestKind::Protect, &target("alice"));
+        knowledge.acted(SessionKind::Protect, &target("alice"));
         assert_eq!(knowledge.last_protected, Some(id("alice")));
 
-        knowledge.acted(RequestKind::Protect, &target("bob"));
+        knowledge.acted(SessionKind::Protect, &target("bob"));
         assert_eq!(knowledge.last_protected, Some(id("bob")));
     }
 
@@ -570,7 +570,7 @@ mod tests {
                 who,
                 Message::Select(Select {
                     round: Round::new(1),
-                    kind: RequestKind::Nominate,
+                    kind: SessionKind::Nominate,
                     target: id(target),
                     seen_by: BTreeSet::new(),
                 }),
@@ -594,7 +594,7 @@ mod tests {
 
         // The agent's own selection is one of the phase's too, and it is the
         // one entry no forward could supply.
-        knowledge.acted(RequestKind::Nominate, &target("alice"));
+        knowledge.acted(SessionKind::Nominate, &target("alice"));
         assert_eq!(
             knowledge.selections,
             votes([
@@ -622,9 +622,9 @@ mod tests {
         // own.
         let before = folded(Role::Seer, &a_seers_game()[..8]);
         for kind in [
-            RequestKind::Nominate,
-            RequestKind::Devour,
-            RequestKind::Investigate,
+            SessionKind::Nominate,
+            SessionKind::Devour,
+            SessionKind::Investigate,
         ] {
             let mut after = before.clone();
             after.acted(kind, &target("alice"));
@@ -637,7 +637,7 @@ mod tests {
         }
 
         let mut protecting = before.clone();
-        protecting.acted(RequestKind::Protect, &target("alice"));
+        protecting.acted(SessionKind::Protect, &target("alice"));
         assert_eq!(protecting.selections.get(&id(ME)), Some(&id("alice")));
         assert_eq!(protecting.last_protected, Some(id("alice")));
     }
@@ -692,7 +692,7 @@ mod tests {
                 Phase::Night,
                 ids(["alice", "bob", ME]),
             )));
-            knowledge.acted(RequestKind::Protect, &target("alice"));
+            knowledge.acted(SessionKind::Protect, &target("alice"));
             knowledge.observe(&observed(narrated(Narration::NoDeath {
                 round: Round::new(1),
             })));
@@ -734,7 +734,7 @@ mod tests {
 
         knowledge.observe(&observed(phase_began(1, Phase::Day, living.clone())));
         knowledge.observe(&observed(nominated("alice", "bob", 1)));
-        knowledge.acted(RequestKind::Nominate, &target("alice"));
+        knowledge.acted(SessionKind::Nominate, &target("alice"));
         assert_eq!(
             knowledge.selections,
             votes([("alice", target("bob")), (ME, target("alice"))]),

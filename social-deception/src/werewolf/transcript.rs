@@ -59,7 +59,7 @@ use std::fmt;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
-use super::message::{Cause, Message, Narration, Outcome, Phase, RequestKind, Round, Select};
+use super::message::{Cause, Message, Narration, Outcome, Phase, Round, Select, SessionKind};
 use super::role::{Faction, Role};
 use crate::message::ActorId;
 
@@ -106,7 +106,7 @@ pub struct PhaseRecord {
     /// Every selection made this phase, by the player that made it, paired
     /// with the kind of session it was made in. The target alone does not
     /// say whether it was devoured, protected, investigated or nominated.
-    pub moves: BTreeMap<ActorId, (RequestKind, ActorId)>,
+    pub moves: BTreeMap<ActorId, (SessionKind, ActorId)>,
     /// What each seer learned: whom it investigated and the faction that
     /// came back, by seer. Empty on a phase where no seer investigated,
     /// and holding one entry per seer that did, since a game may deal
@@ -195,7 +195,7 @@ pub enum TranscriptError {
         /// The selecting agent.
         from: ActorId,
         /// The session it selected in.
-        kind: RequestKind,
+        kind: SessionKind,
     },
     /// A record belongs to a phase that has not begun: a selection, an
     /// investigation or an elimination before the first night, or a day
@@ -617,7 +617,7 @@ impl Reader {
             // the received selection does not, is that the moderator accepted
             // it: that is where the hammer comes from (ADR-0015).
             (Direction::Sent, Message::Select(selection)) => {
-                if selection.kind == RequestKind::Nominate {
+                if selection.kind == SessionKind::Nominate {
                     self.latest_nomination = Some(sender);
                 }
                 Ok(())
@@ -816,7 +816,7 @@ fn phase(
     let (votes, deeds): (Vec<_>, Vec<_>) = record
         .moves
         .iter()
-        .partition(|(_, (kind, _))| *kind == RequestKind::Nominate);
+        .partition(|(_, (kind, _))| *kind == SessionKind::Nominate);
     // Nominations are a ballot, laid out in columns; night moves differ
     // by kind and get a line each.
     columns(
@@ -827,10 +827,10 @@ fn phase(
     )?;
     for (who, (kind, chosen)) in deeds {
         let verb = match kind {
-            RequestKind::Devour => "devours",
-            RequestKind::Investigate => "investigates",
-            RequestKind::Protect => "protects",
-            RequestKind::Nominate => "nominates",
+            SessionKind::Devour => "devours",
+            SessionKind::Investigate => "investigates",
+            SessionKind::Protect => "protects",
+            SessionKind::Nominate => "nominates",
         };
         let whom = chosen.as_str();
         write!(f, "  {:<width$} {verb} {whom}", who.as_str())?;
@@ -908,8 +908,8 @@ mod tests {
     }
 
     fn moves<const N: usize>(
-        moves: [(&str, RequestKind, ActorId); N],
-    ) -> BTreeMap<ActorId, (RequestKind, ActorId)> {
+        moves: [(&str, SessionKind, ActorId); N],
+    ) -> BTreeMap<ActorId, (SessionKind, ActorId)> {
         moves
             .into_iter()
             .map(|(who, kind, chosen)| (id(who), (kind, chosen)))
@@ -918,16 +918,16 @@ mod tests {
 
     fn nominations<const N: usize>(
         votes: [(&str, &str); N],
-    ) -> BTreeMap<ActorId, (RequestKind, ActorId)> {
+    ) -> BTreeMap<ActorId, (SessionKind, ActorId)> {
         votes
             .into_iter()
-            .map(|(who, whom)| (id(who), (RequestKind::Nominate, target(whom))))
+            .map(|(who, whom)| (id(who), (SessionKind::Nominate, target(whom))))
             .collect()
     }
 
     fn phase<const N: usize>(
         living: [&str; N],
-        moves: BTreeMap<ActorId, (RequestKind, ActorId)>,
+        moves: BTreeMap<ActorId, (SessionKind, ActorId)>,
         investigation: Option<(&str, &str, Faction)>,
         eliminated: Option<(&str, Role, Cause)>,
     ) -> PhaseRecord {
@@ -996,7 +996,7 @@ mod tests {
     /// targets, so nobody reaches the four a majority of the living needs
     /// and the day runs out (ADR-0011).
     fn expected_round_one() -> RoundRecord {
-        use RequestKind::{Devour, Investigate, Protect};
+        use SessionKind::{Devour, Investigate, Protect};
         RoundRecord {
             round: Round::new(1),
             night: phase(
@@ -1031,7 +1031,7 @@ mod tests {
     /// seer finds a werewolf too late to say so.
     fn expected_round_two() -> RoundRecord {
         use Cause::Devoured;
-        use RequestKind::{Devour, Investigate, Protect};
+        use SessionKind::{Devour, Investigate, Protect};
         RoundRecord {
             round: Round::new(2),
             night: phase(
@@ -1065,7 +1065,7 @@ mod tests {
     /// between the pack and the player it agrees on.
     fn expected_round_three() -> RoundRecord {
         use Cause::Devoured;
-        use RequestKind::{Devour, Investigate};
+        use SessionKind::{Devour, Investigate};
         RoundRecord {
             round: Round::new(3),
             night: phase(
@@ -1098,7 +1098,7 @@ mod tests {
     /// the round has no day.
     fn expected_round_four() -> RoundRecord {
         use Cause::Devoured;
-        use RequestKind::{Devour, Investigate};
+        use SessionKind::{Devour, Investigate};
         RoundRecord {
             round: Round::new(4),
             night: phase(
@@ -1266,9 +1266,9 @@ mod tests {
         for round in &transcript.rounds {
             for (who, (kind, _)) in &round.night.moves {
                 let expected = match roles[who] {
-                    Werewolf => RequestKind::Devour,
-                    Seer => RequestKind::Investigate,
-                    Doctor => RequestKind::Protect,
+                    Werewolf => SessionKind::Devour,
+                    Seer => SessionKind::Investigate,
+                    Doctor => SessionKind::Protect,
                     Villager => panic!("{who} acted at night"),
                 };
                 assert_eq!(*kind, expected, "{who} in round {:?}", round.round);
@@ -1277,7 +1277,7 @@ mod tests {
             for (who, (kind, _)) in round.day.iter().flat_map(|day| &day.moves) {
                 assert_eq!(
                     *kind,
-                    RequestKind::Nominate,
+                    SessionKind::Nominate,
                     "{who} in round {:?}",
                     round.round
                 );
@@ -1475,13 +1475,13 @@ mod tests {
         // fixture dealt, so it is derived rather than written in.
         let mut lines = fixture();
         let index = moderator_record(&lines, is_selection);
-        let kind: RequestKind =
+        let kind: SessionKind =
             serde_json::from_value(lines[index]["message"]["payload"]["Select"]["kind"].clone())
                 .expect("a selection names its session");
         let forged = [
-            RequestKind::Devour,
-            RequestKind::Investigate,
-            RequestKind::Protect,
+            SessionKind::Devour,
+            SessionKind::Investigate,
+            SessionKind::Protect,
         ]
         .into_iter()
         .find(|other| *other != kind)
@@ -1802,13 +1802,13 @@ mod tests {
                 // does: a nomination is public, a devour is the pack's, and
                 // the seer's and doctor's business is nobody else's.
                 let seen_by = match kind {
-                    RequestKind::Nominate => game
+                    SessionKind::Nominate => game
                         .living()
                         .iter()
                         .filter(|other| *other != &id(who))
                         .cloned()
                         .collect(),
-                    RequestKind::Devour => roles
+                    SessionKind::Devour => roles
                         .players()
                         .filter(|(other, role)| {
                             role.faction() == Faction::Werewolves && *other != &id(who)
@@ -1816,7 +1816,7 @@ mod tests {
                         .map(|(other, _)| other.clone())
                         .filter(|other| game.living().contains(other))
                         .collect(),
-                    RequestKind::Investigate | RequestKind::Protect => BTreeSet::new(),
+                    SessionKind::Investigate | SessionKind::Protect => BTreeSet::new(),
                 };
                 let selection = Select {
                     round,
@@ -1878,8 +1878,8 @@ mod tests {
         assert_eq!(
             last.night.moves,
             moves([
-                ("bob", RequestKind::Devour, target("alice")),
-                ("dave", RequestKind::Protect, target("bob")),
+                ("bob", SessionKind::Devour, target("alice")),
+                ("dave", SessionKind::Protect, target("bob")),
             ])
         );
         assert_eq!(
@@ -2014,7 +2014,7 @@ mod tests {
         let error = TranscriptError::NotAMember {
             line: 12,
             from: id("bob"),
-            kind: RequestKind::Protect,
+            kind: SessionKind::Protect,
         };
         assert_eq!(
             error.to_string(),

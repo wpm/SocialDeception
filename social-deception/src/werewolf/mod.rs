@@ -57,11 +57,11 @@
 //! action carries is an [`ActorId`](crate::ActorId): the target inside the
 //! selection, not the selection itself. The set of targets the rules permit
 //! in a session is the *action space*, a `Vec<ActorId>` computed by the
-//! rules; a target outside it is a policy bug. A selection names the session
-//! it was made in, by round and [`RequestKind`], which both sides derive from
-//! what they each know — so there is nothing to correlate, and a selection
-//! naming a round that has passed is one whose session closed while it was in
-//! flight.
+//! rules; a target outside it is a strategy bug. A selection names the
+//! session it was made in, by round and [`SessionKind`], which both sides
+//! derive from what they each know — so there is nothing to correlate, and a
+//! selection naming a round that has passed is one whose session closed while
+//! it was in flight.
 //!
 //! A member may select as often as it likes while its session is open, and
 //! its most recent selection is its vote; selecting nowhere is how it
@@ -95,23 +95,22 @@
 //! # What a player knows, and how it decides
 //!
 //! [`Knowledge`] is the state a player carries between cycles: the fold of
-//! every observation it has received, and what a policy conditions on. It
+//! every observation it has received, and what a strategy conditions on. It
 //! records only what the moderator said, so nothing in it can be false.
 //!
-//! A [`Policy`] is handed a [`View`] of that state, the kind of session in
+//! A [`Strategy`] is handed a [`View`] of that state, the kind of session in
 //! front of it and the action space, and returns a target or none.
-//! [`RandomPolicy`] is the uniform random baseline; a language-model
-//! policy is the same trait ([`policy`]).
+//! [`RandomStrategy`] is the uniform random baseline; a language-model
+//! strategy is the same trait ([`strategy`]).
 //!
 //! The action space is the rules' to compute, and the rules are a role's:
-//! [`Villager`], [`Werewolf`], [`Seer`] and [`Doctor`] ([`roles`]) each
-//! carry their own [`Knowledge`] and say which targets a session permits
-//! them, and nothing else. It may be empty — the doctor may be left with
-//! nobody it can protect — and a player with an empty one selects nowhere.
-//! A [`Seat`] ([`player`]) pairs a role with the policy that decides for
-//! it and is the agent the episode runs: it folds every message into the
-//! role's state, acts when it observes a phase begin, and addresses each
-//! selection as the rules allow.
+//! [`Role::action_space`] ([`role`]) says which targets a session permits a
+//! player that knows what it knows, and nothing else. It may be empty — the
+//! doctor may be left with nobody it can protect — and a player with an
+//! empty one selects nowhere. A [`Player`] ([`player`]) joins what it knows
+//! to the strategy that decides for it and is the agent the episode runs: it
+//! folds every message into its knowledge, acts when it observes a phase
+//! begin, and addresses each selection as the rules allow.
 //!
 //! # What no message carries
 //!
@@ -144,11 +143,10 @@ pub mod live;
 pub mod message;
 pub mod moderator;
 pub mod player;
-pub mod policy;
 pub mod role;
-pub mod roles;
 pub mod seed;
 pub mod setup;
+pub mod strategy;
 pub mod transcript;
 
 /// Werewolf as a [`Domain`]: the types this game contributes to the
@@ -173,12 +171,11 @@ pub use config::{Config, ConfigError, RoleCounts};
 pub use game::{Directive, Game};
 pub use knowledge::{Death, Knowledge, Phased};
 pub use live::Text;
-pub use message::{Cause, Message, Narration, Outcome, Phase, RequestKind, Round, Select};
+pub use message::{Cause, Message, Narration, Outcome, Phase, Round, Select, SessionKind};
 pub use moderator::Moderator;
-pub use player::{Player, Seat};
-pub use policy::{Policy, RandomPolicy, View};
+pub use player::Player;
 pub use role::{Faction, Role};
-pub use roles::{Doctor, Seer, Villager, Werewolf};
 pub use seed::seed_for;
 pub use setup::{RunError, episode, run};
+pub use strategy::{RandomStrategy, Strategy, View};
 pub use transcript::{PhaseRecord, RoundRecord, Transcript, TranscriptError};

@@ -64,8 +64,8 @@ use serde::Deserialize;
 use serde_json::Value;
 use social_deception::ActorId;
 use social_deception::werewolf::{
-    Assignment, Cause, Config, Faction, Message, Narration, Outcome, Phase, RequestKind, Role,
-    Round, Select, roles,
+    Assignment, Cause, Config, Faction, Message, Narration, Outcome, Phase, Role, Round, Select,
+    SessionKind, role,
 };
 
 /// Something the moderator said.
@@ -427,7 +427,7 @@ impl<'a> Play<'a> {
         self.heard
             .iter()
             .filter(|heard| {
-                heard.selection.round == round && heard.selection.kind == RequestKind::Protect
+                heard.selection.round == round && heard.selection.kind == SessionKind::Protect
             })
             .map(|heard| (heard.from.clone(), heard.selection.target.clone()))
             .collect()
@@ -441,15 +441,15 @@ impl<'a> Play<'a> {
     fn action_space(
         &self,
         who: &ActorId,
-        kind: RequestKind,
+        kind: SessionKind,
         round: Round,
         living: &BTreeSet<ActorId>,
     ) -> Vec<ActorId> {
         let last_protected = round
             .previous()
-            .filter(|_| kind == RequestKind::Protect)
+            .filter(|_| kind == SessionKind::Protect)
             .and_then(|before| self.protections_in(before).get(who).cloned());
-        roles::action_space(who, living, kind, last_protected.as_ref())
+        role::action_space(who, living, kind, last_protected.as_ref())
     }
 
     /// The members of the session of `kind` in `round`, with `living`
@@ -465,7 +465,7 @@ impl<'a> Play<'a> {
     /// in.
     fn members_of(
         &self,
-        kind: RequestKind,
+        kind: SessionKind,
         round: Round,
         living: &BTreeSet<ActorId>,
     ) -> BTreeSet<ActorId> {
@@ -697,8 +697,8 @@ impl<'a> Play<'a> {
                 // `members_of`, the one place this file works out who a
                 // session's members are, so the audience a forward is
                 // held to is the session the rules opened.
-                RequestKind::Devour => {
-                    let mut pack = self.members_of(RequestKind::Devour, round, &living);
+                SessionKind::Devour => {
+                    let mut pack = self.members_of(SessionKind::Devour, round, &living);
                     pack.remove(&forwarded.from);
                     assert_eq!(
                         forwarded.to, pack,
@@ -712,7 +712,7 @@ impl<'a> Play<'a> {
                 }
                 // The day's vote is public among the living, whether or
                 // not the rules leave each of them somewhere to select.
-                RequestKind::Nominate => {
+                SessionKind::Nominate => {
                     let mut others = living;
                     others.remove(&forwarded.from);
                     assert_eq!(
@@ -720,7 +720,7 @@ impl<'a> Play<'a> {
                         "a nomination goes to the rest of the living: {line}"
                     );
                 }
-                RequestKind::Investigate | RequestKind::Protect => panic!(
+                SessionKind::Investigate | SessionKind::Protect => panic!(
                     "a {:?} selection is nobody else's business and is never passed on: {line}",
                     forwarded.selection.kind
                 ),
@@ -766,7 +766,7 @@ impl<'a> Play<'a> {
         let protected: BTreeMap<Round, &ActorId> = self
             .heard
             .iter()
-            .filter(|heard| heard.selection.kind == RequestKind::Protect)
+            .filter(|heard| heard.selection.kind == SessionKind::Protect)
             .map(|heard| (heard.selection.round, &heard.selection.target))
             .collect();
         let mut phases = Phases {
@@ -934,19 +934,19 @@ impl<'a> Play<'a> {
                 );
                 match selection.kind {
                     // The pack sees its own selecting and nobody else does.
-                    RequestKind::Devour => assert!(
+                    SessionKind::Devour => assert!(
                         others
                             .iter()
                             .all(|other| self.role(other) == Role::Werewolf),
                         "a devour selection is seen by the pack alone: {line}"
                     ),
                     // The day's vote is public among the living.
-                    RequestKind::Nominate => assert!(
+                    SessionKind::Nominate => assert!(
                         others.iter().all(|other| *other != who),
                         "a nomination does not name its own author: {line}"
                     ),
                     // Nobody's business but the moderator's.
-                    RequestKind::Investigate | RequestKind::Protect => assert!(
+                    SessionKind::Investigate | SessionKind::Protect => assert!(
                         others.is_empty(),
                         "a {:?} selection is nobody else's business: {line}",
                         selection.kind
@@ -1090,8 +1090,8 @@ impl<'p, 'a> Phases<'p, 'a> {
     /// never took.
     fn leaders_of(&self, round: Round, phase: Phase) -> BTreeSet<ActorId> {
         let deciding = match phase {
-            Phase::Night => RequestKind::Devour,
-            Phase::Day => RequestKind::Nominate,
+            Phase::Night => SessionKind::Devour,
+            Phase::Day => SessionKind::Nominate,
         };
         let mine = |selection: &Select| selection.round == round && selection.kind == deciding;
         let counted = self

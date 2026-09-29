@@ -39,7 +39,7 @@ one, living and dead alike.
 
 The `werewolf` binary plays one episode of Werewolf from a TOML
 configuration, with every player an agent and every decision made by a
-uniform random policy, and writes the trajectory beside the configuration
+uniform random strategy, and writes the trajectory beside the configuration
 that reproduces it. The example at `examples/werewolf.toml` is a
 seven-player game:
 
