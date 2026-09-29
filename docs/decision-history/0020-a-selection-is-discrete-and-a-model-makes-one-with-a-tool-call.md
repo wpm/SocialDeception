@@ -65,12 +65,22 @@ A model-backed strategy offers the model one tool:
 ```
 
 The `enum` is the action space for this decision. Calling the tool selects;
-not calling it selects nobody. A call whose target is not in the action
-space — a model that ignores the schema — falls back to the strategy's
-fallback, as a failed model call does under
-[ADR-0005](0005-policy-separates-decisions-from-rules.md). The same tool is
-used at night and by day; the structured `{target}` and `{say, target}`
-answers are not built.
+not calling it selects nobody. The same tool is used at night and by day;
+the structured `{target}` and `{say, target}` answers are not built.
+
+### A model that fails to select has not selected
+
+A model call can time out, fail, or come back with a tool call whose target
+is not in the action space (a model that ignores the schema). In every such
+case **the player has simply failed to make a selection**: nothing is sent,
+and nothing stands in for the model. This replaces
+[ADR-0005](0005-policy-separates-decisions-from-rules.md)'s rule that a
+failed model-backed policy falls back to a random choice. A random
+substitute would put decisions in the log that no model made, and would
+blur what an experiment measures about a model's play; a failure to select
+is a fact about the player, recorded as one, and counted in the usage
+report. It costs the player what abstaining costs: at night, its session
+may close without it; by day, it does not count toward a majority.
 
 ### Where selection and speech meet
 
@@ -97,6 +107,10 @@ record) share nothing but, by day, a model call.
 **Every model-backed player needs a model that supports tool calls.** The
 OpenAI protocol's tool calling is widely implemented, including by the
 local servers in view (vLLM, Ollama), but a model without it cannot select.
+
+**Failures are visible.** A model that often fails to select plays
+visibly worse, and the usage report counts its failures, rather than a
+random policy quietly playing in its place.
 
 **The chat client handles tool calls in a stream.** Tool-call arguments
 arrive in pieces like text does; the client assembles them and reports the
