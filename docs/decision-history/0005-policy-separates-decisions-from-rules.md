@@ -13,6 +13,7 @@ by [ADR-0013](0013-speech-typing-and-a-scheduler-for-when-to-speak.md), under wh
 decides what to say, and a separate scheduler decides when;
 and by [ADR-0014](0014-events-carry-information-controls-carry-instruction.md), under which a role also decides whether the rules
 ask anything of it this phase, rather than being told by a request
+and by [ADR-0018](0018-werewolf-speech-goes-through-the-moderator.md), under which Werewolf's `Policy` becomes `Strategy`, the four role types and the `Player` trait give way to rules on `Role`, and `Seat` becomes `Player`
 
 ## Context
 

@@ -11,6 +11,8 @@ with timed pointing sessions, lets a day end without a lynch, and ends a game at
 by [ADR-0012](0012-a-dead-player-stops.md), under which a dead player's agent is stopped at its death;
 and by [ADR-0014](0014-events-carry-information-controls-carry-instruction.md), under which the moderator
 no longer reads a player's role to decide whom to ask: a player acts on observing a phase begin
+and by [ADR-0016](0016-actors-perceive-on-one-thread-and-decide-on-another.md), under which `Moderator` implements `Step` and the environment ends the episode by stopping every actor, itself included
+and by [ADR-0018](0018-werewolf-speech-goes-through-the-moderator.md), under which every player addresses all of its actions to the moderator, which relays speech in an `Envelope`
 
 ## Context
 

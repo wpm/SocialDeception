@@ -6,6 +6,7 @@
 **Amended by:** [ADR-0003](0003-event-record-stamps.md), which replaces the event record's `time` field, and by [ADR-0007](0007-reinforcement-learning-vocabulary.md),
 which replaces the event record with observation, action, dropped, control and reward records,
 and by [ADR-0008](0008-one-observation-per-cycle.md), under which a cycle record names at most one observation
+and by [ADR-0017](0017-messages-carry-a-sequence-number-and-the-log-keeps-the-time.md), under which each record carries one time as an offset from the log writer's origin, the log opens with an `episode` header, messages are joined by sender and sequence number, and the module is `log`
 
 ## Context
 

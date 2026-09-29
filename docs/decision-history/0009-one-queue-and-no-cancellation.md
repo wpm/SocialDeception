@@ -1,9 +1,10 @@
 # ADR-0009: One queue, and an agent that does not know it is being stopped
 
-**Status:** Accepted
+**Status:** Superseded by [ADR-0016](0016-actors-perceive-on-one-thread-and-decide-on-another.md)
 **Date:** 2026-09-25
 **Deciders:** Bill McNeill
 **Amends:** [ADR-0007](0007-reinforcement-learning-vocabulary.md)
+**Superseded by:** [ADR-0016](0016-actors-perceive-on-one-thread-and-decide-on-another.md), under which controls travel on their own channel and a `Stop` preempts everything queued ahead of it
 
 ## Context
 

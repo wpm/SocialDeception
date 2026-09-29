@@ -12,6 +12,7 @@ because it was asked;
 [ADR-0015](0015-an-environment-does-not-summarize-what-agents-observed.md),
 under which no session is sent a tally at all, because each of its members
 has already seen every point the moderator accepted
+and by [ADR-0018](0018-werewolf-speech-goes-through-the-moderator.md), under which a point is timed by its arrival and a session closes on reminders the moderator sets for itself
 
 ## Context
 

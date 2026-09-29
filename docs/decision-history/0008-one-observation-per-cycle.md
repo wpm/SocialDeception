@@ -7,6 +7,7 @@
 [ADR-0007](0007-reinforcement-learning-vocabulary.md)
 **Amended by:** [ADR-0010](0010-a-handler-sets-its-own-deadline.md), under which a handler sets its own
 next deadline instead of waking on a fixed interval
+and by [ADR-0016](0016-actors-perceive-on-one-thread-and-decide-on-another.md), under which one observation per call is kept, the timeout hook is gone, and the handler is `policy` or `step`
 
 ## Context
 

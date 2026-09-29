@@ -4,6 +4,7 @@
 **Date:** 2026-09-26
 **Deciders:** Bill McNeill
 **Amends:** [ADR-0008](0008-one-observation-per-cycle.md)
+**Amended by:** [ADR-0016](0016-actors-perceive-on-one-thread-and-decide-on-another.md), under which a handler's deadline becomes a `Reminder` it sets for itself, reminders accumulate, and each fires once
 
 ## Context
 
