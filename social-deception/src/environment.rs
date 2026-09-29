@@ -1,7 +1,7 @@
 //! The environment: the one agent in an episode that controls it.
 //!
 //! An [`Environment`] is an agent like any other — one thread, one queue,
-//! and a trajectory of its own — with one power nobody else has. Where an ordinary [`Handler`] returns only
+//! and records of its own — with one power nobody else has. Where an ordinary [`Handler`] returns only
 //! [`Action`]s, an environment returns [`Effect`]s, and an `Effect` is
 //! either an action or a [`Control`] addressed to some of the agents. That
 //! is how an episode starts and how it ends: the episode starts the
@@ -62,8 +62,8 @@ use serde::Serialize;
 
 use crate::agent::{Action, Handler, Observation};
 use crate::clock::{Clock, Timestamp};
+use crate::log::{Record, RewardRecord};
 use crate::message::{ActorId, Control, Payload};
-use crate::trajectory::{LogRecord, RewardRecord};
 
 /// What an environment's cycle produces: an action like any agent's, a
 /// control for some of the agents, or a reward for one of them.
@@ -87,10 +87,10 @@ pub enum Effect<W, P: Payload> {
     /// Record what one agent's behavior was worth.
     ///
     /// Nothing is sent and nobody is told. The reward is written to the
-    /// trajectory the instant it is returned; see the
+    /// log the instant it is returned; see the
     /// [module documentation](self).
     Reward {
-        /// The agent rewarded, whose trajectory the record belongs to.
+        /// The agent rewarded, whose records the reward belongs to.
         /// Never the environment itself, which plays no game and so has
         /// nothing to be rewarded for.
         agent: ActorId,
@@ -212,7 +212,7 @@ pub struct Commanded {
 /// Only a refusal travels here. A reward the adapter accepts is written and
 /// nothing is sent; this says the environment produced a reward that could
 /// not become a record, which is a bug in the environment, and the episode
-/// fails rather than finishing with a trajectory that quietly lacks it.
+/// fails rather than finishing with a log that quietly lacks it.
 ///
 /// There are two ways to fail and they are kept apart, because a reader
 /// told the wrong one would look in the wrong place: an agent that could
@@ -244,7 +244,7 @@ pub enum Refusal {
 /// The adapter splits each cycle's effects three ways: the actions go back
 /// to the loop, which stamps, records and dispatches them as it would any
 /// agent's; the controls go on `commands`, a channel the episode drains;
-/// and a reward is **written to the trajectory here**, the instant the
+/// and a reward is **written to the log here**, the instant the
 /// handler returns it, if it names somebody this episode can reward.
 ///
 /// # Why a reward is written here and not by the episode
@@ -262,7 +262,7 @@ pub enum Refusal {
 /// spawned, so the adapter is handed it and answers before it writes. A
 /// reward for a stranger is therefore never written at all, rather than
 /// written and then disowned: the episode is about to fail, and a
-/// trajectory holding a reward for an agent that has no trajectory would
+/// log holding a reward for an agent that has no records of its own would
 /// be evidence of nothing. The name goes on `rewards` instead, and the
 /// episode fails the episode where it drains `commands`.
 ///
@@ -292,7 +292,7 @@ pub struct Adapter<W, P: Payload, E> {
     rewardable: BTreeSet<ActorId>,
     commands: Sender<Commanded>,
     rewards: Sender<Rewarded>,
-    records: Sender<LogRecord<P>>,
+    records: Sender<Record<P>>,
     clock: Clock,
 }
 
@@ -305,7 +305,7 @@ impl<W: Serialize + Copy + Send + 'static, P: Payload, E: Environment<W, P>> Ada
         rewardable: BTreeSet<ActorId>,
         commands: Sender<Commanded>,
         rewards: Sender<Rewarded>,
-        records: Sender<LogRecord<P>>,
+        records: Sender<Record<P>>,
         clock: Clock,
     ) -> Self {
         Self {
@@ -340,7 +340,7 @@ impl<W: Serialize + Copy + Send + 'static, P: Payload, E: Environment<W, P>> Ada
                     let _ = self.commands.send(Commanded { to, control });
                 }
                 Effect::Reward { agent, value } => {
-                    // Checked before it is written, so that a trajectory
+                    // Checked before it is written, so that the log
                     // never carries a reward for somebody who has none:
                     // the roster is settled before any thread starts, so
                     // the answer is here to be had rather than somewhere
@@ -358,7 +358,7 @@ impl<W: Serialize + Copy + Send + 'static, P: Payload, E: Environment<W, P>> Ada
                     // (ADR-0016). Reported and not written if it will not
                     // serialize, for the reason a reward for a stranger is:
                     // the episode is about to fail either way, and a
-                    // trajectory silently missing a reward the environment
+                    // log silently missing a reward the environment
                     // assigned would be evidence of nothing.
                     let Ok(value) = serde_json::to_value(value) else {
                         let _ = self.rewards.send(Rewarded {
@@ -462,7 +462,7 @@ mod tests {
         adapter: Adapter<i32, TestPayload, Opener>,
         commanded: Receiver<Commanded>,
         rewarded: Receiver<Rewarded>,
-        records: Receiver<LogRecord<TestPayload>>,
+        records: Receiver<Record<TestPayload>>,
     }
 
     fn rig() -> Rig {
@@ -520,7 +520,7 @@ mod tests {
         assert!(rig.records.try_recv().is_err(), "the start rewards nobody");
         let actions = rig.adapter.handle(&observation());
         assert!(actions.is_empty(), "a reward is not an action: {actions:?}");
-        let LogRecord::Reward(record) = rig.records.try_recv().unwrap() else {
+        let Record::Reward(record) = rig.records.try_recv().unwrap() else {
             panic!("a reward is written as a reward record");
         };
         assert_eq!(record.agent, id("a"));
@@ -558,11 +558,11 @@ mod tests {
         // integer on the way. A game scored in reals logs reals.
         let (commands, _commanded) = unbounded();
         let (paid, _rewarded) = unbounded();
-        let (recorder, records) = unbounded::<LogRecord<TestPayload>>();
+        let (recorder, records) = unbounded::<Record<TestPayload>>();
         let mut adapter =
             Adapter::new(Scorer, ids(["a"]), commands, paid, recorder, Clock::start());
         assert!(adapter.start(Timestamp::default()).is_empty());
-        let LogRecord::Reward(record) = records.try_recv().unwrap() else {
+        let Record::Reward(record) = records.try_recv().unwrap() else {
             panic!("a reward is written as a reward record");
         };
         assert_eq!(record.value, serde_json::json!(0.5));
@@ -583,12 +583,12 @@ mod tests {
 
     #[test]
     fn a_reward_for_somebody_outside_the_roster_is_reported_and_not_written() {
-        // The episode is about to fail. A trajectory carrying a reward for
-        // an agent that has no trajectory would be evidence of nothing, so
-        // the name is reported and the line is never written.
+        // The episode is about to fail. A log carrying a reward for an
+        // agent that has no records of its own would be evidence of
+        // nothing, so the name is reported and the line is never written.
         let (commands, _commanded) = unbounded();
         let (paid, rewarded) = unbounded();
-        let (recorder, records) = unbounded::<LogRecord<TestPayload>>();
+        let (recorder, records) = unbounded::<Record<TestPayload>>();
         let mut adapter = Adapter::new(
             Stranger,
             ids(["a", "b"]),

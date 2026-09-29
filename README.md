@@ -6,8 +6,8 @@ Social deception games
 
 An episode is a fixed roster of agents, each a thread, talking over
 in-process channels without turn-taking. The framework names the parts as
-reinforcement learning does, because that is what the trajectories it
-writes are read in (see
+reinforcement learning does, because that is the vocabulary its log is
+read in (see
 [ADR-0007](docs/decision-history/0007-reinforcement-learning-vocabulary.md)).
 
 An **agent** runs a loop whose one turn is a **cycle**: it pops every
@@ -18,8 +18,8 @@ decision (see
 [ADR-0008](docs/decision-history/0008-one-observation-per-cycle.md)). What travels between agents is a **message** — sender, recipients,
 creation time and a payload the game defines. The same message is an
 **action** of the agent that sent it and an **observation** of each agent
-that pops it, which is what lets one agent's trajectory be joined to
-another's.
+that pops it, which is what lets one agent's records be joined to
+another's, and a trajectory built from the log.
 
 One agent per episode is the **environment**: it alone starts and stops the
 others, and it alone decides what an agent's behavior was worth. Those two
@@ -30,7 +30,7 @@ cycle's handler returns is always sent ([ADR-0009](docs/decision-history/0009-on
 Getting a stop to an agent with nothing left to do is the episode's job, and
 it does it by holding one back until nothing is in flight. A **reward** does
 not travel at all: nothing in a running episode reads it,
-so the environment writes it straight to the trajectory, where training
+so the environment writes it straight to the log, where training
 picks it up. Werewolf's environment is the moderator, and it pays +1 to
 every player on the winning faction and −1 to every player on the losing
 one, living and dead alike.
@@ -39,7 +39,7 @@ one, living and dead alike.
 
 The `werewolf` binary plays one episode of Werewolf from a TOML
 configuration, with every player an agent and every decision made by a
-uniform random strategy, and writes the trajectory beside the configuration
+uniform random strategy, and writes the log beside the configuration
 that reproduces it. The example at `examples/werewolf.toml` is a
 seven-player game:
 
@@ -53,13 +53,13 @@ it shows each message once, from the side of whoever sent it, in the order
 the players' threads produced them. `replay`, below, is the reproducible
 reading.
 
-It also writes `werewolf.jsonl`, the trajectory, and `werewolf.jsonl.toml`,
+It also writes `werewolf.jsonl`, the log, and `werewolf.jsonl.toml`,
 the effective configuration, at the repository root, where both are
 ignored by git. To read the game back:
 
     cargo run -- replay werewolf.jsonl
 
-That renders the logical game the trajectory records — the deal, each
+That renders the logical game the log records — the deal, each
 round's moves and deaths, and who won — and ends with the reward every
 player was paid, which is the only place a reward is ever shown, since it
 was never said to anybody.

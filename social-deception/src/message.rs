@@ -124,7 +124,7 @@ pub enum Control {
 /// the loop as it sends, never by the handler, which is why the value a
 /// handler returns is an `Action` and not this.
 ///
-/// It has no `Serialize` of its own: a message goes into a trajectory
+/// It has no `Serialize` of its own: a message goes into the log
 /// through the record that carries it, which writes it without the
 /// `created` that record already carries at the top level.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -238,7 +238,7 @@ mod tests {
 
     #[test]
     fn a_message_holds_its_recipients_in_canonical_order() {
-        // A message is written to a trajectory by `trajectory::Envelope`,
+        // A message is written to the log by `log::Envelope`,
         // which is the only wire shape it has, so what is asserted here is
         // the set itself: the order the envelope will write.
         let message = Message::<TestPayload>::new("a", ["c", "b"], at(40), TestPayload::Step(7));

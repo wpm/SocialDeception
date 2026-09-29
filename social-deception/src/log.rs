@@ -1,16 +1,17 @@
-//! Trajectory records and the writer that hands them to its sinks.
+//! The log records and the writer that hands them to its sinks.
 //!
-//! Each agent's own record sequence is its trajectory. The agent loop
-//! records it as it folds and sends the records over an in-process channel
-//! to a [`Writer`].
+//! The log is a record of exactly what happened, and nothing more. The agent
+//! loop writes its records as it folds and sends them over an in-process
+//! channel to a [`Writer`]. Pairing an agent's observations with its actions
+//! into a trajectory is what a parser builds *from* the log; the runtime
+//! builds nothing (ADR-0017).
 //!
 //! The writer is the one place in a running episode that sees every record
 //! as it happens, so it is where anything that wants the whole stream
 //! attaches. It does not write anything itself: it hands each record to a
 //! list of [`Sink`]s, each of which is a format bound to a destination.
-//! [`JsonLines`] over a file is the trajectory on disk; a domain that knows
-//! how to render its own messages can add a sink that shows the game as it
-//! plays.
+//! [`JsonLines`] over a file is the log on disk; a domain that knows how to
+//! render its own messages can add a sink that shows the game as it plays.
 //!
 //! # Five record types
 //!
@@ -38,9 +39,9 @@
 //! over a reward.
 //!
 //! An observation and an action record the same message from the two sides of
-//! it, which is what makes the trajectory joinable: an observation in one
-//! agent's trajectory matches the action in its sender's whose `created` and
-//! payload it carries. Nothing else links them, and nothing else needs to.
+//! it, which is what makes the log joinable: an observation in one agent's
+//! records matches the action in its sender's whose `created` and payload it
+//! carries. Nothing else links them, and nothing else needs to.
 //!
 //! Sequence numbers are per agent and cover every non-cycle record, inputs
 //! and outputs alike. A reward has none, because it is not the agent loop's
@@ -95,7 +96,7 @@
 //!
 //! # On-disk format
 //!
-//! [`JsonLines`] writes one JSON object per line, wrapped in [`LogRecord`],
+//! [`JsonLines`] writes one JSON object per line, wrapped in [`Record`],
 //! whose `type` field is `observation`, `action`, `control`, `reward` or
 //! `cycle`.
 //! Nothing here reads a log back; only `Serialize` is required of a payload
@@ -176,7 +177,7 @@ impl<P: Payload> Serialize for Envelope<'_, P> {
 /// already carries at the top level.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObservationRecord<P: Payload> {
-    /// The agent whose trajectory this record belongs to.
+    /// The agent this record belongs to.
     pub agent: ActorId,
     /// The agent's sequence number for it.
     pub seq: Seq,
@@ -210,7 +211,7 @@ impl<P: Payload> Serialize for ObservationRecord<P> {
 /// recipient's own observation record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActionRecord<P: Payload> {
-    /// The agent whose trajectory this record belongs to.
+    /// The agent this record belongs to.
     pub agent: ActorId,
     /// The agent's sequence number for it.
     pub seq: Seq,
@@ -235,7 +236,7 @@ impl<P: Payload> Serialize for ActionRecord<P> {
 /// A control this agent popped off its queue.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ControlRecord {
-    /// The agent whose trajectory this record belongs to.
+    /// The agent this record belongs to.
     pub agent: ActorId,
     /// The agent's sequence number for it.
     pub seq: Seq,
@@ -251,9 +252,9 @@ pub struct ControlRecord {
 ///
 /// It is the one record an agent does not write about itself. The
 /// environment decides what an agent's behavior was worth, and `agent`
-/// names the agent **rewarded**, whose trajectory the record belongs to,
-/// not the environment that wrote it. Training joins a reward to that
-/// agent's trajectory by the actor id and the time (ADR-0007).
+/// names the agent **rewarded**, whose records the reward belongs to, not
+/// the environment that wrote it. Training joins a reward to that agent's
+/// records by the actor id and the time (ADR-0007).
 ///
 /// There is no `seq`. Sequence numbers are the agent loop's to assign, and
 /// this record was not written by that loop, so numbering it would either
@@ -274,7 +275,7 @@ pub struct ControlRecord {
 /// types any more.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RewardRecord {
-    /// The agent rewarded, whose trajectory this record belongs to.
+    /// The agent rewarded, which is not the agent that wrote it.
     pub agent: ActorId,
     /// When the environment logged it.
     pub created: Timestamp,
@@ -309,12 +310,12 @@ pub struct CycleRecord {
     pub outputs: Vec<Seq>,
 }
 
-/// One record of a trajectory: what a [`Sink`] is handed.
+/// One record of the log: what a [`Sink`] is handed.
 ///
 /// Internally tagged: the `type` field of each line names the record kind.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", bound = "")]
-pub enum LogRecord<P: Payload> {
+pub enum Record<P: Payload> {
     /// A message some agent popped.
     Observation(ObservationRecord<P>),
     /// A message some agent sent.
@@ -327,37 +328,37 @@ pub enum LogRecord<P: Payload> {
     Cycle(CycleRecord),
 }
 
-impl<P: Payload> From<ObservationRecord<P>> for LogRecord<P> {
+impl<P: Payload> From<ObservationRecord<P>> for Record<P> {
     fn from(record: ObservationRecord<P>) -> Self {
         Self::Observation(record)
     }
 }
 
-impl<P: Payload> From<ActionRecord<P>> for LogRecord<P> {
+impl<P: Payload> From<ActionRecord<P>> for Record<P> {
     fn from(record: ActionRecord<P>) -> Self {
         Self::Action(record)
     }
 }
 
-impl<P: Payload> From<ControlRecord> for LogRecord<P> {
+impl<P: Payload> From<ControlRecord> for Record<P> {
     fn from(record: ControlRecord) -> Self {
         Self::Control(record)
     }
 }
 
-impl<P: Payload> From<RewardRecord> for LogRecord<P> {
+impl<P: Payload> From<RewardRecord> for Record<P> {
     fn from(record: RewardRecord) -> Self {
         Self::Reward(record)
     }
 }
 
-impl<P: Payload> From<CycleRecord> for LogRecord<P> {
+impl<P: Payload> From<CycleRecord> for Record<P> {
     fn from(record: CycleRecord) -> Self {
         Self::Cycle(record)
     }
 }
 
-/// A consumer of trajectory records: a format bound to a destination.
+/// A consumer of log records: a format bound to a destination.
 ///
 /// The [`Writer`] hands every record it receives to each of its sinks, in
 /// the order it was given them, which is the order the channel delivered
@@ -375,7 +376,7 @@ pub trait Sink<P: Payload>: Send {
     ///
     /// Whatever the destination returned. What happens next is the sink's
     /// [`Policy`].
-    fn record(&mut self, record: &LogRecord<P>) -> io::Result<()>;
+    fn record(&mut self, record: &Record<P>) -> io::Result<()>;
 
     /// Called once, after the last record: flush, close.
     ///
@@ -394,7 +395,7 @@ pub enum Policy {
     /// An error fails the run: the writer stops, every later send fails at
     /// the agent that attempted it, and [`Writer::join`] returns the error.
     ///
-    /// This is what a trajectory file wants: a run whose record of itself is
+    /// This is what a log file wants: a run whose record of itself is
     /// incomplete is a run that did not happen.
     Required,
     /// An error drops this sink; the others carry on, and [`Writer::join`]
@@ -405,7 +406,7 @@ pub enum Policy {
     Optional,
 }
 
-/// The trajectory writer: a thread that owns the sinks and hands each one
+/// The log writer: a thread that owns the sinks and hands each one
 /// every record it receives.
 ///
 /// Records reach it over an in-process channel whose sender is handed out by
@@ -430,10 +431,8 @@ impl Writer {
     /// discards what it receives, which is what an episode that records
     /// nothing wants.
     #[must_use]
-    pub fn spawn<P: Payload>(
-        sinks: Vec<(Box<dyn Sink<P>>, Policy)>,
-    ) -> (Sender<LogRecord<P>>, Self) {
-        let (sender, receiver) = unbounded::<LogRecord<P>>();
+    pub fn spawn<P: Payload>(sinks: Vec<(Box<dyn Sink<P>>, Policy)>) -> (Sender<Record<P>>, Self) {
+        let (sender, receiver) = unbounded::<Record<P>>();
         let thread = thread::spawn(move || {
             let mut live = sinks;
             for record in receiver {
@@ -458,17 +457,17 @@ impl Writer {
     pub fn join(self) -> io::Result<()> {
         self.thread
             .join()
-            .map_err(|_| io::Error::other("trajectory writer thread panicked"))?
+            .map_err(|_| io::Error::other("log writer thread panicked"))?
     }
 
     /// Creates (or truncates) the file at `path` and starts a writer whose
-    /// one sink writes JSON Lines to it, as a run whose trajectory is that
-    /// file requires.
+    /// one sink writes JSON Lines to it, as a run whose log is that file
+    /// requires.
     ///
     /// # Errors
     ///
     /// Whatever [`File::create`] returns.
-    pub fn create<P: Payload>(path: impl AsRef<Path>) -> io::Result<(Sender<LogRecord<P>>, Self)> {
+    pub fn create<P: Payload>(path: impl AsRef<Path>) -> io::Result<(Sender<Record<P>>, Self)> {
         let sink: Box<dyn Sink<P>> = Box::new(JsonLines::new(File::create(path)?));
         Ok(Self::spawn(vec![(sink, Policy::Required)]))
     }
@@ -502,7 +501,7 @@ fn deliver<P: Payload>(
 
 /// The JSON Lines sink: one JSON object per record, one record per line.
 ///
-/// This is the trajectory format described at the top of this module, and
+/// This is the log format described at the top of this module, and
 /// the format of the file a run writes. The destination is buffered
 /// internally, so there is no need to wrap it in a [`BufWriter`] first;
 /// [`finish`](Sink::finish) flushes that buffer.
@@ -521,7 +520,7 @@ impl<W: Write> JsonLines<W> {
 }
 
 impl<P: Payload, W: Write + Send> Sink<P> for JsonLines<W> {
-    fn record(&mut self, record: &LogRecord<P>) -> io::Result<()> {
+    fn record(&mut self, record: &Record<P>) -> io::Result<()> {
         serde_json::to_writer(&mut self.out, record)?;
         self.out.write_all(b"\n")
     }
@@ -551,7 +550,7 @@ mod tests {
 
     /// A handful of records of every kind: agent `a` pops a start and a
     /// message in one cycle and replies to `b`.
-    fn sample() -> Vec<LogRecord<TestPayload>> {
+    fn sample() -> Vec<Record<TestPayload>> {
         let a = ActorId::new("a");
         vec![
             ControlRecord {
@@ -633,14 +632,14 @@ mod tests {
 
     #[test]
     fn a_reward_names_the_agent_rewarded_and_carries_no_sequence_number() {
-        // Three fields and no more: the agent whose trajectory it belongs
-        // to, when the environment logged it, and what it is worth. No
+        // Three fields and no more: the agent whose records it belongs to,
+        // when the environment logged it, and what it is worth. No
         // `seq`, because the agent loop did not write it, and no
         // `received`, because nobody received it.
         // The value is already JSON by the time the record holds it: the
         // environment serialized it where it assigned it, so the line reads
         // exactly as it did when the record was generic over a reward type.
-        let reward: LogRecord<TestPayload> = RewardRecord {
+        let reward: Record<TestPayload> = RewardRecord {
             agent: ActorId::new("alice"),
             created: at(500),
             value: json!(1),
@@ -675,14 +674,14 @@ mod tests {
             }
         );
         assert!(format!("{reward:?}").starts_with("RewardRecord"));
-        let line: LogRecord<TestPayload> = reward.into();
+        let line: Record<TestPayload> = reward.into();
         assert!(format!("{line:?}").starts_with("Reward"));
         assert_eq!(line, line.clone());
     }
 
     #[test]
     fn a_timeout_cycle_records_what_woke_it_and_no_inputs() {
-        let cycle: LogRecord<TestPayload> = CycleRecord {
+        let cycle: Record<TestPayload> = CycleRecord {
             agent: ActorId::new("a"),
             t_start: at(60),
             t_stop: at(61),
@@ -728,7 +727,7 @@ mod tests {
                 thread::spawn(move || {
                     let agent = ActorId::new(format!("agent-{i}"));
                     for seq in 0..10 {
-                        let record: LogRecord<TestPayload> = ControlRecord {
+                        let record: Record<TestPayload> = ControlRecord {
                             agent: agent.clone(),
                             seq: Seq(seq),
                             created: at(seq),
@@ -825,12 +824,12 @@ mod tests {
     }
 
     impl Sink<TestPayload> for Spy {
-        fn record(&mut self, record: &LogRecord<TestPayload>) -> io::Result<()> {
+        fn record(&mut self, record: &Record<TestPayload>) -> io::Result<()> {
             let mut seen = self.seen.lock().unwrap();
             if self.fails_from.is_some_and(|n| seen.len() >= n) {
                 return Err(io::Error::new(io::ErrorKind::BrokenPipe, "no reader"));
             }
-            // A panic, not a `?`: a `LogRecord` cannot fail to serialize, so
+            // A panic, not a `?`: a `Record` cannot fail to serialize, so
             // a failure here is a bug in the fixture. Converting it to an
             // `io::Error` would hand the writer the one signal this spy
             // exists to control, and a fixture bug would arrive disguised
@@ -841,7 +840,7 @@ mod tests {
     }
 
     /// Sends `sample` to `sender` and joins `writer`.
-    fn play(sender: Sender<LogRecord<TestPayload>>, writer: Writer) -> io::Result<()> {
+    fn play(sender: Sender<Record<TestPayload>>, writer: Writer) -> io::Result<()> {
         for record in sample() {
             let _ = sender.send(record);
         }
@@ -864,7 +863,7 @@ mod tests {
         let broken: Box<dyn Sink<TestPayload>> = Box::new(JsonLines::new(BrokenSink));
         let (sender, writer) = Writer::spawn(vec![(broken, Policy::Required)]);
         // A record small enough to sit in the buffer.
-        let record: LogRecord<TestPayload> = CycleRecord {
+        let record: Record<TestPayload> = CycleRecord {
             agent: ActorId::new("a"),
             t_start: at(0),
             t_stop: at(1),
@@ -875,7 +874,7 @@ mod tests {
         .into();
         // A record larger than the buffer is written while the loop is still
         // running; the thread stops and drops its receiver at that point.
-        let big: LogRecord<TestPayload> = ActionRecord {
+        let big: Record<TestPayload> = ActionRecord {
             agent: ActorId::new("a"),
             seq: Seq(0),
             created: at(0),
@@ -895,7 +894,7 @@ mod tests {
         // checked.
         let error = writer.join().unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::StorageFull);
-        let late: LogRecord<TestPayload> = ControlRecord {
+        let late: Record<TestPayload> = ControlRecord {
             agent: ActorId::new("a"),
             seq: Seq(1),
             created: at(2),
@@ -947,7 +946,7 @@ mod tests {
     #[test]
     fn a_flush_that_fails_is_reported_by_finish() {
         // `BufWriter`'s own `Drop` flushes and discards the error, so a
-        // trajectory could be truncated in silence. `finish` is the call
+        // log could be truncated in silence. `finish` is the call
         // that gets to report it, and it must.
         let destination = UnflushableSink::default();
         let mut sink = JsonLines::new(destination.clone());

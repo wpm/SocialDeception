@@ -7,7 +7,7 @@
 //! # The vocabulary
 //!
 //! The runtime speaks the vocabulary of reinforcement learning, which is
-//! what the trajectories it writes are read in (ADR-0007):
+//! the vocabulary its log is read in (ADR-0007):
 //!
 //! | Term | Is |
 //! |---|---|
@@ -22,7 +22,8 @@
 //! [`Observation`] and [`Action`] are relative to an agent; on the wire
 //! there are only messages and controls. The same [`Message`] is the sent
 //! action of its sender and an observation of each of its recipients, which
-//! is what lets a trajectory be joined across agents.
+//! is what lets the log be joined across agents, and a trajectory built
+//! from it.
 //!
 //! The runtime is generic over one parameter, the [`Payload`] a game's
 //! messages carry. A game's reward type is a second parameter, but it
@@ -38,7 +39,7 @@
 //! - [`message`]: the [`Payload`] a game's messages carry, the [`Message`]
 //!   and [`Control`] that travel on the wire, and the [`Delivery`] that
 //!   carries either of them to an agent;
-//! - [`trajectory`]: the records an agent's loop produces and the [`Writer`]
+//! - [`log`]: the records an agent's loop produces and the [`Writer`]
 //!   that hands each one to every [`Sink`] it was given;
 //! - [`timer`]: the [`TimerSource`] an agent's deadlines come from;
 //! - [`agent`]: the [`Agent`] thread that pops its queue, folds the
@@ -68,12 +69,12 @@ pub mod agent;
 pub mod clock;
 pub mod environment;
 pub mod episode;
+pub mod log;
 pub mod message;
 pub mod router;
 #[cfg(test)]
 mod testing;
 pub mod timer;
-pub mod trajectory;
 pub mod werewolf;
 
 pub use agent::{Action, Agent, CycleDispatch, Error, Handler, Instruction, Observation, Wiring};
@@ -83,12 +84,12 @@ pub use episode::{Episode, EpisodeError, Failure};
 pub use message::{ActorId, Control, Delivery, Message, Payload};
 pub use router::{Queues, RouteError, Router};
 pub use timer::{ManualTimer, ManualTimerControl, TimerSource};
-// [`trajectory::Policy`] is deliberately not re-exported here. The crate
-// root is a shared vocabulary, and the name `Policy` is the framework's to
-// give to the one function a user implements. A sink's policy is read in the
-// company of the sink it belongs to, where `trajectory::Policy::Required`
-// says what it means and collides with nothing.
-pub use trajectory::{
-    ActionRecord, ControlRecord, CycleRecord, JsonLines, LogRecord, ObservationRecord,
-    RewardRecord, Seq, Sink, Woken, Writer,
+// [`log::Policy`] is deliberately not re-exported here. The crate root is a
+// shared vocabulary, and the name `Policy` is the framework's to give to the
+// one function a user implements. A sink's policy is read in the company of
+// the sink it belongs to, where `log::Policy::Required` says what it means
+// and collides with nothing.
+pub use log::{
+    ActionRecord, ControlRecord, CycleRecord, JsonLines, ObservationRecord, Record, RewardRecord,
+    Seq, Sink, Woken, Writer,
 };

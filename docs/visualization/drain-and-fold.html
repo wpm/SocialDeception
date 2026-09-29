@@ -122,7 +122,7 @@
 <main class="wrap">
   <header>
     <h1>Pop and Fold</h1>
-    <p>One agent's cycle, step by step: what the router puts on its queue, what the agent pops, how the handler folds it, and the lines it writes to the trajectory. Play it through, or step with the arrow keys.</p>
+    <p>One agent's cycle, step by step: what the router puts on its queue, what the agent pops, how the handler folds it, and the lines it writes to the log. Play it through, or step with the arrow keys.</p>
   </header>
 
   <section class="stage" aria-live="polite">
@@ -153,7 +153,7 @@
 
     <div class="col writer">
       <div class="box">
-        <div class="boxhead"><span>Writer</span><span class="mono">trajectory.jsonl</span></div>
+        <div class="boxhead"><span>Writer</span><span class="mono">werewolf.jsonl</span></div>
         <ol id="log" class="log"></ol>
       </div>
     </div>
@@ -233,7 +233,7 @@
 
   frame('Fold', 'The handler is given the cycle’s one observation and returns actions: recipients and a payload, nothing more. It cannot name a sender — the loop is what writes that. Nothing interrupts it, and it is never asked to give up: an agent does not know it is being stopped.', s => { s.state = 'folding'; s.handler = 'handle(b→a Step(6)) → [to b: Step(3)]'; s.outputs = [out('b', 3, 24)]; });
 
-  frame('Stamp, record, send', 'Whatever the handler returned is sent. There is no second look at the queue, because nothing arriving during the fold could change the answer. Each action is stamped with this agent as sender and t 24 as created — that stamp is what makes it a message on the wire — and logged as an action record. An action has no received: when b receives it is in b’s own trajectory.', s => { s.state = 'dispatching'; s.clock = 24; s.log.push(actLine(2, 24, envelope('a', 'b', 3))); s.seq = 3; s.dispatch = { deliveries: 1, sent: 1 }; });
+  frame('Stamp, record, send', 'Whatever the handler returned is sent. There is no second look at the queue, because nothing arriving during the fold could change the answer. Each action is stamped with this agent as sender and t 24 as created — that stamp is what makes it a message on the wire — and logged as an action record. An action has no received: when b receives it is in b’s own records.', s => { s.state = 'dispatching'; s.clock = 24; s.log.push(actLine(2, 24, envelope('a', 'b', 3))); s.seq = 3; s.dispatch = { deliveries: 1, sent: 1 }; });
 
   frame('Close the cycle', 'Inputs [1], outputs [2]. Per agent a cycle always follows every record it names, and nothing of this agent’s lands between them: it is one thread, and the next cycle cannot start until this record is sent.', s => { s.clock = 25; s.log.push(cyLine(22, 25, 'queue', '1', '2')); s.state = 'waiting'; s.popped = []; s.handler = ''; s.outputs = []; });
 
@@ -257,11 +257,11 @@
 
   frame('Now the Stop, in a cycle of its own', 'The next cycle pops it and records it: created 150, received 154, the wait it suffered behind the message ahead of it. It shares this cycle’s t_start like any other input. The cycle asks the handler nothing — there is nothing it observed to ask about — and closes with inputs [11] and no outputs.', s => { s.queue = []; s.popped = [ctl('Stop', 150)]; s.state = 'dispatching'; s.clock = 155; s.handler = ''; s.outputs = []; s.log.push(ctlLine(11, 150, 154, 'stop')); s.seq = 12; s.dispatch = { deliveries: 1, sent: 0 }; s.log.push(cyLine(154, 155, 'queue', '11', '')); });
 
-  frame('Exit', 'The loop exits after the cycle that popped Stop. Anything still on the queue is never popped, so it never becomes an observation and is never logged: an agent that has stopped did not see it, and a trajectory that said otherwise would be claiming it did. That is why the episode holds a Stop back until nothing is in flight — so that there is nothing for it to land behind, and nothing left to swallow.', s => { s.state = 'exited'; s.exited = true; s.popped = []; });
+  frame('Exit', 'The loop exits after the cycle that popped Stop. Anything still on the queue is never popped, so it never becomes an observation and is never logged: an agent that has stopped did not see it, and a log that said otherwise would be claiming it did. That is why the episode holds a Stop back until nothing is in flight — so that there is nothing for it to land behind, and nothing left to swallow.', s => { s.state = 'exited'; s.exited = true; s.popped = []; });
 
-  frame('The reward, written by somebody else', 'One line in this agent’s trajectory was not written by this agent. A reward is what the environment decided the agent’s behavior was worth; nothing in a running episode reads it, so it is never sent — the environment writes it straight to the log, naming the agent rewarded. It has no seq, because sequence numbers are the agent loop’s to assign, and no received, because nobody received it. Its created is what places it.', s => { s.log.push(rwdLine(156, 1)); });
+  frame('The reward, written by somebody else', 'One line in this agent’s records was not written by this agent. A reward is what the environment decided the agent’s behavior was worth; nothing in a running episode reads it, so it is never sent — the environment writes it straight to the log, naming the agent rewarded. It has no seq, because sequence numbers are the agent loop’s to assign, and no received, because nobody received it. Its created is what places it.', s => { s.log.push(rwdLine(156, 1)); });
 
-  frame('What always holds', 'Per agent: inputs in pop order, then outputs in the order the handler returned them, then the cycle record, contiguous, with nothing left over — every record is something popped or something sent. A cycle follows every record it names. Controls come before the message in every cycle that has both, no cycle holds more than one observation, and everything a cycle pops is stamped with its t_start. Only a cycle woken by a timeout can have no inputs at all. Every trajectory opens with a start control and ends with a stop. Across agents, lines interleave freely: the file is one stream, and a reader filters on agent.', s => {});
+  frame('What always holds', 'Per agent: inputs in pop order, then outputs in the order the handler returned them, then the cycle record, contiguous, with nothing left over — every record is something popped or something sent. A cycle follows every record it names. Controls come before the message in every cycle that has both, no cycle holds more than one observation, and everything a cycle pops is stamped with its t_start. Only a cycle woken by a timeout can have no inputs at all. Every agent’s records open with a start control and end with a stop. Across agents, lines interleave freely: the file is one stream, and a reader filters on agent.', s => {});
 
   // ---- Rendering -----------------------------------------------------
   const $ = (id) => document.getElementById(id);

@@ -31,9 +31,9 @@
 //! [`Episode`](crate::Episode) from a [`Config`], seating every player and
 //! the moderator, and [`run`] runs one to its [`Outcome`] or a [`RunError`].
 //! The `werewolf` binary's `play` is that, with the effective configuration
-//! written beside the trajectory.
+//! written beside the log.
 //!
-//! A trajectory written by a run reads back as a [`Transcript`]
+//! A log written by a run reads back as a [`Transcript`]
 //! ([`transcript`]): the logical game, with the timestamps and the
 //! interleaving of agents' records projected out, so that two transcripts
 //! are equal exactly when the same game was played. The `werewolf` binary's
@@ -117,11 +117,11 @@
 //! No message carries the episode's seed, and no type here has a field that
 //! could. With the seed, the roster and the public algorithm, anyone could
 //! recompute the deal and every agent's random stream. The seed is recorded
-//! beside the trajectory, never in it.
+//! beside the log, never in it.
 //!
 //! # Serialization
 //!
-//! Every type here is `Serialize` and `Deserialize`, so a trajectory's
+//! Every type here is `Serialize` and `Deserialize`, so a log's
 //! payloads can be read back as typed data. Collections are `BTreeMap` and
 //! `BTreeSet`, so serialization is in a canonical order and two runs of the
 //! same seed produce byte-identical payloads.
@@ -130,7 +130,7 @@
 //! variant name as written, and newtypes are transparent. The runtime's
 //! envelope, [`crate::Message`] and its records, is internally tagged and
 //! snake-cased instead, because its field names are a contract with
-//! whatever reads a trajectory back; the payload's shape belongs to the
+//! whatever reads a log back; the payload's shape belongs to the
 //! environment alone.
 
 pub mod assignment;

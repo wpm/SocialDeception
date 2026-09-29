@@ -24,7 +24,7 @@
 //! chain once it had.
 //!
 //! Every value at every step is known in advance, so any difference between
-//! the trajectory an episode writes and the sequence computed independently
+//! the log an episode writes and the sequence computed independently
 //! is a bug in the runtime, not a model being unpredictable. That is what
 //! this ring is for: it is a second payload type beside Werewolf's, and a
 //! second [`Environment`] beside the moderator, which is what keeps the
@@ -105,7 +105,7 @@ impl Collatz {
     ///
     /// The chain is named by `start`. Two chains opened from the same
     /// number, by this agent or by two, share a name and cannot be told
-    /// apart in the trajectory.
+    /// apart in the log.
     ///
     /// # Panics
     ///
@@ -194,7 +194,7 @@ pub struct CollatzEnvironment {
     /// The loop calls the handler in the same cycle it calls the start
     /// hook, so an environment whose work is already done when it starts
     /// would otherwise ask for the stop twice in one cycle, and an agent
-    /// told to stop twice is an agent whose trajectory says it was running
+    /// told to stop twice is an agent whose records say it was running
     /// after it had stopped.
     stopped: bool,
 }

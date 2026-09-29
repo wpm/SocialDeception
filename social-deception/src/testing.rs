@@ -13,8 +13,8 @@ use serde_json::Value;
 
 use crate::agent::Observation;
 use crate::clock::Timestamp;
+use crate::log::{JsonLines, Policy, Record, Sink, Writer};
 use crate::message::{ActorId, Message, Payload};
-use crate::trajectory::{JsonLines, LogRecord, Policy, Sink, Writer};
 use crate::werewolf::{self, Assignment, Faction, Knowledge, Narration, Phase, Role, Round};
 
 pub(crate) use temp::TempDir;
@@ -71,8 +71,8 @@ impl Write for Shared {
 }
 
 /// A writer whose one required [`JsonLines`] sink writes to a buffer the
-/// test keeps, which is what a test that reads its trajectory back wants.
-pub(crate) fn recording<P: Payload>() -> (Sender<LogRecord<P>>, Writer, Shared) {
+/// test keeps, which is what a test that reads its log back wants.
+pub(crate) fn recording<P: Payload>() -> (Sender<Record<P>>, Writer, Shared) {
     let bytes = Shared::new();
     let sink: Box<dyn Sink<P>> = Box::new(JsonLines::new(bytes.clone()));
     let (sender, writer) = Writer::spawn(vec![(sink, Policy::Required)]);
@@ -90,7 +90,7 @@ pub(crate) fn joined(writer: Writer, bytes: &Shared) -> Vec<u8> {
     bytes.bytes()
 }
 
-/// Parses a trajectory file into one JSON value per line.
+/// Parses a log file into one JSON value per line.
 ///
 /// # Panics
 ///

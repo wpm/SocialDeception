@@ -291,7 +291,7 @@ mod tests {
     /// One message of every kind, including every narration, each with the
     /// JSON shape it serializes to. Between them they hold an actor id in
     /// every position the type has one, so a round trip over this table is
-    /// the round trip a trajectory reader depends on.
+    /// the round trip a log reader depends on.
     fn every_message() -> Vec<(Message, Value)> {
         let mut messages: Vec<_> = every_narration()
             .into_iter()

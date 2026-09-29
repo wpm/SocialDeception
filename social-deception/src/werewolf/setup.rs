@@ -33,7 +33,7 @@
 //! agent's random stream, which is to say every piece of hidden information
 //! in the game. So it lies outside every player's observation space: no
 //! [`Message`] has a field that could carry it, and this
-//! module never puts it in one. It is recorded beside the trajectory, in the
+//! module never puts it in one. It is recorded beside the log, in the
 //! effective configuration the `werewolf` binary writes, never in it.
 
 use std::error;
@@ -55,16 +55,16 @@ use super::role::Role;
 use super::strategy::RandomStrategy;
 use crate::agent::Handler;
 use crate::episode::{Episode, EpisodeError};
+use crate::log::{JsonLines, Policy, Record, Sink, Writer};
 use crate::message::ActorId;
-use crate::trajectory::{JsonLines, LogRecord, Policy, Sink, Writer};
 
 /// Why a run did not end with an outcome.
 #[derive(Debug)]
 pub enum RunError {
-    /// The trajectory could not be created or written.
+    /// The log could not be created or written.
     Io {
         /// Where it was being written, or `None` if it was going nowhere.
-        trajectory: Option<PathBuf>,
+        log: Option<PathBuf>,
         /// What went wrong.
         source: io::Error,
     },
@@ -85,13 +85,10 @@ impl fmt::Display for RunError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io {
-                trajectory: Some(path),
+                log: Some(path),
                 source,
             } => write!(f, "cannot write {}: {source}", path.display()),
-            Self::Io {
-                trajectory: None,
-                source,
-            } => write!(f, "cannot write the trajectory: {source}"),
+            Self::Io { log: None, source } => write!(f, "cannot write the log: {source}"),
             Self::Episode(error) => error.fmt(f),
             Self::NoOutcome => {
                 f.write_str("the episode ended cleanly but the moderator announced no outcome")
@@ -122,7 +119,7 @@ impl From<EpisodeError> for RunError {
 /// The roles are dealt once, from the configuration's seed; every player is
 /// seated with the role it was dealt, deciding with a [`RandomStrategy`]
 /// seeded for it alone; and the moderator runs a [`Game`] over that same
-/// deal. The trajectory goes to `records`.
+/// deal. The log goes to `records`.
 ///
 /// # Panics
 ///
@@ -131,7 +128,7 @@ impl From<EpisodeError> for RunError {
 #[must_use]
 pub fn episode(
     config: &Config,
-    records: Sender<LogRecord<Message>>,
+    records: Sender<Record<Message>>,
 ) -> (Episode<i32, Message>, Receiver<Outcome>) {
     let assignment = Assignment::deal(config);
     let (mut episode, outcomes) = moderate(config, assignment.clone(), records);
@@ -147,7 +144,7 @@ pub fn episode(
 fn moderate(
     config: &Config,
     assignment: Assignment,
-    records: Sender<LogRecord<Message>>,
+    records: Sender<Record<Message>>,
 ) -> (Episode<i32, Message>, Receiver<Outcome>) {
     let (outcome, outcomes) = unbounded();
     let game = Game::new(assignment, config.seed, config.timing);
@@ -190,7 +187,7 @@ fn add(
 ///
 /// Two sinks, either of which may be absent:
 ///
-/// - the trajectory, a **required** [`JsonLines`] over `config.trajectory`
+/// - the log, a **required** [`JsonLines`] over `config.trajectory`
 ///   when it is set. Required because a run whose record of itself is
 ///   incomplete is a run that did not happen;
 /// - the live text, an **optional** [`Text`] over `live` when one is given.
@@ -198,7 +195,7 @@ fn add(
 ///   wanted, and the game is no less played for it.
 ///
 /// With neither, the writer has no sinks at all and discards what it
-/// receives: an episode with no trajectory and nobody watching exercises
+/// receives: an episode with no log and nobody watching exercises
 /// everything a fully observed one does.
 ///
 /// The summary a caller prints afterwards is not a sink. It is the
@@ -210,7 +207,7 @@ fn add(
 ///
 /// # Errors
 ///
-/// [`RunError::Io`] if the trajectory cannot be created or written,
+/// [`RunError::Io`] if the log cannot be created or written,
 /// [`RunError::Episode`] if the episode did not run cleanly — a player that
 /// never selected arrives as
 /// [`EpisodeError::Stalled`] — and
@@ -221,11 +218,11 @@ fn add(
 /// If the configuration would not pass [`Config::validate`]; see
 /// [`episode`].
 pub fn run(config: &Config, live: Option<Box<dyn Write + Send>>) -> Result<Outcome, RunError> {
-    let trajectory = config.trajectory.as_deref();
+    let log = config.trajectory.as_deref();
     let mut sinks: Vec<(Box<dyn Sink<Message>>, Policy)> = Vec::new();
-    if let Some(path) = trajectory {
+    if let Some(path) = log {
         let file = File::create(path).map_err(|source| RunError::Io {
-            trajectory: Some(path.to_path_buf()),
+            log: Some(path.to_path_buf()),
             source,
         })?;
         sinks.push((Box::new(JsonLines::new(file)), Policy::Required));
@@ -238,26 +235,25 @@ pub fn run(config: &Config, live: Option<Box<dyn Write + Send>>) -> Result<Outco
     }
     let (records, writer) = Writer::spawn(sinks);
     let (episode, outcomes) = episode(config, records);
-    play(episode, &outcomes, writer, trajectory)
+    play(episode, &outcomes, writer, log)
 }
 
-/// Runs an assembled episode, joins its writer, which is writing the
-/// trajectory to `trajectory` if anywhere, and takes the outcome off the
-/// moderator's channel.
+/// Runs an assembled episode, joins its writer, which is writing to `log`
+/// if anywhere, and takes the outcome off the moderator's channel.
 fn play(
     episode: Episode<i32, Message>,
     outcomes: &Receiver<Outcome>,
     writer: Writer,
-    trajectory: Option<&Path>,
+    log: Option<&Path>,
 ) -> Result<Outcome, RunError> {
     let ran = episode.run();
     // The episode drops every sender to the writer on its way out, whether
     // or not it ran cleanly, so the writer can be joined now for the whole
-    // trajectory. A failed run is the more informative error of the two.
+    // log. A failed run is the more informative error of the two.
     let written = writer.join();
     ran?;
     written.map_err(|source| RunError::Io {
-        trajectory: trajectory.map(Path::to_path_buf),
+        log: log.map(Path::to_path_buf),
         source,
     })?;
     // The moderator's sender went with its handler when the episode joined
@@ -280,7 +276,7 @@ mod tests {
     const SEED: u64 = 20_260_918;
 
     /// A validated configuration for `players`, with the given special
-    /// roles and no trajectory.
+    /// roles and no log.
     fn config<const N: usize>(
         players: [&str; N],
         werewolves: usize,
@@ -313,7 +309,7 @@ mod tests {
         )
     }
 
-    /// Reads the trajectory at `path` back as the game it records.
+    /// Reads the log at `path` back as the game it records.
     fn transcript(path: &Path, config: &Config) -> Transcript {
         let text = fs::read_to_string(path).unwrap();
         Transcript::read(&transcript::lines(&text).unwrap(), &config.moderator).unwrap()
@@ -383,24 +379,24 @@ mod tests {
     }
 
     #[test]
-    fn the_trajectory_is_written_and_agrees_with_the_outcome() {
+    fn the_log_is_written_and_agrees_with_the_outcome() {
         let dir = TempDir::new();
-        let trajectory = dir.join("werewolf.jsonl");
+        let log = dir.join("werewolf.jsonl");
         let mut config = town();
-        config.trajectory = Some(trajectory.clone());
+        config.trajectory = Some(log.clone());
         let outcome = run(&config, None).unwrap();
 
-        let lines = parse_lines(&fs::read(&trajectory).unwrap());
+        let lines = parse_lines(&fs::read(&log).unwrap());
         assert!(!lines.is_empty());
 
         // The outcome on the channel and the one the moderator announced in
         // world are the same game's; if they ever diverge, the side channel
         // and the record of truth have parted company.
-        assert_eq!(transcript(&trajectory, &config).outcome, outcome);
+        assert_eq!(transcript(&log, &config).outcome, outcome);
     }
 
     #[test]
-    fn the_trajectory_is_the_same_game_across_runs() {
+    fn the_log_is_the_same_game_across_runs() {
         let dir = TempDir::new();
         let first = dir.join("first.jsonl");
         let second = dir.join("second.jsonl");
@@ -413,13 +409,13 @@ mod tests {
     }
 
     #[test]
-    fn a_trajectory_that_cannot_be_created_is_an_io_error_naming_it() {
+    fn a_log_that_cannot_be_created_is_an_io_error_naming_it() {
         let mut config = town();
         let path = Path::new("/no-such-directory/werewolf.jsonl");
         config.trajectory = Some(path.to_path_buf());
         let error = run(&config, None).unwrap_err();
         assert!(
-            matches!(&error, RunError::Io { trajectory: Some(t), .. } if t == path),
+            matches!(&error, RunError::Io { log: Some(t), .. } if t == path),
             "{error:?}"
         );
         assert!(

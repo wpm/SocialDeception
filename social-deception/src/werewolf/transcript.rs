@@ -1,10 +1,10 @@
-//! Reading a trajectory back as the game it records, and rendering that game
+//! Reading the log back as the game it records, and rendering that game
 //! for a person to read.
 //!
 //! A [`Transcript`] is the logical game: who held which role, what everyone
 //! did in each phase, who was eliminated and how, and how it ended. It has no
 //! timestamps and no record interleaving, because those are the two things
-//! about a trajectory file that are not reproducible: the agents are threads,
+//! about a log file that are not reproducible: the agents are threads,
 //! so the same game written twice differs in when each record was stamped
 //! and in how different agents' records happen to be ordered in the file. A
 //! transcript is the file with everything non-reproducible projected out, so
@@ -15,7 +15,7 @@
 //! not game: the same logical game is the same transcript however it was
 //! produced, and a determinism comparison must not be able to pass or fail
 //! on anything but the game itself. The seed lives in the effective
-//! configuration written beside the trajectory (see
+//! configuration written beside the log (see
 //! [`config::effective_path`](super::config::effective_path)), and whoever
 //! prints a transcript prints the seed from there.
 //!
@@ -29,7 +29,7 @@
 //! none of them. It is no exception to the principle, though: a reward is
 //! the environment's own statement about a player, not a partial view
 //! recovered from one, and it is identified by its `type` rather than by
-//! whose trajectory it sits in.
+//! whose records it sits in.
 //!
 //! A reward is also the one record here with no sequence number, so it is
 //! outside the contiguity check the moderator's records are held to. The
@@ -138,7 +138,7 @@ impl PhaseRecord {
     }
 }
 
-/// Why a trajectory could not be read as a game.
+/// Why the log could not be read as a game.
 ///
 /// Every variant names the line it was found on, counting from one, so the
 /// message points at the record and not just at the problem.
@@ -263,7 +263,7 @@ impl Error for TranscriptError {
     }
 }
 
-/// Parses the text of a trajectory file into one JSON value per line, the
+/// Parses the text of a log file into one JSON value per line, the
 /// form [`Transcript::read`] takes.
 ///
 /// # Errors
@@ -391,7 +391,7 @@ impl Transcript {
         }
     }
 
-    /// Reconstructs the game from the moderator's records in a trajectory.
+    /// Reconstructs the game from the moderator's records in the log.
     ///
     /// `lines` is the whole file, one value per line, as [`lines`] returns
     /// it. Records of every other agent are ignored, but every line is
@@ -738,12 +738,12 @@ const COLUMNS: usize = 4;
 impl fmt::Display for Transcript {
     /// The game at a glance: the roster with its roles, then each phase with
     /// its moves and its elimination, then the outcome, then what each
-    /// player's game was worth. Only what the trajectory records, in the
+    /// player's game was worth. Only what the log records, in the
     /// order it records it. Ends with a newline.
     ///
     /// The rewards come last because they are the game's verdict on the
     /// players, which only the outcome above them explains. A game read
-    /// from a trajectory with no reward records renders without the
+    /// from a log with no reward records renders without the
     /// section rather than with an empty one.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let width = self
@@ -1140,7 +1140,7 @@ mod tests {
     fn every_player_has_a_reward_and_it_agrees_with_its_faction() {
         // Read from the `reward` records, which belong to the players and
         // are written by the moderator, so a reader that looked only at
-        // the moderator's trajectory would find none of them.
+        // the moderator's records would find none of them.
         let transcript = read(&fixture()).unwrap();
         assert_eq!(
             transcript.rewards.keys().collect::<BTreeSet<_>>(),
@@ -1231,9 +1231,9 @@ mod tests {
     }
 
     #[test]
-    fn a_game_whose_trajectory_records_no_reward_reads_and_renders_without_them() {
+    fn a_game_whose_log_records_no_reward_reads_and_renders_without_them() {
         // Nothing in the reader requires a reward: a truncated or
-        // hand-written trajectory that has none is still the game it
+        // hand-written log that has none is still the game it
         // records, and renders with no rewards section rather than an
         // empty one.
         let lines: Vec<Value> = fixture()
@@ -1659,7 +1659,7 @@ mod tests {
     fn a_message_the_moderator_never_records_is_an_error() {
         // A narration the moderator observed rather than sent. It only
         // ever sends one, so a narration among its observations is a
-        // trajectory that does not describe this game.
+        // log that does not describe this game.
         let mut lines = fixture();
         let index = moderator_record(&lines, |payload| !payload["Narration"].is_null());
         lines[index]["type"] = json!("observation");
@@ -1695,11 +1695,11 @@ mod tests {
                 "a forwarded selection is sent as the player that made it: {line}"
             );
         }
-        read(&lines).expect("a trajectory with forwarded selections reads");
+        read(&lines).expect("a log with forwarded selections reads");
     }
 
     /// Writes the moderator's records of a game played through [`Game`]
-    /// with scripted responses: a trajectory of exactly what the moderator
+    /// with scripted responses: a log of exactly what the moderator
     /// would record, with nobody else's records and made-up stamps.
     struct Scribe {
         lines: Vec<Value>,
