@@ -41,9 +41,8 @@
 //!
 //! A seat addresses each selection itself, from its own [`Knowledge`]: the
 //! pack it was told at the deal, and the living it learns from each
-//! `PhaseBegan`. It never broadcasts, because a broadcast reaches every agent
-//! in the roster and the night's secrets are exactly what must not travel
-//! that far.
+//! `PhaseBegan`. It never addresses the whole roster, because the night's
+//! secrets are exactly what must not travel that far.
 
 use std::collections::BTreeSet;
 
@@ -218,7 +217,6 @@ mod tests {
     use crate::clock::Timestamp;
 
     use super::*;
-    use crate::agent::Recipients;
     use crate::testing::{ME, id, ids, narrated, observed, phase_began, target};
     use crate::werewolf::message::{Cause, Narration, Phase, RequestKind, Round};
     use crate::werewolf::role::Role;
@@ -425,11 +423,7 @@ mod tests {
         // (ADR-0014).
         for action in &actions {
             assert!(matches!(action.payload, Message::Select(_)), "{action:?}");
-            assert_eq!(
-                action.recipients,
-                Recipients::To(ids([MODERATOR])),
-                "{action:?}"
-            );
+            assert_eq!(action.recipients, ids([MODERATOR]), "{action:?}");
         }
         // What differs is the audience the moderator is asked to forward
         // to: the protect is nobody else's business, the nomination is

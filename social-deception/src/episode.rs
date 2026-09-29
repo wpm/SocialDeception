@@ -429,7 +429,6 @@ fn spawn<D: Domain>(
             dispatches: dispatch.clone(),
             records: records.clone(),
             timeout: None,
-            peers: ids.iter().filter(|peer| **peer != id).cloned().collect(),
         };
         let watched = Watched {
             id,
@@ -979,22 +978,34 @@ mod tests {
         }
     }
 
-    /// Broadcasts once when it starts, then waits to hear from everybody it
-    /// expects before declaring itself done.
+    /// Names everybody at once when it starts, then waits to hear from
+    /// everybody it expects to answer before declaring itself done.
+    ///
+    /// It addresses more agents than it expects to hear from: the
+    /// environment is told what the spokes are told and says nothing back.
     struct Hub {
+        peers: BTreeSet<ActorId>,
         expects: usize,
         heard: usize,
     }
 
     impl Hub {
-        const fn expecting(expects: usize) -> Self {
-            Self { expects, heard: 0 }
+        fn addressing<I, A>(peers: I, expects: usize) -> Self
+        where
+            I: IntoIterator<Item = A>,
+            A: Into<ActorId>,
+        {
+            Self {
+                peers: peers.into_iter().map(Into::into).collect(),
+                expects,
+                heard: 0,
+            }
         }
     }
 
     impl Handler<Counting> for Hub {
         fn start(&mut self, _now: Timestamp) -> Vec<Action<Counting>> {
-            vec![Action::broadcast(Say(0))]
+            vec![Action::to(self.peers.clone(), Say(0))]
         }
 
         fn handle(&mut self, observation: &Observation<Counting>) -> Vec<Action<Counting>> {
@@ -1235,27 +1246,33 @@ mod tests {
                 agents: roster,
             },
         );
-        episode.add("hub", Hub::expecting(6)).unwrap();
+        episode
+            .add(
+                "hub",
+                Hub::addressing(spokes.iter().cloned().chain([REFEREE.to_owned()]), 6),
+            )
+            .unwrap();
         for spoke in &spokes {
             episode.add(spoke.clone(), Spoke).unwrap();
         }
         episode.run().unwrap();
 
-        // Had the broadcast counted as one delivery, the count could have
-        // reached zero after the first spoke's reply, and the episode would
-        // have called a run in progress a stall.
+        // Had the hub's one action counted as one delivery rather than the
+        // seven it made, the count could have reached zero after the first
+        // spoke's reply, and the episode would have called a run in
+        // progress a stall.
         let lines = parse_lines(&joined(writer, &bytes));
         let replies_seen_by_hub = of(&lines, "hub")
             .filter(|line| line["type"] == "observation")
             .count();
         assert_eq!(replies_seen_by_hub, 6);
-        let broadcast = of(&lines, "hub")
+        let opening = of(&lines, "hub")
             .find(|line| line["type"] == "action")
-            .expect("the hub recorded its broadcast");
+            .expect("the hub recorded its opening action");
         assert_eq!(
-            broadcast["message"]["recipients"].as_array().unwrap().len(),
+            opening["message"]["recipients"].as_array().unwrap().len(),
             7,
-            "a broadcast is recorded as everyone it went to: the six spokes and \
+            "an action is recorded as everyone it named: the six spokes and \
              the environment"
         );
     }
@@ -1397,10 +1414,10 @@ mod tests {
         assert_eq!(
             EpisodeError::Route {
                 agent: ActorId::new("a"),
-                error: RouteError::NoRecipients
+                error: RouteError::Loopback(ActorId::new("a"))
             }
             .to_string(),
-            "agent a sent a message that could not be routed: a message must have at least one recipient"
+            "agent a sent a message that could not be routed: agent a addressed itself"
         );
         assert_eq!(
             EpisodeError::Stalled {
@@ -1421,7 +1438,7 @@ mod tests {
             "agents failed: [a: the trajectory writer has gone away] [b: panicked: boom]"
         );
         assert!(
-            EpisodeError::Control(RouteError::NoRecipients)
+            EpisodeError::Control(RouteError::Loopback(ActorId::new("a")))
                 .source()
                 .is_some()
         );

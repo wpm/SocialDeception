@@ -67,10 +67,12 @@
 //! its most recent selection is its vote; selecting nowhere is how it
 //! abstains, which is why there is no move meaning "nobody" (ADR-0011).
 //!
-//! # Nothing is broadcast
+//! # Every message names its recipients
 //!
-//! No message here names its recipients, because that is the sender's
-//! decision: a narration goes to one player, to the living, or to the pack,
+//! The runtime allows an action addressed to nobody, but this game never
+//! sends one: every message here is said to somebody in particular, because
+//! that is the sender's decision. A narration goes to one player, to the
+//! living, or to the pack,
 //! and that choice of recipients is the whole hidden-information mechanism
 //! (see ADR-0004). A player acts on observing that a phase has begun,
 //! which is what gives an agent in a turnless runtime its decision points:
@@ -83,7 +85,7 @@
 //! agrees on a victim without speaking and how a village's vote forms in
 //! the open (ADR-0011).
 //!
-//! Nothing is excepted. ADR-0004 broadcast the final [`Outcome`] to every
+//! Nothing is excepted. ADR-0004 sent the final [`Outcome`] to every
 //! player, living and dead, because it was a dead player's terminal reward
 //! signal; a reward is now logged rather than said (ADR-0007), so the
 //! outcome is narrated to the living like everything else and a dead

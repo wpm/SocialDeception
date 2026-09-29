@@ -182,9 +182,8 @@
 //! let trajectory = Arc::new(Mutex::new(Vec::new()));
 //! let sink: Box<dyn Sink<Chat>> = Box::new(JsonLines::new(Recorded(trajectory.clone())));
 //! let (records, writer) = Writer::spawn(vec![(sink, Policy::Required)]);
-//! let peers = [ActorId::new("caller")].into();
 //! let wiring =
-//!     Wiring { id: "echo".into(), clock, queue, dispatches, records, timeout: None, peers };
+//!     Wiring { id: "echo".into(), clock, queue, dispatches, records, timeout: None };
 //! let agent = Agent::spawn(wiring, Echo, clock);
 //!
 //! let hello = Message::<Chat>::new("caller", ["echo"], clock.now(), String::from("hello"));
@@ -328,8 +327,9 @@ impl Received for Instruction {
 /// `Debug`, `Clone` and equality are written out for the same reason
 /// [`Message`]'s are.
 pub struct Action<D: Domain> {
-    /// The agents to send it to.
-    pub recipients: Recipients,
+    /// The agents to send it to. It may be empty: an action need not be
+    /// directed at anyone, and one addressed to nobody is still logged.
+    pub recipients: BTreeSet<ActorId>,
     /// What to say.
     pub payload: D::Payload,
     /// Who really said it, and when, when this action is one agent
@@ -365,16 +365,7 @@ impl<D: Domain> Action<D> {
         A: Into<ActorId>,
     {
         Self {
-            recipients: Recipients::To(recipients.into_iter().map(Into::into).collect()),
-            payload,
-            origin: None,
-        }
-    }
-
-    /// An action addressed to every other agent in the roster.
-    pub fn broadcast(payload: D::Payload) -> Self {
-        Self {
-            recipients: Recipients::Broadcast,
+            recipients: recipients.into_iter().map(Into::into).collect(),
             payload,
             origin: None,
         }
@@ -404,7 +395,7 @@ impl<D: Domain> Action<D> {
         A: Into<ActorId>,
     {
         Self {
-            recipients: Recipients::To(recipients.into_iter().map(Into::into).collect()),
+            recipients: recipients.into_iter().map(Into::into).collect(),
             payload,
             origin: Some(Origin {
                 sender: sender.into(),
@@ -449,18 +440,6 @@ where
 }
 
 impl<D: Domain> Eq for Action<D> where D::Payload: Eq {}
-
-/// Whom an action is for, as the handler states it.
-///
-/// The loop turns this into the explicit recipient set the sent [`Message`]
-/// carries, so a broadcast is recorded as the agents it actually went to.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Recipients {
-    /// Every other agent in the roster: the agent's [`Wiring::peers`].
-    Broadcast,
-    /// These agents and no others.
-    To(BTreeSet<ActorId>),
-}
 
 /// A game's behavior for one agent.
 ///
@@ -600,8 +579,6 @@ pub struct Wiring<D: Domain> {
     /// waiting runs a cycle that calls [`Handler::timeout`]; one that passes
     /// while a message waits joins that message's cycle instead.
     pub timeout: Option<Duration>,
-    /// The other agents in the roster: what a broadcast goes to.
-    pub peers: BTreeSet<ActorId>,
 }
 
 impl<D: Domain> fmt::Debug for CycleDispatch<D>
@@ -648,7 +625,6 @@ impl<D: Domain> fmt::Debug for Wiring<D> {
         f.debug_struct("Wiring")
             .field("id", &self.id)
             .field("timeout", &self.timeout)
-            .field("peers", &self.peers)
             .finish_non_exhaustive()
     }
 }
@@ -1123,7 +1099,7 @@ where
     }
 
     /// Stamps one action with this agent as sender and the instant of the
-    /// stamp, resolving a broadcast to the peers it actually goes to.
+    /// stamp.
     ///
     /// The stamp is the action's `created` on the wire, and every action a
     /// handler returns is sent, so there is no other case.
@@ -1152,10 +1128,6 @@ where
             payload,
             origin,
         } = action;
-        let recipients = match recipients {
-            Recipients::Broadcast => self.wiring.peers.clone(),
-            Recipients::To(recipients) => recipients,
-        };
         if let Some(Origin { sender, created }) = origin {
             return Message {
                 sender,
@@ -1430,12 +1402,28 @@ mod tests {
         }
     }
 
-    /// Broadcasts a step when it starts.
+    /// Names both of its peers a step when it starts.
     struct Town;
 
     impl Handler<TestDomain> for Town {
         fn start(&mut self, _now: Timestamp) -> Vec<Action<TestDomain>> {
-            vec![Action::broadcast(TestPayload::Step(0))]
+            vec![Action::to(["b", "c"], TestPayload::Step(0))]
+        }
+
+        fn handle(&mut self, _: &Observation<TestDomain>) -> Vec<Action<TestDomain>> {
+            Vec::new()
+        }
+    }
+
+    /// Says one thing to nobody when it starts.
+    ///
+    /// An action need not be directed at anyone. What it is for is the log:
+    /// the agent went on the record, and nobody heard it.
+    struct Soliloquist;
+
+    impl Handler<TestDomain> for Soliloquist {
+        fn start(&mut self, _now: Timestamp) -> Vec<Action<TestDomain>> {
+            vec![Action::to(Vec::<ActorId>::new(), TestPayload::Step(0))]
         }
 
         fn handle(&mut self, _: &Observation<TestDomain>) -> Vec<Action<TestDomain>> {
@@ -1532,7 +1520,6 @@ mod tests {
             dispatches: outbox,
             records: recorder,
             timeout,
-            peers: ["b", "c"].map(ActorId::new).into(),
         };
         Wires {
             wiring,
@@ -2292,7 +2279,7 @@ mod tests {
     }
 
     #[test]
-    fn a_broadcast_is_sent_and_recorded_as_every_peer() {
+    fn an_action_is_sent_and_recorded_as_the_agents_it_names() {
         let rig = rig(Town, None);
         rig.start();
         let sent = rig.dispatch().sent;
@@ -2300,11 +2287,32 @@ mod tests {
         assert_eq!(sent[0].recipients, ["b", "c"].map(ActorId::new).into());
         let (records, cycle) = rig.cycle();
         let LogRecord::Action(action) = &records[1] else {
-            panic!("the broadcast is recorded as an action: {records:?}");
+            panic!("the action is recorded as an action: {records:?}");
         };
         assert_eq!(
             action.message.recipients,
             ["b", "c"].map(ActorId::new).into()
+        );
+        assert_eq!(cycle.outputs, [Seq(1)]);
+        rig.stop();
+        rig.agent.join().unwrap();
+    }
+
+    #[test]
+    fn an_action_addressed_to_nobody_is_still_stamped_and_logged() {
+        let rig = rig(Soliloquist, None);
+        rig.start();
+        let sent = rig.dispatch().sent;
+        assert_eq!(sent.len(), 1, "the action is sent like any other");
+        assert!(sent[0].recipients.is_empty());
+        assert_eq!(sent[0].sender, ActorId::new("a"));
+        let (records, cycle) = rig.cycle();
+        let LogRecord::Action(action) = &records[1] else {
+            panic!("the action addressed to nobody is logged: {records:?}");
+        };
+        assert!(
+            action.message.recipients.is_empty(),
+            "and is logged as addressed to nobody"
         );
         assert_eq!(cycle.outputs, [Seq(1)]);
         rig.stop();
@@ -2551,7 +2559,7 @@ mod tests {
 
         let records: Vec<LogRecord<TestDomain>> = wires.records.try_iter().collect();
         let kinds: Vec<&str> = records.iter().map(kind).collect();
-        // `Town` broadcasts when it starts and says nothing to an
+        // `Town` speaks when it starts and says nothing to an
         // observation, so the opening action between them is the start
         // hook's, which places the start ahead of the observation without
         // the test having to read two stamps that may be equal.

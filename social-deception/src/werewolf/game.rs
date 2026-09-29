@@ -132,7 +132,7 @@ use crate::werewolf::seed::{TIES, pick, seed_for};
 
 /// What the game wants said, in the order it wants it said.
 ///
-/// Every directive names its recipients. There is no broadcast: the choice
+/// Every directive names its recipients, and none names nobody: the choice
 /// of recipients is the whole hidden-information mechanism, and the one
 /// exception ADR-0004 made for the [`Outcome`] is withdrawn (ADR-0007),
 /// which is why the outcome is a `Narrate` to the living like any other.

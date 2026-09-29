@@ -74,9 +74,7 @@ pub mod timer;
 pub mod trajectory;
 pub mod werewolf;
 
-pub use agent::{
-    Action, Agent, CycleDispatch, Error, Handler, Instruction, Observation, Recipients, Wiring,
-};
+pub use agent::{Action, Agent, CycleDispatch, Error, Handler, Instruction, Observation, Wiring};
 pub use clock::{Clock, Created, Received, Timestamp};
 pub use environment::{Effect, Environment};
 pub use episode::{Episode, EpisodeError, Failure};
