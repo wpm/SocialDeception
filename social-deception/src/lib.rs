@@ -52,7 +52,25 @@
 //! - [`episode`]: the [`Episode`] that runs a roster and its environment
 //!   from start to stop.
 //!
-//! On top of that runtime sits one game, [`werewolf`]: the roles, phases
+//! # Two runtimes, side by side
+//!
+//! [`actor`] is the runtime ADR-0016 describes, in which every participant
+//! perceives on one thread and decides on another, so that **perceiving never
+//! waits on deciding**. It is built beside the modules listed above rather
+//! than in place of them: [`werewolf`] runs on the older one until issue #116
+//! moves it, and issue #117 then deletes the older one. The Collatz test ring
+//! runs on [`actor`] today, which is what keeps it honest.
+//!
+//! The two share this crate's vocabulary — [`Message`], [`ActorId`],
+//! [`Control`], [`Envelope`], [`Payload`], the [`Clock`] and the whole of
+//! [`log`] — and differ in the runtime around it. Where a name means
+//! different things in the two, the [`actor`] one is the one ADR-0016 gives:
+//! its [`Observation`](actor::Observation) carries the instant a message
+//! *arrived* rather than the instant a queue was popped, its
+//! [`Action`](actor::Action) can be a [`Reminder`](actor::Reminder), and its
+//! [`Episode`](actor::Episode) starts the clock itself.
+//!
+//! On top of the older runtime sits one game, [`werewolf`]: the roles, phases
 //! and the [`werewolf::Message`] payload that a runtime [`Message`]
 //! carries in a game of Werewolf, the [`Knowledge`](werewolf::Knowledge)
 //! a player folds its observations into, the
@@ -66,6 +84,7 @@
 //! [`Config`](werewolf::Config), and the `werewolf` binary is the command
 //! line for that.
 
+pub mod actor;
 pub mod agent;
 pub mod clock;
 pub mod environment;
@@ -92,5 +111,6 @@ pub use timer::{ManualTimer, ManualTimerControl, TimerSource};
 // and collides with nothing.
 pub use log::{
     ActionRecord, ControlRecord, CycleRecord, Elapsed, EpisodeRecord, JsonLines, Key,
-    ObservationRecord, Record, RewardRecord, Sink, Woken, Writer,
+    ObservationRecord, Record, RewardRecord, Sink, Sinks, UndeliveredRecord, UnsentRecord, Woken,
+    Writer,
 };
