@@ -15,11 +15,21 @@ Do all work on the feature branch. Never change the default branch.
     - For a single issue, the order does not matter.
     - A feature with multiple issues may specify their dependency order in issue text or by using the GitHub
       Relationships fields.
-    - Use Agent Teams to implement issues in parallel as much as the dependency order allows.
+    - Use Agent Teams to implement issues in parallel as much as the dependency order allows. A strictly sequential
+      chain is implemented one issue at a time; that is the dependency order allowing no parallelism, not a departure
+      from this step.
     - Don't worry if multiple issues touch the same source files. Conflicts are resolved in the CI pipeline.
+    - Tell each issue's agent what has already landed on the feature branch, in the vocabulary it will actually find
+      there. An issue's text was written before its siblings merged and may name types that have since been renamed
+      or removed.
 4. Implement each individual issue using the /issue command. The issue's target branch is the feature branch from step 1.
-5. After all of its issues have been implemented, create a pull request for the feature issue that will close the
-   feature issue.
+5. Finish the feature.
+    - If the feature branch holds this feature alone, create a pull request for the feature issue that will close the
+      feature issue.
+    - If the branch is a milestone branch collecting several features, land this feature's issues on it and stop. Do
+      not open a pull request to the default branch; a later feature is still to come. The milestone gets one pull
+      request after its last feature.
+    - Ask which it is when the branch's purpose is not clear from context.
 6. Set the Project status of the feature issue to "In review".
 
 While feature development is underway, print a status update every few minutes in the form of a chart showing progress
