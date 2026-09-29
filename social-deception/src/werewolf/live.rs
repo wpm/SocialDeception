@@ -249,7 +249,7 @@ mod tests {
     use crate::trajectory::{
         ControlRecord, CycleRecord, ObservationRecord, RewardRecord, Seq, Woken,
     };
-    use crate::werewolf::message::{Outcome, RequestKind, Round};
+    use crate::werewolf::message::{Outcome, Round, SessionKind};
     use crate::werewolf::role::{Faction, Role};
 
     fn at(nanos: u64) -> Timestamp {
@@ -407,7 +407,7 @@ mod tests {
         assert_eq!(
             shown(Message::Select(Select {
                 round: Round::new(1),
-                kind: RequestKind::Nominate,
+                kind: SessionKind::Nominate,
                 target: id("frank"),
                 seen_by: BTreeSet::new(),
             })),
@@ -464,7 +464,7 @@ mod tests {
             0,
             Message::Select(Select {
                 round: Round::new(1),
-                kind: RequestKind::Devour,
+                kind: SessionKind::Devour,
                 target: id("alice"),
                 seen_by: BTreeSet::new(),
             }),

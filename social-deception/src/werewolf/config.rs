@@ -843,7 +843,7 @@ mod tests {
 
     #[test]
     fn a_player_may_not_be_named_for_a_reserved_seed_stream() {
-        // Such a player's policy would draw from the deal's generator, or
+        // Such a player's strategy would draw from the deal's generator, or
         // the moderator's, and the streams would not be independent.
         for reserved in seed::RESERVED {
             let mut config = valid();
@@ -860,7 +860,7 @@ mod tests {
                 "{text}"
             );
         }
-        // The moderator has no policy stream, so its name is free.
+        // The moderator has no strategy stream, so its name is free.
         let mut config = valid();
         config.moderator = ActorId::new(seed::TIES);
         config.validate().unwrap();

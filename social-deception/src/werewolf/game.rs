@@ -109,9 +109,9 @@
 //! vouch for a state built on it. Each panics with a message naming the agent
 //! and the session. A selection that merely arrived too late — for a session
 //! that has closed, or a round that has passed — is not among them. The
-//! action space a selection is checked against is [`roles::action_space`],
-//! the same function the role types compute theirs with, so the game holds
-//! every player to exactly the rules the roles apply to themselves, including
+//! action space a selection is checked against is [`role::action_space`],
+//! the same function a player computes its own with, so the game holds
+//! every player to exactly the rules a role applies to itself, including
 //! the doctor's: for that the game remembers whom each doctor protected last
 //! night, as the doctor does.
 
@@ -125,9 +125,8 @@ use crate::clock::Timestamp;
 use crate::message::ActorId;
 use crate::werewolf::assignment::Assignment;
 use crate::werewolf::config::Timing;
-use crate::werewolf::message::{Cause, Narration, Outcome, Phase, RequestKind, Round, Select};
-use crate::werewolf::role::{Faction, Role};
-use crate::werewolf::roles;
+use crate::werewolf::message::{Cause, Narration, Outcome, Phase, Round, Select, SessionKind};
+use crate::werewolf::role::{self, Faction, Role};
 use crate::werewolf::seed::{TIES, pick, seed_for};
 
 /// What the game wants said, in the order it wants it said.
@@ -195,7 +194,7 @@ pub enum Directive {
 #[derive(Debug, Clone)]
 struct Session {
     /// What its members were asked.
-    kind: RequestKind,
+    kind: SessionKind,
     /// Everyone asked, whether or not they have selected.
     members: BTreeSet<ActorId>,
     /// Each member's latest target. A member that has not selected is
@@ -260,7 +259,7 @@ pub struct Game {
     sessions: Vec<Session>,
     /// What the night's closed sessions decided, kept until the last of
     /// them closes and the night resolves.
-    resolved: Vec<(RequestKind, BTreeMap<ActorId, ActorId>)>,
+    resolved: Vec<(SessionKind, BTreeMap<ActorId, ActorId>)>,
     /// The clocks every session runs on.
     timing: Timing,
     /// Whom each doctor protected last night, for doctors that protected
@@ -349,7 +348,7 @@ impl Game {
     ///
     /// If the rules ask nothing of this player in a session of that kind —
     /// because it is not living, or its role is not asked that at all — or
-    /// if the target is outside the action space [`roles::action_space`]
+    /// if the target is outside the action space [`role::action_space`]
     /// computes for it: the player itself, somebody not living, or, for a
     /// doctor, the player it protected the night before. Each is a bug in
     /// a player rather than a lost race.
@@ -423,7 +422,7 @@ impl Game {
         // The forward comes first: a player learns of the selection that
         // lynched somebody before it learns of the lynch, which is the
         // order the messages happened in.
-        if kind == RequestKind::Nominate && self.majority().is_some() {
+        if kind == SessionKind::Nominate && self.majority().is_some() {
             // This selection is the one that completed the majority, so the
             // player who made it is the hammer.
             directives.extend(self.close_day(Some(from), at));
@@ -520,12 +519,12 @@ impl Game {
     /// The targets the rules permit `who` in a session of `kind`, from the
     /// game's own state.
     ///
-    /// The same [`roles::action_space`] a player computes from its
+    /// The same [`role::action_space`] a player computes from its
     /// knowledge, so the two cannot disagree; this is the game's side of
     /// it, and what [`select`](Self::select) checks against.
     #[must_use]
-    pub fn action_space_for(&self, who: &ActorId, kind: RequestKind) -> Vec<ActorId> {
-        roles::action_space(who, &self.living, kind, self.last_protected.get(who))
+    pub fn action_space_for(&self, who: &ActorId, kind: SessionKind) -> Vec<ActorId> {
+        role::action_space(who, &self.living, kind, self.last_protected.get(who))
     }
 
     /// Everyone dealt into the game, living and dead, in agent order.
@@ -589,7 +588,7 @@ impl Game {
         // closes the session (ADR-0014). A player the rules leave
         // nowhere to select is not a member, so a session with no member
         // does not open.
-        let mut members: BTreeMap<RequestKind, BTreeSet<ActorId>> = BTreeMap::new();
+        let mut members: BTreeMap<SessionKind, BTreeSet<ActorId>> = BTreeMap::new();
         for who in &self.living {
             let Some(kind) = self.role(who).asked_in(self.phase) else {
                 continue;
@@ -614,12 +613,12 @@ impl Game {
 
     /// The quiet period and hard limit configured for a session of `kind`.
     /// The day has no quiet period.
-    fn timing_for(&self, kind: RequestKind) -> (Option<Duration>, Duration) {
+    fn timing_for(&self, kind: SessionKind) -> (Option<Duration>, Duration) {
         match kind {
-            RequestKind::Devour => (Some(self.timing.pack.quiet), self.timing.pack.limit),
-            RequestKind::Investigate => (Some(self.timing.seer.quiet), self.timing.seer.limit),
-            RequestKind::Protect => (Some(self.timing.doctor.quiet), self.timing.doctor.limit),
-            RequestKind::Nominate => (None, self.timing.day.limit),
+            SessionKind::Devour => (Some(self.timing.pack.quiet), self.timing.pack.limit),
+            SessionKind::Investigate => (Some(self.timing.seer.quiet), self.timing.seer.limit),
+            SessionKind::Protect => (Some(self.timing.doctor.quiet), self.timing.doctor.limit),
+            SessionKind::Nominate => (None, self.timing.day.limit),
         }
     }
 
@@ -637,17 +636,17 @@ impl Game {
         let mut directives = Vec::new();
         for (who, target) in &session.selections {
             match session.kind {
-                RequestKind::Protect => {
+                SessionKind::Protect => {
                     self.last_protected.insert(who.clone(), target.clone());
                 }
-                RequestKind::Investigate => directives.push(Directive::Narrate {
+                SessionKind::Investigate => directives.push(Directive::Narrate {
                     to: [who.clone()].into(),
                     narration: Narration::Investigated {
                         target: target.clone(),
                         faction: self.role(target).faction(),
                     },
                 }),
-                RequestKind::Devour | RequestKind::Nominate => {}
+                SessionKind::Devour | SessionKind::Nominate => {}
             }
         }
         self.resolved
@@ -663,10 +662,10 @@ impl Game {
         let mut protected = BTreeSet::new();
         for (kind, selections) in std::mem::take(&mut self.resolved) {
             match kind {
-                RequestKind::Devour => votes = selections,
-                RequestKind::Protect => protected.extend(selections.into_values()),
-                RequestKind::Investigate => {}
-                RequestKind::Nominate => unreachable!("nobody nominates at night"),
+                SessionKind::Devour => votes = selections,
+                SessionKind::Protect => protected.extend(selections.into_values()),
+                SessionKind::Investigate => {}
+                SessionKind::Nominate => unreachable!("nobody nominates at night"),
             }
         }
         // No wolf selected, no kill: the pack that cannot agree to act does
@@ -895,7 +894,7 @@ mod tests {
     /// because it is what closes a session. A test script stands in for
     /// every player at once, so it reads the same membership off the game
     /// rather than off a directive that no longer exists.
-    fn asks(game: &Game) -> BTreeMap<ActorId, RequestKind> {
+    fn asks(game: &Game) -> BTreeMap<ActorId, SessionKind> {
         game.sessions
             .iter()
             .flat_map(|session| {
@@ -1050,7 +1049,7 @@ mod tests {
     /// Records one selection in the session of `kind` of the round now under
     /// way. A selection says for itself which session it belongs to
     /// (ADR-0014), so there is no id to look up.
-    fn respond(game: &mut Game, from: &str, kind: RequestKind, target: ActorId) -> Vec<Directive> {
+    fn respond(game: &mut Game, from: &str, kind: SessionKind, target: ActorId) -> Vec<Directive> {
         let round = game.round;
         let selection = Select {
             round,
@@ -1066,7 +1065,7 @@ mod tests {
         game: &mut Game,
         from: &str,
         round: u32,
-        kind: RequestKind,
+        kind: SessionKind,
         target: ActorId,
     ) -> Vec<Directive> {
         let selection = Select {
@@ -1088,7 +1087,7 @@ mod tests {
         game: &mut Game,
         from: &str,
         round: u32,
-        kind: RequestKind,
+        kind: SessionKind,
         target: &str,
         seen_by: [&str; N],
         when: (Timestamp, Timestamp),
@@ -1143,7 +1142,7 @@ mod tests {
             &mut game,
             "bob",
             1,
-            RequestKind::Devour,
+            SessionKind::Devour,
             "carol",
             ["alice"],
             (at(1), now + Duration::from_millis(1)),
@@ -1166,7 +1165,7 @@ mod tests {
             &mut game,
             "bob",
             1,
-            RequestKind::Devour,
+            SessionKind::Devour,
             "carol",
             ["alice"],
             (at(1), deadline + Duration::from_millis(1)),
@@ -1200,7 +1199,7 @@ mod tests {
             &mut game,
             "erin",
             round,
-            RequestKind::Nominate,
+            SessionKind::Nominate,
             "carol",
             ["carol", "dave"],
             (at(1), at(10 * LATER)),
@@ -1222,7 +1221,7 @@ mod tests {
             &mut game,
             "bob",
             1,
-            RequestKind::Devour,
+            SessionKind::Devour,
             "carol",
             ["alice", "erin"],
             (at(1), at(2)),
@@ -1260,7 +1259,7 @@ mod tests {
             let at_instant = night + Duration::from_millis(index as u64 + 1);
             let selection = Select {
                 round: game.round,
-                kind: RequestKind::Nominate,
+                kind: SessionKind::Nominate,
                 target: target.clone(),
                 seen_by: seen_by.iter().map(|who| id(who)).collect(),
             };
@@ -1297,7 +1296,7 @@ mod tests {
             &mut game,
             "bob",
             1,
-            RequestKind::Devour,
+            SessionKind::Devour,
             "carol",
             ["alice"],
             (at(1), deadline),
@@ -1312,7 +1311,7 @@ mod tests {
             &mut game,
             "bob",
             1,
-            RequestKind::Devour,
+            SessionKind::Devour,
             "erin",
             ["alice"],
             (at(2), deadline + Duration::from_millis(1)),
@@ -1345,7 +1344,7 @@ mod tests {
             let at_instant = night + Duration::from_millis(index as u64 + 1);
             let selection = Select {
                 round: game.round,
-                kind: RequestKind::Nominate,
+                kind: SessionKind::Nominate,
                 target: target.clone(),
                 seen_by: seen_by.iter().map(|who| id(who)).collect(),
             };
@@ -1384,7 +1383,7 @@ mod tests {
             &mut game,
             "bob",
             1,
-            RequestKind::Devour,
+            SessionKind::Devour,
             "carol",
             ["alice"],
             (at(1), at(2)),
@@ -1393,7 +1392,7 @@ mod tests {
         let counted = game
             .sessions
             .iter()
-            .find(|session| session.kind == RequestKind::Devour);
+            .find(|session| session.kind == SessionKind::Devour);
         let counted = counted.expect("the pack's session is open");
         assert_eq!(
             counted.selections.get(&id("bob")),
@@ -1408,7 +1407,7 @@ mod tests {
             &mut game,
             "bob",
             2,
-            RequestKind::Devour,
+            SessionKind::Devour,
             "erin",
             ["alice"],
             (at(3), at(4)),
@@ -1417,7 +1416,7 @@ mod tests {
         let counted = game
             .sessions
             .iter()
-            .find(|session| session.kind == RequestKind::Devour)
+            .find(|session| session.kind == SessionKind::Devour)
             .expect("still open");
         assert_eq!(
             counted.selections.get(&id("bob")),
@@ -1433,8 +1432,8 @@ mod tests {
         let mut game = game(village());
         game.begin(at(0));
         for (who, kind) in [
-            ("carol", RequestKind::Investigate),
-            ("dave", RequestKind::Protect),
+            ("carol", SessionKind::Investigate),
+            ("dave", SessionKind::Protect),
         ] {
             let directives =
                 selections_seen_by(&mut game, who, 1, kind, "alice", [], (at(1), at(2)));
@@ -1655,7 +1654,7 @@ mod tests {
             let selection_round = game.round;
             for (who, kind) in asked {
                 let space =
-                    roles::action_space(&who, &game.living, kind, game.last_protected.get(&who));
+                    role::action_space(&who, &game.living, kind, game.last_protected.get(&who));
                 let selection = Select {
                     round: selection_round,
                     kind,
@@ -2122,7 +2121,7 @@ mod tests {
             asked.keys().cloned().collect::<BTreeSet<_>>(),
             ids(["alice", "bob", "carol"])
         );
-        assert!(asked.values().all(|kind| *kind == RequestKind::Devour));
+        assert!(asked.values().all(|kind| *kind == SessionKind::Devour));
         assert_eq!(game.sessions.len(), 1, "one session, the pack's");
     }
 
@@ -2154,8 +2153,8 @@ mod tests {
         assert_eq!(
             asks(&game),
             [
-                (id("bob"), RequestKind::Devour),
-                (id("carol"), RequestKind::Investigate),
+                (id("bob"), SessionKind::Devour),
+                (id("carol"), SessionKind::Investigate),
             ]
             .into_iter()
             .collect::<BTreeMap<_, _>>()
@@ -2347,7 +2346,7 @@ mod tests {
         // game can say so from the role alone.
         let mut game = game(village());
         game.begin(at(0));
-        respond(&mut game, "carol", RequestKind::Devour, target("alice"));
+        respond(&mut game, "carol", SessionKind::Devour, target("alice"));
     }
 
     #[test]
@@ -2355,7 +2354,7 @@ mod tests {
     fn selecting_from_outside_the_game_panics() {
         let mut game = game(village());
         game.begin(at(0));
-        respond(&mut game, "zara", RequestKind::Devour, target("alice"));
+        respond(&mut game, "zara", SessionKind::Devour, target("alice"));
     }
 
     #[test]
@@ -2371,7 +2370,7 @@ mod tests {
         let closed = game.expire(at(LATER));
         assert!(!closed.is_empty(), "the night's sessions closed");
         assert!(
-            respond_in(&mut game, "bob", 1, RequestKind::Devour, target("alice")).is_empty(),
+            respond_in(&mut game, "bob", 1, SessionKind::Devour, target("alice")).is_empty(),
             "a selection for a closed session causes nothing"
         );
     }
@@ -2397,7 +2396,7 @@ mod tests {
         );
         assert_eq!(game.round, Round::new(2), "the second night is under way");
         assert!(
-            respond_in(&mut game, "bob", 1, RequestKind::Devour, target("erin")).is_empty(),
+            respond_in(&mut game, "bob", 1, SessionKind::Devour, target("erin")).is_empty(),
             "a selection from round one causes nothing in round two"
         );
     }
@@ -2409,7 +2408,7 @@ mod tests {
     fn a_doctor_protecting_itself_panics() {
         let mut game = game(village());
         game.begin(at(0));
-        respond(&mut game, "dave", RequestKind::Protect, target("dave"));
+        respond(&mut game, "dave", SessionKind::Protect, target("dave"));
     }
 
     /// In the village, alice is devoured while the doctor protects erin,
@@ -2434,7 +2433,7 @@ mod tests {
     fn a_doctor_protecting_the_same_player_two_nights_running_panics() {
         let mut game = game(village());
         play(&mut game, &doctor_protected_erin());
-        respond(&mut game, "dave", RequestKind::Protect, target("erin"));
+        respond(&mut game, "dave", SessionKind::Protect, target("erin"));
     }
 
     /// Nine players and two werewolves, bob and frank; carol is the seer
@@ -2504,10 +2503,10 @@ mod tests {
             );
             assert_eq!(game.round, Round::new(3), "the third night is under way");
             assert_eq!(asks(&game).len(), 4, "four members select tonight");
-            let permitted = roles::action_space(
+            let permitted = role::action_space(
                 &id("dave"),
                 game.living(),
-                RequestKind::Protect,
+                SessionKind::Protect,
                 game.last_protected.get(&id("dave")),
             );
             assert!(
@@ -2516,10 +2515,10 @@ mod tests {
             );
             assert_eq!(
                 asks(&game).get(&id("dave")),
-                Some(&RequestKind::Protect),
+                Some(&SessionKind::Protect),
                 "the doctor is a member of the third night's Protect session"
             );
-            respond(&mut game, "dave", RequestKind::Protect, target("erin"));
+            respond(&mut game, "dave", SessionKind::Protect, target("erin"));
         }
     }
 
@@ -2537,7 +2536,7 @@ mod tests {
                 ("dave", "erin"),
             ])],
         );
-        respond(&mut game, "bob", RequestKind::Nominate, target("alice"));
+        respond(&mut game, "bob", SessionKind::Nominate, target("alice"));
     }
 
     #[test]
@@ -2547,7 +2546,7 @@ mod tests {
         let mut game = game(village());
         play(&mut game, &village_wins());
         assert!(game.outcome().is_some());
-        assert!(respond(&mut game, "carol", RequestKind::Nominate, target("dave")).is_empty());
+        assert!(respond(&mut game, "carol", SessionKind::Nominate, target("dave")).is_empty());
     }
 
     #[test]

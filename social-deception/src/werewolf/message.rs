@@ -172,7 +172,7 @@ pub struct Outcome {
 /// Ordered so that a night's sessions can be kept in a map: the order is
 /// the declaration order below and carries no meaning of its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub enum RequestKind {
+pub enum SessionKind {
     /// Name a player to lynch. Asked of every living player by day.
     Nominate,
     /// Name a player to eat. Asked of every living werewolf at night.
@@ -185,7 +185,7 @@ pub enum RequestKind {
     Protect,
 }
 
-impl RequestKind {
+impl SessionKind {
     /// The phase a session of this kind belongs to: nomination by day,
     /// everything else at night.
     #[must_use]
@@ -214,7 +214,7 @@ pub struct Select {
     /// The round the session belongs to.
     pub round: Round,
     /// Which of the phase's sessions this is: what the selection is for.
-    pub kind: RequestKind,
+    pub kind: SessionKind,
     /// The player selected.
     pub target: ActorId,
     /// The other players who should see this selection, for the moderator to
@@ -300,7 +300,7 @@ mod tests {
         messages.push((
             Message::Select(Select {
                 round: Round::new(1),
-                kind: RequestKind::Devour,
+                kind: SessionKind::Devour,
                 target: ActorId::new("alice"),
                 seen_by: BTreeSet::new(),
             }),
@@ -317,11 +317,11 @@ mod tests {
 
     #[test]
     fn request_kinds_have_a_phase() {
-        assert_eq!(RequestKind::Nominate.phase(), Phase::Day);
+        assert_eq!(SessionKind::Nominate.phase(), Phase::Day);
         for kind in [
-            RequestKind::Devour,
-            RequestKind::Investigate,
-            RequestKind::Protect,
+            SessionKind::Devour,
+            SessionKind::Investigate,
+            SessionKind::Protect,
         ] {
             assert_eq!(kind.phase(), Phase::Night, "{kind:?}");
         }
@@ -382,7 +382,7 @@ mod tests {
         assert_eq!(
             json(&Select {
                 round: Round::new(3),
-                kind: RequestKind::Nominate,
+                kind: SessionKind::Nominate,
                 target: ActorId::new("alice"),
                 seen_by: BTreeSet::new(),
             }),

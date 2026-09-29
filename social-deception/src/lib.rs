@@ -52,10 +52,11 @@
 //! [`WerewolfDomain`](werewolf::WerewolfDomain) names its types: the roles,
 //! phases and the [`werewolf::Message`] payload that a runtime [`Message`]
 //! carries in a game of Werewolf, the [`Knowledge`](werewolf::Knowledge)
-//! a player folds its observations into, the [`Policy`](werewolf::Policy)
-//! that picks its moves, the roles ([`werewolf::roles`]) whose rules say
-//! which moves it may pick from and the [`Seat`](werewolf::Seat) that plays
-//! one as an agent, the [`Game`](werewolf::Game) whose rules decide what is
+//! a player folds its observations into, the
+//! [`Strategy`](werewolf::Strategy) that picks its moves, the
+//! [`Role`](werewolf::Role) whose rules say which moves it may pick from and
+//! the [`Player`](werewolf::Player) that plays one as an agent, the
+//! [`Game`](werewolf::Game) whose rules decide what is
 //! said to whom, and the [`Moderator`](werewolf::Moderator), Werewolf's
 //! [`Environment`], which runs the game and starts and stops the players.
 //! [`werewolf::run`] plays one episode of it from a
@@ -82,8 +83,8 @@ pub use message::{ActorId, Control, Delivery, Domain, Message, Payload};
 pub use router::{Queues, RouteError, Router};
 pub use timer::{ManualTimer, ManualTimerControl, TimerSource};
 // [`trajectory::Policy`] is deliberately not re-exported here. The crate
-// root is a shared vocabulary, and `werewolf::Policy` — the trait a player
-// decides with — already has the name in it. A sink's policy is read in the
+// root is a shared vocabulary, and the name `Policy` is the framework's to
+// give to the one function a user implements. A sink's policy is read in the
 // company of the sink it belongs to, where `trajectory::Policy::Required`
 // says what it means and collides with nothing.
 pub use trajectory::{

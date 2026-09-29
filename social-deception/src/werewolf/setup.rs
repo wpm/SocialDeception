@@ -3,7 +3,7 @@
 //!
 //! This is the whole of the seam between Werewolf and the runtime. Nothing
 //! in the runtime knows about Werewolf: [`episode`] *constructs* an
-//! [`Episode`], dealing the roles and adding a [`Seat`] for every player and
+//! [`Episode`], dealing the roles and adding a [`Player`] for everyone and
 //! the [`Moderator`] that runs their game, and [`run`] runs one to
 //! completion and hands back how it ended. If a change here ever wants to
 //! modify `Episode`, `Agent` or the router, something upstream was designed
@@ -51,10 +51,9 @@ use super::game::Game;
 use super::live::Text;
 use super::message::Outcome;
 use super::moderator::Moderator;
-use super::player::Seat;
-use super::policy::RandomPolicy;
+use super::player::Player;
 use super::role::Role;
-use super::roles::{Doctor, Seer, Villager, Werewolf};
+use super::strategy::RandomStrategy;
 use crate::agent::Handler;
 use crate::episode::{Episode, EpisodeError};
 use crate::message::ActorId;
@@ -122,7 +121,7 @@ impl From<EpisodeError> for RunError {
 /// once the moderator has announced it.
 ///
 /// The roles are dealt once, from the configuration's seed; every player is
-/// seated as the type its role calls for, deciding with a [`RandomPolicy`]
+/// seated with the role it was dealt, deciding with a [`RandomStrategy`]
 /// seeded for it alone; and the moderator runs a [`Game`] over that same
 /// deal. The trajectory goes to `records`.
 ///
@@ -161,25 +160,15 @@ fn moderate(
     (episode, outcomes)
 }
 
-/// Seats `who` in the roster as its role, with a policy seeded for it.
+/// Seats `who` in the roster as its role, with a strategy seeded for it.
 fn seat(episode: &mut Episode<WerewolfDomain>, config: &Config, who: &ActorId, role: Role) {
-    let policy = RandomPolicy::for_agent(config.seed, who);
+    let strategy = RandomStrategy::for_agent(config.seed, who);
     let moderator = config.moderator.clone();
-    let me = who.clone();
-    match role {
-        Role::Villager => add(
-            episode,
-            who,
-            Seat::new(Villager::new(me), policy, moderator),
-        ),
-        Role::Werewolf => add(
-            episode,
-            who,
-            Seat::new(Werewolf::new(me), policy, moderator),
-        ),
-        Role::Seer => add(episode, who, Seat::new(Seer::new(me), policy, moderator)),
-        Role::Doctor => add(episode, who, Seat::new(Doctor::new(me), policy, moderator)),
-    }
+    add(
+        episode,
+        who,
+        Player::new(who.clone(), role, strategy, moderator),
+    );
 }
 
 /// Adds an agent to the roster.
