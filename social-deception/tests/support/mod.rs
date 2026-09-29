@@ -1,8 +1,7 @@
-//! Helpers shared by the integration tests: the [`collatz`] environment,
-//! a [`TempDir`] to write a log in, reading a log file back,
-//! checking the invariants every log satisfies whatever the game,
-//! and, in [`werewolf`], the invariants the log of a game of Werewolf satisfies
-//! on top of them.
+//! Helpers shared by the integration tests: the [`collatz`] environment, a
+//! [`TempDir`] to write a log in, reading a log file back, checking the
+//! invariants every log satisfies whatever the game, and, in [`werewolf`],
+//! the invariants the log of a game of Werewolf satisfies on top of them.
 //!
 //! The checks here are properties of the log, not of any game. They are
 //! meant to run unchanged against episodes where no independent check on the

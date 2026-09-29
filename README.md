@@ -6,7 +6,7 @@ Social deception games
 
 An episode is a fixed roster of agents, each a thread, talking over
 in-process channels without turn-taking. The framework names the parts as
-reinforcement learning does, because that is what the log it writes is
+reinforcement learning does, because that is the vocabulary its log is
 read in (see
 [ADR-0007](docs/decision-history/0007-reinforcement-learning-vocabulary.md)).
 
@@ -19,7 +19,7 @@ decision (see
 creation time and a payload the game defines. The same message is an
 **action** of the agent that sent it and an **observation** of each agent
 that pops it, which is what lets one agent's records be joined to
-another's.
+another's, and a trajectory built from the log.
 
 One agent per episode is the **environment**: it alone starts and stops the
 others, and it alone decides what an agent's behavior was worth. Those two

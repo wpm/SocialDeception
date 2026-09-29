@@ -20,7 +20,7 @@
 //!
 //! A configuration also writes back out, as the *effective configuration* of
 //! a run: [`Config::effective`] is the TOML that [`load`] reads back to the
-//! same value, and [`write_effective`] puts it beside a trajectory, at
+//! same value, and [`write_effective`] puts it beside a log, at
 //! [`effective_path`], so that a run can be reproduced from its artifacts
 //! alone.
 
@@ -58,7 +58,7 @@ pub struct Config {
     pub players: Vec<ActorId>,
     /// How many of each special role to deal. The rest are villagers.
     pub roles: RoleCounts,
-    /// Where to write the trajectory, if anywhere.
+    /// Where to write the log, if anywhere.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trajectory: Option<PathBuf>,
     /// The moderator's actor id. The moderator is an agent in the same
@@ -415,31 +415,31 @@ impl Error for ConfigError {
     }
 }
 
-/// Where the effective configuration of a run is written, beside its
-/// trajectory: the trajectory's path with `.toml` appended, so
-/// `werewolf.jsonl` has `werewolf.jsonl.toml` beside it.
+/// Where the effective configuration of a run is written, beside its log:
+/// the log's path with `.toml` appended, so `werewolf.jsonl` has
+/// `werewolf.jsonl.toml` beside it.
 ///
 /// The effective configuration is the [`Config`] a run was played from after
 /// any command-line overrides, without its `trajectory` field. It exists
-/// because the seed never appears in a trajectory, and a run has to be
+/// because the seed never appears in the log, and a run has to be
 /// reproducible from its artifacts. Appending the extension rather than
 /// replacing it means the file can never collide with the configuration the
 /// run was started from, however the two are named.
 #[must_use]
-pub fn effective_path(trajectory: &Path) -> PathBuf {
-    let mut path = trajectory.as_os_str().to_owned();
+pub fn effective_path(log: &Path) -> PathBuf {
+    let mut path = log.as_os_str().to_owned();
     path.push(".toml");
     PathBuf::from(path)
 }
 
 /// Writes the effective configuration of a run played from `config` beside
-/// its trajectory, at [`effective_path`], and returns where it was written.
+/// its log, at [`effective_path`], and returns where it was written.
 ///
 /// # Errors
 ///
 /// [`ConfigError::Write`] if the file cannot be written.
-pub fn write_effective(config: &Config, trajectory: &Path) -> Result<PathBuf, ConfigError> {
-    let path = effective_path(trajectory);
+pub fn write_effective(config: &Config, log: &Path) -> Result<PathBuf, ConfigError> {
+    let path = effective_path(log);
     fs::write(&path, config.effective()).map_err(|source| ConfigError::Write {
         path: path.clone(),
         source,
@@ -530,10 +530,10 @@ impl Config {
     /// `[timing]` table resolved.
     ///
     /// It is a valid configuration file in the schema [`load`] reads, and
-    /// reads back as this configuration with no trajectory. That is what
-    /// makes reproducing a run `werewolf play <trajectory>.toml --trajectory
-    /// <elsewhere>`: the trajectory is omitted so that replaying the file
-    /// cannot truncate the very trajectory it describes, and a reproduction
+    /// reads back as this configuration naming no log. That is what makes
+    /// reproducing a run `werewolf play <log>.toml --trajectory
+    /// <elsewhere>`: the `trajectory` field is omitted so that replaying the
+    /// file cannot truncate the very log it describes, and a reproduction
     /// names its own output.
     ///
     /// `day_cap` is written as the number the run actually played to, rather
@@ -677,7 +677,7 @@ mod tests {
     }
 
     #[test]
-    fn the_effective_config_sits_beside_the_trajectory() {
+    fn the_effective_config_sits_beside_the_log() {
         assert_eq!(
             effective_path(Path::new("werewolf.jsonl")),
             PathBuf::from("werewolf.jsonl.toml")
@@ -686,8 +686,8 @@ mod tests {
             effective_path(Path::new("runs/first.jsonl")),
             PathBuf::from("runs/first.jsonl.toml")
         );
-        // The extension is appended, never replaced, so a trajectory named
-        // like a configuration cannot have its configuration overwritten.
+        // The extension is appended, never replaced, so a log named like a
+        // configuration cannot have its configuration overwritten.
         assert_eq!(
             effective_path(Path::new("werewolf.toml")),
             PathBuf::from("werewolf.toml.toml")
@@ -905,11 +905,11 @@ mod tests {
     }
 
     #[test]
-    fn the_effective_config_is_written_beside_the_trajectory_and_loads() {
+    fn the_effective_config_is_written_beside_the_log_and_loads() {
         let dir = TempDir::new();
-        let trajectory = dir.join("werewolf.jsonl");
-        let written = write_effective(&valid(), &trajectory).unwrap();
-        assert_eq!(written, effective_path(&trajectory));
+        let log = dir.join("werewolf.jsonl");
+        let written = write_effective(&valid(), &log).unwrap();
+        assert_eq!(written, effective_path(&log));
         let config = valid();
         assert_eq!(
             load(&written).unwrap(),
@@ -923,10 +923,10 @@ mod tests {
 
     #[test]
     fn an_unwritable_effective_config_is_a_write_error_naming_it() {
-        let trajectory = Path::new("/no-such-directory/werewolf.jsonl");
-        let error = write_effective(&valid(), trajectory).unwrap_err();
+        let log = Path::new("/no-such-directory/werewolf.jsonl");
+        let error = write_effective(&valid(), log).unwrap_err();
         assert!(
-            matches!(&error, ConfigError::Write { path, .. } if *path == effective_path(trajectory)),
+            matches!(&error, ConfigError::Write { path, .. } if *path == effective_path(log)),
             "{error:?}"
         );
         assert!(error.source().is_some());

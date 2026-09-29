@@ -10,9 +10,8 @@
 //! as it happens, so it is where anything that wants the whole stream
 //! attaches. It does not write anything itself: it hands each record to a
 //! list of [`Sink`]s, each of which is a format bound to a destination.
-//! [`JsonLines`] over a file is the log on disk; a domain that knows
-//! how to render its own messages can add a sink that shows the game as it
-//! plays.
+//! [`JsonLines`] over a file is the log on disk; a domain that knows how to
+//! render its own messages can add a sink that shows the game as it plays.
 //!
 //! # Five record types
 //!
@@ -41,8 +40,8 @@
 //!
 //! An observation and an action record the same message from the two sides of
 //! it, which is what makes the log joinable: an observation in one agent's
-//! records matches the action in its sender's whose `created` and
-//! payload it carries. Nothing else links them, and nothing else needs to.
+//! records matches the action in its sender's whose `created` and payload it
+//! carries. Nothing else links them, and nothing else needs to.
 //!
 //! Sequence numbers are per agent and cover every non-cycle record, inputs
 //! and outputs alike. A reward has none, because it is not the agent loop's
@@ -178,7 +177,7 @@ impl<P: Payload> Serialize for Envelope<'_, P> {
 /// already carries at the top level.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObservationRecord<P: Payload> {
-    /// The agent whose records this one belongs to.
+    /// The agent this record belongs to.
     pub agent: ActorId,
     /// The agent's sequence number for it.
     pub seq: Seq,
@@ -212,7 +211,7 @@ impl<P: Payload> Serialize for ObservationRecord<P> {
 /// recipient's own observation record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActionRecord<P: Payload> {
-    /// The agent whose records this one belongs to.
+    /// The agent this record belongs to.
     pub agent: ActorId,
     /// The agent's sequence number for it.
     pub seq: Seq,
@@ -237,7 +236,7 @@ impl<P: Payload> Serialize for ActionRecord<P> {
 /// A control this agent popped off its queue.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ControlRecord {
-    /// The agent whose records this one belongs to.
+    /// The agent this record belongs to.
     pub agent: ActorId,
     /// The agent's sequence number for it.
     pub seq: Seq,
@@ -276,7 +275,7 @@ pub struct ControlRecord {
 /// types any more.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RewardRecord {
-    /// The agent rewarded, whose records this one belongs to.
+    /// The agent rewarded, which is not the agent that wrote it.
     pub agent: ActorId,
     /// When the environment logged it.
     pub created: Timestamp,

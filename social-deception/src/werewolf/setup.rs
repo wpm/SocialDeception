@@ -238,9 +238,8 @@ pub fn run(config: &Config, live: Option<Box<dyn Write + Send>>) -> Result<Outco
     play(episode, &outcomes, writer, log)
 }
 
-/// Runs an assembled episode, joins its writer, which is writing the log
-/// to `log` if anywhere, and takes the outcome off the
-/// moderator's channel.
+/// Runs an assembled episode, joins its writer, which is writing to `log`
+/// if anywhere, and takes the outcome off the moderator's channel.
 fn play(
     episode: Episode<i32, Message>,
     outcomes: &Receiver<Outcome>,

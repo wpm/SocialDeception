@@ -584,8 +584,8 @@ mod tests {
     #[test]
     fn a_reward_for_somebody_outside_the_roster_is_reported_and_not_written() {
         // The episode is about to fail. A log carrying a reward for an
-        // agent that has no records of its own would be evidence of nothing, so
-        // the name is reported and the line is never written.
+        // agent that has no records of its own would be evidence of
+        // nothing, so the name is reported and the line is never written.
         let (commands, _commanded) = unbounded();
         let (paid, rewarded) = unbounded();
         let (recorder, records) = unbounded::<Record<TestPayload>>();

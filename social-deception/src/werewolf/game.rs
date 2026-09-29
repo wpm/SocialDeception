@@ -550,7 +550,7 @@ impl Game {
     ///
     /// Being dead is not being out of the game. A villager the pack
     /// devoured in the first round wins with its faction, and the record
-    /// says so, because what a game is being scored for is the
+    /// says so, because what a trajectory is being scored for is the
     /// behavior that led to the result and not the length of the episode.
     #[must_use]
     pub fn rewards(&self) -> Option<BTreeMap<ActorId, i32>> {

@@ -7,7 +7,7 @@
 //! # The vocabulary
 //!
 //! The runtime speaks the vocabulary of reinforcement learning, which is
-//! what the log it writes is read in (ADR-0007):
+//! the vocabulary its log is read in (ADR-0007):
 //!
 //! | Term | Is |
 //! |---|---|
@@ -22,7 +22,8 @@
 //! [`Observation`] and [`Action`] are relative to an agent; on the wire
 //! there are only messages and controls. The same [`Message`] is the sent
 //! action of its sender and an observation of each of its recipients, which
-//! is what lets the log be joined across agents.
+//! is what lets the log be joined across agents, and a trajectory built
+//! from it.
 //!
 //! The runtime is generic over one parameter, the [`Payload`] a game's
 //! messages carry. A game's reward type is a second parameter, but it

@@ -32,9 +32,9 @@
 //!   seer alone, and a narration to the living goes to exactly the living.
 //!   Routing is the whole of the hidden-information mechanism, so these are
 //!   what the design exists to guarantee;
-//! - **the episode's shape**: every agent's records, the moderator's included,
-//!   begins with a `Start` control and ends with a `Stop`, because the
-//!   moderator is the episode's environment and starting and stopping the
+//! - **the episode's shape**: every agent's records, the moderator's
+//!   included, begin with a `Start` control and end with a `Stop`, because
+//!   the moderator is the episode's environment and starting and stopping the
 //!   players is its doing. Nothing at all reaches a dead player from the
 //!   moment of its death: not its own death, which it is never told, not
 //!   a peer's selection, nothing. The victim is left out of the `Eliminated`
@@ -157,7 +157,7 @@ pub fn check(lines: &[Value], config: &Config) {
 }
 
 /// Every agent's records, the moderator's included, begin with a `Start`
-/// control and ends with a `Stop`, and nobody is started or stopped twice.
+/// control and end with a `Stop`, and nobody is started or stopped twice.
 ///
 /// It is the moderator that sends both, being the episode's environment, so
 /// this is the check that the game's own shutdown happened: a log

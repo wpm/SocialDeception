@@ -9,7 +9,7 @@ target
 # MSVC Windows builds of rustc generate these, which store debugging information
 *.pdb
 
-# Trajectories and their effective configs, as written at the repository
+# Logs and their effective configs, as written at the repository
 # root by the example: `cargo run -- play examples/werewolf.toml`
 /*.jsonl
 /*.jsonl.toml

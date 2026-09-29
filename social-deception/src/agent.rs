@@ -898,8 +898,7 @@ where
                 // has already run, and running it again would reopen an
                 // agent that has been playing — and recording it anyway
                 // would put a claim in the log the loop did not act on.
-                // Whoever sent it has a bug the log must not
-                // paper over.
+                // Whoever sent it has a bug the log must not paper over.
                 Control::Start => {
                     assert!(!self.started, "{} was started twice", self.wiring.id);
                     self.started = true;
