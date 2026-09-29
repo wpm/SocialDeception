@@ -73,8 +73,8 @@ lists the rest.
 
 ## Developing
 
-After cloning, run this once so that the checked-in pre-commit hook runs
-before every commit:
+After cloning, run this once so that the checked-in pre-push hook runs
+before every push:
 
     git config core.hooksPath .githooks
 

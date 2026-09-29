@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Pre-commit hook: the same checks CI runs, so a commit that passes here is
-# very unlikely to fail there.
+# Pre-push hook: the same checks CI runs, so a push that passes here is very
+# unlikely to fail there. Running at push time rather than on every commit
+# keeps the full suite off the path of each individual commit.
 #
 # Wire it up once per clone with:
 #
@@ -48,4 +49,4 @@ else
     printf '   Install with: cargo install --locked typos-cli\n'
 fi
 
-printf '\nAll pre-commit checks passed.\n'
+printf '\nAll pre-push checks passed.\n'
