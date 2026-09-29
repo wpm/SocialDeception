@@ -7,8 +7,10 @@
 //! transport.
 //!
 //! The router validates at the boundary rather than trusting handlers. An
-//! unknown actor id, an empty recipient set, and a sender in its own
-//! recipient set are each rejected loudly. There is no loopback.
+//! unknown actor id and a sender in its own recipient set are each rejected
+//! loudly. There is no loopback. An empty recipient set is not an error: an
+//! action need not be directed at anyone, and one addressed to nobody is
+//! logged as its sender's action and delivered to nobody.
 //!
 //! # One sender per agent, carrying both kinds
 //!
@@ -58,8 +60,6 @@ use crate::message::{ActorId, Control, Delivery, Domain, Message};
 pub enum RouteError {
     /// A sender or recipient that is not in the roster.
     UnknownAgent(ActorId),
-    /// A message addressed to nobody.
-    NoRecipients,
     /// A sender that addressed itself.
     Loopback(ActorId),
     /// A recipient whose queue has been dropped, so the copy for it could
@@ -74,7 +74,6 @@ impl fmt::Display for RouteError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::UnknownAgent(id) => write!(f, "no agent {id} in the roster"),
-            Self::NoRecipients => f.write_str("a message must have at least one recipient"),
             Self::Loopback(id) => write!(f, "agent {id} addressed itself"),
             Self::QueueClosed(id) => write!(f, "the queue of agent {id} is closed"),
             Self::NotTheEnvironment(id) => {
@@ -174,7 +173,6 @@ impl<D: Domain> Router<D> {
     ///
     /// # Errors
     ///
-    /// - [`RouteError::NoRecipients`] for an empty recipient set;
     /// - [`RouteError::Loopback`] if the sender is among the recipients;
     /// - [`RouteError::UnknownAgent`] if the sender or a recipient is not in
     ///   the roster;
@@ -187,9 +185,6 @@ impl<D: Domain> Router<D> {
         let Message {
             sender, recipients, ..
         } = message;
-        if recipients.is_empty() {
-            return Err(RouteError::NoRecipients);
-        }
         if recipients.contains(sender) {
             return Err(RouteError::Loopback(sender.clone()));
         }
@@ -457,10 +452,10 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_recipient_set_is_rejected() {
-        let (router, _queues) = world(&["a", "b"]);
-        let error = router.route(&message("a", [], 1)).unwrap_err();
-        assert_eq!(error, RouteError::NoRecipients);
+    fn an_empty_recipient_set_is_routed_to_nobody() {
+        let (router, queues) = world(&["a", "b"]);
+        assert_eq!(router.route(&message("a", [], 1)), Ok(0));
+        assert!(queues[&id("b")].try_recv().is_err());
     }
 
     #[test]
@@ -623,10 +618,6 @@ mod tests {
         assert_eq!(
             RouteError::UnknownAgent(id("z")).to_string(),
             "no agent z in the roster"
-        );
-        assert_eq!(
-            RouteError::NoRecipients.to_string(),
-            "a message must have at least one recipient"
         );
         assert_eq!(
             RouteError::Loopback(id("a")).to_string(),

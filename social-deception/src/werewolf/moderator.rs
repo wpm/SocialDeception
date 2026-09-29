@@ -27,11 +27,11 @@
 //! Once the game is over the moderator emits nothing, whatever arrives. The
 //! episode is winding down, and a late response is not the game's problem.
 //!
-//! # No message of this game is broadcast
+//! # Every message of this game names somebody
 //!
 //! Every message carries an explicit recipient set, and the choice of
 //! recipients is the whole hidden-information mechanism (ADR-0004).
-//! ADR-0004 made one exception, broadcasting the final [`Outcome`] to every
+//! ADR-0004 made one exception, sending the final [`Outcome`] to every
 //! player, living and dead, because it was a dead player's terminal reward
 //! signal. A reward is now logged rather than said (ADR-0007), so the
 //! exception is withdrawn: the outcome is narrated to the living like any
@@ -86,7 +86,7 @@ use std::collections::BTreeSet;
 use super::WerewolfDomain;
 use super::game::{Directive, Game};
 use super::message::{Message, Outcome};
-use crate::agent::{Action, Observation, Recipients};
+use crate::agent::{Action, Observation};
 use crate::clock::Timestamp;
 use crate::environment::{Effect, Environment};
 use crate::message::{ActorId, Control};
@@ -181,11 +181,9 @@ impl Moderator {
 /// player out of it, which is a control rather than a message (ADR-0012).
 fn send(directive: Directive) -> Effect<WerewolfDomain> {
     match directive {
-        Directive::Narrate { to, narration } => Effect::Act(Action {
-            recipients: Recipients::To(to),
-            payload: Message::Narration(narration),
-            origin: None,
-        }),
+        Directive::Narrate { to, narration } => {
+            Effect::Act(Action::to(to, Message::Narration(narration)))
+        }
         // A forwarded selection is sent as the player that made it, not as the
         // moderator: what a recipient observes is what it would have
         // observed had the player addressed it directly (ADR-0014).
@@ -270,7 +268,6 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    use crate::agent::Recipients;
     use crate::message::ActorId;
     use crate::testing::{fast, id, ids, observed, town, village};
     use crate::werewolf::assignment::Assignment;
@@ -400,10 +397,7 @@ mod tests {
             .iter()
             .filter_map(|action| match &action.payload {
                 Message::Narration(Narration::PhaseBegan { round, phase, .. }) => {
-                    let Recipients::To(to) = &action.recipients else {
-                        panic!("a phase was broadcast: {action:?}");
-                    };
-                    Some((*round, *phase, to))
+                    Some((*round, *phase, &action.recipients))
                 }
                 _ => None,
             })
@@ -510,12 +504,10 @@ mod tests {
     /// to.
     fn announced_outcome(sent: &[Action<WerewolfDomain>]) -> (&BTreeSet<ActorId>, &Outcome) {
         sent.iter()
-            .find_map(|action| match action {
-                Action {
-                    recipients: Recipients::To(to),
-                    payload: Message::Narration(Narration::Outcome(outcome)),
-                    ..
-                } => Some((to, outcome)),
+            .find_map(|action| match &action.payload {
+                Message::Narration(Narration::Outcome(outcome)) => {
+                    Some((&action.recipients, outcome))
+                }
                 _ => None,
             })
             .expect("no outcome was announced")
@@ -736,27 +728,18 @@ mod tests {
     }
 
     #[test]
-    fn nothing_the_moderator_says_is_broadcast() {
+    fn every_action_names_somebody() {
         // Routing is the whole hidden-information mechanism, and there is
-        // no longer an exception for the outcome: every message the
-        // moderator sends names its recipients.
+        // no longer an exception for the outcome: everything the moderator
+        // says is said to somebody in particular. The runtime would carry
+        // an action addressed to nobody; this game never sends one, and
+        // this is where that is held.
         for Played { sent, .. } in played_games() {
             for action in &sent {
                 assert!(
-                    matches!(action.recipients, Recipients::To(_)),
-                    "{action:?} is broadcast"
+                    !action.recipients.is_empty(),
+                    "{action:?} is addressed to nobody"
                 );
-            }
-        }
-    }
-
-    #[test]
-    fn no_action_has_an_empty_recipient_set() {
-        for Played { sent, .. } in played_games() {
-            for action in &sent {
-                if let Recipients::To(to) = &action.recipients {
-                    assert!(!to.is_empty(), "{action:?} is addressed to nobody");
-                }
             }
         }
     }
@@ -766,9 +749,7 @@ mod tests {
         for Played { sent, .. } in played_games() {
             let mut dead = BTreeSet::new();
             for message in &sent {
-                let Recipients::To(to) = &message.recipients else {
-                    continue;
-                };
+                let to = &message.recipients;
                 let own_death = match &message.payload {
                     Message::Narration(Narration::Eliminated { who, .. }) => Some(who),
                     _ => None,
@@ -797,10 +778,7 @@ mod tests {
                 let Message::Narration(Narration::Assigned { pack, .. }) = &message.payload else {
                     continue;
                 };
-                let Recipients::To(to) = &message.recipients else {
-                    panic!("an assignment was broadcast: {message:?}");
-                };
-                for who in to {
+                for who in &message.recipients {
                     if assignment.role(who) == Some(Werewolf) {
                         assert_eq!(pack, assignment.pack(), "{who}");
                     } else {

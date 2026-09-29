@@ -31,13 +31,12 @@
 //!
 //! # An ordinary agent cannot send a control, and the types say so
 //!
-//! [`Handler::handle`] returns `Vec<Action<D>>`. There is no constructor
-//! for a control or a reward on an action, and no variant of
-//! [`Recipients`](crate::Recipients) that could carry one, so a player's
-//! policy has nothing to reach for. The check the
-//! [`Router`](crate::Router) makes — that a control's sender is the
-//! environment — is a backstop for a hole in the runtime, not a rule the
-//! game code has to remember.
+//! [`Handler::handle`] returns `Vec<Action<D>>`. An action carries a
+//! payload and a set of recipients, and there is no constructor for a
+//! control or a reward on one, so a player's policy has nothing to reach
+//! for. The check the [`Router`](crate::Router) makes — that a control's
+//! sender is the environment — is a backstop for a hole in the runtime,
+//! not a rule the game code has to remember.
 //!
 //! # The environment's cycle is an agent's cycle
 //!
