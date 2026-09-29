@@ -14,6 +14,8 @@ is delivered at once rather than held until nothing is in flight;
 and by [ADR-0014](0014-events-carry-information-controls-carry-instruction.md), which makes the observation/action split a rule rather than
 a vocabulary: an event to an agent must inform it, and an agent's state is
 its own rather than the trajectory's
+and by [ADR-0016](0016-actors-perceive-on-one-thread-and-decide-on-another.md), under which the runtime's nouns are actors and messages, observation and action are what a handler takes and returns, `Effect` is what `step` returns, and `Domain` goes
+and by [ADR-0017](0017-messages-carry-a-sequence-number-and-the-log-keeps-the-time.md), under which messages carry a sequence number and no times
 
 ## Context
 

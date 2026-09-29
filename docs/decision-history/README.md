@@ -41,10 +41,13 @@ from the earlier attempt at the project are not part of its history.
 | [0006](0006-knowledge-holds-what-the-agent-did-in-secret.md) | Knowledge holds what the agent did in secret | Accepted |
 | [0007](0007-reinforcement-learning-vocabulary.md) | The framework speaks the vocabulary of reinforcement learning | Accepted |
 | [0008](0008-one-observation-per-cycle.md) | A cycle handles one observation | Accepted |
-| [0009](0009-one-queue-and-no-cancellation.md) | One queue, and an agent that does not know it is being stopped | Accepted |
+| [0009](0009-one-queue-and-no-cancellation.md) | One queue, and an agent that does not know it is being stopped | Superseded by [0016](0016-actors-perceive-on-one-thread-and-decide-on-another.md) |
 | [0010](0010-a-handler-sets-its-own-deadline.md) | A handler sets its own deadline | Accepted |
 | [0011](0011-werewolf-phases-are-timed-pointing-sessions.md) | Werewolf phases are timed pointing sessions | Accepted |
 | [0012](0012-a-dead-player-stops.md) | A dead player stops | Accepted |
 | [0013](0013-speech-typing-and-a-scheduler-for-when-to-speak.md) | Speech and typing are events, and a scheduler decides when to speak | Accepted |
 | [0014](0014-events-carry-information-controls-carry-instruction.md) | Events carry information, controls carry instruction | Accepted |
 | [0015](0015-an-environment-does-not-summarize-what-agents-observed.md) | An environment does not summarize what its agents already observed | Accepted |
+| [0016](0016-actors-perceive-on-one-thread-and-decide-on-another.md) | Actors perceive on one thread and decide on another | Accepted |
+| [0017](0017-messages-carry-a-sequence-number-and-the-log-keeps-the-time.md) | Messages carry a sequence number, and the log keeps the time | Accepted |
+| [0018](0018-werewolf-speech-goes-through-the-moderator.md) | In Werewolf, all speech goes through the moderator | Accepted |

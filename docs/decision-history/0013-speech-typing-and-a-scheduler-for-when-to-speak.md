@@ -7,6 +7,7 @@
 **Depends on:** [ADR-0010](0010-a-handler-sets-its-own-deadline.md),
 [ADR-0011](0011-werewolf-phases-are-timed-pointing-sessions.md),
 [ADR-0012](0012-a-dead-player-stops.md)
+**Amended by:** [ADR-0018](0018-werewolf-speech-goes-through-the-moderator.md), under which speech goes to the moderator, which relays it to the living, and [ADR-0016](0016-actors-perceive-on-one-thread-and-decide-on-another.md) lets a policy yield `TypingStarted` before its model call
 
 ## Context
 

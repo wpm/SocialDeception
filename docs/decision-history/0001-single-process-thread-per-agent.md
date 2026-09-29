@@ -3,6 +3,7 @@
 **Status:** Accepted
 **Date:** 2026-09-17
 **Deciders:** Bill McNeill
+**Amended by:** [ADR-0016](0016-actors-perceive-on-one-thread-and-decide-on-another.md), under which each actor has two threads, one that perceives and one that decides, and a handler thread sends straight to its recipients rather than through the episode
 
 ## Context
 
