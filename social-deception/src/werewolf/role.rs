@@ -3,9 +3,12 @@
 //! action space it permits in each.
 //!
 //! A role is an enum value and its rules are its methods. There is no type
-//! per role, because the four would differ in nothing: the one role-specific
-//! rule in the game is the doctor's, and it is decided from the role the
-//! player's [`Knowledge`] already holds.
+//! per role, because a type per role would carry no state the role does not:
+//! the only thing four such types ever held was a [`Knowledge`] built for
+//! the role, and a `Knowledge` names its own role. What each role is asked
+//! is [`Role::asked_in`], and the one rule that distinguishes a role's
+//! action space — the doctor's — follows from the kind of session it is
+//! asked in, which follows from the role.
 //!
 //! # The action space, and its order
 //!
@@ -19,31 +22,23 @@
 //! same on every run and in every episode with the same living set, which
 //! is why the action space is a `Vec<ActorId>` and not a set.
 //!
-//! **It may be empty.** The doctor may protect neither itself nor last
-//! night's patient, which in a small enough game leaves nobody, and a
-//! member with nothing it may select is not asked at all. That is what
-//! used to be an abstention (ADR-0011).
+//! **It may be empty.** The one rule beyond the two universal ones is the
+//! doctor's: it may not protect the same player on two consecutive nights,
+//! so a `Protect` also excludes [`Knowledge::last_protected`]. That is a
+//! rule of the game, not advice, and it is what can leave a player with
+//! nowhere to go: the doctor may protect neither itself nor last night's
+//! patient, which in a small enough game leaves nobody. A member with
+//! nothing it may select is not asked at all — that is what used to be an
+//! abstention (ADR-0011) — and no other kind can empty a space, since
+//! `Nominate` and `Devour` open only while a valid target lives.
 //!
 //! [`Role::action_space`] is what a player computes from its own knowledge,
 //! and the [`Game`](super::Game) checks every selection against the same
 //! function from what it knows, so the two cannot disagree about what the
 //! rules permit: a player of any kind, a language-model agent or a test
-//! stub, is held to exactly the space a role computes.
-//!
-//! Which sessions a role is a member of is [`Role::asked_in`]'s to say, and
-//! asking a role for an action space of a kind it is never asked is a bug in
-//! the caller: it panics naming the role and the kind. The one role-specific
-//! rule in the game is the doctor's: it may not protect the same player on
-//! two consecutive nights, so its `Protect` action space also excludes
-//! [`Knowledge::last_protected`]. That is a rule of the variant, not advice,
-//! and it is why the action space can shrink to nothing: with few players
-//! living, the targets minus last night's can be empty.
-//!
-//! The action space is empty only where the rules really do leave a player
-//! nowhere to select, and such a player is not a member of the session at
-//! all: `Nominate` and `Devour` open only while at least one valid target
-//! lives, since the game would be over otherwise, and `Protect` and
-//! `Investigate` always leave the player free to select nowhere.
+//! stub, is held to exactly the space a role computes. Asking a role for an
+//! action space of a kind [`Role::asked_in`] never asks it is a bug in the
+//! caller: it panics naming the role and the kind.
 //!
 //! Nothing here narrows an action space for strategic reasons. A werewolf's
 //! `Devour` includes its living packmates, and a seer's `Investigate`

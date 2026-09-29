@@ -5,8 +5,8 @@
 //! state, in the vocabulary the [module](super) documentation states and
 //! ADR-0005 explains. [`View`] is what it conditions on: the state, the
 //! kind of session in front of it, and the action space. Nothing here
-//! decides what
-//! the rules permit; this module only picks from what they permit.
+//! decides what the rules permit; this module only picks from what they
+//! permit.
 //!
 //! # Every strategy sees the same action space
 //!
@@ -96,8 +96,8 @@ pub struct View<'a> {
     /// Which of the phase's sessions this is: what the selection is for.
     pub kind: SessionKind,
     /// Every target the rules permit, in canonical order: sorted agent
-    /// order. May be empty, and a strategy handed an empty one has nowhere to
-    /// selection.
+    /// order. May be empty, and a strategy handed an empty one has nowhere
+    /// to select.
     pub action_space: &'a [ActorId],
 }
 
@@ -370,7 +370,7 @@ mod tests {
     }
 
     #[test]
-    fn a_policy_selects_somewhere_whenever_it_can() {
+    fn a_strategy_selects_somewhere_whenever_it_can() {
         // Selecting nowhere is for a member with nowhere to select. While the
         // action space holds anybody at all, the baseline names somebody.
         let doctor = knowing(Role::Doctor, ["alice", "bob"]);

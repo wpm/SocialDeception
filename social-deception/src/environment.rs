@@ -33,7 +33,7 @@
 //!
 //! [`Handler::handle`] returns `Vec<Action<D>>`. An action carries a
 //! payload and a set of recipients, and there is no constructor for a
-//! control or a reward on one, so a player's policy has nothing to reach
+//! control or a reward on one, so a player's strategy has nothing to reach
 //! for. The check the [`Router`](crate::Router) makes — that a control's
 //! sender is the environment — is a backstop for a hole in the runtime,
 //! not a rule the game code has to remember.

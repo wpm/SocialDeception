@@ -92,11 +92,6 @@ impl<S: Strategy> Player<S> {
         &self.knowledge
     }
 
-    /// The role this player was dealt.
-    const fn role(&self) -> Role {
-        self.knowledge.role
-    }
-
     /// The selection this player makes in the session of `kind` now open, if
     /// the strategy names a target: its choice from the role's action
     /// space, checked against it and folded into what it knows.
@@ -107,7 +102,7 @@ impl<S: Strategy> Player<S> {
     /// sent and nothing is folded either way — a selection never made is not
     /// a vote.
     fn select(&mut self, round: Round, kind: SessionKind) -> Option<Select> {
-        let action_space = self.role().action_space(&self.knowledge, kind);
+        let action_space = self.knowledge.role.action_space(&self.knowledge, kind);
         let chosen = self.strategy.choose(View {
             knowledge: &self.knowledge,
             kind,
@@ -184,7 +179,7 @@ impl<S: Strategy> Handler<WerewolfDomain> for Player<S> {
             // the rules leave nowhere to select, both say nothing.
             Message::Narration(Narration::PhaseBegan { round, phase, .. }) => {
                 let round = *round;
-                let Some(kind) = self.role().asked_in(*phase) else {
+                let Some(kind) = self.knowledge.role.asked_in(*phase) else {
                     return Vec::new();
                 };
                 self.select(round, kind)
