@@ -5,7 +5,7 @@ argument-hint: [ issue number or GitHub URL ] [ target branch ]
 
 1. Create a git worktree in which to do the work.
 2. Implement the issue.
-   a. Set the issue's Project status to "In progress"
+   a. Set the issue's Project status to "In progress".
    b. Get it working locally. Write tests and make sure all tests pass.
    c. Run `/simplify`.
 3. Create a pull request.
