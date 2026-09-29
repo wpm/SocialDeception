@@ -16,6 +16,7 @@ Do all work on the feature branch. Never change the default branch.
     - A feature with multiple issues may specify their dependency order in issue text or by using the GitHub
       Relationships fields.
     - Use Agent Teams to implement issues in parallel as much as the dependency order allows.
+    - Don't worry if multiple issues touch the same source files. Conflicts are resolved in the CI pipeline.
 4. Implement each individual issue using the /issue command. The issue's target branch is the feature branch from step 1.
 5. After all of its issues have been implemented, create a pull request for the feature issue that will close the
    feature issue.
