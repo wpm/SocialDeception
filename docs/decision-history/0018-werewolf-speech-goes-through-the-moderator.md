@@ -24,7 +24,18 @@ moment, and under
 also the one that stops a player at its death, with a stop that now takes
 effect ahead of anything queued.
 
-It also strains the vocabulary. In the multi-agent reinforcement learning
+Selections already go through the moderator. A player sends its point to
+the moderator alone, and the moderator forwards it to the players who
+should see it, dropping points that arrive after their session closed. But
+it forwards by **impersonation**: `Action::relay` carries an `Origin`, and
+the router stamps the forwarded event with the original player as sender
+and the original creation time, so the log never records that a relay
+happened. Under
+[ADR-0017](0017-messages-carry-a-sequence-number-and-the-log-keeps-the-time.md)
+the log is a record of exactly what happened, and a message the moderator
+sent that claims another actor as its sender is not one.
+
+The direct routing of speech also strains the vocabulary. In the multi-agent reinforcement learning
 picture the framework follows, agents do not talk to each other: an agent
 sends an action to the environment, and the environment sends observations
 to agents. Direct speech made a player's `Say` an observation for other
@@ -43,6 +54,10 @@ The moderator decides who observes it and sends it on.**
   message ([ADR-0016](0016-actors-perceive-on-one-thread-and-decide-on-another.md)),
   so a listener knows who spoke, and the log can join the relay to the
   speaker's action by the envelope's sender and sequence number.
+- Selections are relayed the same way. `Origin` and `Action::relay` go: a
+  forwarded selection is the moderator's own message, its envelope names
+  the player who pointed, and `Knowledge` reads the actor from the envelope
+  rather than from the message's sender.
 - Players no longer compute recipients for speech. A player's `Knowledge`
   still records what it heard, in the order it observed it.
 - The moderator relays with the same determinism rule as everything else it
