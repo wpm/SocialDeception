@@ -14,7 +14,7 @@ decides what to say, and a separate scheduler decides when;
 and by [ADR-0014](0014-events-carry-information-controls-carry-instruction.md), under which a role also decides whether the rules
 ask anything of it this phase, rather than being told by a request
 and by [ADR-0018](0018-werewolf-speech-goes-through-the-moderator.md), under which Werewolf's `Policy` becomes `Strategy`, the four role types and the `Player` trait give way to rules on `Role`, and `Seat` becomes `Player`
-and by [ADR-0020](0020-a-selection-is-discrete-and-a-model-makes-one-with-a-tool-call.md), under which a selection is always a discrete message and a model-backed strategy makes one only through a `select` tool call
+and by [ADR-0020](0020-a-selection-is-discrete-and-a-model-makes-one-with-a-tool-call.md), under which a selection is always a discrete message and a model-backed strategy makes one only through a `select` tool call, and a model that fails to select has not selected: there is no random fallback
 
 ## Context
 
