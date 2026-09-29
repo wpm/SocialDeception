@@ -9,12 +9,11 @@
 //!
 //! # Only actions are shown
 //!
-//! [`line()`] renders an [`ActionRecord`] and nothing else. Every event in an
-//! episode is some agent's action, so rendering actions shows each event
-//! exactly once, from the side of whoever sent it. An observation would
-//! show it a second time, once per recipient; a cycle, a control or a
-//! reward is the runtime's bookkeeping rather than something that happened
-//! in the game.
+//! [`line()`] renders an [`ActionRecord`] and nothing else. Every message in
+//! an episode is some agent's action, so rendering actions shows each message
+//! exactly once, from the side of whoever sent it. An observation would show
+//! it a second time, once per recipient; a cycle, a control or a reward is
+//! the runtime's bookkeeping rather than something that happened in the game.
 //!
 //! That is a deliberate limit. What a live line shows is what its sender
 //! said, not what each player knew, so the live view is not the transcript.
@@ -35,7 +34,7 @@ use std::io::{self, Write};
 
 use super::WerewolfDomain;
 use super::message::{Cause, Message, Narration, Phase, Select};
-use crate::event::AgentId;
+use crate::message::ActorId;
 use crate::trajectory::{ActionRecord, LogRecord, Sink};
 
 /// How wide the time column is, so that the columns line up for any game
@@ -45,7 +44,7 @@ const TIME_WIDTH: usize = 8;
 /// Renders one record as one line, or nothing.
 ///
 /// `senders` is how wide the sender column is: the width of the longest
-/// agent id in the game, so that the columns line up. [`Text`] takes it
+/// actor id in the game, so that the columns line up. [`Text`] takes it
 /// from the roster it is built with.
 ///
 /// The line has four columns: the time since the episode's clock started,
@@ -64,15 +63,15 @@ pub fn line(record: &LogRecord<WerewolfDomain>, senders: usize) -> Option<String
 
 /// One action record as its four columns.
 fn rendered(action: &ActionRecord<WerewolfDomain>, senders: usize) -> String {
-    // The sender goes in as `&str`, not as the `AgentId` it is: `AgentId`'s
+    // The sender goes in as `&str`, not as the `ActorId` it is: `ActorId`'s
     // `Display` writes straight through and so ignores the width, which is
     // the whole point of the column.
     format!(
         "{:>TIME_WIDTH$} {:<senders$}  \u{2192} {}  {}",
         Elapsed(action.created.nanos()),
         action.agent.as_str(),
-        listed(&action.event.recipients),
-        action.event.payload,
+        listed(&action.message.recipients),
+        action.message.payload,
     )
 }
 
@@ -179,13 +178,13 @@ impl fmt::Display for Phase {
     }
 }
 
-/// A comma-separated list of agent ids, in the order given.
+/// A comma-separated list of actor ids, in the order given.
 ///
 /// Not named `ids`: the test helper `testing::ids` builds a set of them,
 /// and two functions of that name in one file would be a puzzle.
-fn listed<'a>(who: impl IntoIterator<Item = &'a AgentId>) -> String {
+fn listed<'a>(who: impl IntoIterator<Item = &'a ActorId>) -> String {
     who.into_iter()
-        .map(AgentId::as_str)
+        .map(ActorId::as_str)
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -214,7 +213,7 @@ impl<W: Write> Text<W> {
     ///
     /// The width comes from the roster rather than from the ids seen so far
     /// because a column that widened partway down would not be a column.
-    pub fn new<'a>(out: W, roster: impl IntoIterator<Item = &'a AgentId>) -> Self {
+    pub fn new<'a>(out: W, roster: impl IntoIterator<Item = &'a ActorId>) -> Self {
         let senders = roster
             .into_iter()
             .map(|who| who.as_str().chars().count())
@@ -245,7 +244,7 @@ mod tests {
 
     use super::*;
     use crate::clock::Timestamp;
-    use crate::event::{Control, Event};
+    use crate::message::Control;
     use crate::testing::{Shared, id, ids};
     use crate::trajectory::{
         ControlRecord, CycleRecord, ObservationRecord, RewardRecord, Seq, Woken,
@@ -269,7 +268,7 @@ mod tests {
             agent: id(sender),
             seq: Seq(0),
             created: at(nanos),
-            event: Event::new(sender, recipients, at(nanos), payload),
+            message: crate::Message::new(sender, recipients, at(nanos), payload),
         }
         .into()
     }
@@ -484,7 +483,7 @@ mod tests {
 
     #[test]
     fn nothing_but_an_action_renders() {
-        let event = Event::new(
+        let message = crate::Message::new(
             "moderator",
             ["alice"],
             at(0),
@@ -498,7 +497,7 @@ mod tests {
                 seq: Seq(0),
                 created: at(0),
                 received: at(1),
-                event,
+                message,
             }
             .into(),
             ControlRecord {

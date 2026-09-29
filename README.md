@@ -11,12 +11,12 @@ writes are read in (see
 [ADR-0007](docs/decision-history/0007-reinforcement-learning-vocabulary.md)).
 
 An **agent** runs a loop whose one turn is a **cycle**: it pops every
-control waiting and one event, folds that one observation into its own
+control waiting and one message, folds that one observation into its own
 state, and sends what its handler returns. One observation per cycle, so an
-agent with a full queue runs a cycle per event and is stale by at most one
+agent with a full queue runs a cycle per message and is stale by at most one
 decision (see
-[ADR-0008](docs/decision-history/0008-one-observation-per-cycle.md)). What travels between agents is an **event** — sender, recipients,
-creation time and a payload the game defines. The same event is an
+[ADR-0008](docs/decision-history/0008-one-observation-per-cycle.md)). What travels between agents is a **message** — sender, recipients,
+creation time and a payload the game defines. The same message is an
 **action** of the agent that sent it and an **observation** of each agent
 that pops it, which is what lets one agent's trajectory be joined to
 another's.
@@ -49,7 +49,7 @@ That narrates the game as it happens, a line per thing that is said —
 the time, who said it, who heard it, and what it was — and then prints
 how it ended. `--quiet` leaves the narration out and prints the summary
 alone. The narration is a live view rather than the record of the game:
-it shows each event once, from the side of whoever sent it, in the order
+it shows each message once, from the side of whoever sent it, in the order
 the players' threads produced them. `replay`, below, is the reproducible
 reading.
 

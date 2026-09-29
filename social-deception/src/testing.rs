@@ -13,10 +13,10 @@ use serde_json::Value;
 
 use crate::agent::Observation;
 use crate::clock::Timestamp;
-use crate::event::{AgentId, Domain, Event};
+use crate::message::{ActorId, Domain, Message};
 use crate::trajectory::{JsonLines, LogRecord, Policy, Sink, Writer};
 use crate::werewolf::{
-    Assignment, Faction, Knowledge, Message, Narration, Phase, Role, Round, WerewolfDomain,
+    self, Assignment, Faction, Knowledge, Narration, Phase, Role, Round, WerewolfDomain,
 };
 
 pub(crate) use temp::TempDir;
@@ -125,20 +125,20 @@ pub(crate) fn json<T: serde::Serialize>(value: &T) -> Value {
     serde_json::to_value(value).unwrap()
 }
 
-/// An agent id, for tests that name agents by string literal.
-pub(crate) fn id(name: &str) -> AgentId {
-    AgentId::new(name)
+/// An actor id, for tests that name agents by string literal.
+pub(crate) fn id(name: &str) -> ActorId {
+    ActorId::new(name)
 }
 
-/// A set of agent ids, for tests that name agents by string literal.
-pub(crate) fn ids<const N: usize>(names: [&str; N]) -> BTreeSet<AgentId> {
-    names.map(AgentId::new).into()
+/// A set of actor ids, for tests that name agents by string literal.
+pub(crate) fn ids<const N: usize>(names: [&str; N]) -> BTreeSet<ActorId> {
+    names.map(ActorId::new).into()
 }
 
 /// The agent a selection targets, for tests that name agents by string
 /// literal. The same thing as [`id`], named for the place it is used: it
 /// reads as "the target" where a selection's target is what is meant.
-pub(crate) fn target(name: &str) -> AgentId {
+pub(crate) fn target(name: &str) -> ActorId {
     id(name)
 }
 
@@ -172,35 +172,35 @@ pub(crate) fn fast() -> crate::werewolf::config::Timing {
     }
 }
 
-/// An event from `sender` to [`ME`], created at a time no test reads.
+/// A message from `sender` to [`ME`], created at a time no test reads.
 ///
 /// Every werewolf unit test is a fold over what arrives, and the fold is a
-/// pure function of the payloads; the instant each event was created plays
+/// pure function of the payloads; the instant each message was created plays
 /// no part in it, so one stand-in time serves them all.
-pub(crate) fn from(sender: &str, payload: Message) -> Event<WerewolfDomain> {
-    Event::new(sender, [ME], Timestamp::default(), payload)
+pub(crate) fn from(sender: &str, payload: werewolf::Message) -> Message<WerewolfDomain> {
+    Message::new(sender, [ME], Timestamp::default(), payload)
 }
 
-/// An event as [`ME`] observes it, received at a time no test reads. Like
+/// A message as [`ME`] observes it, received at a time no test reads. Like
 /// the creation time in [`from`], it plays no part in any fold.
-pub(crate) fn observed(event: Event<WerewolfDomain>) -> Observation<WerewolfDomain> {
+pub(crate) fn observed(message: Message<WerewolfDomain>) -> Observation<WerewolfDomain> {
     Observation {
-        event,
+        message,
         received: Timestamp::default(),
     }
 }
 
 /// A narration from the moderator to [`ME`].
-pub(crate) fn narrated(narration: Narration) -> Event<WerewolfDomain> {
-    from("moderator", Message::Narration(narration))
+pub(crate) fn narrated(narration: Narration) -> Message<WerewolfDomain> {
+    from("moderator", werewolf::Message::Narration(narration))
 }
 
 /// The moderator announcing a phase to [`ME`].
 pub(crate) fn phase_began(
     round: u32,
     phase: Phase,
-    living: BTreeSet<AgentId>,
-) -> Event<WerewolfDomain> {
+    living: BTreeSet<ActorId>,
+) -> Message<WerewolfDomain> {
     narrated(Narration::PhaseBegan {
         round: Round::new(round),
         phase,

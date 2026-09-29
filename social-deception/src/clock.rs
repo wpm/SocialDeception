@@ -8,12 +8,12 @@
 //!
 //! Two traits say what a stamped thing knows about itself, and every type
 //! the runtime stamps implements one of them. [`Created`] is the instant
-//! something came into being: for an event, the instant its sender sent it.
+//! something came into being: for a message, the instant its sender sent it.
 //! [`Received`] adds the instant it reached whoever holds it, and with it a
 //! [`latency`](Received::latency), the delay that holder actually suffered.
 //!
-//! The split is not decoration. An event on the wire was created and not yet
-//! received; the same event, popped off a queue as an observation, is both.
+//! The split is not decoration. A message on the wire was created and not yet
+//! received; the same message, popped off a queue as an observation, is both.
 //! Keeping them apart in the types means a value that cannot say when it was
 //! received cannot be asked.
 

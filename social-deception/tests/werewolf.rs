@@ -31,7 +31,7 @@ use std::process::{Command, Stdio};
 
 use std::time::Duration;
 
-use social_deception::AgentId;
+use social_deception::ActorId;
 use social_deception::werewolf::config::DEFAULT_MODERATOR;
 use social_deception::werewolf::config::{DayTiming, NightTiming, Timing};
 use social_deception::werewolf::{self, Config, Faction, RoleCounts, Transcript, config};
@@ -105,14 +105,14 @@ const FAST_NIGHT: NightTiming = NightTiming {
 fn config(players: &[&str], werewolves: usize, seers: usize, doctors: usize, seed: u64) -> Config {
     let config = Config {
         seed,
-        players: players.iter().map(|who| AgentId::new(*who)).collect(),
+        players: players.iter().map(|who| ActorId::new(*who)).collect(),
         roles: RoleCounts {
             werewolves,
             seers,
             doctors,
         },
         trajectory: None,
-        moderator: AgentId::new(DEFAULT_MODERATOR),
+        moderator: ActorId::new(DEFAULT_MODERATOR),
         timing: FAST,
     };
     config.validate().unwrap();

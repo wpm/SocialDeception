@@ -4,11 +4,15 @@
 //!
 //! The vocabulary is the [`Role`]s a player can be dealt, the [`Faction`]s
 //! they play for, the [`Round`] and [`Phase`] that locate a moment in a
-//! game, and [`Message`], the one payload type that travels over the
-//! runtime's [`Event`](crate::Event) between the moderator and the players.
-//! The only facts it states are properties of a session kind itself, such
-//! as which phase it belongs to; every rule that depends on who is alive
-//! lives with the moderator and the roles, not here.
+//! game, and [`Message`], the one payload type a runtime
+//! [`Message`](crate::Message) carries between the moderator and the
+//! players. The only facts it states are properties of a session kind
+//! itself, such as which phase it belongs to; every rule that depends on
+//! who is alive lives with the moderator and the roles, not here.
+//!
+//! Two types are called `Message`, and the module path tells them apart:
+//! unqualified within `werewolf` it is this game's payload, and the
+//! runtime's envelope is written [`crate::Message`].
 //!
 //! The setup is a [`Config`] read from a TOML file ([`config`]), the
 //! [`Assignment`] of roles dealt from its seed ([`assignment`]), and
@@ -48,15 +52,17 @@
 //! (ADR-0014); being told what its own role already says would inform it of
 //! nothing.
 //!
-//! In the reinforcement-learning vocabulary of the design, `Event<Message>`
-//! is the observation type and the move a player's action carries is an
-//! [`AgentId`](crate::AgentId): the target inside the selection, not the
-//! selection itself. The set of targets the rules permit in a session is the
-//! *action space*, a `Vec<AgentId>` computed by the rules; a target outside
-//! it is a policy bug. A selection names the session it was made in, by round
-//! and [`RequestKind`], which both sides derive from what they each know — so
-//! there is nothing to correlate, and a selection naming a round that has
-//! passed is one whose session closed while it was in flight.
+//! In the reinforcement-learning vocabulary of the design, a
+//! `crate::Message<WerewolfDomain>` — a runtime envelope carrying this
+//! module's [`Message`] — is the observation type, and the move a player's
+//! action carries is an [`ActorId`](crate::ActorId): the target inside the
+//! selection, not the selection itself. The set of targets the rules permit
+//! in a session is the *action space*, a `Vec<ActorId>` computed by the
+//! rules; a target outside it is a policy bug. A selection names the session
+//! it was made in, by round and [`RequestKind`], which both sides derive from
+//! what they each know — so there is nothing to correlate, and a selection
+//! naming a round that has passed is one whose session closed while it was in
+//! flight.
 //!
 //! A member may select as often as it likes while its session is open, and
 //! its most recent selection is its vote; selecting nowhere is how it
@@ -104,7 +110,7 @@
 //! them, and nothing else. It may be empty — the doctor may be left with
 //! nobody it can protect — and a player with an empty one selects nowhere.
 //! A [`Seat`] ([`player`]) pairs a role with the policy that decides for
-//! it and is the agent the episode runs: it folds every event into the
+//! it and is the agent the episode runs: it folds every message into the
 //! role's state, acts when it observes a phase begin, and addresses each
 //! selection as the rules allow.
 //!
@@ -124,12 +130,12 @@
 //!
 //! The payload uses serde's defaults: enums are externally tagged with the
 //! variant name as written, and newtypes are transparent. The runtime's
-//! envelope, [`Event`](crate::Event) and its records, is internally tagged
-//! and snake-cased instead, because its field names are a contract with
+//! envelope, [`crate::Message`] and its records, is internally tagged and
+//! snake-cased instead, because its field names are a contract with
 //! whatever reads a trajectory back; the payload's shape belongs to the
 //! environment alone.
 
-use crate::event::Domain;
+use crate::message::Domain;
 
 pub mod assignment;
 pub mod config;
@@ -149,7 +155,8 @@ pub mod transcript;
 /// Werewolf as a [`Domain`]: the types this game contributes to the
 /// runtime.
 ///
-/// Its events carry a [`Message`], and a player's reward is an integer,
+/// Its messages carry a [`Message`] — this module's payload, not the
+/// runtime envelope of the same name — and a player's reward is an integer,
 /// because a game of Werewolf is won or lost and nothing finer is scored.
 ///
 /// The name is not `Werewolf`, which is the role a player may be dealt. A

@@ -18,7 +18,7 @@
 //! strategy, and nothing can do them. The order is canonical and
 //! load-bearing: an index into the vector is a stable action label, the
 //! same on every run and in every episode with the same living set, which
-//! is why the action space is a `Vec<AgentId>` and not a set.
+//! is why the action space is a `Vec<ActorId>` and not a set.
 //!
 //! **It may be empty.** The doctor may protect neither itself nor last
 //! night's patient, which in a small enough game leaves nobody, and a
@@ -59,7 +59,7 @@ use super::knowledge::Knowledge;
 use super::message::RequestKind;
 use super::player::Player;
 use super::role::Role;
-use crate::event::AgentId;
+use crate::message::ActorId;
 
 /// The action space the rules permit `me` in a session of `kind` while
 /// `living` are alive: a target for each living player other than `me`, in
@@ -76,12 +76,12 @@ use crate::event::AgentId;
 /// asked at all.
 #[must_use]
 pub fn action_space(
-    me: &AgentId,
-    living: &BTreeSet<AgentId>,
+    me: &ActorId,
+    living: &BTreeSet<ActorId>,
     kind: RequestKind,
-    last_protected: Option<&AgentId>,
-) -> Vec<AgentId> {
-    let excluded = |who: &&AgentId| {
+    last_protected: Option<&ActorId>,
+) -> Vec<ActorId> {
+    let excluded = |who: &&ActorId| {
         *who != me && !(kind == RequestKind::Protect && Some(*who) == last_protected)
     };
     living.iter().filter(excluded).cloned().collect()
@@ -96,7 +96,7 @@ pub fn action_space(
 /// If the kind is one the player's role is never asked, by
 /// [`Role::asked_in`]: a bug in the caller, not a runtime condition.
 #[must_use]
-pub fn base_action_space(knowledge: &Knowledge, kind: RequestKind) -> Vec<AgentId> {
+pub fn base_action_space(knowledge: &Knowledge, kind: RequestKind) -> Vec<ActorId> {
     assert_eq!(
         knowledge.role.asked_in(kind.phase()),
         Some(kind),
@@ -120,7 +120,7 @@ pub struct Villager {
 impl Villager {
     /// A villager named `me` that has observed nothing yet.
     #[must_use]
-    pub fn new(me: AgentId) -> Self {
+    pub fn new(me: ActorId) -> Self {
         Self {
             knowledge: Knowledge::new(me, Role::Villager),
         }
@@ -136,7 +136,7 @@ impl Player for Villager {
         &mut self.knowledge
     }
 
-    fn action_space(&self, kind: RequestKind) -> Vec<AgentId> {
+    fn action_space(&self, kind: RequestKind) -> Vec<ActorId> {
         base_action_space(&self.knowledge, kind)
     }
 }
@@ -151,7 +151,7 @@ impl Werewolf {
     /// A werewolf named `me` that has observed nothing yet. Its pack arrives
     /// in the moderator's `Assigned` narration.
     #[must_use]
-    pub fn new(me: AgentId) -> Self {
+    pub fn new(me: ActorId) -> Self {
         Self {
             knowledge: Knowledge::new(me, Role::Werewolf),
         }
@@ -169,7 +169,7 @@ impl Player for Werewolf {
 
     /// Eating a packmate is in the action space; see the
     /// [module documentation](self).
-    fn action_space(&self, kind: RequestKind) -> Vec<AgentId> {
+    fn action_space(&self, kind: RequestKind) -> Vec<ActorId> {
         base_action_space(&self.knowledge, kind)
     }
 }
@@ -183,7 +183,7 @@ pub struct Seer {
 impl Seer {
     /// A seer named `me` that has observed nothing yet.
     #[must_use]
-    pub fn new(me: AgentId) -> Self {
+    pub fn new(me: ActorId) -> Self {
         Self {
             knowledge: Knowledge::new(me, Role::Seer),
         }
@@ -201,7 +201,7 @@ impl Player for Seer {
 
     /// Re-investigating someone is in the action space: permitted but
     /// pointless, and "pointless" is the policy's judgment to make.
-    fn action_space(&self, kind: RequestKind) -> Vec<AgentId> {
+    fn action_space(&self, kind: RequestKind) -> Vec<ActorId> {
         base_action_space(&self.knowledge, kind)
     }
 }
@@ -217,7 +217,7 @@ impl Doctor {
     /// A doctor named `me` that has observed nothing yet and protected
     /// nobody.
     #[must_use]
-    pub fn new(me: AgentId) -> Self {
+    pub fn new(me: ActorId) -> Self {
         Self {
             knowledge: Knowledge::new(me, Role::Doctor),
         }
@@ -236,7 +236,7 @@ impl Player for Doctor {
     /// For `Protect`, everyone living but itself and whoever it protected
     /// last night, which its knowledge remembers. `Abstain` is always there,
     /// so the space is never empty.
-    fn action_space(&self, kind: RequestKind) -> Vec<AgentId> {
+    fn action_space(&self, kind: RequestKind) -> Vec<ActorId> {
         base_action_space(&self.knowledge, kind)
     }
 }
@@ -269,7 +269,7 @@ mod tests {
     }
 
     /// Selects `target` for a `Protect`, the way a seat would.
-    fn protected(doctor: &mut Doctor, target: &AgentId) {
+    fn protected(doctor: &mut Doctor, target: &ActorId) {
         doctor.knowledge_mut().acted(RequestKind::Protect, target);
     }
 

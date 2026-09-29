@@ -1,12 +1,16 @@
 //! Everything said in a Werewolf episode: the [`Message`] payload and the
 //! vocabulary of rounds, phases, sessions and targets it is built from.
+//!
+//! The [`Message`] here is this game's payload. The runtime's envelope,
+//! which carries one between actors, is [`crate::Message`]; the two are
+//! told apart by the module path.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::num::NonZero;
 
 use super::role::{Faction, Role};
-use crate::event::AgentId;
+use crate::message::ActorId;
 
 /// A round of the game, counted from 1. Each round is a night then a day.
 ///
@@ -69,6 +73,10 @@ pub enum Phase {
 /// Every agent in an episode shares this one payload type, so it covers
 /// moderator-to-player and player-to-moderator traffic alike. Serializes as
 /// an object with one field, named after the variant.
+///
+/// This is the payload, not the envelope that carries it: a
+/// [`crate::Message`] is what travels between actors, and its `payload`
+/// field is one of these.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Message {
     /// Moderator to chosen players: something they now observe.
@@ -88,7 +96,7 @@ pub enum Narration {
         role: Role,
         /// The werewolves. Non-empty only when the recipient is one of them:
         /// no message naming the pack is ever addressed to anyone else.
-        pack: BTreeSet<AgentId>,
+        pack: BTreeSet<ActorId>,
     },
     /// To the living: a phase has begun.
     PhaseBegan {
@@ -97,12 +105,12 @@ pub enum Narration {
         /// Which half of the round.
         phase: Phase,
         /// Everyone still in the game.
-        living: BTreeSet<AgentId>,
+        living: BTreeSet<ActorId>,
     },
     /// To the seer alone: what it learned tonight.
     Investigated {
         /// The player it looked at.
-        target: AgentId,
+        target: ActorId,
         /// The side that player is on.
         faction: Faction,
     },
@@ -110,7 +118,7 @@ pub enum Narration {
     /// of the game, and their role is revealed.
     Eliminated {
         /// The eliminated player.
-        who: AgentId,
+        who: ActorId,
         /// The role they held.
         role: Role,
         /// The round it happened in.
@@ -156,7 +164,7 @@ pub struct Outcome {
     /// The round the game ended in.
     pub rounds: Round,
     /// Everyone still in the game at the end.
-    pub living: BTreeSet<AgentId>,
+    pub living: BTreeSet<ActorId>,
 }
 
 /// What one of a phase's sessions is for.
@@ -212,7 +220,7 @@ pub struct Select {
     /// Which of the phase's sessions this is: what the selection is for.
     pub kind: RequestKind,
     /// The player selected.
-    pub target: AgentId,
+    pub target: ActorId,
     /// The other players who should see this selection, for the moderator to
     /// forward it to.
     ///
@@ -222,7 +230,7 @@ pub struct Select {
     /// `Nominate` the rest of the living, and in neither case does it name
     /// the sender or the moderator.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
-    pub seen_by: BTreeSet<AgentId>,
+    pub seen_by: BTreeSet<ActorId>,
 }
 
 #[cfg(test)]
@@ -230,7 +238,7 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
-    use crate::event::Payload;
+    use crate::message::Payload;
     use crate::testing::json;
 
     /// Every narration variant, each with the JSON shape it serializes to.
@@ -239,7 +247,7 @@ mod tests {
             (
                 Narration::Assigned {
                     role: Role::Werewolf,
-                    pack: ["wanda", "wolfgang"].map(AgentId::new).into(),
+                    pack: ["wanda", "wolfgang"].map(ActorId::new).into(),
                 },
                 json!({"Assigned": {"role": "Werewolf", "pack": ["wanda", "wolfgang"]}}),
             ),
@@ -247,20 +255,20 @@ mod tests {
                 Narration::PhaseBegan {
                     round: Round::new(1),
                     phase: Phase::Night,
-                    living: ["alice", "bob"].map(AgentId::new).into(),
+                    living: ["alice", "bob"].map(ActorId::new).into(),
                 },
                 json!({"PhaseBegan": {"round": 1, "phase": "Night", "living": ["alice", "bob"]}}),
             ),
             (
                 Narration::Investigated {
-                    target: AgentId::new("bob"),
+                    target: ActorId::new("bob"),
                     faction: Faction::Village,
                 },
                 json!({"Investigated": {"target": "bob", "faction": "Village"}}),
             ),
             (
                 Narration::Eliminated {
-                    who: AgentId::new("bob"),
+                    who: ActorId::new("bob"),
                     role: Role::Seer,
                     round: Round::new(2),
                     cause: Cause::Lynched,
@@ -277,7 +285,7 @@ mod tests {
                 Narration::Outcome(Outcome {
                     winner: Some(Faction::Werewolves),
                     rounds: Round::new(3),
-                    living: ["wanda"].map(AgentId::new).into(),
+                    living: ["wanda"].map(ActorId::new).into(),
                 }),
                 json!({"Outcome": {"winner": "Werewolves", "rounds": 3, "living": ["wanda"]}}),
             ),
@@ -285,7 +293,7 @@ mod tests {
     }
 
     /// One message of every kind, including every narration, each with the
-    /// JSON shape it serializes to. Between them they hold an `AgentId` in
+    /// JSON shape it serializes to. Between them they hold an actor id in
     /// every position the type has one, so a round trip over this table is
     /// the round trip a trajectory reader depends on.
     fn every_message() -> Vec<(Message, Value)> {
@@ -297,7 +305,7 @@ mod tests {
             Message::Select(Select {
                 round: Round::new(1),
                 kind: RequestKind::Devour,
-                target: AgentId::new("alice"),
+                target: ActorId::new("alice"),
                 seen_by: BTreeSet::new(),
             }),
             json!({"Select": {"round": 1, "kind": "Devour", "target": "alice"}}),
@@ -379,7 +387,7 @@ mod tests {
             json(&Select {
                 round: Round::new(3),
                 kind: RequestKind::Nominate,
-                target: AgentId::new("alice"),
+                target: ActorId::new("alice"),
                 seen_by: BTreeSet::new(),
             }),
             json!({"round": 3, "kind": "Nominate", "target": "alice"})
@@ -388,9 +396,9 @@ mod tests {
 
     #[test]
     fn agent_id_serializes_as_a_bare_string_and_deserializes_from_one() {
-        let alice = AgentId::new("alice");
+        let alice = ActorId::new("alice");
         assert_eq!(json(&alice), json!("alice"));
-        let back: AgentId = serde_json::from_value(json!("alice")).unwrap();
+        let back: ActorId = serde_json::from_value(json!("alice")).unwrap();
         assert_eq!(back, alice);
     }
 }

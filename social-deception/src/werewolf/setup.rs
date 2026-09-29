@@ -57,7 +57,7 @@ use super::role::Role;
 use super::roles::{Doctor, Seer, Villager, Werewolf};
 use crate::agent::Handler;
 use crate::episode::{Episode, EpisodeError};
-use crate::event::AgentId;
+use crate::message::ActorId;
 use crate::trajectory::{JsonLines, LogRecord, Policy, Sink, Writer};
 
 /// Why a run did not end with an outcome.
@@ -162,7 +162,7 @@ fn moderate(
 }
 
 /// Seats `who` in the roster as its role, with a policy seeded for it.
-fn seat(episode: &mut Episode<WerewolfDomain>, config: &Config, who: &AgentId, role: Role) {
+fn seat(episode: &mut Episode<WerewolfDomain>, config: &Config, who: &ActorId, role: Role) {
     let policy = RandomPolicy::for_agent(config.seed, who);
     let moderator = config.moderator.clone();
     let me = who.clone();
@@ -190,7 +190,7 @@ fn seat(episode: &mut Episode<WerewolfDomain>, config: &Config, who: &AgentId, r
 /// not an error of its own.
 fn add(
     episode: &mut Episode<WerewolfDomain>,
-    who: &AgentId,
+    who: &ActorId,
     handler: impl Handler<WerewolfDomain> + Send + 'static,
 ) {
     episode
@@ -301,7 +301,7 @@ mod tests {
     ) -> Config {
         let config = Config {
             seed: SEED,
-            players: players.map(AgentId::new).into(),
+            players: players.map(ActorId::new).into(),
             roles: RoleCounts {
                 werewolves,
                 seers,
@@ -334,7 +334,7 @@ mod tests {
     /// Asserts that `outcome` is a finished game among `config`'s players,
     /// decided within as many rounds as there are players.
     fn check(config: &Config, outcome: &Outcome) {
-        let players: BTreeSet<&AgentId> = config.players.iter().collect();
+        let players: BTreeSet<&ActorId> = config.players.iter().collect();
         // No lower bound to check: a `Round` cannot be zero, so that a
         // finished game lasted at least one round is the type's guarantee.
         assert!(
@@ -352,7 +352,7 @@ mod tests {
     fn the_roster_is_every_player_and_the_moderator() {
         let (records, _writer) = Writer::spawn(Vec::new());
         let (episode, _outcomes) = episode(&town(), records);
-        let roster: BTreeSet<AgentId> = episode.ids().cloned().collect();
+        let roster: BTreeSet<ActorId> = episode.ids().cloned().collect();
         assert_eq!(
             roster,
             ids([

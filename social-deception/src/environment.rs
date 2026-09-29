@@ -44,11 +44,11 @@
 //! The environment runs in [`Agent`](crate::Agent)'s loop, wrapped in the
 //! adapter this module provides, so everything said about a cycle is true
 //! of it: it takes the controls at the head of its queue before the one
-//! event behind them, it observes one thing per cycle, and its
+//! message behind them, it observes one thing per cycle, and its
 //! `Effect::Act` actions are stamped, logged and sent exactly as an
 //! agent's. The one thing the adapter adds is the seam the controls leave
 //! by, and the two controls leave it differently. A `Start` goes out as
-//! soon as the episode sees it, ahead of the events of the cycle that
+//! soon as the episode sees it, ahead of the messages of the cycle that
 //! asked for it, so that an agent is started before anything is addressed
 //! to it. A `Stop` is held until nothing is in flight, so a player told to
 //! stop in the same cycle it is told something first observes the message
@@ -61,14 +61,14 @@ use crossbeam_channel::Sender;
 
 use crate::agent::{Action, Handler, Observation};
 use crate::clock::{Clock, Timestamp};
-use crate::event::{AgentId, Control, Domain};
+use crate::message::{ActorId, Control, Domain};
 use crate::trajectory::{LogRecord, RewardRecord};
 
 /// What an environment's cycle produces: an action like any agent's, a
 /// control for some of the agents, or a reward for one of them.
 ///
 /// `Debug`, `Clone` and equality are written out rather than derived, for
-/// the reason [`Event`](crate::Event)'s are: a derive would ask them of
+/// the reason [`Message`](crate::Message)'s are: a derive would ask them of
 /// `D`, the marker type, when what has to have them is `D::Payload`.
 pub enum Effect<D: Domain> {
     /// Say something, as any agent says anything.
@@ -77,7 +77,7 @@ pub enum Effect<D: Domain> {
     Control {
         /// The agents told. Never the environment itself: the episode is
         /// what starts and stops the environment.
-        to: BTreeSet<AgentId>,
+        to: BTreeSet<ActorId>,
         /// What they are told.
         control: Control,
     },
@@ -90,7 +90,7 @@ pub enum Effect<D: Domain> {
         /// The agent rewarded, whose trajectory the record belongs to.
         /// Never the environment itself, which plays no game and so has
         /// nothing to be rewarded for.
-        agent: AgentId,
+        agent: ActorId,
         /// What its behavior was worth, in the game's own units.
         value: D::Reward,
     },
@@ -101,7 +101,7 @@ impl<D: Domain> Effect<D> {
     pub fn control<I, A>(to: I, control: Control) -> Self
     where
         I: IntoIterator<Item = A>,
-        A: Into<AgentId>,
+        A: Into<ActorId>,
     {
         Self::Control {
             to: to.into_iter().map(Into::into).collect(),
@@ -110,7 +110,7 @@ impl<D: Domain> Effect<D> {
     }
 
     /// A reward of `value` for `agent`.
-    pub fn reward(agent: impl Into<AgentId>, value: D::Reward) -> Self {
+    pub fn reward(agent: impl Into<ActorId>, value: D::Reward) -> Self {
         Self::Reward {
             agent: agent.into(),
             value,
@@ -271,7 +271,7 @@ impl<D: Domain, E: Environment<D> + ?Sized> Environment<D> for Box<E> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Commanded {
     /// The agents told.
-    pub to: BTreeSet<AgentId>,
+    pub to: BTreeSet<ActorId>,
     /// What they are told.
     pub control: Control,
 }
@@ -286,7 +286,7 @@ pub struct Commanded {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rewarded {
     /// The agent rewarded.
-    pub agent: AgentId,
+    pub agent: ActorId,
 }
 
 /// An [`Environment`] wearing a [`Handler`]'s face, so that the agent loop
@@ -323,7 +323,7 @@ pub struct Rewarded {
 /// running, which is strictly before the loop sends that cycle's dispatch.
 /// The episode never looks at `commands` except just after it has taken a
 /// dispatch off the environment's, so a control this cycle asked for is
-/// already there to be found, and the events it accompanies have already
+/// already there to be found, and the messages it accompanies have already
 /// been routed. That is the whole of the ordering guarantee, and it is what
 /// makes "narrate the outcome, then stop everybody" a thing one cycle can
 /// say: each player observes the narration and stops afterwards, rather
@@ -333,7 +333,7 @@ pub struct Adapter<D: Domain, E> {
     /// Whom this episode may reward: every agent in the roster but the
     /// environment itself. Fixed before any thread is spawned and never
     /// added to, so the adapter can answer the question rather than ask.
-    rewardable: BTreeSet<AgentId>,
+    rewardable: BTreeSet<ActorId>,
     commands: Sender<Commanded>,
     rewards: Sender<Rewarded>,
     records: Sender<LogRecord<D>>,
@@ -346,7 +346,7 @@ impl<D: Domain, E: Environment<D>> Adapter<D, E> {
     /// naming each rewarded agent on `rewards` for the episode to check.
     pub const fn new(
         environment: E,
-        rewardable: BTreeSet<AgentId>,
+        rewardable: BTreeSet<ActorId>,
         commands: Sender<Commanded>,
         rewards: Sender<Rewarded>,
         records: Sender<LogRecord<D>>,
@@ -442,7 +442,7 @@ mod tests {
     use crossbeam_channel::{Receiver, unbounded};
 
     use super::*;
-    use crate::event::Event;
+    use crate::message::Message;
     use crate::testing::{TestDomain, TestPayload, id, ids};
 
     /// The one observation a cycle hands the adapter. What it says never
@@ -450,7 +450,7 @@ mod tests {
     /// three effects, and these tests are about where each effect goes.
     fn observation() -> Observation<TestDomain> {
         Observation {
-            event: Event::new(
+            message: Message::new(
                 "a",
                 ["environment"],
                 Timestamp::default(),

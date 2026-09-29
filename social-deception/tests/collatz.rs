@@ -91,16 +91,16 @@ fn run(ring: &Ring) -> Vec<Value> {
     lines
 }
 
-/// The step a record's event carries, as the chain's name and the value, or
+/// The step a record's message carries, as the chain's name and the value, or
 /// `None` for a `Finished`, a control or a cycle.
 fn step(record: &Value) -> Option<(u64, u64)> {
-    let step = &record["event"]["payload"]["Step"];
+    let step = &record["message"]["payload"]["Step"];
     Some((step["chain"].as_u64()?, step["value"].as_u64()?))
 }
 
 /// The chain a record reports finished, or `None` for anything else.
 fn finished(record: &Value) -> Option<u64> {
-    record["event"]["payload"]["Finished"]["chain"].as_u64()
+    record["message"]["payload"]["Finished"]["chain"].as_u64()
 }
 
 /// The records of `lines` of the given type.
@@ -136,7 +136,7 @@ fn reports(lines: &[Value]) -> Vec<u64> {
         .filter_map(|line| {
             let chain = finished(line)?;
             assert_eq!(
-                line["event"]["recipients"].as_array().unwrap().as_slice(),
+                line["message"]["recipients"].as_array().unwrap().as_slice(),
                 [Value::from(ENVIRONMENT)],
                 "a report goes to the environment and nobody else: {line}"
             );
@@ -257,9 +257,9 @@ fn check_outcome(lines: &[Value], ring: &Ring) {
         .map(|(i, (name, _))| (*name, passes_to(ring, i)))
         .collect();
     for line in of(lines, "action").filter(|line| step(line).is_some()) {
-        let recipients = line["event"]["recipients"]
+        let recipients = line["message"]["recipients"]
             .as_array()
-            .expect("an event lists its recipients");
+            .expect("a message lists its recipients");
         assert_eq!(
             recipients.as_slice(),
             [Value::from(next[support::agent(line)])],
@@ -340,11 +340,11 @@ fn interleaved_chains() -> Vec<Value> {
                            "received": received, "control": control})
     };
     // An action and the observation of it carry the same `created`: they are
-    // the same event from its two ends, and that is what joins them.
+    // the same message from its two ends, and that is what joins them.
     let action = |agent: &str, seq: u64, created: u64, chain: u64, value: u64| {
         let other = if agent == "a" { "b" } else { "a" };
         serde_json::json!({"type": "action", "agent": agent, "seq": seq, "created": created,
-                           "event": {"sender": agent, "recipients": [other],
+                           "message": {"sender": agent, "recipients": [other],
                                      "payload": {"Step": {"chain": chain, "value": value}}}})
     };
     let observation =
@@ -352,18 +352,18 @@ fn interleaved_chains() -> Vec<Value> {
             let other = if agent == "a" { "b" } else { "a" };
             serde_json::json!({"type": "observation", "agent": agent, "seq": seq,
                                "created": created, "received": received,
-                               "event": {"sender": other, "recipients": [agent],
+                               "message": {"sender": other, "recipients": [agent],
                                          "payload": {"Step": {"chain": chain, "value": value}}}})
         };
     let reported = |agent: &str, seq: u64, created: u64, chain: u64| {
         serde_json::json!({"type": "action", "agent": agent, "seq": seq, "created": created,
-                           "event": {"sender": agent, "recipients": [ENVIRONMENT],
+                           "message": {"sender": agent, "recipients": [ENVIRONMENT],
                                      "payload": {"Finished": {"chain": chain}}}})
     };
     let heard = |seq: u64, created: u64, received: u64, from: &str, chain: u64| {
         serde_json::json!({"type": "observation", "agent": ENVIRONMENT, "seq": seq,
                            "created": created, "received": received,
-                           "event": {"sender": from, "recipients": [ENVIRONMENT],
+                           "message": {"sender": from, "recipients": [ENVIRONMENT],
                                      "payload": {"Finished": {"chain": chain}}}})
     };
     let cycle = |agent: &str, t_start: u64, t_stop: u64, inputs: &[u64], outputs: &[u64]| {
@@ -427,7 +427,7 @@ fn a_step_sent_on_the_wrong_chain_is_caught() {
         .iter()
         .position(|line| line["agent"] == "b" && line["seq"] == 2)
         .unwrap();
-    lines[wrong]["event"]["payload"]["Step"]["chain"] = serde_json::json!(2);
+    lines[wrong]["message"]["payload"]["Step"]["chain"] = serde_json::json!(2);
     let ring: &Ring = &[("a", &[4, 2]), ("b", &[])];
     every_hop_follows_the_rule(&lines, ring);
 }
@@ -441,7 +441,7 @@ fn a_step_sent_to_the_wrong_agent_is_caught() {
         .iter()
         .position(|line| line["agent"] == "a" && line["seq"] == 1)
         .unwrap();
-    lines[opening]["event"]["recipients"] = serde_json::json!(["c"]);
+    lines[opening]["message"]["recipients"] = serde_json::json!(["c"]);
     let ring: &Ring = &[("a", &[4, 2]), ("b", &[])];
     check_outcome(&lines, ring);
 }

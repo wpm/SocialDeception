@@ -58,7 +58,7 @@ use super::WerewolfDomain;
 use super::message::{Cause, Message, Narration, Outcome, Phase, RequestKind, Round};
 use super::role::{Faction, Role};
 use crate::agent::Observation;
-use crate::event::AgentId;
+use crate::message::ActorId;
 
 /// What one player knows: the fold of every observation it has received.
 ///
@@ -67,7 +67,7 @@ use crate::event::AgentId;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Knowledge {
     /// This agent's own id.
-    pub me: AgentId,
+    pub me: ActorId,
     /// This agent's role, fixed at construction. The `Assigned` narration
     /// must agree with it.
     pub role: Role,
@@ -78,18 +78,18 @@ pub struct Knowledge {
     pub moment: Option<(Round, Phase)>,
     /// Everyone still in the game, as last announced and kept current
     /// between announcements.
-    pub living: BTreeSet<AgentId>,
+    pub living: BTreeSet<ActorId>,
     /// Everyone out of the game, with how and when they left and the role
     /// their death revealed.
-    pub dead: BTreeMap<AgentId, Death>,
+    pub dead: BTreeMap<ActorId, Death>,
     /// The living werewolves this agent knows of. Empty unless it is one.
-    pub pack: BTreeSet<AgentId>,
+    pub pack: BTreeSet<ActorId>,
     /// What the seer has learned, by target. Empty unless it is the seer.
-    pub investigations: BTreeMap<AgentId, Faction>,
+    pub investigations: BTreeMap<ActorId, Faction>,
     /// Whom the doctor protected last night, if anyone: the one player the
     /// rules keep it from protecting again tonight. `None` unless it is the
     /// doctor and it selected somewhere last night.
-    pub last_protected: Option<AgentId>,
+    pub last_protected: Option<ActorId>,
     /// The latest target of each player whose selection this agent has seen
     /// in the current phase, including its own, cleared when a new phase
     /// begins.
@@ -99,7 +99,7 @@ pub struct Knowledge {
     /// addressed, plus what it selected itself: a villager never sees a
     /// `Devour`, and nobody but the moderator sees an `Investigate` or a
     /// `Protect`.
-    pub selections: BTreeMap<AgentId, AgentId>,
+    pub selections: BTreeMap<ActorId, ActorId>,
     /// How each finished phase selected, oldest first: the `selections` of
     /// that phase, archived when the next one began.
     ///
@@ -139,13 +139,13 @@ pub struct Phased {
     /// selection it *sent*, which may have lost its race with the session's
     /// clock: whether a last-second selection counted is the moderator's
     /// bookkeeping and no agent is told it (ADR-0015).
-    pub selections: BTreeMap<AgentId, AgentId>,
+    pub selections: BTreeMap<ActorId, ActorId>,
 }
 
 impl Knowledge {
     /// The state of a player that has observed nothing yet.
     #[must_use]
-    pub fn new(me: AgentId, role: Role) -> Self {
+    pub fn new(me: ActorId, role: Role) -> Self {
         Self {
             me,
             role,
@@ -172,7 +172,7 @@ impl Knowledge {
     /// `Protect` is also remembered on its own as
     /// [`last_protected`](Self::last_protected), because the rules ask for it
     /// by name the next night.
-    pub fn acted(&mut self, kind: RequestKind, chosen: &AgentId) {
+    pub fn acted(&mut self, kind: RequestKind, chosen: &ActorId) {
         self.selections.insert(self.me.clone(), chosen.clone());
         if kind == RequestKind::Protect {
             self.last_protected = Some(chosen.clone());
@@ -197,7 +197,7 @@ impl Knowledge {
     /// fails at the start of the episode rather than producing a plausible
     /// game.
     pub fn observe(&mut self, observation: &Observation<WerewolfDomain>) {
-        match &observation.event.payload {
+        match &observation.message.payload {
             Message::Narration(narration) => self.narrated(narration),
             // The sender's latest selection, which replaces whatever it
             // selected before. The session is not checked: a selection this
@@ -205,7 +205,7 @@ impl Knowledge {
             // the phase's own `PhaseBegan` is what clears the slate.
             Message::Select(selection) => {
                 self.selections
-                    .insert(observation.event.sender.clone(), selection.target.clone());
+                    .insert(observation.message.sender.clone(), selection.target.clone());
             }
         }
     }
@@ -276,7 +276,7 @@ impl Knowledge {
 
     /// Whether `who` is still in the game.
     #[must_use]
-    pub fn is_living(&self, who: &AgentId) -> bool {
+    pub fn is_living(&self, who: &ActorId) -> bool {
         self.living.contains(who)
     }
 
@@ -284,7 +284,7 @@ impl Knowledge {
     /// space. Sorted, so that an index into an action space built from it
     /// is a stable action label.
     #[must_use]
-    pub fn living_others(&self) -> BTreeSet<AgentId> {
+    pub fn living_others(&self) -> BTreeSet<ActorId> {
         self.living
             .iter()
             .filter(|who| **who != self.me)
@@ -296,29 +296,33 @@ impl Knowledge {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::Event;
     use crate::testing::{ME, from, id, ids, narrated, observed, phase_began, target};
     use crate::werewolf::message::Select;
 
-    fn votes<const N: usize>(votes: [(&str, AgentId); N]) -> BTreeMap<AgentId, AgentId> {
+    fn votes<const N: usize>(votes: [(&str, ActorId); N]) -> BTreeMap<ActorId, ActorId> {
         votes
             .into_iter()
             .map(|(who, action)| (id(who), action))
             .collect()
     }
 
-    fn assigned(role: Role, pack: BTreeSet<AgentId>) -> Event<WerewolfDomain> {
+    fn assigned(role: Role, pack: BTreeSet<ActorId>) -> crate::Message<WerewolfDomain> {
         narrated(Narration::Assigned { role, pack })
     }
 
-    fn investigated(target: &str, faction: Faction) -> Event<WerewolfDomain> {
+    fn investigated(target: &str, faction: Faction) -> crate::Message<WerewolfDomain> {
         narrated(Narration::Investigated {
             target: id(target),
             faction,
         })
     }
 
-    fn eliminated(who: &str, role: Role, round: u32, cause: Cause) -> Event<WerewolfDomain> {
+    fn eliminated(
+        who: &str,
+        role: Role,
+        round: u32,
+        cause: Cause,
+    ) -> crate::Message<WerewolfDomain> {
         narrated(Narration::Eliminated {
             who: id(who),
             role,
@@ -335,21 +339,21 @@ mod tests {
         }
     }
 
-    /// A fresh state for this agent with every event folded in, in order.
+    /// A fresh state for this agent with every message folded in, in order.
     fn folded<'a>(
         role: Role,
-        events: impl IntoIterator<Item = &'a Event<WerewolfDomain>>,
+        messages: impl IntoIterator<Item = &'a crate::Message<WerewolfDomain>>,
     ) -> Knowledge {
         let mut knowledge = Knowledge::new(id(ME), role);
-        for event in events {
-            knowledge.observe(&observed(event.clone()));
+        for message in messages {
+            knowledge.observe(&observed(message.clone()));
         }
         knowledge
     }
 
     /// The day-1 selections of [`a_seers_game`], as this seer saw them: the
     /// other living players' nominations, forwarded to it one by one.
-    fn day_selections() -> BTreeMap<AgentId, AgentId> {
+    fn day_selections() -> BTreeMap<ActorId, ActorId> {
         votes([
             ("bob", target("carol")),
             ("carol", target("bob")),
@@ -359,7 +363,7 @@ mod tests {
 
     /// One player's nomination, forwarded by the moderator as the player
     /// that made it (ADR-0014).
-    fn nominated(who: &str, whom: &str, round: u32) -> Event<WerewolfDomain> {
+    fn nominated(who: &str, whom: &str, round: u32) -> crate::Message<WerewolfDomain> {
         from(
             who,
             Message::Select(Select {
@@ -372,7 +376,7 @@ mod tests {
     }
 
     /// A seer's whole game, from the deal to the werewolves' win.
-    fn a_seers_game() -> Vec<Event<WerewolfDomain>> {
+    fn a_seers_game() -> Vec<crate::Message<WerewolfDomain>> {
         vec![
             assigned(Role::Seer, BTreeSet::new()),
             phase_began(
@@ -536,10 +540,10 @@ mod tests {
         let no_ops = [narrated(Narration::NoDeath {
             round: Round::new(2),
         })];
-        for event in &no_ops {
+        for message in &no_ops {
             let mut after = knowledge.clone();
-            after.observe(&observed(event.clone()));
-            assert_eq!(after, knowledge, "{event:?}");
+            after.observe(&observed(message.clone()));
+            assert_eq!(after, knowledge, "{message:?}");
         }
     }
 

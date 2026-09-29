@@ -61,7 +61,7 @@ use serde_json::{Map, Value};
 
 use super::message::{Cause, Message, Narration, Outcome, Phase, RequestKind, Round, Select};
 use super::role::{Faction, Role};
-use crate::event::AgentId;
+use crate::message::ActorId;
 
 /// A game of Werewolf as its moderator recorded it: everything that is
 /// reproducible about a run, and nothing that is not.
@@ -70,7 +70,7 @@ use crate::event::AgentId;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Transcript {
     /// Each player's role, as the moderator dealt it.
-    pub assignment: BTreeMap<AgentId, Role>,
+    pub assignment: BTreeMap<ActorId, Role>,
     /// Every round, in order.
     pub rounds: Vec<RoundRecord>,
     /// How the game ended.
@@ -84,7 +84,7 @@ pub struct Transcript {
     /// is part of the logical game and so part of what two runs of one
     /// seed must agree on, which is why it is here and not left to a
     /// reader of the raw file.
-    pub rewards: BTreeMap<AgentId, i32>,
+    pub rewards: BTreeMap<ActorId, i32>,
 }
 
 /// One round: a night, then a day unless the game ended at night.
@@ -102,31 +102,31 @@ pub struct RoundRecord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PhaseRecord {
     /// Everyone in the game when the phase began.
-    pub living: BTreeSet<AgentId>,
+    pub living: BTreeSet<ActorId>,
     /// Every selection made this phase, by the player that made it, paired
     /// with the kind of session it was made in. The target alone does not
     /// say whether it was devoured, protected, investigated or nominated.
-    pub moves: BTreeMap<AgentId, (RequestKind, AgentId)>,
+    pub moves: BTreeMap<ActorId, (RequestKind, ActorId)>,
     /// What each seer learned: whom it investigated and the faction that
     /// came back, by seer. Empty on a phase where no seer investigated,
     /// and holding one entry per seer that did, since a game may deal
     /// more than one.
-    pub investigations: BTreeMap<AgentId, (AgentId, Faction)>,
+    pub investigations: BTreeMap<ActorId, (ActorId, Faction)>,
     /// Who was eliminated, the role their death revealed, and how. `None`
     /// on a night when nobody died and on a day that ran out of time.
-    pub eliminated: Option<(AgentId, Role, Cause)>,
+    pub eliminated: Option<(ActorId, Role, Cause)>,
     /// Whether this day closed at its limit with no majority, so that a
     /// day with nobody lynched is told from a day still being read
     /// (ADR-0011). Always false for a night.
     pub no_lynch: bool,
     /// The player whose selection completed the majority that ended the day:
     /// the *hammer*. `None` for a night, and for a day that ran out.
-    pub hammer: Option<AgentId>,
+    pub hammer: Option<ActorId>,
 }
 
 impl PhaseRecord {
     /// A phase in which nothing has happened yet.
-    fn begun(living: BTreeSet<AgentId>) -> Self {
+    fn begun(living: BTreeSet<ActorId>) -> Self {
         Self {
             living,
             moves: BTreeMap::new(),
@@ -193,7 +193,7 @@ pub enum TranscriptError {
         /// The line.
         line: usize,
         /// The selecting agent.
-        from: AgentId,
+        from: ActorId,
         /// The session it selected in.
         kind: RequestKind,
     },
@@ -305,13 +305,13 @@ enum Line<'a> {
     Numbered {
         /// The record.
         record: &'a Map<String, Value>,
-        /// Which way its event went, or `None` if it carries no event.
+        /// Which way its message went, or `None` if it carries no message.
         direction: Option<Direction>,
     },
     /// A reward: the agent paid and what it was paid.
     Reward {
         /// The agent rewarded.
-        agent: AgentId,
+        agent: ActorId,
         /// What its game was worth.
         value: i32,
     },
@@ -321,8 +321,8 @@ enum Line<'a> {
 struct Record {
     line: usize,
     direction: Direction,
-    sender: AgentId,
-    recipients: BTreeSet<AgentId>,
+    sender: ActorId,
+    recipients: BTreeSet<ActorId>,
     message: Message,
 }
 
@@ -335,9 +335,9 @@ struct Record {
 pub struct Verdict {
     /// Who was eliminated and how, or `None` for a night nobody died in
     /// and a day nobody was lynched in.
-    pub eliminated: Option<(AgentId, Role, Cause)>,
+    pub eliminated: Option<(ActorId, Role, Cause)>,
     /// What each seer learned this phase.
-    pub investigations: BTreeMap<AgentId, (AgentId, Faction)>,
+    pub investigations: BTreeMap<ActorId, (ActorId, Faction)>,
 }
 
 /// Everything a run of one seed must reproduce (ADR-0011).
@@ -350,13 +350,13 @@ pub struct Verdict {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Verdicts {
     /// Each player's role, as the moderator dealt it.
-    pub assignment: BTreeMap<AgentId, Role>,
+    pub assignment: BTreeMap<ActorId, Role>,
     /// Each phase in order, night before day.
     pub phases: Vec<Verdict>,
     /// How the game ended.
     pub outcome: Outcome,
     /// What each player's game was worth.
-    pub rewards: BTreeMap<AgentId, i32>,
+    pub rewards: BTreeMap<ActorId, i32>,
 }
 
 impl Transcript {
@@ -402,7 +402,7 @@ impl Transcript {
     /// A [`TranscriptError`] naming the first line that keeps the file from
     /// being a game, or [`TranscriptError::NoOutcome`] if the moderator's
     /// records end without one.
-    pub fn read(lines: &[Value], moderator: &AgentId) -> Result<Self, TranscriptError> {
+    pub fn read(lines: &[Value], moderator: &ActorId) -> Result<Self, TranscriptError> {
         let mut reader = Reader::default();
         let mut next_seq = 0;
         let mut rewards = BTreeMap::new();
@@ -461,7 +461,7 @@ impl Transcript {
 fn read_line<'a>(
     value: &'a Value,
     line: usize,
-    moderator: &AgentId,
+    moderator: &ActorId,
 ) -> Result<Option<Line<'a>>, TranscriptError> {
     let record = value
         .as_object()
@@ -474,7 +474,7 @@ fn read_line<'a>(
         // it does not look like a gap.
         Some("control") => None,
         Some("reward") => {
-            let agent: AgentId = decode(record, "agent", line)?;
+            let agent: ActorId = decode(record, "agent", line)?;
             let value = record
                 .get("value")
                 .and_then(Value::as_i64)
@@ -494,19 +494,19 @@ fn read_line<'a>(
     Ok((agent == moderator.as_str()).then_some(Line::Numbered { record, direction }))
 }
 
-/// Decodes an event record's envelope and payload.
+/// Decodes a message record's envelope and payload.
 fn message(
     record: &Map<String, Value>,
     direction: Direction,
     line: usize,
 ) -> Result<Record, TranscriptError> {
-    let event = record
-        .get("event")
+    let message = record
+        .get("message")
         .and_then(Value::as_object)
-        .ok_or_else(|| malformed(line, "no event"))?;
-    let sender: AgentId = decode(event, "sender", line)?;
-    let recipients: BTreeSet<AgentId> = decode(event, "recipients", line)?;
-    let payload = event
+        .ok_or_else(|| malformed(line, "no message"))?;
+    let sender: ActorId = decode(message, "sender", line)?;
+    let recipients: BTreeSet<ActorId> = decode(message, "recipients", line)?;
+    let payload = message
         .get("payload")
         .ok_or_else(|| malformed(line, "no payload"))?;
     let message = Message::deserialize(payload)
@@ -561,9 +561,9 @@ fn decode<T: serde::de::DeserializeOwned>(
 /// addressed to none or to several.
 fn only(
     line: usize,
-    recipients: BTreeSet<AgentId>,
+    recipients: BTreeSet<ActorId>,
     what: &str,
-) -> Result<AgentId, TranscriptError> {
+) -> Result<ActorId, TranscriptError> {
     let mut recipients = recipients.into_iter();
     match (recipients.next(), recipients.next()) {
         (Some(who), None) => Ok(who),
@@ -574,7 +574,7 @@ fn only(
 /// The game so far, as a fold over the moderator's records.
 #[derive(Default)]
 struct Reader {
-    assignment: BTreeMap<AgentId, Role>,
+    assignment: BTreeMap<ActorId, Role>,
     rounds: Vec<RoundRecord>,
     /// The player that made the latest nomination the moderator passed
     /// on, and which is therefore still a candidate for the hammer.
@@ -586,7 +586,7 @@ struct Reader {
     /// whose selection ended the day, and no narration has to say so
     /// (ADR-0015). Cleared when a phase begins, so that a lynching can
     /// never take its hammer from the day before.
-    latest_nomination: Option<AgentId>,
+    latest_nomination: Option<ActorId>,
     /// How the game ended, once the moderator has announced it. `None`
     /// until then, and still `None` at the end of a truncated transcript,
     /// which is [`TranscriptError::NoOutcome`].
@@ -629,7 +629,7 @@ impl Reader {
     fn narrated(
         &mut self,
         line: usize,
-        recipients: BTreeSet<AgentId>,
+        recipients: BTreeSet<ActorId>,
         narration: Narration,
     ) -> Result<(), TranscriptError> {
         match narration {
@@ -692,7 +692,7 @@ impl Reader {
     fn answered(
         &mut self,
         line: usize,
-        from: AgentId,
+        from: ActorId,
         selection: Select,
     ) -> Result<(), TranscriptError> {
         // The selection says which session it was made in, so there is
@@ -783,7 +783,7 @@ impl fmt::Display for Transcript {
         }
         let plural = if rounds == 1 { "" } else { "s" };
         write!(f, " after {rounds} round{plural}.  Survivors: ")?;
-        let survivors: Vec<&str> = self.outcome.living.iter().map(AgentId::as_str).collect();
+        let survivors: Vec<&str> = self.outcome.living.iter().map(ActorId::as_str).collect();
         if survivors.is_empty() {
             writeln!(f, "none")?;
         } else {
@@ -891,7 +891,7 @@ mod tests {
 
     const MODERATOR: &str = "moderator";
 
-    fn moderator() -> AgentId {
+    fn moderator() -> ActorId {
         id(MODERATOR)
     }
 
@@ -903,13 +903,13 @@ mod tests {
         Transcript::read(lines, &moderator())
     }
 
-    fn target(who: &str) -> AgentId {
+    fn target(who: &str) -> ActorId {
         id(who)
     }
 
     fn moves<const N: usize>(
-        moves: [(&str, RequestKind, AgentId); N],
-    ) -> BTreeMap<AgentId, (RequestKind, AgentId)> {
+        moves: [(&str, RequestKind, ActorId); N],
+    ) -> BTreeMap<ActorId, (RequestKind, ActorId)> {
         moves
             .into_iter()
             .map(|(who, kind, chosen)| (id(who), (kind, chosen)))
@@ -918,7 +918,7 @@ mod tests {
 
     fn nominations<const N: usize>(
         votes: [(&str, &str); N],
-    ) -> BTreeMap<AgentId, (RequestKind, AgentId)> {
+    ) -> BTreeMap<ActorId, (RequestKind, ActorId)> {
         votes
             .into_iter()
             .map(|(who, whom)| (id(who), (RequestKind::Nominate, target(whom))))
@@ -927,7 +927,7 @@ mod tests {
 
     fn phase<const N: usize>(
         living: [&str; N],
-        moves: BTreeMap<AgentId, (RequestKind, AgentId)>,
+        moves: BTreeMap<ActorId, (RequestKind, ActorId)>,
         investigation: Option<(&str, &str, Faction)>,
         eliminated: Option<(&str, Role, Cause)>,
     ) -> PhaseRecord {
@@ -1323,15 +1323,15 @@ mod tests {
         assert!(matches!(error, TranscriptError::NoOutcome), "{error:?}");
     }
 
-    /// The index of the first of the moderator's records that carries an
-    /// event whose payload satisfies `matching`.
+    /// The index of the first of the moderator's records that carries a
+    /// message whose payload satisfies `matching`.
     fn moderator_record(lines: &[Value], matching: impl Fn(&Value) -> bool) -> usize {
         lines
             .iter()
             .position(|line| {
                 line["agent"] == MODERATOR
                     && (line["type"] == "action" || line["type"] == "observation")
-                    && matching(&line["event"]["payload"])
+                    && matching(&line["message"]["payload"])
             })
             .expect("the fixture has such a record")
     }
@@ -1401,7 +1401,7 @@ mod tests {
     #[test]
     fn a_record_missing_part_of_its_envelope_is_an_error() {
         let index = moderator_record(&fixture(), is_selection);
-        for key in ["agent", "seq", "event"] {
+        for key in ["agent", "seq", "message"] {
             let mut lines = fixture();
             lines[index].as_object_mut().unwrap().remove(key);
             let error = read(&lines).unwrap_err();
@@ -1413,7 +1413,7 @@ mod tests {
         }
         for key in ["sender", "recipients", "payload"] {
             let mut lines = fixture();
-            lines[index]["event"].as_object_mut().unwrap().remove(key);
+            lines[index]["message"].as_object_mut().unwrap().remove(key);
             let error = read(&lines).unwrap_err();
             assert!(
                 matches!(&error, TranscriptError::Malformed { line, what }
@@ -1441,7 +1441,7 @@ mod tests {
     fn a_payload_that_will_not_deserialize_is_an_error() {
         let mut lines = fixture();
         let index = moderator_record(&lines, is_selection);
-        lines[index]["event"]["payload"] = json!({"Response": {"request": "seven"}});
+        lines[index]["message"]["payload"] = json!({"Response": {"request": "seven"}});
         let error = read(&lines).unwrap_err();
         assert!(
             matches!(&error, TranscriptError::Payload { line, .. } if *line == index + 1),
@@ -1476,7 +1476,7 @@ mod tests {
         let mut lines = fixture();
         let index = moderator_record(&lines, is_selection);
         let kind: RequestKind =
-            serde_json::from_value(lines[index]["event"]["payload"]["Select"]["kind"].clone())
+            serde_json::from_value(lines[index]["message"]["payload"]["Select"]["kind"].clone())
                 .expect("a selection names its session");
         let forged = [
             RequestKind::Devour,
@@ -1486,7 +1486,7 @@ mod tests {
         .into_iter()
         .find(|other| *other != kind)
         .expect("a night has three kinds and a role is asked one");
-        lines[index]["event"]["payload"]["Select"]["kind"] = json!(forged);
+        lines[index]["message"]["payload"]["Select"]["kind"] = json!(forged);
         let error = read(&lines).unwrap_err();
         assert!(
             matches!(&error, TranscriptError::NotAMember { line, kind, .. }
@@ -1505,7 +1505,7 @@ mod tests {
         // session at all.
         let mut lines = fixture();
         let index = moderator_record(&lines, is_selection);
-        lines[index]["event"]["sender"] = json!("frank");
+        lines[index]["message"]["sender"] = json!("frank");
         let error = read(&lines).unwrap_err();
         assert!(
             matches!(&error, TranscriptError::NotAMember { from, .. } if from.as_str() == "frank"),
@@ -1519,7 +1519,7 @@ mod tests {
         // selection. A sender the deal never named has no role to check.
         let mut lines = fixture();
         let index = moderator_record(&lines, is_selection);
-        lines[index]["event"]["sender"] = json!("zara");
+        lines[index]["message"]["sender"] = json!("zara");
         let error = read(&lines).unwrap_err();
         assert!(
             matches!(&error, TranscriptError::NotAMember { from, .. } if from.as_str() == "zara"),
@@ -1544,36 +1544,36 @@ mod tests {
 
     #[test]
     fn an_empty_agent_id_is_an_error_wherever_it_appears() {
-        // `AgentId` refuses to deserialize from the empty string, so an
+        // `ActorId` refuses to deserialize from the empty string, so an
         // empty id in the envelope is a malformed envelope and one in the
         // payload is a payload that is not a Werewolf message, each naming
         // the line.
         let index = moderator_record(&fixture(), is_selection);
         for (key, empty) in [("sender", json!("")), ("recipients", json!([""]))] {
             let mut lines = fixture();
-            lines[index]["event"][key] = empty;
+            lines[index]["message"][key] = empty;
             let error = read(&lines).unwrap_err();
             assert!(
                 matches!(&error, TranscriptError::Malformed { line, what }
                     if *line == index + 1 && what.starts_with(key)),
                 "{key}: {error:?}"
             );
-            assert!(error.to_string().contains("non-empty agent id"), "{error}");
+            assert!(error.to_string().contains("non-empty actor id"), "{error}");
         }
         let mut lines = fixture();
-        lines[index]["event"]["payload"]["Select"]["target"] = json!("");
+        lines[index]["message"]["payload"]["Select"]["target"] = json!("");
         let error = read(&lines).unwrap_err();
         assert!(
             matches!(&error, TranscriptError::Payload { line, .. } if *line == index + 1),
             "{error:?}"
         );
-        assert!(error.to_string().contains("non-empty agent id"), "{error}");
+        assert!(error.to_string().contains("non-empty actor id"), "{error}");
         // A narration's ids are checked too.
         let mut lines = fixture();
         let index = moderator_record(&lines, |payload| {
             !payload["Narration"]["Eliminated"].is_null()
         });
-        lines[index]["event"]["payload"]["Narration"]["Eliminated"]["who"] = json!("");
+        lines[index]["message"]["payload"]["Narration"]["Eliminated"]["who"] = json!("");
         let error = read(&lines).unwrap_err();
         assert!(
             matches!(&error, TranscriptError::Payload { line, .. } if *line == index + 1),
@@ -1592,7 +1592,7 @@ mod tests {
         assert!(
             !lines
                 .iter()
-                .any(|line| !line["event"]["payload"]["Request"].is_null()),
+                .any(|line| !line["message"]["payload"]["Request"].is_null()),
             "a transcript still holds a request"
         );
     }
@@ -1604,7 +1604,7 @@ mod tests {
             let index = moderator_record(&lines, |payload| {
                 !payload["Narration"]["Investigated"].is_null()
             });
-            lines[index]["event"]["recipients"] = to.clone();
+            lines[index]["message"]["recipients"] = to.clone();
             let error = read(&lines).unwrap_err();
             assert!(
                 matches!(&error, TranscriptError::Malformed { line, what }
@@ -1622,7 +1622,7 @@ mod tests {
         let index = moderator_record(&lines, |payload| {
             !payload["Narration"]["PhaseBegan"].is_null()
         });
-        lines[index]["event"]["payload"] = json!({"Narration": {"NoDeath": {"round": 1}}});
+        lines[index]["message"]["payload"] = json!({"Narration": {"NoDeath": {"round": 1}}});
         let error = read(&lines).unwrap_err();
         let first_response = moderator_record(&lines, is_selection);
         assert!(
@@ -1638,7 +1638,7 @@ mod tests {
         // The first night announced as a day.
         let mut lines = fixture();
         let index = moderator_record(&lines, is_phase);
-        lines[index]["event"]["payload"]["Narration"]["PhaseBegan"]["phase"] = json!("Day");
+        lines[index]["message"]["payload"]["Narration"]["PhaseBegan"]["phase"] = json!("Day");
         let error = read(&lines).unwrap_err();
         assert!(
             matches!(error, TranscriptError::NoPhase { line } if line == index + 1),
@@ -1647,7 +1647,7 @@ mod tests {
         // The first day announced as belonging to a round yet to come.
         let mut lines = fixture();
         let day = index + 1 + moderator_record(&lines[index + 1..], is_phase);
-        lines[day]["event"]["payload"]["Narration"]["PhaseBegan"]["round"] = json!(2);
+        lines[day]["message"]["payload"]["Narration"]["PhaseBegan"]["round"] = json!(2);
         let error = read(&lines).unwrap_err();
         assert!(
             matches!(error, TranscriptError::NoPhase { line } if line == day + 1),
@@ -1679,7 +1679,7 @@ mod tests {
         // actions is no error: the fixture contains both, and it reads.
         let lines = fixture();
         let forwarded = lines.iter().filter(|line| {
-            line["type"] == "action" && !line["event"]["payload"]["Select"].is_null()
+            line["type"] == "action" && !line["message"]["payload"]["Select"].is_null()
         });
         let forwarded: Vec<&Value> = forwarded.collect();
         assert!(
@@ -1690,7 +1690,7 @@ mod tests {
         // moderator: that is what makes the relay invisible.
         for line in forwarded {
             assert_ne!(
-                line["event"]["sender"],
+                line["message"]["sender"],
                 json!(MODERATOR),
                 "a forwarded selection is sent as the player that made it: {line}"
             );
@@ -1717,7 +1717,7 @@ mod tests {
             &mut self,
             kind: &str,
             sender: &str,
-            recipients: &BTreeSet<AgentId>,
+            recipients: &BTreeSet<ActorId>,
             payload: &Message,
         ) {
             let seq = self.lines.len();
@@ -1726,7 +1726,7 @@ mod tests {
                 "agent": MODERATOR,
                 "seq": seq,
                 "created": seq * 10,
-                "event": {
+                "message": {
                     "sender": sender,
                     "recipients": recipients,
                     "payload": payload,
@@ -1774,7 +1774,7 @@ mod tests {
 
     /// Plays `script`, one phase's selections per entry, through a game over
     /// `assignment`, and returns the moderator's records.
-    fn scripted(assignment: Assignment, script: &[Vec<(&str, AgentId)>]) -> Vec<Value> {
+    fn scripted(assignment: Assignment, script: &[Vec<(&str, ActorId)>]) -> Vec<Value> {
         /// Far enough apart that one phase's clocks never reach the next.
         const STEP: u64 = 10_000;
 
@@ -1844,7 +1844,7 @@ mod tests {
         scribe.lines
     }
 
-    fn answers<const N: usize>(answers: [(&'static str, &str); N]) -> Vec<(&'static str, AgentId)> {
+    fn answers<const N: usize>(answers: [(&'static str, &str); N]) -> Vec<(&'static str, ActorId)> {
         answers
             .into_iter()
             .map(|(who, whom)| (who, target(whom)))
@@ -1919,8 +1919,8 @@ mod tests {
         // what follows it, with no summary of the session that decided.
         let narrated: Vec<String> = lines
             .iter()
-            .filter(|line| line["type"] == "action" && line["event"]["sender"] == "moderator")
-            .filter_map(|line| line["event"]["payload"]["Narration"].as_object())
+            .filter(|line| line["type"] == "action" && line["message"]["sender"] == "moderator")
+            .filter_map(|line| line["message"]["payload"]["Narration"].as_object())
             .flat_map(|narration| narration.keys().cloned())
             .collect();
         assert!(

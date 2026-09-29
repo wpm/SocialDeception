@@ -5,8 +5,8 @@
 //! touches no channel, spawns no thread and reads no clock — every instant it
 //! knows is an argument — so the whole of the rules is testable by calling
 //! functions with a scripted sequence of selections and instants. The
-//! moderator that wraps it is plumbing: it folds the events it receives into
-//! [`Game::select`], wakes on [`Game::next_deadline`] to call
+//! moderator that wraps it is plumbing: it folds the messages it receives
+//! into [`Game::select`], wakes on [`Game::next_deadline`] to call
 //! [`Game::expire`], and turns the directives into messages.
 //!
 //! # A phase is made of sessions
@@ -122,7 +122,7 @@ use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 
 use crate::clock::Timestamp;
-use crate::event::AgentId;
+use crate::message::ActorId;
 use crate::werewolf::assignment::Assignment;
 use crate::werewolf::config::Timing;
 use crate::werewolf::message::{Cause, Narration, Outcome, Phase, RequestKind, Round, Select};
@@ -141,16 +141,16 @@ pub enum Directive {
     /// To exactly these agents.
     Narrate {
         /// The recipients, never empty.
-        to: BTreeSet<AgentId>,
+        to: BTreeSet<ActorId>,
         /// What they are told.
         narration: Narration,
     },
     /// Pass a player's selection on to the other players who should see it.
     ///
     /// The moderator is the only agent a player addresses, so this is how
-    /// a selection reaches anybody else (ADR-0014). The forwarded event names
-    /// the player that selected and the instant it selected, so a recipient
-    /// cannot tell the selection came by way of the moderator; see
+    /// a selection reaches anybody else (ADR-0014). The forwarded message
+    /// names the player that selected and the instant it selected, so a
+    /// recipient cannot tell the selection came by way of the moderator; see
     /// [`Action::relay`](crate::agent::Action::relay).
     ///
     /// Only a selection the game accepted is forwarded. One whose session has
@@ -159,11 +159,11 @@ pub enum Directive {
     /// whether the session is still open.
     Forward {
         /// The player whose selection it is.
-        from: AgentId,
+        from: ActorId,
         /// When that player made it.
         created: Timestamp,
         /// The other players who should see it, never empty.
-        to: BTreeSet<AgentId>,
+        to: BTreeSet<ActorId>,
         /// The selection itself, exactly as it was sent.
         selection: Select,
     },
@@ -175,7 +175,7 @@ pub enum Directive {
     /// be paid.
     Stop {
         /// The agent out of the game.
-        who: AgentId,
+        who: ActorId,
     },
 }
 
@@ -192,10 +192,10 @@ struct Session {
     /// What its members were asked.
     kind: RequestKind,
     /// Everyone asked, whether or not they have selected.
-    members: BTreeSet<AgentId>,
+    members: BTreeSet<ActorId>,
     /// Each member's latest target. A member that has not selected is
     /// absent, which is how it abstains.
-    selections: BTreeMap<AgentId, AgentId>,
+    selections: BTreeMap<ActorId, ActorId>,
     /// The quiet period, for a night session; `None` for the day.
     quiet: Option<Duration>,
     /// The instant the session closes however its members behave.
@@ -211,7 +211,7 @@ impl Session {
     ///
     /// A repeat of the same target is not a change and does not restart
     /// the quiet period; a change of mind is and does.
-    fn select(&mut self, from: &AgentId, target: &AgentId, at: Timestamp) -> bool {
+    fn select(&mut self, from: &ActorId, target: &ActorId, at: Timestamp) -> bool {
         let changed = self.selections.get(from) != Some(target);
         self.selections.insert(from.clone(), target.clone());
         if changed {
@@ -244,7 +244,7 @@ impl Session {
 #[derive(Debug, Clone)]
 pub struct Game {
     assignment: Assignment,
-    living: BTreeSet<AgentId>,
+    living: BTreeSet<ActorId>,
     round: Round,
     phase: Phase,
     ties: ChaCha8Rng,
@@ -255,13 +255,13 @@ pub struct Game {
     sessions: Vec<Session>,
     /// What the night's closed sessions decided, kept until the last of
     /// them closes and the night resolves.
-    resolved: Vec<(RequestKind, BTreeMap<AgentId, AgentId>)>,
+    resolved: Vec<(RequestKind, BTreeMap<ActorId, ActorId>)>,
     /// The clocks every session runs on.
     timing: Timing,
     /// Whom each doctor protected last night, for doctors that protected
     /// someone: the state the doctor's own rule constrains its next
     /// `Protect` with.
-    last_protected: BTreeMap<AgentId, AgentId>,
+    last_protected: BTreeMap<ActorId, ActorId>,
     outcome: Option<Outcome>,
 }
 
@@ -275,7 +275,7 @@ impl Game {
     /// players, so that the game would be over before it began.
     #[must_use]
     pub fn new(assignment: Assignment, seed: u64, timing: Timing) -> Self {
-        let living: BTreeSet<AgentId> = assignment.players().map(|(who, _)| who.clone()).collect();
+        let living: BTreeSet<ActorId> = assignment.players().map(|(who, _)| who.clone()).collect();
         let werewolves = assignment.pack().len();
         assert!(werewolves >= 1, "a game needs at least one werewolf");
         assert!(
@@ -337,7 +337,7 @@ impl Game {
     ///
     /// **A selection for a session that has closed is ignored**, not a panic.
     /// It lost a race with the clock, which ADR-0011 makes an ordinary
-    /// event rather than a bug: no session of that round and kind is open
+    /// message rather than a bug: no session of that round and kind is open
     /// any more, and nothing comes of the selection.
     ///
     /// # Panics
@@ -355,7 +355,7 @@ impl Game {
     /// player consulted to decide to select at all.
     pub fn select(
         &mut self,
-        from: &AgentId,
+        from: &ActorId,
         selection: &Select,
         created: Timestamp,
         at: Timestamp,
@@ -417,7 +417,7 @@ impl Game {
         //
         // The forward comes first: a player learns of the selection that
         // lynched somebody before it learns of the lynch, which is the
-        // order the events happened in.
+        // order the messages happened in.
         if kind == RequestKind::Nominate && self.majority().is_some() {
             // This selection is the one that completed the majority, so the
             // player who made it is the hammer.
@@ -488,9 +488,9 @@ impl Game {
     ///
     /// A majority of the *living*, not of those who have selected: a
     /// village that mostly stays quiet does not lynch on two votes.
-    fn majority(&self) -> Option<AgentId> {
+    fn majority(&self) -> Option<ActorId> {
         let session = self.sessions.first()?;
-        let mut counts: BTreeMap<&AgentId, usize> = BTreeMap::new();
+        let mut counts: BTreeMap<&ActorId, usize> = BTreeMap::new();
         for target in session.selections.values() {
             *counts.entry(target).or_default() += 1;
         }
@@ -508,7 +508,7 @@ impl Game {
 
     /// Everyone still in the game.
     #[must_use]
-    pub fn living(&self) -> &BTreeSet<AgentId> {
+    pub fn living(&self) -> &BTreeSet<ActorId> {
         &self.living
     }
 
@@ -519,7 +519,7 @@ impl Game {
     /// knowledge, so the two cannot disagree; this is the game's side of
     /// it, and what [`select`](Self::select) checks against.
     #[must_use]
-    pub fn action_space_for(&self, who: &AgentId, kind: RequestKind) -> Vec<AgentId> {
+    pub fn action_space_for(&self, who: &ActorId, kind: RequestKind) -> Vec<ActorId> {
         roles::action_space(who, &self.living, kind, self.last_protected.get(who))
     }
 
@@ -528,7 +528,7 @@ impl Game {
     /// This is the roster the moderator starts and, when the game is over,
     /// stops. A player leaves the *game* when it is eliminated and the
     /// *episode* when it is stopped, and those are not the same moment.
-    pub fn players(&self) -> impl Iterator<Item = &AgentId> {
+    pub fn players(&self) -> impl Iterator<Item = &ActorId> {
         self.assignment.players().map(|(who, _)| who)
     }
 
@@ -549,7 +549,7 @@ impl Game {
     /// says so, because what a trajectory is being scored for is the
     /// behavior that led to the result and not the length of the episode.
     #[must_use]
-    pub fn rewards(&self) -> Option<BTreeMap<AgentId, i32>> {
+    pub fn rewards(&self) -> Option<BTreeMap<ActorId, i32>> {
         let winner = self.outcome.as_ref()?.winner;
         Some(
             self.assignment
@@ -584,7 +584,7 @@ impl Game {
         // closes the session (ADR-0014). A player the rules leave
         // nowhere to select is not a member, so a session with no member
         // does not open.
-        let mut members: BTreeMap<RequestKind, BTreeSet<AgentId>> = BTreeMap::new();
+        let mut members: BTreeMap<RequestKind, BTreeSet<ActorId>> = BTreeMap::new();
         for who in &self.living {
             let Some(kind) = self.role(who).asked_in(self.phase) else {
                 continue;
@@ -687,7 +687,7 @@ impl Game {
     /// dies, and it is never narrated. A reader recovers it from the
     /// trajectory as the last selection forwarded before the lynching, and a
     /// player that saw that selection saw the same thing (ADR-0015).
-    fn close_day(&mut self, hammer: Option<&AgentId>, now: Timestamp) -> Vec<Directive> {
+    fn close_day(&mut self, hammer: Option<&ActorId>, now: Timestamp) -> Vec<Directive> {
         let session = self.sessions.remove(0);
         // The hammer is the selection that made the majority, and the target
         // of that majority is who dies for it.
@@ -705,7 +705,7 @@ impl Game {
 
     /// Removes a player from the living and announces it, with the role
     /// revealed, to the living and to the player itself.
-    fn eliminate(&mut self, who: &AgentId, cause: Cause) -> Vec<Directive> {
+    fn eliminate(&mut self, who: &ActorId, cause: Cause) -> Vec<Directive> {
         assert!(self.living.remove(who), "{who} is not living");
         // To the living, which no longer includes the victim. A dead
         // player observes nothing, its own death least of all: it is
@@ -804,7 +804,7 @@ impl Game {
     }
 
     /// The role of a player.
-    fn role(&self, who: &AgentId) -> Role {
+    fn role(&self, who: &ActorId) -> Role {
         self.assignment
             .role(who)
             .unwrap_or_else(|| panic!("{who} is not a player"))
@@ -817,15 +817,15 @@ impl Game {
 /// A tie is broken by [`pick`]ing among the tied players, in agent order,
 /// from `ties`, which is touched only when there is a tie.
 fn plurality<'a>(
-    targets: impl IntoIterator<Item = &'a AgentId>,
+    targets: impl IntoIterator<Item = &'a ActorId>,
     ties: &mut ChaCha8Rng,
-) -> Option<AgentId> {
-    let mut counts: BTreeMap<&AgentId, usize> = BTreeMap::new();
+) -> Option<ActorId> {
+    let mut counts: BTreeMap<&ActorId, usize> = BTreeMap::new();
     for who in targets {
         *counts.entry(who).or_default() += 1;
     }
     let most = *counts.values().max()?;
-    let leaders: Vec<&AgentId> = counts
+    let leaders: Vec<&ActorId> = counts
         .iter()
         .filter(|(_, count)| **count == most)
         .map(|(who, _)| *who)
@@ -845,7 +845,7 @@ mod tests {
 
     /// One phase of a script: every member's selection, keyed by the agent
     /// making it, in the order they are to be recorded.
-    type Answers = Vec<(&'static str, AgentId)>;
+    type Answers = Vec<(&'static str, ActorId)>;
 
     fn answers(pairs: &[(&'static str, &str)]) -> Answers {
         pairs
@@ -890,7 +890,7 @@ mod tests {
     /// because it is what closes a session. A test script stands in for
     /// every player at once, so it reads the same membership off the game
     /// rather than off a directive that no longer exists.
-    fn asks(game: &Game) -> BTreeMap<AgentId, RequestKind> {
+    fn asks(game: &Game) -> BTreeMap<ActorId, RequestKind> {
         game.sessions
             .iter()
             .flat_map(|session| {
@@ -1045,7 +1045,7 @@ mod tests {
     /// Records one selection in the session of `kind` of the round now under
     /// way. A selection says for itself which session it belongs to
     /// (ADR-0014), so there is no id to look up.
-    fn respond(game: &mut Game, from: &str, kind: RequestKind, target: AgentId) -> Vec<Directive> {
+    fn respond(game: &mut Game, from: &str, kind: RequestKind, target: ActorId) -> Vec<Directive> {
         let round = game.round;
         let selection = Select {
             round,
@@ -1062,7 +1062,7 @@ mod tests {
         from: &str,
         round: u32,
         kind: RequestKind,
-        target: AgentId,
+        target: ActorId,
     ) -> Vec<Directive> {
         let selection = Select {
             round: Round::new(round),
@@ -1099,7 +1099,7 @@ mod tests {
     }
 
     /// The forwards among some directives: who is told of whose selection.
-    fn forwards(directives: &[Directive]) -> Vec<(&AgentId, &BTreeSet<AgentId>, &Select)> {
+    fn forwards(directives: &[Directive]) -> Vec<(&ActorId, &BTreeSet<ActorId>, &Select)> {
         directives
             .iter()
             .filter_map(|directive| match directive {
@@ -1242,7 +1242,7 @@ mod tests {
         // the day and three of them are a majority.
         let night = game.next_deadline().expect("the night has a clock");
         game.expire(night);
-        let living: Vec<AgentId> = game.living().iter().cloned().collect();
+        let living: Vec<ActorId> = game.living().iter().cloned().collect();
         assert_eq!(living.len(), 5, "nobody died in the night");
         let target = living[0].clone();
         let mut closing = Vec::new();
@@ -1250,7 +1250,7 @@ mod tests {
             let seen_by: Vec<&str> = living
                 .iter()
                 .filter(|other| *other != who)
-                .map(AgentId::as_str)
+                .map(ActorId::as_str)
                 .collect();
             let at_instant = night + Duration::from_millis(index as u64 + 1);
             let selection = Select {
@@ -1328,12 +1328,12 @@ mod tests {
         game.begin(at(0));
         let night = game.next_deadline().expect("the night has a clock");
         game.expire(night);
-        let living: Vec<AgentId> = game.living().iter().cloned().collect();
+        let living: Vec<ActorId> = game.living().iter().cloned().collect();
         let voter = living[0].clone();
         let seen_by: Vec<&str> = living
             .iter()
             .filter(|other| **other != voter)
-            .map(AgentId::as_str)
+            .map(ActorId::as_str)
             .collect();
         let mut targets = Vec::new();
         for (index, target) in [&living[1], &living[2]].into_iter().enumerate() {
@@ -1350,7 +1350,7 @@ mod tests {
                 panic!("each selection is forwarded once: {directives:?}");
             };
             assert_eq!(*from, &voter);
-            let expected: BTreeSet<AgentId> = seen_by.iter().map(|who| id(who)).collect();
+            let expected: BTreeSet<ActorId> = seen_by.iter().map(|who| id(who)).collect();
             assert_eq!(**to, expected);
             targets.push(forwarded.target.clone());
         }
@@ -1696,7 +1696,7 @@ mod tests {
                 }
                 // The dead are paid too, which is the whole point of
                 // paying on the faction rather than on survival.
-                let dead: Vec<&AgentId> = rewards
+                let dead: Vec<&ActorId> = rewards
                     .keys()
                     .filter(|who| !outcome.living.contains(who))
                     .collect();
@@ -2356,7 +2356,7 @@ mod tests {
     #[test]
     fn a_selection_for_a_closed_session_is_ignored() {
         // It lost a race with the clock, which ADR-0011 makes an ordinary
-        // event rather than a bug. bob is a werewolf, so the Devour
+        // message rather than a bug. bob is a werewolf, so the Devour
         // session was genuinely its own: what is wrong with the selection is
         // only that it is late.
         let mut game = game(village());
