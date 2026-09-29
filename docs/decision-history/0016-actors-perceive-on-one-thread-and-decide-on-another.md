@@ -164,8 +164,13 @@ its own business; the framework offers no mechanism for it.
 
 A message's recipients may be **empty**: an action need not be directed at
 anyone, and one addressed to nobody is still logged. The router's rule that
-an empty recipient set is a bug goes; its other checks stay. A message's
-recipients may also include its sender.
+an empty recipient set is a bug goes; its other checks stay.
+
+A message's recipients may **not** include its sender. The router keeps its
+rule that there is no loopback. An actor that wants to send itself a message
+sets a `Reminder`, which is the one way a message reaches the actor that sent
+it. An actor that wants to remember its own actions keeps them in its own
+state; the runtime never hands a handler back what it did.
 
 ### Relaying keeps the origin
 
@@ -187,8 +192,9 @@ was set, so there is no wake-up type and no question of what to do with one.
 - **A reminder is always self-directed.** Another actor cannot decide when
   you think; it can only send you a message asking you to, and your handler
   may answer with a reminder of its own. `Reminder` has no recipients.
-- **The deadline is required.** A reminder due now would be a message to
-  oneself.
+- **The deadline is required.** A reminder is the only way to send oneself
+  a message, so one wanted at once is simply a reminder whose deadline is
+  now.
 - **Reminders accumulate.** Each fires once. A handler that has changed its
   mind ignores a stale reminder when it arrives; nothing is cancelled. This
   replaces `Handler::deadline` and ADR-0010's single deadline.
