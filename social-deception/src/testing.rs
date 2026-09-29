@@ -14,7 +14,7 @@ use serde_json::Value;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
-use crate::agent::Observation;
+use crate::actor::Observation;
 use crate::clock::Clock;
 use crate::log::{JsonLines, Policy, Record, Sink, Sinks, Writer};
 use crate::message::{ActorId, Envelope, Message, Payload};
@@ -172,8 +172,9 @@ pub(crate) fn header_anchor(line: &Value) -> u64 {
 /// An `Instant` has no epoch to build one from, so a test that wants
 /// arbitrary times offsets one reading taken once for the whole run. It is
 /// far enough in the future that a deadline named from it never fires on a
-/// real clock; a test that wants one to fire uses a
-/// [`ManualTimer`](crate::ManualTimer).
+/// real clock, which is what lets a test drive a handler with instants of its
+/// own: a test that wants a reminder to fire delivers it by hand, as the
+/// moderator's tests do, rather than waiting for a timer.
 pub(crate) static BASE: LazyLock<Instant> =
     LazyLock::new(|| Instant::now() + Duration::from_secs(3600));
 

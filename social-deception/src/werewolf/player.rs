@@ -14,14 +14,19 @@
 //! moderator says night has fallen and the werewolves select, because they
 //! are werewolves and it is night.
 //!
-//! A player has no opening move: it says nothing until the first phase
-//! begins, so it needs no [`start`](Handler::start). The two halves of
-//! deciding are kept apart, and ADR-0005 says why: a [`Role`] computes the
-//! action space the rules permit and nothing else; a [`Strategy`] picks one
-//! target from that space, or none. The rules are in [`role`](super::role),
-//! the baseline strategy in [`strategy`](super::strategy).
+//! **A player has no opening move.** It says nothing until the first phase
+//! begins, so its [`start`](Policy::start) returns nothing; what it does
+//! there is keep the episode's [`Clock`] in its [`Knowledge`], since that is
+//! the one origin every actor and the log share (ADR-0017) and a
+//! language-model player stamps its prompt with times measured from it.
 //!
-//! [`Player`] joins the two with what it knows. It is the [`Handler`] the
+//! The two halves of deciding are kept apart, and ADR-0005 says why: a
+//! [`Role`] computes the action space the rules permit and nothing else; a
+//! [`Strategy`] picks one target from that space, or none. The rules are in
+//! [`role`](super::role), the baseline strategy in
+//! [`strategy`](super::strategy).
+//!
+//! [`Player`] joins the two with what it knows. It is the [`Policy`] the
 //! episode runs, the same for every role, and it is where a target outside
 //! the action space is caught: a strategy that returns one has a bug, and
 //! the game cannot continue from it.
@@ -49,7 +54,8 @@ use super::knowledge::Knowledge;
 use super::message::{Message, Narration, Round, Select, SessionKind};
 use super::role::Role;
 use super::strategy::{Strategy, View};
-use crate::agent::{self, Handler, Observation};
+use crate::actor::{Action, Observation, Policy};
+use crate::clock::Clock;
 use crate::message::ActorId;
 
 /// A player in the episode: what it knows, the strategy that decides for it,
@@ -148,17 +154,51 @@ impl<S: Strategy> Player<S> {
             .cloned()
             .collect()
     }
+
+    /// `payload` addressed to the moderator and to nobody else.
+    ///
+    /// The one place a player names a recipient, so the rule ADR-0018 states
+    /// is written once and asserted once. It is a `debug_assert!` rather than
+    /// an `assert!` because a player that addressed somebody else would be a
+    /// bug in this file and not a rule the game has to enforce against an
+    /// adversary: players cooperate with the moderator.
+    fn addressed(&self, payload: Message) -> Action<Message> {
+        let action = Action::to([self.moderator.clone()], payload);
+        debug_assert!(
+            matches!(&action, Action::Send { to, .. } if to == std::slice::from_ref(&self.moderator)),
+            "{} addresses every action to the moderator alone",
+            self.knowledge.me
+        );
+        action
+    }
 }
 
-impl<S: Strategy> Handler<Message> for Player<S> {
+impl<S: Strategy> Policy<Message> for Player<S> {
+    /// Keeps the episode's origin and says nothing.
+    ///
+    /// A player has no opening move: nothing has happened yet, and it is a
+    /// phase beginning that makes a player act (ADR-0014). What the hook is
+    /// for here is the [`Clock`], which is the episode's one origin, shared
+    /// by every actor and the log writer (ADR-0017): a player that measures
+    /// time is then measuring it on the log's timeline.
+    fn start(&mut self, clock: Clock) -> impl IntoIterator<Item = Action<Message>> {
+        self.knowledge.started(clock);
+        []
+    }
+
     /// Folds the observation into what the player knows and, if it was a
-    /// phase beginning a session its role is a member of, selections from
-    /// the state every earlier observation produced, this one included.
-    /// Every other observation produces nothing but the fold.
+    /// phase beginning a session its role is a member of, selects from the
+    /// state every earlier observation produced, this one included. Every
+    /// other observation produces nothing but the fold.
     ///
     /// The fold comes first for exactly that reason: the phase's own
     /// narration says who is still living, and the selection has to be
     /// decided from the living set that includes it.
+    ///
+    /// **Every action goes to the moderator and to nobody else** (ADR-0018),
+    /// which a `debug_assert!` checks. Players cooperate with the moderator
+    /// and are not assumed to cheat, so that catches a mistake here rather
+    /// than enforcing a rule on a player that might break it.
     ///
     /// # Panics
     ///
@@ -166,42 +206,54 @@ impl<S: Strategy> Handler<Message> for Player<S> {
     /// panic for the other reason [`Role::action_space`] gives, since the
     /// kind it passes came from this player's own
     /// [`Role::asked_in`].
-    fn handle(&mut self, observation: &Observation<Message>) -> Vec<agent::Action<Message>> {
-        self.knowledge.observe(observation);
-        match &observation.message.payload {
-            // A phase beginning is what makes a player act, and it acts
-            // on its own role rather than on anybody's instruction
-            // (ADR-0014). A player the phase asks nothing of, and one
-            // the rules leave nowhere to select, both say nothing.
-            Message::Narration(Narration::PhaseBegan { round, phase, .. }) => {
-                let round = *round;
-                let Some(kind) = self.knowledge.role.asked_in(*phase) else {
-                    return Vec::new();
-                };
-                self.select(round, kind)
-                    .map(|selection| {
-                        agent::Action::to([self.moderator.clone()], Message::Select(selection))
-                    })
-                    .into_iter()
-                    .collect()
-            }
-            _ => Vec::new(),
-        }
+    fn policy(
+        &mut self,
+        observation: Observation<Message>,
+    ) -> impl IntoIterator<Item = Action<Message>> {
+        self.knowledge.observe(&observation);
+        // A phase beginning is what makes a player act, and it acts on its
+        // own role rather than on anybody's instruction (ADR-0014). A player
+        // the phase asks nothing of, and one the rules leave nowhere to
+        // select, both say nothing.
+        let Message::Narration(Narration::PhaseBegan { round, phase, .. }) =
+            &observation.message.payload
+        else {
+            return Vec::new();
+        };
+        let (round, phase) = (*round, *phase);
+        let Some(kind) = self.knowledge.role.asked_in(phase) else {
+            return Vec::new();
+        };
+        self.select(round, kind)
+            .map(|selection| self.addressed(Message::Select(selection)))
+            .into_iter()
+            .collect()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
-    use std::time::Instant;
 
     use super::*;
     use crate::testing::{ME, id, ids, narrated, observed, phase_began, target};
     use crate::werewolf::message::{Cause, Narration, Phase, Round, SessionKind};
 
-    use crate::agent::Action;
+    use crate::actor::Action;
 
     const MODERATOR: &str = "moderator";
+
+    /// The payload of a send, for a test that reads one.
+    ///
+    /// # Panics
+    ///
+    /// On a reminder, which no player ever sets.
+    fn payload_of(action: &Action<Message>) -> &Message {
+        match action {
+            Action::Send { payload, .. } => payload,
+            Action::Remind(_) => panic!("a player sets no reminders: {action:?}"),
+        }
+    }
 
     /// Selects the first target in the action space.
     struct First;
@@ -280,16 +332,25 @@ mod tests {
         selecting(round, kind, target, [])
     }
 
-    /// What a player does with a run of messages, each in a cycle of its own,
-    /// as the loop hands them over (ADR-0008): every action they produced,
-    /// in order.
+    /// What a player does with a run of messages, each in a call of its own,
+    /// as the handler thread hands them over (ADR-0008): every action they
+    /// produced, in order.
+    ///
+    /// There are no threads here. A policy is a function from an observation
+    /// to actions, so a test of one is a run of calls and nothing else
+    /// (ADR-0016).
     fn handling<S: Strategy, const N: usize>(
         player: &mut Player<S>,
         messages: [crate::Message<Message>; N],
     ) -> Vec<Action<Message>> {
         messages
             .into_iter()
-            .flat_map(|message| player.handle(&observed(message)))
+            .flat_map(|message| {
+                player
+                    .policy(observed(message))
+                    .into_iter()
+                    .collect::<Vec<_>>()
+            })
             .collect()
     }
 
@@ -370,20 +431,26 @@ mod tests {
     }
 
     #[test]
-    fn a_player_opens_with_nothing() {
-        // A player says nothing until the first phase begins, so the
-        // default start hook is the right one for every role.
-        assert!(villager(First).start(Instant::now()).is_empty());
-        assert!(doctor(First).start(Instant::now()).is_empty());
+    fn a_player_opens_with_nothing_and_keeps_the_clock() {
+        // A player says nothing until the first phase begins, so its `start`
+        // yields nothing whatever its role. What it does there is keep the
+        // episode's origin, which is the one clock every actor and the log
+        // share (ADR-0017).
+        let clock = Clock::start();
+        for mut player in [villager(First), doctor(First)] {
+            let opened: Vec<_> = player.start(clock).into_iter().collect();
+            assert!(opened.is_empty(), "{opened:?}");
+            assert_eq!(
+                player.knowledge().clock,
+                Some(clock),
+                "the origin the episode gave it"
+            );
+        }
     }
 
     #[test]
-    fn a_timeout_produces_nothing() {
-        // What a timeout cycle looks like from inside a handler: the loop
-        // calls `timeout`, not `handle`, and a player has nothing to say on
-        // a deadline.
-        let mut player = villager(Last);
-        assert!(player.timeout(Instant::now()).is_empty());
+    fn a_player_knows_no_clock_until_it_is_started() {
+        assert_eq!(villager(First).knowledge().clock, None);
     }
 
     #[test]
@@ -402,16 +469,20 @@ mod tests {
         // what stops a selection outliving its session in a peer's queue
         // (ADR-0018).
         for action in &actions {
-            assert!(matches!(action.payload, Message::Select(_)), "{action:?}");
-            assert_eq!(action.recipients, ids([MODERATOR]), "{action:?}");
+            assert!(
+                matches!(payload_of(action), Message::Select(_)),
+                "{action:?}"
+            );
+            let Action::Send { to, .. } = action else {
+                panic!("a player sends and never reminds itself: {action:?}");
+            };
+            assert_eq!(*to, vec![id(MODERATOR)], "{action:?}");
         }
         // What differs is the audience the moderator is asked to relay to:
         // the protect is nobody else's business, the nomination is public.
-        let seen_by = |action: &Action<Message>| match &action.payload {
+        let seen_by = |action: &Action<Message>| match payload_of(action) {
             Message::Select(selection) => selection.seen_by.clone(),
-            other @ (Message::Narration(_) | Message::Relayed(_)) => {
-                panic!("a selection, not {other:?}")
-            }
+            other => panic!("a selection, not {other:?}"),
         };
         assert_eq!(seen_by(&actions[0]), BTreeSet::new());
         assert_eq!(seen_by(&actions[1]), ids(["alice", "bob", "carol"]));

@@ -56,7 +56,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::message::{Cause, Message, Narration, Outcome, Phase, Round, SessionKind};
 use super::role::{Faction, Role};
-use crate::agent::Observation;
+use crate::actor::Observation;
+use crate::clock::Clock;
 use crate::message::ActorId;
 
 /// What one player knows: the fold of every observation it has received.
@@ -109,6 +110,16 @@ pub struct Knowledge {
     pub history: Vec<Phased>,
     /// Set once the game is over.
     pub outcome: Option<Outcome>,
+    /// The episode's origin, from the moment this player was started, or
+    /// `None` before it was.
+    ///
+    /// It is the one origin every actor and the log share (ADR-0017), handed
+    /// to every `start` hook by the episode itself, so a player that
+    /// measures time measures it on the log's timeline. A scripted player
+    /// reads nothing from it; it is here because a language-model player
+    /// stamps its prompt with how long the game has been going, and the
+    /// place to keep what a player knows is what it knows.
+    pub clock: Option<Clock>,
 }
 
 /// How and when a player left the game, and what they turned out to be.
@@ -157,7 +168,14 @@ impl Knowledge {
             selections: BTreeMap::new(),
             history: Vec::new(),
             outcome: None,
+            clock: None,
         }
+    }
+
+    /// Records the episode's origin, which the episode hands every actor's
+    /// `start` hook (ADR-0017).
+    pub fn started(&mut self, clock: Clock) {
+        self.clock = Some(clock);
     }
 
     /// Folds one of this agent's own moves into the state: the target it
@@ -222,6 +240,16 @@ impl Knowledge {
                 false,
                 "{} was sent {}'s {:?} selection directly rather than relayed",
                 self.me, observation.message.sender, selection.kind
+            ),
+            // A reminder is always self-directed, and only the moderator ever
+            // sets one in this game (ADR-0016, ADR-0018), so a player can
+            // reach this arm only by having been sent something nobody
+            // sends. It is a `debug_assert!` for the same reason the arm
+            // above is, and the fold stays total.
+            Message::Reminder(look) => debug_assert!(
+                false,
+                "{} was sent a {:?} reminder, which only the moderator sets and only for itself",
+                self.me, look
             ),
         }
     }
@@ -459,6 +487,9 @@ mod tests {
                     rounds: Round::new(2),
                     living: ids([ME, "wolfgang"]),
                 }),
+                // The origin is kept by `start`, and this fold never
+                // started anybody: it is the fold that is under test here.
+                clock: None,
             }
         );
     }

@@ -37,7 +37,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 /// one, which every offset is measured from, and the wall clock, which the
 /// log's header carries so that an episode can be lined up against another
 /// log. They are the same moment by construction.
-#[derive(Debug, Clone, Copy)]
+///
+/// Two clocks are equal when they name the same moment, which is what makes
+/// "these actors share one origin" something a test can assert.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Clock {
     origin: Instant,
     start_unix_ns: u64,
@@ -49,6 +52,23 @@ impl Clock {
     pub fn start() -> Self {
         Self {
             origin: Instant::now(),
+            start_unix_ns: unix_nanos(SystemTime::now()),
+        }
+    }
+
+    /// A clock whose monotonic origin is `origin`, for a test that drives a
+    /// handler with instants of its own.
+    ///
+    /// The wall-clock anchor is read now and is therefore *not* the same
+    /// moment as `origin`, which is the invariant [`start`](Self::start)
+    /// exists to keep. That is why this is crate-private and why no episode
+    /// can reach it: a log written from one of these would have a header
+    /// naming a moment its offsets are not measured from. What a test wants
+    /// it for is the origin alone.
+    #[cfg(test)]
+    pub(crate) fn from_origin(origin: Instant) -> Self {
+        Self {
+            origin,
             start_unix_ns: unix_nanos(SystemTime::now()),
         }
     }

@@ -18,13 +18,45 @@
 //!
 //! # A missing outcome is the runtime's error, not this module's
 //!
-//! The moderator is the episode's [`Environment`](crate::Environment), so
-//! an episode ends when the moderator says it does, which is when it has
-//! announced the outcome. A player that never selects leaves
-//! nothing in flight and nobody stopped, which the episode reports as
-//! [`EpisodeError::Stalled`] naming the players still running. So there is
-//! nothing for this module to detect: [`run`] takes the outcome from the
-//! moderator's channel and a clean run always has one.
+//! The moderator is the episode's environment, so an episode ends when the
+//! moderator says it does: it stops every actor, itself included, once it has
+//! announced the outcome and its players have heard it (ADR-0016). A
+//! moderator that never gets there leaves the episode running until its
+//! **hard time limit**, which it reports as
+//! [`EpisodeError::Timeout`] naming the
+//! actors still going. So there is nothing for this module to detect: [`run`]
+//! takes the outcome from the moderator's channel and a clean run always has
+//! one.
+//!
+//! # How the time limit is derived
+//!
+//! The limit is a **backstop against a runtime or moderator bug**, not a
+//! schedule anything is meant to meet, so it is derived generously from the
+//! clocks the configuration sets and then multiplied.
+//!
+//! A game ends within its `day_cap` rounds however its players act
+//! (ADR-0011), and a round costs at most one night and one day. A night's
+//! three sessions run **at once**, so a night costs the longest of the three
+//! hard limits rather than their sum; a day costs its own limit. So the rules
+//! bound a game at
+//!
+//! ```text
+//! day_cap × (max(pack.limit, seer.limit, doctor.limit) + day.limit)
+//! ```
+//!
+//! plus the moderator's farewell interval at the end. [`limit`] is
+//! [`limit`] is a slack multiple of that, floored, and both of those are for
+//! the same
+//! thing: nothing above accounts for thread scheduling, and a game whose
+//! sessions are measured in tens of milliseconds — which is how this
+//! repository's tests play them — can spend a comparable share of its time
+//! simply waiting to be scheduled on a loaded machine. A game played on the
+//! example's clocks, which are seconds, is bounded by a number so much larger
+//! than it needs that the slack costs nothing.
+//!
+//! What the limit must never be is *tight*. A limit that fired on a slow but
+//! correct game would turn a scheduling delay into a failed run, which is
+//! worse than the hang it is there to prevent.
 //!
 //! # The seed never enters the game
 //!
@@ -40,12 +72,14 @@ use std::error;
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+use std::time::Duration;
 
-use crossbeam_channel::{Receiver, Sender, unbounded};
+use crossbeam_channel::{Receiver, unbounded};
 
 use super::assignment::Assignment;
 use super::config::Config;
+use super::config::Timing;
 use super::game::Game;
 use super::live::Text;
 use super::message::{Message, Outcome};
@@ -53,10 +87,8 @@ use super::moderator::Moderator;
 use super::player::Player;
 use super::role::Role;
 use super::strategy::RandomStrategy;
-use crate::agent::Handler;
-use crate::clock::Clock;
-use crate::episode::{Episode, EpisodeError};
-use crate::log::{JsonLines, Policy, Record, Sink, Writer};
+use crate::actor::{Episode, EpisodeError, Policy as Policies};
+use crate::log::{JsonLines, Policy, Sinks};
 use crate::message::ActorId;
 
 /// Why a run did not end with an outcome.
@@ -69,15 +101,15 @@ pub enum RunError {
         /// What went wrong.
         source: io::Error,
     },
-    /// The episode did not run cleanly. A game in which some player never
-    /// selected arrives here as
-    /// [`EpisodeError::Stalled`].
+    /// The episode did not run cleanly. A game the moderator never ended
+    /// arrives here as
+    /// [`EpisodeError::Timeout`].
     Episode(EpisodeError),
     /// The episode ran cleanly and the moderator announced no outcome.
     ///
     /// Nothing known produces this: an episode the moderator did not end is
-    /// a stall, and one it did end it ended by announcing the outcome. It is
-    /// here because `run` cannot prove that from the types, and a silent
+    /// a timeout, and one it did end it ended by announcing the outcome. It
+    /// is here because `run` cannot prove that from the types, and a silent
     /// `unwrap` would be a worse answer than a named error.
     NoOutcome,
 }
@@ -114,16 +146,56 @@ impl From<EpisodeError> for RunError {
     }
 }
 
-/// Builds an episode from a configuration. The receiver yields the outcome
-/// once the moderator has announced it.
+/// How much of the slack the derived time limit is: the rules' bound on a
+/// game, multiplied by this.
+///
+/// It is there for thread scheduling, which nothing in the rules accounts
+/// for; see the [module documentation](self) for why it is generous rather
+/// than tight.
+const SLACK: u32 = 8;
+
+/// The least a derived time limit ever is, whatever the configuration's
+/// clocks.
+///
+/// A configuration may set clocks in single milliseconds, and a bound of a
+/// few hundred milliseconds would be a limit a correct game could lose a race
+/// with on a loaded machine. This is the floor beneath which the multiplier
+/// stops being the thing that matters.
+const FLOOR: Duration = Duration::from_secs(30);
+
+/// The hard time limit an episode played under `timing` with `players`
+/// players is given, derived as the [module documentation](self) sets out.
+#[must_use]
+pub fn limit(timing: &Timing, players: usize) -> Duration {
+    // A night's three sessions run at once, so a night costs the longest of
+    // their hard limits and not their sum.
+    let night = timing
+        .pack
+        .limit
+        .max(timing.seer.limit)
+        .max(timing.doctor.limit);
+    let round = night + timing.day.limit;
+    let rules = round.saturating_mul(timing.day_cap(players));
+    // The farewell interval the moderator waits before stopping everybody is
+    // inside the slack, which is orders of magnitude larger than it.
+    rules.saturating_mul(SLACK).max(FLOOR)
+}
+
+/// Builds an episode from a configuration, whose log goes to `sinks`. The
+/// receiver yields the outcome once the moderator has announced it.
 ///
 /// The roles are dealt once, from the configuration's seed; every player is
 /// seated with the role it was dealt, deciding with a [`RandomStrategy`]
 /// seeded for it alone; and the moderator runs a [`Game`] over that same
-/// deal. The log goes to `records`.
+/// deal.
 ///
-/// `clock` is the episode's origin, which must be the one the writer behind
-/// `records` was given; see [`Episode::new`].
+/// **There is no clock argument.** The episode starts the one clock itself,
+/// before the writer and before any actor, and hands a copy to every actor's
+/// `start` hook, which is what makes the shared origin structural rather than
+/// something a caller can get wrong (ADR-0017).
+///
+/// The episode is given the hard time limit [`limit`] derives from the
+/// configuration's clocks.
 ///
 /// # Panics
 ///
@@ -132,11 +204,10 @@ impl From<EpisodeError> for RunError {
 #[must_use]
 pub fn episode(
     config: &Config,
-    records: Sender<Record<Message>>,
-    clock: Clock,
+    sinks: Sinks<Message>,
 ) -> (Episode<i32, Message>, Receiver<Outcome>) {
     let assignment = Assignment::deal(config);
-    let (mut episode, outcomes) = moderate(config, assignment.clone(), records, clock);
+    let (mut episode, outcomes) = moderate(config, assignment.clone(), sinks);
     for (who, role) in assignment.players() {
         seat(&mut episode, config, who, role);
     }
@@ -149,17 +220,17 @@ pub fn episode(
 fn moderate(
     config: &Config,
     assignment: Assignment,
-    records: Sender<Record<Message>>,
-    clock: Clock,
+    sinks: Sinks<Message>,
 ) -> (Episode<i32, Message>, Receiver<Outcome>) {
     let (outcome, outcomes) = unbounded();
+    let players = assignment.players().count();
     let game = Game::new(assignment, config.seed, config.timing);
     let episode = Episode::new(
-        records,
+        sinks,
         config.moderator.clone(),
-        Moderator::new(game, outcome),
-        clock,
-    );
+        Moderator::new(config.moderator.clone(), game, outcome),
+    )
+    .within(limit(&config.timing, players));
     (episode, outcomes)
 }
 
@@ -183,7 +254,7 @@ fn seat(episode: &mut Episode<i32, Message>, config: &Config, who: &ActorId, rol
 fn add(
     episode: &mut Episode<i32, Message>,
     who: &ActorId,
-    handler: impl Handler<Message> + Send + 'static,
+    handler: impl Policies<Message> + Send + 'static,
 ) {
     episode
         .add(who.clone(), handler)
@@ -215,9 +286,9 @@ fn add(
 /// # Errors
 ///
 /// [`RunError::Io`] if the log cannot be created or written,
-/// [`RunError::Episode`] if the episode did not run cleanly — a player that
-/// never selected arrives as
-/// [`EpisodeError::Stalled`] — and
+/// [`RunError::Episode`] if the episode did not run cleanly — a game the
+/// moderator never ended arrives as
+/// [`EpisodeError::Timeout`] — and
 /// [`RunError::NoOutcome`] if a clean run left no outcome on the channel.
 ///
 /// # Panics
@@ -226,7 +297,7 @@ fn add(
 /// [`episode`].
 pub fn run(config: &Config, live: Option<Box<dyn Write + Send>>) -> Result<Outcome, RunError> {
     let log = config.trajectory.as_deref();
-    let mut sinks: Vec<(Box<dyn Sink<Message>>, Policy)> = Vec::new();
+    let mut sinks: Sinks<Message> = Vec::new();
     if let Some(path) = log {
         let file = File::create(path).map_err(|source| RunError::Io {
             log: Some(path.to_path_buf()),
@@ -237,33 +308,21 @@ pub fn run(config: &Config, live: Option<Box<dyn Write + Send>>) -> Result<Outco
     if let Some(live) = live {
         sinks.push((Box::new(Text::new(live)), Policy::Optional));
     }
-    // One clock for the run, captured before the writer or any actor, so the
-    // log's offsets and everything an actor measures are on one timeline
-    // (ADR-0017).
-    let clock = Clock::start();
-    let (records, writer) = Writer::spawn(sinks, clock);
-    let (episode, outcomes) = episode(config, records, clock);
-    play(episode, &outcomes, writer, log)
+    let (episode, outcomes) = episode(config, sinks);
+    play(episode, &outcomes)
 }
 
-/// Runs an assembled episode, joins its writer, which is writing to `log`
-/// if anywhere, and takes the outcome off the moderator's channel.
-fn play(
-    episode: Episode<i32, Message>,
-    outcomes: &Receiver<Outcome>,
-    writer: Writer,
-    log: Option<&Path>,
-) -> Result<Outcome, RunError> {
-    let ran = episode.run();
-    // The episode drops every sender to the writer on its way out, whether
-    // or not it ran cleanly, so the writer can be joined now for the whole
-    // log. A failed run is the more informative error of the two.
-    let written = writer.join();
-    ran?;
-    written.map_err(|source| RunError::Io {
-        log: log.map(Path::to_path_buf),
-        source,
-    })?;
+/// Runs an assembled episode and takes the outcome off the moderator's
+/// channel.
+///
+/// **The episode joins its own writer** (ADR-0017), because it is the episode
+/// that started it, so a required sink that fails mid-episode surfaces as the
+/// actors' `WriterClosed` inside
+/// [`EpisodeError::Agents`] rather than as
+/// a [`RunError::Io`] naming the path. The path is still named for the
+/// failure this function can see first: a log that cannot be created at all.
+fn play(episode: Episode<i32, Message>, outcomes: &Receiver<Outcome>) -> Result<Outcome, RunError> {
+    episode.run()?;
     // The moderator's sender went with its handler when the episode joined
     // it, so the receiver holds the outcome now or never will.
     outcomes.try_recv().map_err(|_| RunError::NoOutcome)
@@ -276,7 +335,7 @@ mod tests {
     use std::path::Path;
 
     use super::*;
-    use crate::agent::{Action, Observation};
+    use crate::actor::{Action, Observation};
     use crate::testing::{TempDir, fast, id, ids, parse_lines};
     use crate::werewolf::config::{DEFAULT_MODERATOR, RoleCounts};
     use crate::werewolf::transcript::{self, Transcript};
@@ -342,9 +401,7 @@ mod tests {
 
     #[test]
     fn the_roster_is_every_player_and_the_moderator() {
-        let clock = Clock::start();
-        let (records, _writer) = Writer::spawn(Vec::new(), clock);
-        let (episode, _outcomes) = episode(&town(), records, clock);
+        let (episode, _outcomes) = episode(&town(), Vec::new());
         let roster: BTreeSet<ActorId> = episode.ids().cloned().collect();
         assert_eq!(
             roster,
@@ -438,9 +495,9 @@ mod tests {
     /// A player that never selects.
     struct Silent;
 
-    impl Handler<Message> for Silent {
-        fn handle(&mut self, _: &Observation<Message>) -> Vec<Action<Message>> {
-            Vec::new()
+    impl Policies<Message> for Silent {
+        fn policy(&mut self, _: Observation<Message>) -> impl IntoIterator<Item = Action<Message>> {
+            []
         }
     }
 
@@ -455,9 +512,7 @@ mod tests {
         let config = config(["alice", "bob", "carol"], 1, 0, 0);
         let assignment = Assignment::deal(&config);
         let silent = assignment.pack().iter().next().unwrap().clone();
-        let clock = Clock::start();
-        let (records, writer) = Writer::spawn(Vec::new(), clock);
-        let (mut episode, outcomes) = moderate(&config, assignment.clone(), records, clock);
+        let (mut episode, outcomes) = moderate(&config, assignment.clone(), Vec::new());
         for (who, role) in assignment.players() {
             if *who == silent {
                 add(&mut episode, who, Silent);
@@ -470,7 +525,7 @@ mod tests {
         // random players never put two on one target either, so nobody
         // dies at all and the game runs to its day cap: a stalemate,
         // which pays -1 to everyone (ADR-0011).
-        let outcome = play(episode, &outcomes, writer, None).unwrap();
+        let outcome = play(episode, &outcomes).unwrap();
         assert_eq!(outcome.winner, None);
         assert_eq!(outcome.living.len(), 3, "nobody died");
     }

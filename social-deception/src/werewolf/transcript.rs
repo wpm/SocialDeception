@@ -49,14 +49,27 @@
 //! in the order it played it. That is what this reader folds over.
 //!
 //! What it checks is the one thing the log can prove about that order: the
-//! moderator's **action** records carry its own sequence numbers, which are
-//! contiguous from zero in the order it sent them, so a gap means the file is
-//! missing one of its messages. Every action of the moderator's is counted,
-//! relays included: a relay is the moderator's own message and takes a number
-//! of the moderator's (ADR-0017), and the player it passes on is named by the
-//! envelope inside it. An observation carries the number of the *player* that
-//! sent it, and a control or a reward carries none at all, so neither is
-//! counted.
+//! moderator's own sequence numbers are contiguous from zero in the order it
+//! decided them, so a gap means the file is missing one of its messages.
+//! Every action of the moderator's is counted, relays included: a relay is
+//! the moderator's own message and takes a number of the moderator's
+//! (ADR-0017), and the player it passes on is named by the envelope inside
+//! it.
+//!
+//! A **reminder is counted too**, and it is the one message of the
+//! moderator's that appears in the log as an *observation* rather than as an
+//! action. A reminder is numbered where it is set, like everything else the
+//! moderator sends, but it is not logged there: it is logged when it arrives,
+//! as the observation it becomes, because that is the one instant about it
+//! that means anything (ADR-0016). So the moderator's numbers run over its
+//! narrations, its relays and its reminders together, and a reader that
+//! counted only the actions would see a gap wherever a reminder took a
+//! number.
+//!
+//! An observation of a *player's* selection carries the number of the player
+//! that sent it, and a control or a reward carries none at all, so neither is
+//! counted. What tells the two kinds of observation apart is the sender: a
+//! reminder is always self-directed, so its sender is the moderator.
 //!
 //! # No game logic
 //!
@@ -304,6 +317,15 @@ enum Direction {
     Sent,
     /// An `observation` record: something the moderator received.
     Received,
+    /// An `undelivered` or `unsent` record: a message that went nowhere,
+    /// because the actor it belonged to had been stopped (ADR-0016).
+    ///
+    /// The reader folds nothing from one — nothing happened in the game — but
+    /// it is the moderator's message all the same, and it took a number, so
+    /// it is counted. A moderator that is stopped with a reminder still on
+    /// its timer leaves exactly one of these, and a reader that did not count
+    /// it would see a gap.
+    Lost,
 }
 
 /// One record the reader takes an interest in.
@@ -422,7 +444,15 @@ impl Transcript {
     /// records end without one.
     pub fn read(lines: &[Value], moderator: &ActorId) -> Result<Self, TranscriptError> {
         let mut reader = Reader::default();
-        let mut next_seq = 0;
+        // Every number the moderator's own records carry, and the line each
+        // was found on. It is a **set** and not a running count, because
+        // nothing about a log's line order is promised (ADR-0017) and a
+        // reminder in particular is logged when it arrives, which is after
+        // actions the moderator decided later. What is promised is that the
+        // numbers are dense over everything the moderator's handler yielded,
+        // which is checked once, at the end.
+        let mut mine: BTreeMap<u64, usize> = BTreeMap::new();
+        let mut folding = Vec::new();
         let mut rewards = BTreeMap::new();
         for (index, value) in lines.iter().enumerate() {
             let line = index + 1;
@@ -434,27 +464,33 @@ impl Transcript {
                 }
                 Some(Line::Message { record, direction }) => {
                     let record = message(record, direction, line)?;
-                    // The moderator's own messages are numbered from zero
-                    // in the order it sent them, so a gap is a missing
-                    // record. A relay is one of them and is counted like the
-                    // rest; an observation carries the *sender's* number,
-                    // which is nothing to count here.
-                    if direction == Direction::Sent {
-                        let seq = record.seq;
-                        if seq != next_seq {
-                            return Err(TranscriptError::SeqGap {
-                                line,
-                                expected: next_seq,
-                                found: seq,
-                            });
-                        }
-                        next_seq += 1;
+                    // A relay is one of the moderator's own messages and is
+                    // counted like a narration, and so is a reminder, which
+                    // is the moderator's own message to itself (ADR-0016). An
+                    // observation of a *player's* selection carries the
+                    // sender's number, which is nothing to count here; the
+                    // sender is what tells the two apart.
+                    if record.sender == *moderator {
+                        mine.insert(record.seq, line);
                     }
-                    reader.fold(record)?;
+                    folding.push(record);
                 }
             }
         }
+        for record in folding {
+            reader.fold(record)?;
+        }
+        // The numbers last, after the game itself has been read. A file
+        // missing one of the moderator's messages is missing whatever that
+        // message said, so the fold usually fails first, on something
+        // downstream of the hole; where the fold survives the loss — a
+        // narration nothing else depends on — this is what catches it.
+        //
+        // After the outcome, because a truncated file is missing its last
+        // numbers as well, and "this is not a whole game" is the more useful
+        // thing to say about one than "number 56 is missing".
         let outcome = reader.outcome.ok_or(TranscriptError::NoOutcome)?;
+        check_the_numbers(&mine)?;
         Ok(Self {
             assignment: reader.assignment,
             rounds: reader.rounds,
@@ -462,6 +498,32 @@ impl Transcript {
             rewards,
         })
     }
+}
+
+/// The moderator's numbers are dense from zero.
+///
+/// `mine` is every number one of the moderator's records carried, against the
+/// line it was found on. The check is a set's and not a running count's: line
+/// order in a log carries no meaning (ADR-0017), and a reminder in particular
+/// reaches the writer when it arrives rather than when the number was taken,
+/// so the numbers are not in file order.
+///
+/// # Errors
+///
+/// [`TranscriptError::SeqGap`] naming the line of the first number that is
+/// not where it should be, which is the line a reader can actually look at.
+fn check_the_numbers(mine: &BTreeMap<u64, usize>) -> Result<(), TranscriptError> {
+    for (expected, (found, line)) in mine.iter().enumerate() {
+        let expected = expected as u64;
+        if *found != expected {
+            return Err(TranscriptError::SeqGap {
+                line: *line,
+                expected,
+                found: *found,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// The record on one line, if the reader has any use for it; `None` for a
@@ -484,6 +546,11 @@ fn read_line<'a>(
     let direction = match record.get("type").and_then(Value::as_str) {
         Some("action") => Direction::Sent,
         Some("observation") => Direction::Received,
+        // A message that went nowhere because its actor had been stopped
+        // (ADR-0016). Nothing happened in the game, but the moderator's
+        // number was taken, so the reader reads it to count it and folds
+        // nothing.
+        Some("undelivered" | "unsent") => Direction::Lost,
         Some("reward") => {
             let agent: ActorId = decode(record, "agent", line)?;
             let value = record
@@ -627,6 +694,12 @@ impl Reader {
             recipients,
             message,
         } = record;
+        // A message that went nowhere is not something that happened in the
+        // game. It has already been counted, which is all a reader wants of
+        // it.
+        if direction == Direction::Lost {
+            return Ok(());
+        }
         match (direction, message) {
             (Direction::Sent, Message::Narration(narration)) => {
                 self.narrated(line, recipients, narration)
@@ -634,6 +707,12 @@ impl Reader {
             (Direction::Received, Message::Select(selection)) => {
                 self.answered(line, sender, selection)
             }
+            // A reminder is the moderator's own note to itself, which says
+            // nothing about the game: what it prompted the moderator to do is
+            // whatever the game said when the reminder arrived, and that is
+            // already in the moderator's actions. It is read only to be
+            // counted, which `read` has done by the time the fold sees it.
+            (Direction::Received, Message::Reminder(_)) => Ok(()),
             // A relay is the moderator passing a selection on to the players
             // who should see it (ADR-0018). The envelope names the player who
             // made it and which of that player's messages it was, which is
@@ -1340,7 +1419,12 @@ mod tests {
         // pair, and nothing else links the two.
         //
         // Every action is its own agent's message, relays included, so the
-        // join is total on the sending side and nothing is exempt.
+        // join is total on the sending side, with one exception on the
+        // receiving side: a **reminder** joins no action, because it is the
+        // actor's own message to itself and is logged where it arrives rather
+        // than where it was set (ADR-0016). It is recognized by its sender
+        // being its own recipient, which is the one shape no other message
+        // has.
         let lines = fixture();
         let sent: BTreeSet<(String, u64)> = lines
             .iter()
@@ -1362,7 +1446,16 @@ mod tests {
             .filter(|line| line["type"] == "observation")
             .collect();
         assert!(!observations.is_empty(), "the fixture has observations");
+        let mut reminders = 0;
         for line in &observations {
+            if line["message"]["recipients"] == json!([line["message"]["sender"]]) {
+                reminders += 1;
+                assert!(
+                    !line["message"]["payload"]["Reminder"].is_null(),
+                    "the only message an actor sends itself is a reminder: {line}"
+                );
+                continue;
+            }
             let key = (
                 line["from"]
                     .as_str()
@@ -1375,6 +1468,10 @@ mod tests {
                 "an observation joins the action it came from by (from, seq): {line}"
             );
         }
+        assert!(
+            reminders > 0,
+            "the fixture has the moderator's reminders, or this exemption is untested"
+        );
     }
 
     #[test]
@@ -1629,17 +1726,29 @@ mod tests {
 
     #[test]
     fn a_gap_in_the_moderators_sequence_numbers_is_an_error() {
-        // The moderator's own messages are numbered from zero in the order
-        // it sent them, so a gap means the file is missing one. Only its
-        // own: a narration it sent, not an observation or a forward, whose
-        // numbers are the players'.
+        // The moderator's own messages are numbered densely from zero, so a
+        // gap means the file is missing one. Only its own: a narration it
+        // sent, or a reminder that came back to it, and not an observation of
+        // somebody's selection, whose number is that player's.
+        //
+        // What is checked is a **set** of numbers rather than a running
+        // count, since a log's line order carries no meaning (ADR-0017): a
+        // reminder reaches the writer when it arrives and not when its number
+        // was taken. So the error names the line where the first number out
+        // of place was found, which is the line after the hole.
+        //
+        // The forgery drops one of the moderator's `NoLynch` narrations,
+        // which is a record nothing else in the fold depends on: the game
+        // still reads as a game, and the hole its number leaves is the only
+        // thing wrong with the file.
         let mut lines = fixture();
-        let index = moderator_record(&lines, |payload| !payload["Narration"].is_null());
-        lines[index]["seq"] = json!(lines[index]["seq"].as_u64().unwrap() + 1);
+        let index = moderator_record(&lines, |payload| !payload["Narration"]["NoLynch"].is_null());
+        let missing = lines[index]["seq"].as_u64().expect("a numbered record");
+        lines.remove(index);
         let error = read(&lines).unwrap_err();
         assert!(
-            matches!(&error, TranscriptError::SeqGap { line, expected, found }
-                if *line == index + 1 && *found == *expected + 1),
+            matches!(&error, TranscriptError::SeqGap { expected, found, .. }
+                if *expected == missing && *found == missing + 1),
             "{error:?}"
         );
         assert!(error.to_string().contains("sequence number"), "{error}");

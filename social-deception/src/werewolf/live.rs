@@ -79,7 +79,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::io::{self, Write};
 
-use super::message::{Cause, Message, Narration, Phase, Select};
+use super::message::{Cause, Look, Message, Narration, Phase, Select};
 use crate::log::{ActionRecord, Elapsed, Record, Sink};
 use crate::message::ActorId;
 
@@ -167,7 +167,10 @@ impl Reading {
             Message::Narration(Narration::Eliminated { who, .. }) => {
                 self.living.remove(who);
             }
-            Message::Narration(_) | Message::Select(_) | Message::Relayed(_) => {}
+            Message::Narration(_)
+            | Message::Select(_)
+            | Message::Relayed(_)
+            | Message::Reminder(_) => {}
         }
     }
 
@@ -253,6 +256,16 @@ impl fmt::Display for Message {
             Self::Relayed(envelope) => {
                 write!(f, "Relayed({}: {})", envelope.from, envelope.payload)
             }
+            // The moderator's own note to itself, which says which phase's
+            // clocks it was watching. It reaches a line only through the
+            // observation record the reminder becomes when it fires, and
+            // `line` renders actions alone, so nothing in a live view shows
+            // one today; rendering it anyway is what keeps every payload of
+            // this game legible in one place.
+            Self::Reminder(Look::Session { round, phase }) => {
+                write!(f, "Reminder({phase} {})", round.number())
+            }
+            Self::Reminder(Look::Farewell) => f.write_str("Reminder(Farewell)"),
         }
     }
 }
