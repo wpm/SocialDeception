@@ -61,6 +61,27 @@ const SEED: u64 = 20_260_918;
 /// it is why the number is no longer small.
 const SEEDS: u64 = 120;
 
+/// How many seeds the search plays at once.
+///
+/// A game is seventeen threads that spend nearly all of their time
+/// blocked — on a session's limit, on a quiet period, on an empty inbox —
+/// so seeds overlap almost for free, and the search is bounded by wall
+/// clock rather than by cores. What bounds the batch is the other end: the
+/// `FAST` clocks hold only while every player's one selection is scheduled
+/// inside its session, and enough concurrent games will starve one of them,
+/// at which point a game stops being the game its seed names — silently,
+/// for the reason [`FAST`] gives, since a starved player is
+/// indistinguishable from one that abstained. Widening this batch spends
+/// the same margin those limits are set for.
+///
+/// Eight is chosen for margin rather than for speed. Twenty-four seeds
+/// played this way were compared against the same seeds played one at a
+/// time, and the verdicts still matched at a batch of twenty-four — some
+/// four hundred threads on a twelve-core machine. Three times the headroom
+/// is what is left to the slower and smaller machines this also runs on,
+/// and to whatever else `cargo test` is running beside it.
+const BATCH: usize = 8;
+
 /// A validated configuration for `players` with the given special roles,
 /// played from `seed`, writing no log.
 /// Timing fast enough that a test does not spend real time waiting on a
@@ -82,6 +103,20 @@ const SEEDS: u64 = 120;
 /// once, because seven agent threads on a loaded machine can outrun a margin
 /// that small. A **quiet period** costs real time on every night, since a
 /// night closes one quiet period after its members settle, so it stays short.
+/// Only the hard limit is exposed this way: a quiet period is measured from
+/// the moment every member has selected, so it cannot close a session on
+/// somebody who has not been heard from.
+///
+/// **Nothing catches it when a limit is too short.** A player whose thread
+/// was not scheduled in time is simply absent from its session's selections,
+/// and absent is how a member abstains (ADR-0011) — the game cannot tell a
+/// player that chose nowhere from a player the machine never got to. So the
+/// session closes on a smaller field, a plurality falls differently, and the
+/// seed goes on to play a *different* game that breaks no invariant and
+/// fails no assertion. That is a fact about the computer wearing the costume
+/// of a fact about the game, and it is the reason these limits are set with
+/// margin rather than trimmed until the tests are fast: the failure they
+/// guard against is silent, and would be read as the game's own behavior.
 ///
 /// The day's limit is the expensive one — a random day rarely reaches a
 /// majority, so most days run it out — but it is also the one a slow
@@ -219,19 +254,40 @@ fn the_seeds_hold_a_save_and_a_win_for_each_side() {
     // have turned up. A stalemate is not among them: at the default cap
     // of one day per player a seven-player random game always resolves
     // first, which 400 seeds confirm. Where the cap does bite is a unit
-    // test of its own, `a_random_game_stalemates_only_when_the_cap_is_tight`. Every game searched goes through the full invariant
-    // suite on the way, which is where "the doctor is working" is actually
-    // asserted: a quiet night is one on which it protected the pack's
-    // choice. Here it need only happen.
+    // test of its own,
+    // `a_random_game_stalemates_only_when_the_cap_is_tight`.
+    //
+    // Every game searched goes through the full invariant suite on the
+    // way, which is where "the doctor is working" is actually asserted: a
+    // quiet night is one on which it protected the pack's choice. Here it
+    // need only happen.
+    //
+    // A game here is almost all waiting — on a day's limit, on a night's
+    // quiet period — so a seed costs wall clock rather than a core, and
+    // the search plays `BATCH` seeds at once. The batch is what keeps the
+    // early stop: the search still gives up as soon as a batch has
+    // completed the set, having played at most `BATCH - 1` seeds it did
+    // not need.
     let mut saved = false;
     let mut winners = Vec::new();
-    for seed in 0..SEEDS {
-        let transcript = run(&town(seed));
-        saved |= transcript
-            .rounds
-            .iter()
-            .any(|round| round.night.eliminated.is_none());
-        winners.push(transcript.outcome.winner);
+    for batch in (0..SEEDS).step_by(BATCH) {
+        let seeds = batch..SEEDS.min(batch + BATCH as u64);
+        let transcripts: Vec<Transcript> = std::thread::scope(|scope| {
+            let played: Vec<_> = seeds
+                .map(|seed| scope.spawn(move || run(&town(seed))))
+                .collect();
+            played
+                .into_iter()
+                .map(|game| game.join().expect("a game played to its end"))
+                .collect()
+        });
+        for transcript in transcripts {
+            saved |= transcript
+                .rounds
+                .iter()
+                .any(|round| round.night.eliminated.is_none());
+            winners.push(transcript.outcome.winner);
+        }
         if saved
             && winners.contains(&Some(Faction::Village))
             && winners.contains(&Some(Faction::Werewolves))
