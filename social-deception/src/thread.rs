@@ -591,12 +591,20 @@ impl<P: Payload> Perception<P> {
     /// channel it waits on has closed.
     ///
     /// **At most one call is pending at a time.** The channel to the handler
-    /// thread is a rendezvous, so a message only leaves the inbox when the
-    /// handler is ready for it, and what a slow handler leaves behind piles up
-    /// in the inbox — which is exactly what a `Stop` preempts. Perception does
-    /// not *block* on the handoff, though: a pending call is offered on a send
-    /// arm of the same `select!` that watches for controls, so a `Stop` reaches
-    /// a thread whose handler has been thinking for a minute at once.
+    /// thread is a rendezvous — `bounded(0)`, holding no slot to park a
+    /// message in, so a send completes only in the instant a receive takes
+    /// it and the two threads meet. A message therefore only leaves the
+    /// inbox when the handler is ready for it, and what a slow handler
+    /// leaves behind piles up in the inbox — which is exactly what a `Stop`
+    /// preempts. A buffer here would put that backlog somewhere the stop
+    /// path never looks, and the log would say a message was delivered that
+    /// nobody ever observed.
+    ///
+    /// Perception does not *block* on the handoff, though: a pending call is
+    /// offered on a send arm of the same `select!` that watches for
+    /// controls, so a `Stop` reaches a thread whose handler has been
+    /// thinking for a minute at once. The rendezvous fixes when a message
+    /// moves, not what else this thread may do while it waits to move one.
     fn run(mut self) -> Result<(), ActorError> {
         loop {
             match self.sense() {
