@@ -58,22 +58,24 @@
   }
   * { box-sizing: border-box; }
   body { background: var(--ground); color: var(--ink); font-family: var(--sans); font-size: 15px; line-height: 1.5; }
-  .wrap { max-width: 1240px; margin: 0 auto; padding-block: 28px 48px; padding-inline: 20px; }
-  header h1 { font-size: 30px; font-weight: 600; letter-spacing: -0.01em; margin: 0 0 6px; text-wrap: balance; }
-  header p { margin: 0; color: var(--ink-2); max-width: 70ch; }
-  header p + p { margin-top: 8px; }
+  .wrap { max-width: 1240px; margin: 0 auto; padding-block: 20px 24px; padding-inline: 20px; }
+  header h1 { font-size: 26px; font-weight: 600; letter-spacing: -0.01em; margin: 0; text-wrap: balance; }
   .mono { font-family: var(--mono); font-size: 0.92em; }
 
-  .stage { display: grid; grid-template-columns: 1fr 1.05fr 1.55fr; gap: 16px; margin-top: 24px; align-items: start; }
+  .stage { display: grid; grid-template-columns: 1fr 1.05fr 1.55fr; gap: 16px; margin-top: 16px; align-items: start; }
   .col { display: grid; gap: 12px; }
   .box { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
   .boxhead { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-weight: 600; font-size: 13px; letter-spacing: 0.04em; text-transform: uppercase; color: var(--ink-2); margin-bottom: 8px; }
   .boxhead b { font-weight: 600; color: var(--ink); text-transform: none; letter-spacing: 0; font-family: var(--mono); font-size: 13px; }
   .box p { margin: 0; color: var(--ink-2); font-size: 13.5px; }
 
-  .lane { background: var(--panel-2); border: 1px dashed var(--line); border-radius: 10px; padding: 10px 12px; }
+  /* The same vertical box model as `.box`, so that the first row of a
+     channel lane sits level with the first row of perception and of the
+     writer beside it. The panels' own edges already lined up; their
+     contents did not, because the padding and the heading differed. */
+  .lane { background: var(--panel-2); border: 1px dashed var(--line); border-radius: 10px; padding: 12px 12px; }
   .lane.control { border-color: var(--ctl); }
-  .lanehead { font-size: 12px; letter-spacing: 0.04em; text-transform: uppercase; color: var(--ink-3); margin-bottom: 6px; display: flex; justify-content: space-between; gap: 8px; }
+  .lanehead { font-size: 13px; letter-spacing: 0.04em; text-transform: uppercase; color: var(--ink-3); margin-bottom: 8px; display: flex; justify-content: space-between; gap: 8px; }
   .lanehead .mono { text-transform: none; letter-spacing: 0; }
   .chips { display: flex; flex-wrap: wrap; gap: 6px; min-height: 28px; }
   .chips:empty::before { content: "empty"; color: var(--ink-3); font-size: 12px; font-family: var(--mono); padding: 4px 0; }
@@ -103,7 +105,22 @@
 
   .rendezvous { text-align: center; font-family: var(--mono); font-size: 11.5px; color: var(--ink-3); padding: 2px 0; }
 
-  .log { list-style: none; margin: 0; padding: 0; font-family: var(--mono); font-size: 11.5px; line-height: 1.45; display: grid; gap: 3px; max-height: 460px; overflow: auto; }
+  /* `overflow-y: scroll` rather than `auto`: the track is reserved whether
+     or not the log is long enough to need it yet, so the lines do not
+     shift sideways the moment one more arrives and the scrollbar appears.
+     The colors are given explicitly because the platform's own overlay
+     scrollbar fades out a moment after scrolling, and here it is worth
+     keeping: it is how far through a run the log is.
+
+     `align-content: start` because the box has a fixed height: the default
+     `stretch` would share it out among however many lines have been
+     written, so a run's first two records would each be half the panel
+     tall. */
+  .log { list-style: none; margin: 0; padding: 0; font-family: var(--mono); font-size: 11.5px; line-height: 1.45; display: grid; gap: 3px; align-content: start; min-height: 320px; max-height: 460px; overflow-y: scroll; scrollbar-gutter: stable; scrollbar-width: thin; scrollbar-color: var(--line) transparent; }
+  .log::-webkit-scrollbar { width: 10px; }
+  .log::-webkit-scrollbar-track { background: transparent; }
+  .log::-webkit-scrollbar-thumb { background: var(--line); border-radius: 999px; border: 2px solid var(--panel); }
+  .log::-webkit-scrollbar-thumb:hover { background: var(--ink-3); }
   .log:empty::before { content: "nothing written yet"; color: var(--ink-3); }
   .log li { padding: 3px 8px; border-radius: 6px; background: var(--panel-2); color: var(--ink-2); white-space: nowrap; overflow-x: auto; }
   .log li.cycle { color: var(--log); background: var(--log-bg); }
@@ -111,12 +128,36 @@
   .log li.lost { color: var(--lost); background: var(--lost-bg); }
   .log li.new { outline: 1px solid var(--log); animation: enter 320ms ease; }
 
-  .caption { margin-top: 20px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 18px; display: grid; grid-template-columns: auto 1fr; gap: 6px 16px; align-items: baseline; }
+  .caption { --measure: 46ch; --colgap: 28px; margin: 14px auto 0; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 18px; display: grid; grid-template-columns: auto 1fr; gap: 6px 16px; align-items: baseline; width: fit-content; max-width: 100%; }
   .stepno { font-family: var(--mono); font-size: 12px; color: var(--ink-3); grid-row: 1 / span 2; padding-top: 4px; font-variant-numeric: tabular-nums; }
+  /* The narration runs in two columns: it is the tallest thing under the
+     stage, and every line it saves is a line the stage above it keeps,
+     which is what lets the whole page be watched on one screen without
+     scrolling the title away. `columns` flows one paragraph
+     across both, so the text stays one piece of prose and only its shape
+     changes — and two half-height columns of the same words are close to
+     half the height.
+
+     The measure is per column, so it is narrower than a single column of
+     the same prose would want; `--measure` is the width of one, and the
+     box is two of those plus the gap. It is a token on the parent because
+     `ch` resolves against each element's own font size, and the heading's
+     is larger, so declaring it on the children would give two different
+     widths and the blocks would not line up. */
   .caption h2 { margin: 0; font-size: 17px; font-weight: 600; }
-  .caption p { margin: 0; color: var(--ink-2); max-width: 78ch; }
+  .caption p {
+    margin: 0; color: var(--ink-2);
+    width: calc(var(--measure) * 2 + var(--colgap)); max-width: 100%;
+    columns: 2; column-gap: var(--colgap); column-fill: balance;
+  }
+  /* One column again where two would each be too narrow to read. */
+  @media (max-width: 760px) { .caption p { columns: 1; width: var(--measure); } }
 
   .controls { margin-top: 12px; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+  /* Filling the screen drops the page's own margins, which exist to sit a
+     document in a browser window and only waste room once the window is
+     gone. The stage keeps its own padding. */
+  .wrap:fullscreen { max-width: none; width: 100%; padding: 20px 28px; overflow-y: auto; background: var(--ground); }
   button { font: inherit; font-weight: 500; font-size: 14px; padding: 7px 14px; border-radius: 8px; border: 1px solid var(--line); background: var(--panel); color: var(--ink); cursor: pointer; }
   button.primary { background: var(--out); border-color: var(--out); color: #fff; }
   button:focus-visible, select:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
@@ -125,7 +166,7 @@
   .progress { flex: 1 1 160px; height: 6px; background: var(--panel-2); border-radius: 999px; overflow: hidden; min-width: 120px; }
   .progress i { display: block; height: 100%; background: var(--out); width: 0; transition: width 240ms ease; }
 
-  .legend { margin-top: 22px; display: flex; flex-wrap: wrap; gap: 8px 18px; font-size: 13px; color: var(--ink-2); }
+  .legend { margin-top: 14px; display: flex; flex-wrap: wrap; gap: 8px 18px; font-size: 13px; color: var(--ink-2); }
   .legend span { display: inline-flex; align-items: center; gap: 6px; }
   .sw { width: 12px; height: 12px; border-radius: 3px; }
 
@@ -137,16 +178,10 @@
 <main class="wrap">
   <header>
     <h1>Perceive and Decide</h1>
-    <p>One actor, step by step: what arrives on its inbox, its control channel and its reminder timer; what its perception thread stamps and logs; what its handler thread decides; and the lines both write to the log. Play it through, or step with the arrow keys.</p>
-    <p>An actor is <strong>two threads</strong>. The point of the second one is that <strong>perceiving never waits on deciding</strong>: a handler busy in a model call cannot delay the stamp on what arrives while it thinks.</p>
   </header>
 
   <section class="stage" aria-live="polite">
     <div class="col">
-      <div class="box">
-        <div class="boxhead">Router</div>
-        <p>A fixed roster from actor id to that actor's inbox and control channel. A handler thread sends straight to its recipients' inboxes — there is no central loop in the middle, and nothing counts deliveries in flight. Senders are unbounded, so a send never blocks.</p>
-      </div>
       <div class="lane control">
         <div class="lanehead"><span>control channel</span><span class="mono">checked first</span></div>
         <div id="control" class="chips"></div>
@@ -199,6 +234,7 @@
     <label for="speed" class="mono" style="color:var(--ink-3);font-size:12px">speed</label>
     <select id="speed"><option value="4200">slow</option><option value="2600" selected>normal</option><option value="1400">fast</option></select>
     <div class="progress"><i id="bar"></i></div>
+    <button id="full" type="button" title="Full screen (f)" aria-pressed="false">Full screen</button>
   </div>
 
   <div class="legend">
@@ -432,14 +468,129 @@
   el.prev.addEventListener('click', () => { stop(); go(i - 1); });
   el.reset.addEventListener('click', () => { stop(); lastLog = 0; go(0); });
   el.speed.addEventListener('change', () => { if (timer) { stop(); start(); } });
+  // Full screen. The button reflects the browser's state rather than its own
+  // idea of it, because Escape and the browser's own shortcut leave without
+  // asking us, and `fullscreenchange` is the only thing that hears about it.
+  const full = document.getElementById('full');
+  const stage = document.querySelector('.wrap');
+  full.addEventListener('click', () => {
+    if (document.fullscreenElement) document.exitFullscreen();
+    else stage.requestFullscreen().catch(() => {});
+  });
+  document.addEventListener('fullscreenchange', () => {
+    const on = document.fullscreenElement === stage;
+    full.textContent = on ? 'Exit full screen' : 'Full screen';
+    full.setAttribute('aria-pressed', String(on));
+  });
+
   document.addEventListener('keydown', (e) => {
     if (e.target.tagName === 'SELECT') return;
     if (e.key === 'ArrowRight') { stop(); go(i + 1); }
     else if (e.key === 'ArrowLeft') { stop(); go(i - 1); }
     else if (e.key === ' ') { e.preventDefault(); timer ? stop() : start(); }
+    else if (e.key === 'f' || e.key === 'F') { full.click(); }
   });
 
+  // Every box that varies with its frame is held at the height of whichever
+  // frame fills it most, so that stepping through never jogs what sits
+  // below it. The caption grows with its narration; the handler box grows
+  // with a long call line and with the chips it is observing or has
+  // yielded; the perception box grows with what it has stamped.
+  //
+  // The heights are measured rather than guessed. Which frame is tallest
+  // depends on the font, the width and the text, so any number written
+  // here would be wrong the first time one of those changed. Each frame is
+  // rendered in turn and the boxes measured, which costs one pass over the
+  // script at load and nothing afterwards.
+  const sized = [
+    document.querySelector('.caption'),
+    document.querySelector('.threadbox.perceive'),
+    document.querySelector('.threadbox.decide'),
+  ];
+  const columns = document.querySelectorAll('.stage .col');
+  const log = el.log;
+  function sizeBoxes() {
+    for (const box of sized) box.style.minHeight = '';
+    const tallest = sized.map(() => 0);
+    for (let n = 0; n < frames.length; n++) {
+      render(n, 0);
+      sized.forEach((box, k) => {
+        tallest[k] = Math.max(tallest[k], box.getBoundingClientRect().height);
+      });
+    }
+    sized.forEach((box, k) => { box.style.minHeight = tallest[k] + 'px'; });
+
+    // The writer ends level with the columns beside it. Its log is the one
+    // thing here that would otherwise run past them — a full run is more
+    // lines than the other two columns are tall — so it is held to
+    // whatever room the taller neighbor leaves and scrolls inside that.
+    // The height is read from the laid-out columns rather than written
+    // down, because those columns have just been pinned to their own
+    // tallest frames and the number is whatever that came to.
+    //
+    // Measured after the boxes above are pinned, since that is what fixes
+    // where the neighbors end.
+    log.style.maxHeight = '';
+    const mine = log.closest('.col');
+    const neighbors = [...columns].filter((c) => c !== mine);
+    const bottom = Math.max(...neighbors.map((c) => c.getBoundingClientRect().bottom));
+    // Measured from the log's own top, so the box's heading and top padding
+    // need no accounting; its bottom padding does, or the box would end one
+    // padding lower than its neighbors.
+    const pad = parseFloat(window.getComputedStyle(mine.querySelector('.box')).paddingBottom) || 0;
+    const room = bottom - log.getBoundingClientRect().top - pad;
+    // The page is meant to be watched whole — title and controls on one
+    // screen — so the log is also held to what the viewport leaves once
+    // the controls, caption and legend below the stage have their room,
+    // plus the page's own bottom padding. Whichever limit is tighter wins.
+    // Each of those is measured from its own box, so clamping the log,
+    // which is what shortens the stage, does not change any of them.
+    const under = ['.controls', '.caption', '.legend']
+      .map((sel) => document.querySelector(sel))
+      .filter(Boolean)
+      .reduce((sum, e) => {
+        const style = window.getComputedStyle(e);
+        // Their top margins are read too, rather than repeated here as
+        // numbers that would drift the moment the stylesheet changed.
+        return sum + e.getBoundingClientRect().height
+          + (parseFloat(style.marginTop) || 0);
+      }, 0);
+    const wrap = document.querySelector('.wrap');
+    const below = parseFloat(window.getComputedStyle(wrap).paddingBottom) || 0;
+    const fits = window.innerHeight - log.getBoundingClientRect().top
+      - under - below - pad;
+    const limit = Math.min(room, fits);
+    // Below about a hundred pixels the log is too short to be worth reading,
+    // which is also the case at the narrow breakpoints: there the writer
+    // wraps *below* its neighbors, so `room` comes out negative and the cap
+    // is rightly left off, letting the column run to its natural height.
+    //
+    // `minHeight` as well as `maxHeight`, so the log is that tall from the
+    // first frame rather than growing into it. A run's first frames write
+    // one or two lines, and a box that grew with them would move the
+    // caption below it on nearly every step — the thing every other box
+    // here is pinned to avoid.
+    log.style.minHeight = '';
+    if (limit > 100) {
+      log.style.maxHeight = limit + 'px';
+      log.style.minHeight = limit + 'px';
+    }
+
+    // Back to the frame the viewer was on. `lastLog` is reset because the
+    // measuring pass has already walked the log past it, and leaving it
+    // would suppress the entry animation on the next real step.
+    lastLog = 0;
+    render(i, 0);
+  }
+
   render(0, 0);
+  sizeBoxes();
+  window.addEventListener('resize', sizeBoxes);
+  // A frame later, because the viewport is not its new size yet when
+  // `fullscreenchange` fires and measuring now would read the old width.
+  document.addEventListener('fullscreenchange', () => {
+    requestAnimationFrame(sizeBoxes);
+  });
 })();
 </script>
 
