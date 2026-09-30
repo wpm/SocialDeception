@@ -475,6 +475,21 @@ fn started<H: Send + 'static>(actor: Actor<H>) -> Started {
     }
 }
 
+/// Stops everybody so that the log is complete up to whatever went wrong,
+/// ignoring the actors that cannot be stopped because they already are.
+///
+/// An actor that has been stopped no longer has a control receiver —
+/// `Perception::abandon` consumes itself and drops it — so a send to it is
+/// refused. That is not a diagnosis and must not replace one: an episode
+/// whose environment hung after some agent had died would otherwise come
+/// back as `Control` ("could not deliver a control") rather than as the
+/// `Timeout` naming who was still running, which is the whole reason this
+/// milestone has a `Timeout` at all. [`join`] documents the same reasoning
+/// for the same send; this is that treatment, applied where it was missing.
+fn stop_everybody<P: Payload>(router: &Router<P>, everybody: &[ActorId]) {
+    let _ = router.command_as_episode(everybody, Control::Stop);
+}
+
 /// Waits for every actor's threads to report, within `limit`.
 ///
 /// Two threads per actor, so two reports per actor, and each report says
@@ -507,9 +522,7 @@ fn wait<P: Payload>(
                     // Nobody told it to stop, so the episode was abandoned
                     // where it stood. The rest are stopped so that the log is
                     // complete up to the departure.
-                    router
-                        .command_as_episode(&everybody, Control::Stop)
-                        .map_err(EpisodeError::Control)?;
+                    stop_everybody(router, &everybody);
                     return Err(EpisodeError::Departed);
                 }
                 if let Some(left) = outstanding.get_mut(&who) {
@@ -524,9 +537,7 @@ fn wait<P: Payload>(
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                 let running = outstanding.keys().cloned().collect();
-                router
-                    .command_as_episode(&everybody, Control::Stop)
-                    .map_err(EpisodeError::Control)?;
+                stop_everybody(router, &everybody);
                 return Err(EpisodeError::Timeout { limit, running });
             }
         }
@@ -834,6 +845,66 @@ mod tests {
             .filter(|line| line["type"] == "control" && line["control"] == "stop")
             .count();
         assert_eq!(stops, 2, "the episode stopped both actors: {lines:?}");
+    }
+
+    #[test]
+    fn a_timeout_is_still_a_timeout_when_somebody_was_already_stopped() {
+        /// An environment that starts both agents, stops one of them the
+        /// moment it hears anything, and then never ends the episode — the
+        /// shape Werewolf has, where a player is stopped where it dies and
+        /// the moderator may hang afterwards.
+        struct StopsOneThenHangs {
+            stopped: bool,
+        }
+
+        impl Step<i32, TestPayload> for StopsOneThenHangs {
+            fn start(
+                &mut self,
+                _clock: Clock,
+            ) -> impl IntoIterator<Item = Effect<i32, TestPayload>> {
+                [Effect::command(["a", "b"], Control::Start)]
+            }
+
+            fn step(
+                &mut self,
+                _observation: Observation<TestPayload>,
+            ) -> impl IntoIterator<Item = Effect<i32, TestPayload>> {
+                // Stopping "a" closes its control channel, so the episode's
+                // own `Stop` to everybody will be refused for it later.
+                //
+                // Once only: an environment that commands an actor it has
+                // already stopped has its own send refused, which fails the
+                // environment's thread — a separate hole in the same family
+                // as this test's, and not the one under test here.
+                let first = !self.stopped;
+                self.stopped = true;
+                first
+                    .then(|| Effect::command(["a"], Control::Stop))
+                    .into_iter()
+            }
+        }
+
+        let (mut episode, _log) = episode(StopsOneThenHangs { stopped: false });
+        episode.add("a", Greeting).unwrap();
+        episode.add("b", Greeting).unwrap();
+        let limit = Duration::from_millis(200);
+        // The diagnosis must be the timeout and who was still running. Before
+        // the fix the episode's own `Stop` to the already-stopped actor was
+        // refused, the `?` turned that into `Control`, and the timeout — the
+        // reason this milestone has a `Timeout` at all — was lost.
+        match episode.within(limit).run() {
+            Err(EpisodeError::Timeout {
+                limit: given,
+                running,
+            }) => {
+                assert_eq!(given, limit);
+                assert!(
+                    !running.is_empty(),
+                    "the timeout names who was still running"
+                );
+            }
+            other => panic!("a stopped actor must not mask the timeout: {other:?}"),
+        }
     }
 
     #[test]

@@ -1,9 +1,11 @@
 //! Everything said in a Werewolf episode: the [`Message`] payload and the
 //! vocabulary of rounds, phases, sessions and targets it is built from.
 
-use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::num::NonZero;
+use std::time::Instant;
+
+use serde::{Deserialize, Serialize};
 
 use super::role::{Faction, Role};
 use crate::message::{ActorId, Envelope};
@@ -140,6 +142,18 @@ pub enum Look {
         round: Round,
         /// Which half of that round.
         phase: Phase,
+        /// The deadline this reminder was set for, which is the key the
+        /// moderator filed it under and so the key it must be removed
+        /// under when it arrives.
+        ///
+        /// **Not serialized**, and not part of the log's format. An
+        /// `Instant` is a reading of this process's monotonic clock: it
+        /// cannot be written down and it would mean nothing to a reader of
+        /// the file, which is why the log keeps elapsed times instead
+        /// (ADR-0017). A reminder read back from a log therefore carries
+        /// `None` here, which is correct — nothing replays a timer.
+        #[serde(skip)]
+        deadline: Option<Instant>,
     },
     /// The game is over and its last narrations have had time to arrive: stop
     /// everybody.

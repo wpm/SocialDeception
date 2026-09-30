@@ -249,16 +249,32 @@ impl Moderator {
                 directives.extend(self.game.expire(now));
                 directives
             }
+            // Relaying and narrating are the moderator's own moves, and so is
+            // reminding itself: a player that sends one is a player claiming
+            // to be the moderator. Unchecked, a player could send
+            // `Look::Session` and close every session whose deadline had
+            // passed, resolving a night early and skipping the stragglers.
+            Message::Reminder(_) if *sender != self.me => {
+                panic!("{sender} sent the moderator a reminder")
+            }
             // A reminder the moderator set for itself. Whether anything has
             // actually expired is the game's to say, and a reminder for a
             // deadline that has since moved closes nothing (ADR-0018).
-            Message::Reminder(_) => {
-                self.reminded.remove(&now);
+            Message::Reminder(look) => {
+                // Removed under the key it was filed under. `now` is when
+                // perception popped it off the inbox, which is always later
+                // than the deadline it was set for, so removing by `now`
+                // removed nothing and the set grew for the life of the game.
+                if let Look::Session {
+                    deadline: Some(deadline),
+                    ..
+                } = look
+                {
+                    self.reminded.remove(deadline);
+                }
                 self.game.expire(now)
             }
             Message::Narration(_) => panic!("{sender} sent the moderator a narration"),
-            // Relaying is the moderator's own move, so a player sending one
-            // is a player claiming to be the moderator.
             Message::Relayed(_) => panic!("{sender} sent the moderator a relay"),
         }
     }
@@ -325,7 +341,7 @@ impl Moderator {
         }
         vec![Effect::Act(Action::Remind(Reminder::new(
             deadline,
-            self.session_reminder(),
+            self.session_reminder(deadline),
         )))]
     }
 
@@ -344,9 +360,13 @@ impl Moderator {
     /// A session reminder's payload: which phase of which round the moderator
     /// was watching when it set it, which is provenance and nothing the game
     /// reads back.
-    fn session_reminder(&self) -> Message {
+    fn session_reminder(&self, deadline: Instant) -> Message {
         let (phase, round) = self.game.phase_now();
-        Message::Reminder(Look::Session { round, phase })
+        Message::Reminder(Look::Session {
+            round,
+            phase,
+            deadline: Some(deadline),
+        })
     }
 
     /// The one command that ends the episode: every actor still running
@@ -1014,8 +1034,9 @@ mod tests {
             Message::Reminder(Look::Session {
                 round: Round::FIRST,
                 phase: Phase::Night,
+                deadline: Some(deadline),
             }),
-            "and says which phase's clocks it was set for"
+            "and says which phase's clocks it was set for, and for when"
         );
     }
 
@@ -1105,6 +1126,7 @@ mod tests {
             Message::Reminder(Look::Session {
                 round: Round::FIRST,
                 phase: Phase::Night,
+                deadline: Some(quiet),
             })
         );
 
@@ -1707,6 +1729,9 @@ mod tests {
                 Message::Reminder(Look::Session {
                     round: Round::FIRST,
                     phase: Phase::Day,
+                    // Hand-built rather than set by the moderator, so there
+                    // is no deadline it was filed under to remove.
+                    deadline: None,
                 }),
                 at(0),
             ),
@@ -1775,6 +1800,57 @@ mod tests {
             assert!(clock < 10_000, "a stub game should have ended by now");
         }
         assert!(reference.game.outcome().is_some() && doubled.game.outcome().is_some());
+    }
+
+    #[test]
+    #[should_panic(expected = "erin sent the moderator a reminder")]
+    fn a_reminder_from_a_player_panics() {
+        // Reminding itself is the moderator's own move. Unchecked, a player
+        // could send `Look::Session` and expire every session whose deadline
+        // had passed — resolving a night early and skipping the selections
+        // of whoever had not answered yet.
+        let (mut moderator, _receiver) = moderator(village());
+        started(&mut moderator);
+        let _ = stepped(
+            &mut moderator,
+            from_player(
+                "erin",
+                at(0),
+                Message::Reminder(Look::Session {
+                    round: Round::FIRST,
+                    phase: Phase::Night,
+                    deadline: None,
+                }),
+            ),
+        );
+    }
+
+    #[test]
+    fn a_reminder_that_arrives_is_taken_off_the_set_it_was_filed_under() {
+        // `reminded` is keyed by deadline, and a reminder arrives strictly
+        // after the deadline it was set for, so removing by the arrival
+        // instant removed nothing and the set grew for the life of the game.
+        // The deadline rides along on the reminder for exactly this.
+        let (mut moderator, _receiver) = moderator(village());
+        let opening = started(&mut moderator);
+        let (deadline, payload) = one_reminder(&opening);
+        assert_eq!(
+            moderator.reminded.len(),
+            1,
+            "the opening filed one deadline"
+        );
+
+        // Delivered a moment after the deadline, which is how a reminder
+        // always arrives: perception pops it off the inbox strictly later
+        // than the instant it was set for.
+        let _ = stepped(
+            &mut moderator,
+            reminder(payload, deadline + Duration::from_millis(1)),
+        );
+        assert!(
+            !moderator.reminded.contains(&deadline),
+            "the deadline it was filed under is gone once the reminder arrives"
+        );
     }
 
     #[test]

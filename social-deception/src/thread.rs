@@ -429,29 +429,63 @@ fn act<P: Payload>(
             context.router.route(&message).map_err(ActorError::Refused)
         }
         Action::Remind(reminder) => {
-            if context.is_stopped() {
-                // A reminder yielded too late brings nothing back, so it is
-                // unsent in exactly the sense a send is: the message it would
-                // have become never travels.
-                let message = reminder_message(&context.id, seq, reminder.payload);
-                let key = Key::of(&message);
-                return context.send_record(
-                    UnsentRecord {
-                        agent: context.id.clone(),
-                        t: Instant::now(),
-                        key,
-                        message,
+            // Checked before the handoff, and again if the handoff fails.
+            // The two are not one step, and perception's `stop` closes the
+            // requests channel between them: it sets the flag and then
+            // consumes itself, dropping the receiver. A reminder yielded in
+            // that window finds the flag clear and the channel gone, so a
+            // failed send is read as the stop it is rather than as a broken
+            // timer. Without the second look a `Remind` racing a `Stop`
+            // fails its thread and an otherwise clean episode comes back as
+            // `EpisodeError::Agents`.
+            if !context.is_stopped() {
+                // A reminder is not logged where it is set. It is logged when
+                // it arrives, as the observation it becomes, because that is
+                // the one instant about it that means anything to the actor.
+                match held.send(Held { seq, reminder }) {
+                    Ok(()) => return Ok(()),
+                    Err(returned) => {
+                        if !context.is_stopped() {
+                            return Err(ActorError::TimerClosed);
+                        }
+                        // Stopped after all, and the send gave the reminder
+                        // back, so it is recorded below like any other
+                        // reminder yielded too late.
+                        return unsent_reminder(returned.0.reminder, seq, context);
                     }
-                    .into(),
-                );
+                }
             }
-            // A reminder is not logged where it is set. It is logged when it
-            // arrives, as the observation it becomes, because that is the one
-            // instant about it that means anything to the actor.
-            held.send(Held { seq, reminder })
-                .map_err(|_| ActorError::TimerClosed)
+            // A reminder yielded too late brings nothing back, so it is
+            // unsent in exactly the sense a send is: the message it would
+            // have become never travels.
+            unsent_reminder(reminder, seq, context)
         }
     }
+}
+
+/// Records a reminder that will never come back, because the actor was
+/// stopped before its timer could hold it.
+///
+/// Reached two ways: the reminder was yielded after the stop was already
+/// visible, or it lost the race to perception closing the requests channel.
+/// Both mean the same thing to a reader — the message it would have become
+/// never travels — so both are one record.
+fn unsent_reminder<P: Payload>(
+    reminder: Reminder<P>,
+    seq: u64,
+    context: &mut Context<P>,
+) -> Result<(), ActorError> {
+    let message = reminder_message(&context.id, seq, reminder.payload);
+    let key = Key::of(&message);
+    context.send_record(
+        UnsentRecord {
+            agent: context.id.clone(),
+            t: Instant::now(),
+            key,
+            message,
+        }
+        .into(),
+    )
 }
 
 /// Carries out one command: a control to each of its recipients' control
@@ -1550,6 +1584,93 @@ mod tests {
             json!("a"),
             "a reminder is the actor's own message: {}",
             lost[0]
+        );
+    }
+
+    #[test]
+    fn a_reminder_whose_handoff_fails_after_a_stop_is_unsent_not_an_error() {
+        // The interleaving the fix is for: the handler reads the stopped flag
+        // as clear, perception's `stop` then sets it and returns — `abandon`
+        // consumes `self`, so the requests receiver drops — and only then does
+        // the handler hand over its reminder. The send fails, and the second
+        // look at the flag is what tells `act` this is a stop rather than a
+        // broken timer.
+        //
+        // The flag has to change *while* `act` runs, which one thread cannot
+        // express, so the change is made from another one: this thread sets it
+        // and closes the channel while the handler is parked on the handoff.
+        // The handoff is a rendezvous, so parking there is what the real
+        // handler does too.
+        let (_unstarted, router, bench, _report) = wired::<TestPayload>("a");
+        let stopped = Arc::new(AtomicBool::new(false));
+        let mut context = Context {
+            id: ActorId::new("a"),
+            router,
+            records: bench.records.clone(),
+            next_seq: 0,
+            stopped: Arc::clone(&stopped),
+        };
+        let (held, requests) = bounded::<Held<TestPayload>>(0);
+
+        // Clear when `act` looks, which is the premise.
+        assert!(!stopped.load(Ordering::SeqCst), "clear at the check");
+        let raising = {
+            let stopped = Arc::clone(&stopped);
+            thread::spawn(move || {
+                // Let the handler reach the handoff and block on it, then do
+                // what `stop` does: raise the flag, then drop the receiver.
+                thread::sleep(Duration::from_millis(50));
+                stopped.store(true, Ordering::SeqCst);
+                drop(requests);
+            })
+        };
+
+        let reminder = Reminder::new(Instant::now() + Duration::from_secs(3600), step(3));
+        act(Action::Remind(reminder), &mut context, &held)
+            .expect("a reminder that lost the race is not an error");
+        raising.join().unwrap();
+
+        // Accounted for as unsent, with the actor's own name and number, the
+        // same shape a reminder yielded after a visible stop gets.
+        drop(context);
+        let lines = bench.lines();
+        let unsent: Vec<&Value> = lines
+            .iter()
+            .filter(|line| line["type"] == "unsent")
+            .collect();
+        assert_eq!(unsent.len(), 1, "one unsent reminder: {lines:?}");
+        assert_eq!(unsent[0]["seq"], json!(0));
+        assert_eq!(
+            unsent[0]["message"]["sender"],
+            json!("a"),
+            "a reminder is the actor's own message: {}",
+            unsent[0]
+        );
+    }
+
+    #[test]
+    fn a_reminder_whose_timer_has_gone_while_running_is_an_error() {
+        // The other side of the same check: the timer really is broken, the
+        // actor was never stopped, and that must still fail the thread rather
+        // than being quietly logged as unsent.
+        let (_unstarted, router, bench, _report) = wired::<TestPayload>("a");
+        let mut context = Context {
+            id: ActorId::new("a"),
+            router,
+            records: bench.records.clone(),
+            next_seq: 0,
+            stopped: Arc::new(AtomicBool::new(false)),
+        };
+        let (held, requests) = unbounded::<Held<TestPayload>>();
+        drop(requests);
+
+        let reminder = Reminder::new(Instant::now() + Duration::from_secs(3600), step(3));
+        assert!(
+            matches!(
+                act(Action::Remind(reminder), &mut context, &held),
+                Err(ActorError::TimerClosed)
+            ),
+            "a timer that has gone while the actor runs is still an error"
         );
     }
 

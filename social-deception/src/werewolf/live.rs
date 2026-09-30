@@ -262,7 +262,7 @@ impl fmt::Display for Message {
             // `line` renders actions alone, so nothing in a live view shows
             // one today; rendering it anyway is what keeps every payload of
             // this game legible in one place.
-            Self::Reminder(Look::Session { round, phase }) => {
+            Self::Reminder(Look::Session { round, phase, .. }) => {
                 write!(f, "Reminder({phase} {})", round.number())
             }
             Self::Reminder(Look::Farewell) => f.write_str("Reminder(Farewell)"),
