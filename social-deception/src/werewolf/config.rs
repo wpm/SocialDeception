@@ -20,7 +20,7 @@
 //!
 //! A configuration also writes back out, as the *effective configuration* of
 //! a run: [`Config::effective`] is the TOML that [`load`] reads back to the
-//! same value, and [`write_effective`] puts it beside a trajectory, at
+//! same value, and [`write_effective`] puts it beside a log, at
 //! [`effective_path`], so that a run can be reproduced from its artifacts
 //! alone.
 
@@ -35,7 +35,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use super::seed;
-use crate::event::AgentId;
+use crate::message::ActorId;
 
 /// The moderator's id when the file does not set one.
 pub const DEFAULT_MODERATOR: &str = "moderator";
@@ -55,16 +55,16 @@ pub struct Config {
     pub seed: u64,
     /// The players, in the order written. The order does not affect the
     /// deal, which sorts them first.
-    pub players: Vec<AgentId>,
+    pub players: Vec<ActorId>,
     /// How many of each special role to deal. The rest are villagers.
     pub roles: RoleCounts,
-    /// Where to write the trajectory, if anywhere.
+    /// Where to write the log, if anywhere.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trajectory: Option<PathBuf>,
-    /// The moderator's agent id. The moderator is an agent in the same
+    /// The moderator's actor id. The moderator is an agent in the same
     /// roster as the players, so no player may have this id.
     #[serde(default = "default_moderator")]
-    pub moderator: AgentId,
+    pub moderator: ActorId,
     /// The clocks the game's selection sessions run on.
     #[serde(default)]
     pub timing: Timing,
@@ -92,8 +92,8 @@ impl RoleCounts {
     }
 }
 
-fn default_moderator() -> AgentId {
-    AgentId::new(DEFAULT_MODERATOR)
+fn default_moderator() -> ActorId {
+    ActorId::new(DEFAULT_MODERATOR)
 }
 
 /// The clocks a game's selection sessions run on (ADR-0011).
@@ -281,7 +281,7 @@ mod seconds {
 
 /// Why a configuration was rejected.
 ///
-/// An empty agent id is not among these: `AgentId` does not deserialize
+/// An empty actor id is not among these: `ActorId` does not deserialize
 /// from the empty string, so a file naming one fails to parse.
 #[derive(Debug)]
 pub enum ConfigError {
@@ -322,12 +322,12 @@ pub enum ConfigError {
     /// `roles.doctors` is more than one.
     TooManyDoctors(usize),
     /// A player id appears more than once.
-    DuplicatePlayer(AgentId),
+    DuplicatePlayer(ActorId),
     /// A player has the moderator's id.
-    PlayerIsModerator(AgentId),
+    PlayerIsModerator(ActorId),
     /// A player has the name of one of the seed streams that are not a
     /// player's, [`seed::RESERVED`], and would share its generator with it.
-    ReservedPlayer(AgentId),
+    ReservedPlayer(ActorId),
     /// A timing duration is zero. A session with no time cannot be selected
     /// in.
     TimingNotPositive {
@@ -415,31 +415,31 @@ impl Error for ConfigError {
     }
 }
 
-/// Where the effective configuration of a run is written, beside its
-/// trajectory: the trajectory's path with `.toml` appended, so
-/// `werewolf.jsonl` has `werewolf.jsonl.toml` beside it.
+/// Where the effective configuration of a run is written, beside its log:
+/// the log's path with `.toml` appended, so `werewolf.jsonl` has
+/// `werewolf.jsonl.toml` beside it.
 ///
 /// The effective configuration is the [`Config`] a run was played from after
 /// any command-line overrides, without its `trajectory` field. It exists
-/// because the seed never appears in a trajectory, and a run has to be
+/// because the seed never appears in the log, and a run has to be
 /// reproducible from its artifacts. Appending the extension rather than
 /// replacing it means the file can never collide with the configuration the
 /// run was started from, however the two are named.
 #[must_use]
-pub fn effective_path(trajectory: &Path) -> PathBuf {
-    let mut path = trajectory.as_os_str().to_owned();
+pub fn effective_path(log: &Path) -> PathBuf {
+    let mut path = log.as_os_str().to_owned();
     path.push(".toml");
     PathBuf::from(path)
 }
 
 /// Writes the effective configuration of a run played from `config` beside
-/// its trajectory, at [`effective_path`], and returns where it was written.
+/// its log, at [`effective_path`], and returns where it was written.
 ///
 /// # Errors
 ///
 /// [`ConfigError::Write`] if the file cannot be written.
-pub fn write_effective(config: &Config, trajectory: &Path) -> Result<PathBuf, ConfigError> {
-    let path = effective_path(trajectory);
+pub fn write_effective(config: &Config, log: &Path) -> Result<PathBuf, ConfigError> {
+    let path = effective_path(log);
     fs::write(&path, config.effective()).map_err(|source| ConfigError::Write {
         path: path.clone(),
         source,
@@ -530,10 +530,10 @@ impl Config {
     /// `[timing]` table resolved.
     ///
     /// It is a valid configuration file in the schema [`load`] reads, and
-    /// reads back as this configuration with no trajectory. That is what
-    /// makes reproducing a run `werewolf play <trajectory>.toml --trajectory
-    /// <elsewhere>`: the trajectory is omitted so that replaying the file
-    /// cannot truncate the very trajectory it describes, and a reproduction
+    /// reads back as this configuration naming no log. That is what makes
+    /// reproducing a run `werewolf play <log>.toml --trajectory
+    /// <elsewhere>`: the `trajectory` field is omitted so that replaying the
+    /// file cannot truncate the very log it describes, and a reproduction
     /// names its own output.
     ///
     /// `day_cap` is written as the number the run actually played to, rather
@@ -605,8 +605,8 @@ mod tests {
         werewolves = 1
     "#;
 
-    fn ids<const N: usize>(names: [&str; N]) -> Vec<AgentId> {
-        names.map(AgentId::new).into()
+    fn ids<const N: usize>(names: [&str; N]) -> Vec<ActorId> {
+        names.map(ActorId::new).into()
     }
 
     /// A valid configuration to break one field of at a time.
@@ -627,7 +627,7 @@ mod tests {
                     doctors: 1,
                 },
                 trajectory: Some(PathBuf::from("werewolf.jsonl")),
-                moderator: AgentId::new("narrator"),
+                moderator: ActorId::new("narrator"),
                 timing: Timing {
                     day_cap: Some(5),
                     pack: NightTiming {
@@ -663,7 +663,7 @@ mod tests {
                     doctors: 0,
                 },
                 trajectory: None,
-                moderator: AgentId::new(DEFAULT_MODERATOR),
+                moderator: ActorId::new(DEFAULT_MODERATOR),
                 timing: Timing::default(),
             }
         );
@@ -677,7 +677,7 @@ mod tests {
     }
 
     #[test]
-    fn the_effective_config_sits_beside_the_trajectory() {
+    fn the_effective_config_sits_beside_the_log() {
         assert_eq!(
             effective_path(Path::new("werewolf.jsonl")),
             PathBuf::from("werewolf.jsonl.toml")
@@ -686,8 +686,8 @@ mod tests {
             effective_path(Path::new("runs/first.jsonl")),
             PathBuf::from("runs/first.jsonl.toml")
         );
-        // The extension is appended, never replaced, so a trajectory named
-        // like a configuration cannot have its configuration overwritten.
+        // The extension is appended, never replaced, so a log named like a
+        // configuration cannot have its configuration overwritten.
         assert_eq!(
             effective_path(Path::new("werewolf.toml")),
             PathBuf::from("werewolf.toml.toml")
@@ -747,7 +747,7 @@ mod tests {
         );
         assert!(error.to_string().contains("2 werewolves among 4 players"));
         // One more player and the check passes.
-        config.players.push(AgentId::new("erin"));
+        config.players.push(ActorId::new("erin"));
         config.validate().unwrap();
     }
 
@@ -803,7 +803,7 @@ mod tests {
         let text = FULL.replace("\"dave\"", "\"\"");
         let error = Config::parse(&text).unwrap_err();
         assert!(matches!(error, ConfigError::Parse(_)), "{error:?}");
-        assert!(error.to_string().contains("non-empty agent id"), "{error}");
+        assert!(error.to_string().contains("non-empty actor id"), "{error}");
     }
 
     #[test]
@@ -811,13 +811,13 @@ mod tests {
         let text = FULL.replace("\"narrator\"", "\"\"");
         let error = Config::parse(&text).unwrap_err();
         assert!(matches!(error, ConfigError::Parse(_)), "{error:?}");
-        assert!(error.to_string().contains("non-empty agent id"), "{error}");
+        assert!(error.to_string().contains("non-empty actor id"), "{error}");
     }
 
     #[test]
     fn duplicate_player() {
         let mut config = valid();
-        config.players[5] = AgentId::new("bob");
+        config.players[5] = ActorId::new("bob");
         let error = config.validate().unwrap_err();
         assert!(
             matches!(&error, ConfigError::DuplicatePlayer(who) if who.as_str() == "bob"),
@@ -829,7 +829,7 @@ mod tests {
     #[test]
     fn player_is_moderator() {
         let mut config = valid();
-        config.players[0] = AgentId::new("narrator");
+        config.players[0] = ActorId::new("narrator");
         let error = config.validate().unwrap_err();
         assert!(
             matches!(&error, ConfigError::PlayerIsModerator(who) if who.as_str() == "narrator"),
@@ -843,11 +843,11 @@ mod tests {
 
     #[test]
     fn a_player_may_not_be_named_for_a_reserved_seed_stream() {
-        // Such a player's policy would draw from the deal's generator, or
+        // Such a player's strategy would draw from the deal's generator, or
         // the moderator's, and the streams would not be independent.
         for reserved in seed::RESERVED {
             let mut config = valid();
-            config.players[2] = AgentId::new(reserved);
+            config.players[2] = ActorId::new(reserved);
             let error = config.validate().unwrap_err();
             assert!(
                 matches!(&error, ConfigError::ReservedPlayer(who) if who.as_str() == reserved),
@@ -860,9 +860,9 @@ mod tests {
                 "{text}"
             );
         }
-        // The moderator has no policy stream, so its name is free.
+        // The moderator has no strategy stream, so its name is free.
         let mut config = valid();
-        config.moderator = AgentId::new(seed::TIES);
+        config.moderator = ActorId::new(seed::TIES);
         config.validate().unwrap();
     }
 
@@ -905,11 +905,11 @@ mod tests {
     }
 
     #[test]
-    fn the_effective_config_is_written_beside_the_trajectory_and_loads() {
+    fn the_effective_config_is_written_beside_the_log_and_loads() {
         let dir = TempDir::new();
-        let trajectory = dir.join("werewolf.jsonl");
-        let written = write_effective(&valid(), &trajectory).unwrap();
-        assert_eq!(written, effective_path(&trajectory));
+        let log = dir.join("werewolf.jsonl");
+        let written = write_effective(&valid(), &log).unwrap();
+        assert_eq!(written, effective_path(&log));
         let config = valid();
         assert_eq!(
             load(&written).unwrap(),
@@ -923,10 +923,10 @@ mod tests {
 
     #[test]
     fn an_unwritable_effective_config_is_a_write_error_naming_it() {
-        let trajectory = Path::new("/no-such-directory/werewolf.jsonl");
-        let error = write_effective(&valid(), trajectory).unwrap_err();
+        let log = Path::new("/no-such-directory/werewolf.jsonl");
+        let error = write_effective(&valid(), log).unwrap_err();
         assert!(
-            matches!(&error, ConfigError::Write { path, .. } if *path == effective_path(trajectory)),
+            matches!(&error, ConfigError::Write { path, .. } if *path == effective_path(log)),
             "{error:?}"
         );
         assert!(error.source().is_some());

@@ -19,13 +19,13 @@ use rand_chacha::ChaCha8Rng;
 use super::config::Config;
 use super::role::{Faction, Role};
 use super::seed::{ASSIGNMENT, seed_for};
-use crate::event::AgentId;
+use crate::message::ActorId;
 
 /// Which player holds which role.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Assignment {
-    roles: BTreeMap<AgentId, Role>,
-    pack: BTreeSet<AgentId>,
+    roles: BTreeMap<ActorId, Role>,
+    pack: BTreeSet<ActorId>,
 }
 
 /// The pack a deal implies: every player whose role is of the werewolves'
@@ -33,7 +33,7 @@ pub struct Assignment {
 ///
 /// Both constructors derive the pack this way, so the two cannot disagree
 /// about who the werewolves are.
-fn pack_of(roles: &BTreeMap<AgentId, Role>) -> BTreeSet<AgentId> {
+fn pack_of(roles: &BTreeMap<ActorId, Role>) -> BTreeSet<ActorId> {
     roles
         .iter()
         .filter(|(_, role)| role.faction() == Faction::Werewolves)
@@ -58,7 +58,7 @@ impl Assignment {
     /// [`Config::validate`] rejects.
     #[must_use]
     pub fn deal(config: &Config) -> Self {
-        let players: BTreeSet<&AgentId> = config.players.iter().collect();
+        let players: BTreeSet<&ActorId> = config.players.iter().collect();
         let counts = config.roles;
         let villagers = players
             .len()
@@ -78,7 +78,7 @@ impl Assignment {
         // construction, and keep the golden value that the hand-rolled
         // version produces.
         roles.shuffle(&mut rng);
-        let roles: BTreeMap<AgentId, Role> = players.into_iter().cloned().zip(roles).collect();
+        let roles: BTreeMap<ActorId, Role> = players.into_iter().cloned().zip(roles).collect();
         let pack = pack_of(&roles);
         Self { roles, pack }
     }
@@ -94,7 +94,7 @@ impl Assignment {
     pub fn new<I, A>(roles: I) -> Self
     where
         I: IntoIterator<Item = (A, Role)>,
-        A: Into<AgentId>,
+        A: Into<ActorId>,
     {
         let mut dealt = BTreeMap::new();
         for (who, role) in roles {
@@ -110,18 +110,18 @@ impl Assignment {
 
     /// The role dealt to `who`, or `None` if `who` is not a player.
     #[must_use]
-    pub fn role(&self, who: &AgentId) -> Option<Role> {
+    pub fn role(&self, who: &ActorId) -> Option<Role> {
         self.roles.get(who).copied()
     }
 
     /// The werewolves.
     #[must_use]
-    pub const fn pack(&self) -> &BTreeSet<AgentId> {
+    pub const fn pack(&self) -> &BTreeSet<ActorId> {
         &self.pack
     }
 
-    /// Every player with its role, in agent-id order.
-    pub fn players(&self) -> impl Iterator<Item = (&AgentId, Role)> {
+    /// Every player with its role, in actor-id order.
+    pub fn players(&self) -> impl Iterator<Item = (&ActorId, Role)> {
         self.roles.iter().map(|(who, role)| (who, *role))
     }
 
@@ -140,10 +140,10 @@ mod tests {
     fn game(seed: u64, players: &[&str], roles: RoleCounts) -> Config {
         let config = Config {
             seed,
-            players: players.iter().copied().map(AgentId::new).collect(),
+            players: players.iter().copied().map(ActorId::new).collect(),
             roles,
             trajectory: None,
-            moderator: AgentId::new("moderator"),
+            moderator: ActorId::new("moderator"),
             timing: Timing::default(),
         };
         config.validate().unwrap();
@@ -197,7 +197,7 @@ mod tests {
             assert_eq!(assignment.count(Role::Doctor), 1, "seed {seed}");
             assert_eq!(assignment.count(Role::Villager), 3, "seed {seed}");
             assert_eq!(assignment.players().count(), 7, "seed {seed}");
-            let werewolves: BTreeSet<AgentId> = assignment
+            let werewolves: BTreeSet<ActorId> = assignment
                 .players()
                 .filter(|(_, role)| *role == Role::Werewolf)
                 .map(|(who, _)| who.clone())
@@ -210,10 +210,10 @@ mod tests {
     fn every_player_has_a_role_and_nobody_else_does() {
         let assignment = Assignment::deal(&game(3, &SEVEN, FULL_HOUSE));
         for who in SEVEN {
-            assert!(assignment.role(&AgentId::new(who)).is_some(), "{who}");
+            assert!(assignment.role(&ActorId::new(who)).is_some(), "{who}");
         }
-        assert_eq!(assignment.role(&AgentId::new("moderator")), None);
-        assert_eq!(assignment.role(&AgentId::new("")), None);
+        assert_eq!(assignment.role(&ActorId::new("moderator")), None);
+        assert_eq!(assignment.role(&ActorId::new("")), None);
     }
 
     #[test]

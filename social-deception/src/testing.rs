@@ -11,13 +11,14 @@ use crossbeam_channel::Sender;
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::agent::Observation;
-use crate::clock::Timestamp;
-use crate::event::{AgentId, Domain, Event};
-use crate::trajectory::{JsonLines, LogRecord, Policy, Sink, Writer};
-use crate::werewolf::{
-    Assignment, Faction, Knowledge, Message, Narration, Phase, Role, Round, WerewolfDomain,
-};
+use std::sync::LazyLock;
+use std::time::{Duration, Instant};
+
+use crate::Observation;
+use crate::clock::Clock;
+use crate::log::{JsonLines, Policy, Record, Sink, Sinks, Writer};
+use crate::message::{ActorId, Envelope, Message, Payload};
+use crate::werewolf::{self, Assignment, Faction, Knowledge, Narration, Phase, Role, Round};
 
 pub(crate) use temp::TempDir;
 
@@ -26,20 +27,23 @@ pub(crate) const ME: &str = "me";
 
 /// What a runtime unit test's agents say to each other: a counter, which is
 /// enough to tell one message from the next.
+///
+/// It is an enum with one variant rather than a bare `u64` because a game's
+/// payload is an enum of the things that game says, and a test payload that
+/// serializes as `{"Step": 7}` is what the log's records are read against.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) enum TestPayload {
     /// A step, carrying its number.
     Step(u64),
 }
 
-/// The domain the runtime's own unit tests are written against, standing in
-/// for a game the runtime knows nothing about.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct TestDomain;
-
-impl Domain for TestDomain {
-    type Payload = TestPayload;
-    type Reward = i32;
+impl TestPayload {
+    /// The number a step carries.
+    pub(crate) fn step(&self) -> u64 {
+        match self {
+            Self::Step(n) => *n,
+        }
+    }
 }
 
 /// A destination a test can read back after the writer has taken ownership
@@ -83,12 +87,24 @@ impl Write for Shared {
 }
 
 /// A writer whose one required [`JsonLines`] sink writes to a buffer the
-/// test keeps, which is what a test that reads its trajectory back wants.
-pub(crate) fn recording<D: Domain>() -> (Sender<LogRecord<D>>, Writer, Shared) {
-    let bytes = Shared::new();
-    let sink: Box<dyn Sink<D>> = Box::new(JsonLines::new(bytes.clone()));
-    let (sender, writer) = Writer::spawn(vec![(sink, Policy::Required)]);
+/// test keeps, which is what a test that reads its log back wants.
+pub(crate) fn recording<P: Payload>(clock: Clock) -> (Sender<Record<P>>, Writer, Shared) {
+    let (sinks, bytes) = sinking();
+    let (sender, writer) = Writer::spawn(sinks, clock);
     (sender, writer, bytes)
+}
+
+/// One required [`JsonLines`] sink over a buffer the test keeps, for a
+/// caller that hands its sinks to something that starts the writer itself.
+///
+/// [`Episode`](crate::Episode) takes its sinks rather than a records channel,
+/// because starting the clock and the writer itself is what makes the
+/// shared-origin invariant structural (ADR-0017). So a test of it wants the
+/// sink and not the sender.
+pub(crate) fn sinking<P: Payload>() -> (Sinks<P>, Shared) {
+    let bytes = Shared::new();
+    let sink: Box<dyn Sink<P>> = Box::new(JsonLines::new(bytes.clone()));
+    (vec![(sink, Policy::Required)], bytes)
 }
 
 /// Joins `writer` and gives back everything its [`JsonLines`] sink wrote
@@ -102,7 +118,7 @@ pub(crate) fn joined(writer: Writer, bytes: &Shared) -> Vec<u8> {
     bytes.bytes()
 }
 
-/// Parses a trajectory file into one JSON value per line.
+/// Parses a log file into one JSON value per line.
 ///
 /// # Panics
 ///
@@ -116,6 +132,47 @@ pub(crate) fn parse_lines(bytes: &[u8]) -> Vec<Value> {
         .collect()
 }
 
+/// Asserts that `line` is the `episode` header a log opens with, and returns
+/// the wall-clock anchor it carries.
+///
+/// The anchor is the one wall-clock time in a log and so differs on every
+/// run; a caller that wants to check *which* moment it is compares it with
+/// the [`Clock`] the log was written from.
+///
+/// # Panics
+///
+/// If the line is not a header, or carries no anchor.
+pub(crate) fn header_anchor(line: &Value) -> u64 {
+    assert_eq!(
+        line["type"], "episode",
+        "the first line is the header: {line}"
+    );
+    assert!(
+        line["agent"].is_null(),
+        "the header is nobody's record: {line}"
+    );
+    line["start_unix_ns"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("the header anchors the episode to the wall clock: {line}"))
+}
+
+/// A fixed base for the instants a test names, so that `at(0)`, `at(1)` and
+/// so on are one comparable series.
+///
+/// An `Instant` has no epoch to build one from, so a test that wants
+/// arbitrary times offsets one reading taken once for the whole run. It is
+/// far enough in the future that a deadline named from it never fires on a
+/// real clock, which is what lets a test drive a handler with instants of its
+/// own: a test that wants a reminder to fire delivers it by hand, as the
+/// moderator's tests do, rather than waiting for a timer.
+pub(crate) static BASE: LazyLock<Instant> =
+    LazyLock::new(|| Instant::now() + Duration::from_secs(3600));
+
+/// `millis` after [`BASE`].
+pub(crate) fn at_millis(millis: u64) -> Instant {
+    *BASE + Duration::from_millis(millis)
+}
+
 /// Serializes a value to a JSON value, for asserting on its shape.
 ///
 /// # Panics
@@ -125,20 +182,20 @@ pub(crate) fn json<T: serde::Serialize>(value: &T) -> Value {
     serde_json::to_value(value).unwrap()
 }
 
-/// An agent id, for tests that name agents by string literal.
-pub(crate) fn id(name: &str) -> AgentId {
-    AgentId::new(name)
+/// An actor id, for tests that name agents by string literal.
+pub(crate) fn id(name: &str) -> ActorId {
+    ActorId::new(name)
 }
 
-/// A set of agent ids, for tests that name agents by string literal.
-pub(crate) fn ids<const N: usize>(names: [&str; N]) -> BTreeSet<AgentId> {
-    names.map(AgentId::new).into()
+/// A set of actor ids, for tests that name agents by string literal.
+pub(crate) fn ids<const N: usize>(names: [&str; N]) -> BTreeSet<ActorId> {
+    names.map(ActorId::new).into()
 }
 
 /// The agent a selection targets, for tests that name agents by string
 /// literal. The same thing as [`id`], named for the place it is used: it
 /// reads as "the target" where a selection's target is what is meant.
-pub(crate) fn target(name: &str) -> AgentId {
+pub(crate) fn target(name: &str) -> ActorId {
     id(name)
 }
 
@@ -172,35 +229,52 @@ pub(crate) fn fast() -> crate::werewolf::config::Timing {
     }
 }
 
-/// An event from `sender` to [`ME`], created at a time no test reads.
+/// A message from `sender` to [`ME`], numbered as no test reads.
 ///
 /// Every werewolf unit test is a fold over what arrives, and the fold is a
-/// pure function of the payloads; the instant each event was created plays
-/// no part in it, so one stand-in time serves them all.
-pub(crate) fn from(sender: &str, payload: Message) -> Event<WerewolfDomain> {
-    Event::new(sender, [ME], Timestamp::default(), payload)
+/// pure function of the payloads; which of its sender's messages each one is
+/// plays no part in it, so one stand-in number serves them all.
+pub(crate) fn from(sender: &str, payload: werewolf::Message) -> Message<werewolf::Message> {
+    Message::new(sender, [ME], 0, payload)
 }
 
-/// An event as [`ME`] observes it, received at a time no test reads. Like
-/// the creation time in [`from`], it plays no part in any fold.
-pub(crate) fn observed(event: Event<WerewolfDomain>) -> Observation<WerewolfDomain> {
+/// A message as [`ME`] observes it, arriving at a time no test reads. Like
+/// the sequence number in [`from`], it plays no part in any fold.
+pub(crate) fn observed(message: Message<werewolf::Message>) -> Observation<werewolf::Message> {
     Observation {
-        event,
-        received: Timestamp::default(),
+        message,
+        at: Instant::now(),
     }
 }
 
 /// A narration from the moderator to [`ME`].
-pub(crate) fn narrated(narration: Narration) -> Event<WerewolfDomain> {
-    from("moderator", Message::Narration(narration))
+pub(crate) fn narrated(narration: Narration) -> Message<werewolf::Message> {
+    from("moderator", werewolf::Message::Narration(narration))
+}
+
+/// The moderator relaying `who`'s selection to [`ME`], as its `seq`th
+/// message.
+///
+/// A player addresses the moderator alone, so this is the only shape in which
+/// another player's selection reaches [`ME`] (ADR-0018): the moderator's own
+/// message, with the envelope inside it naming who selected.
+pub(crate) fn relayed(
+    who: &str,
+    seq: u64,
+    selection: werewolf::Select,
+) -> Message<werewolf::Message> {
+    from(
+        "moderator",
+        werewolf::Message::Relayed(Envelope::new(who, seq, selection)),
+    )
 }
 
 /// The moderator announcing a phase to [`ME`].
 pub(crate) fn phase_began(
     round: u32,
     phase: Phase,
-    living: BTreeSet<AgentId>,
-) -> Event<WerewolfDomain> {
+    living: BTreeSet<ActorId>,
+) -> Message<werewolf::Message> {
     narrated(Narration::PhaseBegan {
         round: Round::new(round),
         phase,

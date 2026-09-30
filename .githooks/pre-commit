@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# Pre-commit hook: spelling only, on the files being committed.
+#
+# The full suite runs at push time (see `pre-push`), which keeps it off the
+# path of each individual commit. Spelling is the exception worth catching
+# earlier: it is fast, it is the check most likely to fail on a commit that
+# is otherwise finished, and a failure at push time means amending or
+# adding a fix-up commit for something a moment's check would have caught.
+# U.S. spellings are a house rule here, and `typos` is what enforces it.
+#
+# Wire it up once per clone with:
+#
+#     git config core.hooksPath .githooks
+#
+# Runs when typos is installed; when it is not, the hook says so and both
+# pre-push and CI still enforce it.
+
+set -euo pipefail
+
+cd "$(git rev-parse --show-toplevel)"
+
+if ! command -v typos >/dev/null 2>&1; then
+    printf '!! typos is not installed; skipping. pre-push and CI run it.\n'
+    printf '   Install with: cargo install --locked typos-cli\n'
+    exit 0
+fi
+
+# Only what is staged, and only what still exists: a commit that deletes a
+# file should not be judged on the spelling it removed.
+#
+# Newline-delimited rather than `-z`, and read with a plain `while` loop
+# rather than `mapfile -d`, because macOS ships bash 3.2 and neither
+# `mapfile -d` nor `readarray` exists there. A path containing a newline
+# would be misread, which git can produce but this repository does not
+# have; a path containing a space is fine, since each line is one path.
+staged=$(git diff --cached --name-only --diff-filter=d)
+
+if [ -z "$staged" ]; then
+    exit 0
+fi
+
+# `--file-list -` takes the paths on stdin, so the check is scoped to the
+# commit rather than to the whole tree: an unrelated typo elsewhere in the
+# working tree is not this commit's business, and would be somebody else's
+# commit to fix.
+if ! printf '%s\n' "$staged" | typos --file-list -; then
+    printf '\nSpelling errors in the staged files (U.S. spellings, see CLAUDE.md).\n'
+    printf 'Fix them, or run `typos --write-changes` on the files above.\n'
+    exit 1
+fi

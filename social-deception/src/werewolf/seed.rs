@@ -2,9 +2,9 @@
 //! from the generator it seeds.
 //!
 //! Every source of randomness in an episode draws from a generator of its
-//! own: the role deal, each player's policy, the moderator's tie-breaks. Each
-//! generator is seeded with the master seed mixed with a label naming the
-//! stream, so that one stream can be recomputed without the others and so
+//! own: the role deal, each player's strategy, the moderator's tie-breaks.
+//! Each generator is seeded with the master seed mixed with a label naming
+//! the stream, so that one stream can be recomputed without the others and so
 //! that a player's own choices do not depend on how many other players there
 //! are. A shared generator would instead make every stream depend on the
 //! order the agents' threads happened to run.
@@ -28,7 +28,7 @@ pub const TIES: &str = "moderator:ties";
 
 /// The labels that are not an agent's: [`ASSIGNMENT`] and [`TIES`].
 ///
-/// A player's policy is seeded under its own id, so a player with one of
+/// A player's strategy is seeded under its own id, so a player with one of
 /// these names would share its generator with the deal or with the
 /// tie-breaks, and the streams would not be independent. A configuration
 /// naming such a player is rejected
@@ -41,7 +41,7 @@ pub const RESERVED: [&str; 2] = [ASSIGNMENT, TIES];
 /// FNV-1a over the master seed's little-endian bytes followed by the label's
 /// bytes, finished with the splitmix64 mixer so that nearby inputs give
 /// unrelated outputs. Labels in use: [`ASSIGNMENT`] for the role deal, an
-/// agent's own id for its policy, and [`TIES`] for the moderator's
+/// agent's own id for its strategy, and [`TIES`] for the moderator's
 /// tie-breaks. Distinct labels give distinct streams, and the reserved
 /// labels are not valid player ids, so no two streams in a run share a
 /// generator.

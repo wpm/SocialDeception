@@ -3,7 +3,7 @@
 //!
 //! This is the whole of the seam between Werewolf and the runtime. Nothing
 //! in the runtime knows about Werewolf: [`episode`] *constructs* an
-//! [`Episode`], dealing the roles and adding a [`Seat`] for every player and
+//! [`Episode`], dealing the roles and adding a [`Player`] for everyone and
 //! the [`Moderator`] that runs their game, and [`run`] runs one to
 //! completion and hands back how it ended. If a change here ever wants to
 //! modify `Episode`, `Agent` or the router, something upstream was designed
@@ -18,13 +18,45 @@
 //!
 //! # A missing outcome is the runtime's error, not this module's
 //!
-//! The moderator is the episode's [`Environment`](crate::Environment), so
-//! an episode ends when the moderator says it does, which is when it has
-//! announced the outcome. A player that never selects leaves
-//! nothing in flight and nobody stopped, which the episode reports as
-//! [`EpisodeError::Stalled`] naming the players still running. So there is
-//! nothing for this module to detect: [`run`] takes the outcome from the
-//! moderator's channel and a clean run always has one.
+//! The moderator is the episode's environment, so an episode ends when the
+//! moderator says it does: it stops every actor, itself included, once it has
+//! announced the outcome and its players have heard it (ADR-0016). A
+//! moderator that never gets there leaves the episode running until its
+//! **hard time limit**, which it reports as
+//! [`EpisodeError::Timeout`] naming the
+//! actors still going. So there is nothing for this module to detect: [`run`]
+//! takes the outcome from the moderator's channel and a clean run always has
+//! one.
+//!
+//! # How the time limit is derived
+//!
+//! The limit is a **backstop against a runtime or moderator bug**, not a
+//! schedule anything is meant to meet, so it is derived generously from the
+//! clocks the configuration sets and then multiplied.
+//!
+//! A game ends within its `day_cap` rounds however its players act
+//! (ADR-0011), and a round costs at most one night and one day. A night's
+//! three sessions run **at once**, so a night costs the longest of the three
+//! hard limits rather than their sum; a day costs its own limit. So the rules
+//! bound a game at
+//!
+//! ```text
+//! day_cap × (max(pack.limit, seer.limit, doctor.limit) + day.limit)
+//! ```
+//!
+//! plus the moderator's farewell interval at the end. [`limit`] is
+//! [`limit`] is a slack multiple of that, floored, and both of those are for
+//! the same
+//! thing: nothing above accounts for thread scheduling, and a game whose
+//! sessions are measured in tens of milliseconds — which is how this
+//! repository's tests play them — can spend a comparable share of its time
+//! simply waiting to be scheduled on a loaded machine. A game played on the
+//! example's clocks, which are seconds, is bounded by a number so much larger
+//! than it needs that the slack costs nothing.
+//!
+//! What the limit must never be is *tight*. A limit that fired on a slow but
+//! correct game would turn a scheduling delay into a failed run, which is
+//! worse than the hang it is there to prevent.
 //!
 //! # The seed never enters the game
 //!
@@ -32,53 +64,52 @@
 //! and the public algorithm, anyone could recompute the deal and every
 //! agent's random stream, which is to say every piece of hidden information
 //! in the game. So it lies outside every player's observation space: no
-//! [`Message`](super::Message) has a field that could carry it, and this
-//! module never puts it in one. It is recorded beside the trajectory, in the
+//! [`Message`] has a field that could carry it, and this
+//! module never puts it in one. It is recorded beside the log, in the
 //! effective configuration the `werewolf` binary writes, never in it.
 
 use std::error;
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+use std::time::Duration;
 
-use crossbeam_channel::{Receiver, Sender, unbounded};
+use crossbeam_channel::{Receiver, unbounded};
 
-use super::WerewolfDomain;
 use super::assignment::Assignment;
 use super::config::Config;
+use super::config::Timing;
 use super::game::Game;
 use super::live::Text;
-use super::message::Outcome;
+use super::message::{Message, Outcome};
 use super::moderator::Moderator;
-use super::player::Seat;
-use super::policy::RandomPolicy;
+use super::player::Player;
 use super::role::Role;
-use super::roles::{Doctor, Seer, Villager, Werewolf};
-use crate::agent::Handler;
-use crate::episode::{Episode, EpisodeError};
-use crate::event::AgentId;
-use crate::trajectory::{JsonLines, LogRecord, Policy, Sink, Writer};
+use super::strategy::RandomStrategy;
+use crate::log::{JsonLines, Policy, Sinks};
+use crate::message::ActorId;
+use crate::{Episode, EpisodeError, Policy as Policies};
 
 /// Why a run did not end with an outcome.
 #[derive(Debug)]
 pub enum RunError {
-    /// The trajectory could not be created or written.
+    /// The log could not be created or written.
     Io {
         /// Where it was being written, or `None` if it was going nowhere.
-        trajectory: Option<PathBuf>,
+        log: Option<PathBuf>,
         /// What went wrong.
         source: io::Error,
     },
-    /// The episode did not run cleanly. A game in which some player never
-    /// selected arrives here as
-    /// [`EpisodeError::Stalled`].
+    /// The episode did not run cleanly. A game the moderator never ended
+    /// arrives here as
+    /// [`EpisodeError::Timeout`].
     Episode(EpisodeError),
     /// The episode ran cleanly and the moderator announced no outcome.
     ///
     /// Nothing known produces this: an episode the moderator did not end is
-    /// a stall, and one it did end it ended by announcing the outcome. It is
-    /// here because `run` cannot prove that from the types, and a silent
+    /// a timeout, and one it did end it ended by announcing the outcome. It
+    /// is here because `run` cannot prove that from the types, and a silent
     /// `unwrap` would be a worse answer than a named error.
     NoOutcome,
 }
@@ -87,13 +118,10 @@ impl fmt::Display for RunError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io {
-                trajectory: Some(path),
+                log: Some(path),
                 source,
             } => write!(f, "cannot write {}: {source}", path.display()),
-            Self::Io {
-                trajectory: None,
-                source,
-            } => write!(f, "cannot write the trajectory: {source}"),
+            Self::Io { log: None, source } => write!(f, "cannot write the log: {source}"),
             Self::Episode(error) => error.fmt(f),
             Self::NoOutcome => {
                 f.write_str("the episode ended cleanly but the moderator announced no outcome")
@@ -118,13 +146,56 @@ impl From<EpisodeError> for RunError {
     }
 }
 
-/// Builds an episode from a configuration. The receiver yields the outcome
-/// once the moderator has announced it.
+/// How much of the slack the derived time limit is: the rules' bound on a
+/// game, multiplied by this.
+///
+/// It is there for thread scheduling, which nothing in the rules accounts
+/// for; see the [module documentation](self) for why it is generous rather
+/// than tight.
+const SLACK: u32 = 8;
+
+/// The least a derived time limit ever is, whatever the configuration's
+/// clocks.
+///
+/// A configuration may set clocks in single milliseconds, and a bound of a
+/// few hundred milliseconds would be a limit a correct game could lose a race
+/// with on a loaded machine. This is the floor beneath which the multiplier
+/// stops being the thing that matters.
+const FLOOR: Duration = Duration::from_secs(30);
+
+/// The hard time limit an episode played under `timing` with `players`
+/// players is given, derived as the [module documentation](self) sets out.
+#[must_use]
+pub fn limit(timing: &Timing, players: usize) -> Duration {
+    // A night's three sessions run at once, so a night costs the longest of
+    // their hard limits and not their sum.
+    let night = timing
+        .pack
+        .limit
+        .max(timing.seer.limit)
+        .max(timing.doctor.limit);
+    let round = night + timing.day.limit;
+    let rules = round.saturating_mul(timing.day_cap(players));
+    // The farewell interval the moderator waits before stopping everybody is
+    // inside the slack, which is orders of magnitude larger than it.
+    rules.saturating_mul(SLACK).max(FLOOR)
+}
+
+/// Builds an episode from a configuration, whose log goes to `sinks`. The
+/// receiver yields the outcome once the moderator has announced it.
 ///
 /// The roles are dealt once, from the configuration's seed; every player is
-/// seated as the type its role calls for, deciding with a [`RandomPolicy`]
+/// seated with the role it was dealt, deciding with a [`RandomStrategy`]
 /// seeded for it alone; and the moderator runs a [`Game`] over that same
-/// deal. The trajectory goes to `records`.
+/// deal.
+///
+/// **There is no clock argument.** The episode starts the one clock itself,
+/// before the writer and before any actor, and hands a copy to every actor's
+/// `start` hook, which is what makes the shared origin structural rather than
+/// something a caller can get wrong (ADR-0017).
+///
+/// The episode is given the hard time limit [`limit`] derives from the
+/// configuration's clocks.
 ///
 /// # Panics
 ///
@@ -133,10 +204,10 @@ impl From<EpisodeError> for RunError {
 #[must_use]
 pub fn episode(
     config: &Config,
-    records: Sender<LogRecord<WerewolfDomain>>,
-) -> (Episode<WerewolfDomain>, Receiver<Outcome>) {
+    sinks: Sinks<Message>,
+) -> (Episode<i32, Message>, Receiver<Outcome>) {
     let assignment = Assignment::deal(config);
-    let (mut episode, outcomes) = moderate(config, assignment.clone(), records);
+    let (mut episode, outcomes) = moderate(config, assignment.clone(), sinks);
     for (who, role) in assignment.players() {
         seat(&mut episode, config, who, role);
     }
@@ -149,37 +220,29 @@ pub fn episode(
 fn moderate(
     config: &Config,
     assignment: Assignment,
-    records: Sender<LogRecord<WerewolfDomain>>,
-) -> (Episode<WerewolfDomain>, Receiver<Outcome>) {
+    sinks: Sinks<Message>,
+) -> (Episode<i32, Message>, Receiver<Outcome>) {
     let (outcome, outcomes) = unbounded();
+    let players = assignment.players().count();
     let game = Game::new(assignment, config.seed, config.timing);
     let episode = Episode::new(
-        records,
+        sinks,
         config.moderator.clone(),
-        Moderator::new(game, outcome),
-    );
+        Moderator::new(config.moderator.clone(), game, outcome),
+    )
+    .within(limit(&config.timing, players));
     (episode, outcomes)
 }
 
-/// Seats `who` in the roster as its role, with a policy seeded for it.
-fn seat(episode: &mut Episode<WerewolfDomain>, config: &Config, who: &AgentId, role: Role) {
-    let policy = RandomPolicy::for_agent(config.seed, who);
+/// Seats `who` in the roster as its role, with a strategy seeded for it.
+fn seat(episode: &mut Episode<i32, Message>, config: &Config, who: &ActorId, role: Role) {
+    let strategy = RandomStrategy::for_agent(config.seed, who);
     let moderator = config.moderator.clone();
-    let me = who.clone();
-    match role {
-        Role::Villager => add(
-            episode,
-            who,
-            Seat::new(Villager::new(me), policy, moderator),
-        ),
-        Role::Werewolf => add(
-            episode,
-            who,
-            Seat::new(Werewolf::new(me), policy, moderator),
-        ),
-        Role::Seer => add(episode, who, Seat::new(Seer::new(me), policy, moderator)),
-        Role::Doctor => add(episode, who, Seat::new(Doctor::new(me), policy, moderator)),
-    }
+    add(
+        episode,
+        who,
+        Player::new(who.clone(), role, strategy, moderator),
+    );
 }
 
 /// Adds an agent to the roster.
@@ -189,9 +252,9 @@ fn seat(episode: &mut Episode<WerewolfDomain>, config: &Config, who: &AgentId, r
 /// is the configuration's check to make, so a failure here is a panic and
 /// not an error of its own.
 fn add(
-    episode: &mut Episode<WerewolfDomain>,
-    who: &AgentId,
-    handler: impl Handler<WerewolfDomain> + Send + 'static,
+    episode: &mut Episode<i32, Message>,
+    who: &ActorId,
+    handler: impl Policies<Message> + Send + 'static,
 ) {
     episode
         .add(who.clone(), handler)
@@ -202,7 +265,7 @@ fn add(
 ///
 /// Two sinks, either of which may be absent:
 ///
-/// - the trajectory, a **required** [`JsonLines`] over `config.trajectory`
+/// - the log, a **required** [`JsonLines`] over `config.trajectory`
 ///   when it is set. Required because a run whose record of itself is
 ///   incomplete is a run that did not happen;
 /// - the live text, an **optional** [`Text`] over `live` when one is given.
@@ -210,7 +273,7 @@ fn add(
 ///   wanted, and the game is no less played for it.
 ///
 /// With neither, the writer has no sinks at all and discards what it
-/// receives: an episode with no trajectory and nobody watching exercises
+/// receives: an episode with no log and nobody watching exercises
 /// everything a fully observed one does.
 ///
 /// The summary a caller prints afterwards is not a sink. It is the
@@ -222,10 +285,10 @@ fn add(
 ///
 /// # Errors
 ///
-/// [`RunError::Io`] if the trajectory cannot be created or written,
-/// [`RunError::Episode`] if the episode did not run cleanly — a player that
-/// never selected arrives as
-/// [`EpisodeError::Stalled`] — and
+/// [`RunError::Io`] if the log cannot be created or written,
+/// [`RunError::Episode`] if the episode did not run cleanly — a game the
+/// moderator never ended arrives as
+/// [`EpisodeError::Timeout`] — and
 /// [`RunError::NoOutcome`] if a clean run left no outcome on the channel.
 ///
 /// # Panics
@@ -233,45 +296,33 @@ fn add(
 /// If the configuration would not pass [`Config::validate`]; see
 /// [`episode`].
 pub fn run(config: &Config, live: Option<Box<dyn Write + Send>>) -> Result<Outcome, RunError> {
-    let trajectory = config.trajectory.as_deref();
-    let mut sinks: Vec<(Box<dyn Sink<WerewolfDomain>>, Policy)> = Vec::new();
-    if let Some(path) = trajectory {
+    let log = config.trajectory.as_deref();
+    let mut sinks: Sinks<Message> = Vec::new();
+    if let Some(path) = log {
         let file = File::create(path).map_err(|source| RunError::Io {
-            trajectory: Some(path.to_path_buf()),
+            log: Some(path.to_path_buf()),
             source,
         })?;
         sinks.push((Box::new(JsonLines::new(file)), Policy::Required));
     }
     if let Some(live) = live {
-        // The moderator is in the roster the column is sized to: it sends
-        // most of what a watcher sees.
-        let roster = config.players.iter().chain([&config.moderator]);
-        sinks.push((Box::new(Text::new(live, roster)), Policy::Optional));
+        sinks.push((Box::new(Text::new(live)), Policy::Optional));
     }
-    let (records, writer) = Writer::spawn(sinks);
-    let (episode, outcomes) = episode(config, records);
-    play(episode, &outcomes, writer, trajectory)
+    let (episode, outcomes) = episode(config, sinks);
+    play(episode, &outcomes)
 }
 
-/// Runs an assembled episode, joins its writer, which is writing the
-/// trajectory to `trajectory` if anywhere, and takes the outcome off the
-/// moderator's channel.
-fn play(
-    episode: Episode<WerewolfDomain>,
-    outcomes: &Receiver<Outcome>,
-    writer: Writer,
-    trajectory: Option<&Path>,
-) -> Result<Outcome, RunError> {
-    let ran = episode.run();
-    // The episode drops every sender to the writer on its way out, whether
-    // or not it ran cleanly, so the writer can be joined now for the whole
-    // trajectory. A failed run is the more informative error of the two.
-    let written = writer.join();
-    ran?;
-    written.map_err(|source| RunError::Io {
-        trajectory: trajectory.map(Path::to_path_buf),
-        source,
-    })?;
+/// Runs an assembled episode and takes the outcome off the moderator's
+/// channel.
+///
+/// **The episode joins its own writer** (ADR-0017), because it is the episode
+/// that started it, so a required sink that fails mid-episode surfaces as the
+/// actors' `WriterClosed` inside
+/// [`EpisodeError::Agents`] rather than as
+/// a [`RunError::Io`] naming the path. The path is still named for the
+/// failure this function can see first: a log that cannot be created at all.
+fn play(episode: Episode<i32, Message>, outcomes: &Receiver<Outcome>) -> Result<Outcome, RunError> {
+    episode.run()?;
     // The moderator's sender went with its handler when the episode joined
     // it, so the receiver holds the outcome now or never will.
     outcomes.try_recv().map_err(|_| RunError::NoOutcome)
@@ -284,15 +335,15 @@ mod tests {
     use std::path::Path;
 
     use super::*;
-    use crate::agent::{Action, Observation};
     use crate::testing::{TempDir, fast, id, ids, parse_lines};
     use crate::werewolf::config::{DEFAULT_MODERATOR, RoleCounts};
     use crate::werewolf::transcript::{self, Transcript};
+    use crate::{Action, Observation};
 
     const SEED: u64 = 20_260_918;
 
     /// A validated configuration for `players`, with the given special
-    /// roles and no trajectory.
+    /// roles and no log.
     fn config<const N: usize>(
         players: [&str; N],
         werewolves: usize,
@@ -301,7 +352,7 @@ mod tests {
     ) -> Config {
         let config = Config {
             seed: SEED,
-            players: players.map(AgentId::new).into(),
+            players: players.map(ActorId::new).into(),
             roles: RoleCounts {
                 werewolves,
                 seers,
@@ -325,7 +376,7 @@ mod tests {
         )
     }
 
-    /// Reads the trajectory at `path` back as the game it records.
+    /// Reads the log at `path` back as the game it records.
     fn transcript(path: &Path, config: &Config) -> Transcript {
         let text = fs::read_to_string(path).unwrap();
         Transcript::read(&transcript::lines(&text).unwrap(), &config.moderator).unwrap()
@@ -334,7 +385,7 @@ mod tests {
     /// Asserts that `outcome` is a finished game among `config`'s players,
     /// decided within as many rounds as there are players.
     fn check(config: &Config, outcome: &Outcome) {
-        let players: BTreeSet<&AgentId> = config.players.iter().collect();
+        let players: BTreeSet<&ActorId> = config.players.iter().collect();
         // No lower bound to check: a `Round` cannot be zero, so that a
         // finished game lasted at least one round is the type's guarantee.
         assert!(
@@ -350,9 +401,8 @@ mod tests {
 
     #[test]
     fn the_roster_is_every_player_and_the_moderator() {
-        let (records, _writer) = Writer::spawn(Vec::new());
-        let (episode, _outcomes) = episode(&town(), records);
-        let roster: BTreeSet<AgentId> = episode.ids().cloned().collect();
+        let (episode, _outcomes) = episode(&town(), Vec::new());
+        let roster: BTreeSet<ActorId> = episode.ids().cloned().collect();
         assert_eq!(
             roster,
             ids([
@@ -395,24 +445,24 @@ mod tests {
     }
 
     #[test]
-    fn the_trajectory_is_written_and_agrees_with_the_outcome() {
+    fn the_log_is_written_and_agrees_with_the_outcome() {
         let dir = TempDir::new();
-        let trajectory = dir.join("werewolf.jsonl");
+        let log = dir.join("werewolf.jsonl");
         let mut config = town();
-        config.trajectory = Some(trajectory.clone());
+        config.trajectory = Some(log.clone());
         let outcome = run(&config, None).unwrap();
 
-        let lines = parse_lines(&fs::read(&trajectory).unwrap());
+        let lines = parse_lines(&fs::read(&log).unwrap());
         assert!(!lines.is_empty());
 
         // The outcome on the channel and the one the moderator announced in
         // world are the same game's; if they ever diverge, the side channel
         // and the record of truth have parted company.
-        assert_eq!(transcript(&trajectory, &config).outcome, outcome);
+        assert_eq!(transcript(&log, &config).outcome, outcome);
     }
 
     #[test]
-    fn the_trajectory_is_the_same_game_across_runs() {
+    fn the_log_is_the_same_game_across_runs() {
         let dir = TempDir::new();
         let first = dir.join("first.jsonl");
         let second = dir.join("second.jsonl");
@@ -425,13 +475,13 @@ mod tests {
     }
 
     #[test]
-    fn a_trajectory_that_cannot_be_created_is_an_io_error_naming_it() {
+    fn a_log_that_cannot_be_created_is_an_io_error_naming_it() {
         let mut config = town();
         let path = Path::new("/no-such-directory/werewolf.jsonl");
         config.trajectory = Some(path.to_path_buf());
         let error = run(&config, None).unwrap_err();
         assert!(
-            matches!(&error, RunError::Io { trajectory: Some(t), .. } if t == path),
+            matches!(&error, RunError::Io { log: Some(t), .. } if t == path),
             "{error:?}"
         );
         assert!(
@@ -445,9 +495,9 @@ mod tests {
     /// A player that never selects.
     struct Silent;
 
-    impl Handler<WerewolfDomain> for Silent {
-        fn handle(&mut self, _: &Observation<WerewolfDomain>) -> Vec<Action<WerewolfDomain>> {
-            Vec::new()
+    impl Policies<Message> for Silent {
+        fn policy(&mut self, _: Observation<Message>) -> impl IntoIterator<Item = Action<Message>> {
+            []
         }
     }
 
@@ -462,8 +512,7 @@ mod tests {
         let config = config(["alice", "bob", "carol"], 1, 0, 0);
         let assignment = Assignment::deal(&config);
         let silent = assignment.pack().iter().next().unwrap().clone();
-        let (records, writer) = Writer::spawn(Vec::new());
-        let (mut episode, outcomes) = moderate(&config, assignment.clone(), records);
+        let (mut episode, outcomes) = moderate(&config, assignment.clone(), Vec::new());
         for (who, role) in assignment.players() {
             if *who == silent {
                 add(&mut episode, who, Silent);
@@ -476,7 +525,7 @@ mod tests {
         // random players never put two on one target either, so nobody
         // dies at all and the game runs to its day cap: a stalemate,
         // which pays -1 to everyone (ADR-0011).
-        let outcome = play(episode, &outcomes, writer, None).unwrap();
+        let outcome = play(episode, &outcomes).unwrap();
         assert_eq!(outcome.winner, None);
         assert_eq!(outcome.living.len(), 3, "nobody died");
     }

@@ -41,8 +41,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test
-      - name: cargo run exits successfully having done nothing
-        run: cargo run
+      # The suite runs the binary by path, so nothing in it goes through
+      # `cargo run`. This is the command the README tells a reader to type,
+      # run exactly as written: it checks that `werewolf` is still the only
+      # binary, which is what lets `cargo run` resolve without `--bin`.
+      - name: The README's command plays Werewolf
+        run: cargo run -- play examples/werewolf.toml --quiet
 
   doc:
     name: Docs
