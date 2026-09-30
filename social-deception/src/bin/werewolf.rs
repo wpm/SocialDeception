@@ -12,23 +12,23 @@
 //! the pipe costs the narration alone; the summary below it is printed from
 //! the outcome the run returns, not by a sink.
 //!
-//! For the same reason, when a trajectory is written the *effective
-//! configuration* is written beside it, at the trajectory's path with
-//! `.toml` appended: the configuration the game was played from, after
-//! overrides, without its `trajectory` field. The seed is never in the
-//! trajectory itself (see [`werewolf::setup`]), and this file is where a
-//! run's seed is kept. It is a configuration file in its own right, so
-//! reproducing a run is `werewolf play run.jsonl.toml --trajectory
-//! rerun.jsonl`, whatever flags produced the original.
+//! For the same reason, when a log is written the *effective
+//! configuration* is written beside it, at the log's path with `.toml`
+//! appended: the configuration the game was played from, after overrides,
+//! without its `trajectory` field. The seed is never in the log itself
+//! (see [`werewolf::setup`]), and this file is where a run's seed is kept.
+//! It is a configuration file in its own right, so reproducing a run is
+//! `werewolf play run.jsonl.toml --trajectory rerun.jsonl`, whatever flags
+//! produced the original.
 //!
-//! `replay` reads a trajectory written by an earlier run back as a
+//! `replay` reads a log written by an earlier run back as a
 //! [`Transcript`] and prints it, under a header naming the seed, which it
-//! takes from the effective configuration beside the trajectory, along with
-//! the moderator whose records are the game. Without that file the
-//! trajectory is still a game, just not a reproducible one: the header says
-//! the seed is unknown, and the moderator's id is `--moderator`.
+//! takes from the effective configuration beside the log, along with the
+//! moderator whose records are the game. Without that file the log is
+//! still a game, just not a reproducible one: the header says the seed is
+//! unknown, and the moderator's id is `--moderator`.
 //!
-//! Configuration, trajectory and I/O errors go to stderr with a non-zero
+//! Configuration, log and I/O errors go to stderr with a non-zero
 //! exit; usage errors are clap's. A reader that closes the pipe early, as
 //! `werewolf replay run.jsonl | head` does, is not an error.
 
@@ -40,7 +40,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use social_deception::AgentId;
+use social_deception::ActorId;
 use social_deception::werewolf::transcript;
 use social_deception::werewolf::{self, Config, ConfigError, Outcome, Role, Transcript, config};
 
@@ -62,18 +62,18 @@ enum Command {
         /// Override the configuration's seed.
         #[arg(long)]
         seed: Option<u64>,
-        /// Override where the trajectory is written.
+        /// Override where the log is written.
         #[arg(long)]
         trajectory: Option<PathBuf>,
         /// Do not narrate the game as it plays; print only the summary.
         #[arg(long)]
         quiet: bool,
     },
-    /// Render a trajectory written by an earlier run.
+    /// Render a log written by an earlier run.
     Replay {
-        /// The JSON Lines trajectory to read.
+        /// The JSON Lines log to read.
         trajectory: PathBuf,
-        /// The moderator's agent id, when the trajectory has no effective
+        /// The moderator's actor id, when the log has no effective
         /// config beside it [default: moderator].
         #[arg(long)]
         moderator: Option<String>,
@@ -155,7 +155,7 @@ fn print(text: &str) -> io::Result<()> {
 #[derive(Debug)]
 struct Played {
     /// The effective configuration: the file's, after overrides. Its
-    /// trajectory, if any, is where the trajectory was written, with the
+    /// `trajectory` field, if any, is where the log was written, with the
     /// effective configuration beside it.
     config: Config,
     outcome: Outcome,
@@ -164,14 +164,14 @@ struct Played {
 /// Plays one episode from the configuration at `path`, with the overrides
 /// applied, narrating it to stdout unless `quiet`.
 ///
-/// When the configuration names a trajectory, the effective configuration
-/// is written beside it before the game begins, so that even a run that
-/// ends badly leaves the pair that reproduces it. Without a trajectory there
-/// is nothing to pair it with, and nothing is written.
+/// When the configuration names a log, the effective configuration is
+/// written beside it before the game begins, so that even a run that ends
+/// badly leaves the pair that reproduces it. Without a log there is
+/// nothing to pair it with, and nothing is written.
 ///
 /// The narration goes to stdout as an optional sink, so a reader that closes
-/// the pipe costs the narration and nothing else: the game finishes and the
-/// trajectory is complete.
+/// the pipe costs the narration and nothing else: the game finishes and
+/// the log is complete.
 fn play(
     path: &Path,
     seed: Option<u64>,
@@ -200,7 +200,7 @@ impl fmt::Display for Played {
             None => writeln!(f, "winner: none (stalemate)")?,
         }
         writeln!(f, "rounds: {}", self.outcome.rounds.number())?;
-        let survivors: Vec<&str> = self.outcome.living.iter().map(AgentId::as_str).collect();
+        let survivors: Vec<&str> = self.outcome.living.iter().map(ActorId::as_str).collect();
         writeln!(f, "survivors: {}", survivors.join(", "))?;
         match &self.config.trajectory {
             Some(trajectory) => {
@@ -216,20 +216,20 @@ impl fmt::Display for Played {
     }
 }
 
-/// A trajectory read back as a game, with what the header needs.
+/// A log read back as a game, with what the header needs.
 #[derive(Debug)]
 struct Replay {
-    /// The effective config found beside the trajectory, if there was one.
+    /// The effective config found beside the log, if there was one.
     effective: Option<Config>,
     /// The moderator whose records were read.
-    moderator: AgentId,
+    moderator: ActorId,
     /// The `--moderator` that was ignored because the effective config
     /// named someone else.
     overridden: Option<String>,
     transcript: Transcript,
 }
 
-/// Reads a trajectory and the effective config beside it, if there is one.
+/// Reads the log and the effective config beside it, if there is one.
 ///
 /// The effective config is the record of what actually ran, so where it
 /// exists it names the moderator, and a `--moderator` that disagrees with
@@ -251,7 +251,7 @@ fn replay(trajectory: &Path, moderator: Option<&str>) -> Result<Replay, Box<dyn 
                 .map(str::to_owned),
         ),
         None => (
-            AgentId::new(moderator.unwrap_or(config::DEFAULT_MODERATOR)),
+            ActorId::new(moderator.unwrap_or(config::DEFAULT_MODERATOR)),
             None,
         ),
     };
@@ -373,7 +373,7 @@ mod tests {
     }
 
     #[test]
-    fn replay_with_only_its_trajectory() {
+    fn replay_with_only_its_log() {
         let cli = Cli::try_parse_from(["werewolf", "replay", "run.jsonl"]).unwrap();
         assert!(matches!(
             cli.command,
@@ -451,8 +451,8 @@ mod tests {
         path
     }
 
-    /// Writes a five-player configuration file in `dir` whose trajectory, if
-    /// any, is in the directory too. The path is written as a TOML literal
+    /// Writes a five-player configuration file in `dir` whose log, if any,
+    /// is in the directory too. The path is written as a TOML literal
     /// string, so it needs no escaping whatever the platform.
     fn config(dir: &TempDir, name: &str, trajectory: Option<&str>) -> PathBuf {
         let trajectory = trajectory.map_or_else(String::new, |trajectory| {
@@ -493,7 +493,7 @@ mod tests {
     }
 
     #[test]
-    fn play_writes_the_effective_config_beside_the_trajectory() {
+    fn play_writes_the_effective_config_beside_the_log() {
         let dir = TempDir::new();
         let trajectory = dir.join("out.jsonl");
         let played = play(&example(), Some(7), Some(trajectory.clone()), true).unwrap();
@@ -510,7 +510,7 @@ mod tests {
     }
 
     #[test]
-    fn play_without_a_trajectory_writes_nothing() {
+    fn play_without_a_log_writes_nothing() {
         let dir = TempDir::new();
         let config = config(&dir, "game.toml", None);
         let played = play(&config, None, None, true).unwrap();
@@ -529,8 +529,8 @@ mod tests {
         let dir = TempDir::new();
         let first = dir.join("first.jsonl");
         let original = play(&example(), Some(7), Some(first.clone()), true).unwrap();
-        // The whole reproduction recipe: the effective config, and a
-        // trajectory of the reproduction's own.
+        // The whole reproduction recipe: the effective config, and a log
+        // of the reproduction's own.
         let second = dir.join("second.jsonl");
         let reproduced = play(
             &config::effective_path(&first),
@@ -549,9 +549,9 @@ mod tests {
 
     #[test]
     fn the_effective_config_never_overwrites_the_input_config() {
-        // The natural naming: the configuration is `game.toml` and its
-        // trajectory `game.jsonl`, so replacing the trajectory's extension
-        // would land on the configuration. Appending does not.
+        // The natural naming: the configuration is `game.toml` and its log
+        // `game.jsonl`, so replacing the log's extension would land on the
+        // configuration. Appending does not.
         let dir = TempDir::new();
         let config = config(&dir, "game.toml", Some("game.jsonl"));
         let before = fs::read_to_string(&config).unwrap();
@@ -575,9 +575,9 @@ mod tests {
     }
 
     #[test]
-    fn a_trajectory_that_cannot_be_written_is_an_error_naming_it() {
-        // The effective config beside the trajectory is written first, so a
-        // trajectory that is a directory is what makes the run itself fail.
+    fn a_log_that_cannot_be_written_is_an_error_naming_it() {
+        // The effective config beside the log is written first, so a log
+        // that is a directory is what makes the run itself fail.
         let dir = TempDir::new();
         let trajectory = dir.join("out");
         fs::create_dir(&trajectory).unwrap();
@@ -598,7 +598,7 @@ mod tests {
         assert!(error.to_string().contains("no-such-file.toml"), "{error}");
     }
 
-    /// The fixture trajectory, with its effective config beside it.
+    /// The fixture log, with its effective config beside it.
     fn fixture() -> PathBuf {
         PathBuf::from(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -614,7 +614,7 @@ mod tests {
     fn replay_with_the_effective_config_uses_its_seed_and_moderator() {
         let replayed = replay(&fixture(), None).unwrap();
         assert_eq!(seed(&replayed), Some(26));
-        assert_eq!(replayed.moderator, AgentId::new("moderator"));
+        assert_eq!(replayed.moderator, ActorId::new("moderator"));
         assert_eq!(replayed.overridden, None);
         assert_eq!(replayed.transcript.rounds.len(), 4);
         let golden = fs::read_to_string(fixture().with_extension("txt")).unwrap();
@@ -630,7 +630,7 @@ mod tests {
     fn the_effective_config_wins_over_a_disagreeing_moderator_flag() {
         let disagreeing = replay(&fixture(), Some("narrator")).unwrap();
         assert_eq!(seed(&disagreeing), Some(26));
-        assert_eq!(disagreeing.moderator, AgentId::new("moderator"));
+        assert_eq!(disagreeing.moderator, ActorId::new("moderator"));
         assert_eq!(disagreeing.overridden.as_deref(), Some("narrator"));
         assert_eq!(disagreeing.transcript.rounds.len(), 4);
         // The same flag, agreeing, is not overridden.
@@ -646,7 +646,7 @@ mod tests {
 
         let replayed = replay(&alone, None).unwrap();
         assert_eq!(seed(&replayed), None);
-        assert_eq!(replayed.moderator, AgentId::new("moderator"));
+        assert_eq!(replayed.moderator, ActorId::new("moderator"));
         assert_eq!(replayed.overridden, None);
         assert_eq!(replayed.transcript.rounds.len(), 4);
         assert!(
@@ -664,14 +664,14 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_trajectory_is_an_error_not_a_panic() {
+    fn a_missing_log_is_an_error_not_a_panic() {
         let cli = Cli::try_parse_from(["werewolf", "replay", "no-such-run.jsonl"]).unwrap();
         let error = run(cli).unwrap_err();
         assert!(error.to_string().contains("no-such-run.jsonl"), "{error}");
     }
 
     #[test]
-    fn a_corrupt_trajectory_is_an_error_naming_the_line() {
+    fn a_corrupt_log_is_an_error_naming_the_line() {
         let dir = TempDir::new();
         let corrupt = file(&dir, "corrupt.jsonl", "not json\n");
         let error = replay(&corrupt, None).unwrap_err();

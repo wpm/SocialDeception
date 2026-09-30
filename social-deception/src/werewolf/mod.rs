@@ -3,12 +3,15 @@
 //! a pure state machine.
 //!
 //! The vocabulary is the [`Role`]s a player can be dealt, the [`Faction`]s
-//! they play for, the [`Round`] and [`Phase`] that locate a moment in a
-//! game, and [`Message`], the one payload type that travels over the
-//! runtime's [`Event`](crate::Event) between the moderator and the players.
-//! The only facts it states are properties of a session kind itself, such
-//! as which phase it belongs to; every rule that depends on who is alive
-//! lives with the moderator and the roles, not here.
+//! they play for, the [`Round`] and [`Phase`] that locate a moment in a game,
+//! and [`Message`], the one payload type that travels between the moderator
+//! and the players. The only facts it states are properties of a session kind
+//! itself, such as which phase it belongs to; every rule that depends on who
+//! is alive lives with the moderator and the roles, not here.
+//!
+//! Two types are called `Message`, and the module path tells them apart:
+//! unqualified within `werewolf` it is this game's payload, and the
+//! runtime's envelope is written [`crate::Message`].
 //!
 //! The setup is a [`Config`] read from a TOML file ([`config`]), the
 //! [`Assignment`] of roles dealt from its seed ([`assignment`]), and
@@ -18,19 +21,20 @@
 //! The rules live in [`Game`] ([`game`]), which takes an [`Assignment`] and
 //! plays the game as a fold over players' responses, producing
 //! [`Directive`]s that say what to tell whom. The [`Moderator`]
-//! ([`moderator`]) is the agent that runs a game: the thin
-//! [`Environment`](crate::Environment) that folds the observations it pops
-//! into the game, sends the directives as messages, and — being the
-//! episode's environment — starts the players when it begins and stops them
-//! when the game is over.
+//! ([`moderator`]) is the actor that runs a game: the thin
+//! [`Step`](crate::Step) that folds each observation into the game,
+//! sends the directives as messages, sets the reminders its sessions' clocks
+//! call for, and — being the episode's environment — starts the players when
+//! it begins and stops everybody, itself included, when the game is over.
 //!
 //! The seam with the runtime is [`setup`]: [`episode`] builds a populated
-//! [`Episode`](crate::Episode) from a [`Config`], seating every player and
-//! the moderator, and [`run`] runs one to its [`Outcome`] or a [`RunError`].
+//! [`Episode`](crate::Episode) from a [`Config`], seating every player
+//! and the moderator, and [`run`] runs one to its [`Outcome`] or a
+//! [`RunError`].
 //! The `werewolf` binary's `play` is that, with the effective configuration
-//! written beside the trajectory.
+//! written beside the log.
 //!
-//! A trajectory written by a run reads back as a [`Transcript`]
+//! A log written by a run reads back as a [`Transcript`]
 //! ([`transcript`]): the logical game, with the timestamps and the
 //! interleaving of agents' records projected out, so that two transcripts
 //! are equal exactly when the same game was played. The `werewolf` binary's
@@ -48,23 +52,25 @@
 //! (ADR-0014); being told what its own role already says would inform it of
 //! nothing.
 //!
-//! In the reinforcement-learning vocabulary of the design, `Event<Message>`
-//! is the observation type and the move a player's action carries is an
-//! [`AgentId`](crate::AgentId): the target inside the selection, not the
-//! selection itself. The set of targets the rules permit in a session is the
-//! *action space*, a `Vec<AgentId>` computed by the rules; a target outside
-//! it is a policy bug. A selection names the session it was made in, by round
-//! and [`RequestKind`], which both sides derive from what they each know — so
-//! there is nothing to correlate, and a selection naming a round that has
-//! passed is one whose session closed while it was in flight.
+//! In the reinforcement-learning vocabulary of the design, a
+//! `crate::Message<Message>` — a runtime envelope carrying this module's
+//! [`Message`] — is the observation type, and the move a player's
+//! action carries is an [`ActorId`](crate::ActorId): the target inside the
+//! selection, not the selection itself. The set of targets the rules permit
+//! in a session is the *action space*, a `Vec<ActorId>` computed by the
+//! rules; a target outside it is a strategy bug. A selection names the
+//! session it was made in, by round and [`SessionKind`], which both sides
+//! derive from what they each know — so there is nothing to correlate, and a
+//! selection naming a round that has passed is one whose session closed while
+//! it was in flight.
 //!
 //! A member may select as often as it likes while its session is open, and
 //! its most recent selection is its vote; selecting nowhere is how it
 //! abstains, which is why there is no move meaning "nobody" (ADR-0011).
 //!
-//! # Nothing is broadcast
+//! # Every message names its recipients
 //!
-//! No message here names its recipients, because that is the sender's
+//! Every message here names its recipients, because that is the sender's
 //! decision: a narration goes to one player, to the living, or to the pack,
 //! and that choice of recipients is the whole hidden-information mechanism
 //! (see ADR-0004). A player acts on observing that a phase has begun,
@@ -78,7 +84,7 @@
 //! agrees on a victim without speaking and how a village's vote forms in
 //! the open (ADR-0011).
 //!
-//! Nothing is excepted. ADR-0004 broadcast the final [`Outcome`] to every
+//! Nothing is excepted. ADR-0004 sent the final [`Outcome`] to every
 //! player, living and dead, because it was a dead player's terminal reward
 //! signal; a reward is now logged rather than said (ADR-0007), so the
 //! outcome is narrated to the living like everything else and a dead
@@ -90,46 +96,43 @@
 //! # What a player knows, and how it decides
 //!
 //! [`Knowledge`] is the state a player carries between cycles: the fold of
-//! every observation it has received, and what a policy conditions on. It
+//! every observation it has received, and what a strategy conditions on. It
 //! records only what the moderator said, so nothing in it can be false.
 //!
-//! A [`Policy`] is handed a [`View`] of that state, the kind of session in
+//! A [`Strategy`] is handed a [`View`] of that state, the kind of session in
 //! front of it and the action space, and returns a target or none.
-//! [`RandomPolicy`] is the uniform random baseline; a language-model
-//! policy is the same trait ([`policy`]).
+//! [`RandomStrategy`] is the uniform random baseline; a language-model
+//! strategy is the same trait ([`strategy`]).
 //!
 //! The action space is the rules' to compute, and the rules are a role's:
-//! [`Villager`], [`Werewolf`], [`Seer`] and [`Doctor`] ([`roles`]) each
-//! carry their own [`Knowledge`] and say which targets a session permits
-//! them, and nothing else. It may be empty — the doctor may be left with
-//! nobody it can protect — and a player with an empty one selects nowhere.
-//! A [`Seat`] ([`player`]) pairs a role with the policy that decides for
-//! it and is the agent the episode runs: it folds every event into the
-//! role's state, acts when it observes a phase begin, and addresses each
-//! selection as the rules allow.
+//! [`Role::action_space`] ([`role`]) says which targets a session permits a
+//! player that knows what it knows, and nothing else. It may be empty — the
+//! doctor may be left with nobody it can protect — and a player with an
+//! empty one selects nowhere. A [`Player`] ([`player`]) joins what it knows
+//! to the strategy that decides for it and is the agent the episode runs: it
+//! folds every message into its knowledge, acts when it observes a phase
+//! begin, and addresses each selection as the rules allow.
 //!
 //! # What no message carries
 //!
 //! No message carries the episode's seed, and no type here has a field that
 //! could. With the seed, the roster and the public algorithm, anyone could
 //! recompute the deal and every agent's random stream. The seed is recorded
-//! beside the trajectory, never in it.
+//! beside the log, never in it.
 //!
 //! # Serialization
 //!
-//! Every type here is `Serialize` and `Deserialize`, so a trajectory's
+//! Every type here is `Serialize` and `Deserialize`, so a log's
 //! payloads can be read back as typed data. Collections are `BTreeMap` and
 //! `BTreeSet`, so serialization is in a canonical order and two runs of the
 //! same seed produce byte-identical payloads.
 //!
 //! The payload uses serde's defaults: enums are externally tagged with the
 //! variant name as written, and newtypes are transparent. The runtime's
-//! envelope, [`Event`](crate::Event) and its records, is internally tagged
-//! and snake-cased instead, because its field names are a contract with
-//! whatever reads a trajectory back; the payload's shape belongs to the
+//! envelope, [`crate::Message`] and its records, is internally tagged and
+//! snake-cased instead, because its field names are a contract with
+//! whatever reads a log back; the payload's shape belongs to the
 //! environment alone.
-
-use crate::event::Domain;
 
 pub mod assignment;
 pub mod config;
@@ -139,41 +142,22 @@ pub mod live;
 pub mod message;
 pub mod moderator;
 pub mod player;
-pub mod policy;
 pub mod role;
-pub mod roles;
 pub mod seed;
 pub mod setup;
+pub mod strategy;
 pub mod transcript;
-
-/// Werewolf as a [`Domain`]: the types this game contributes to the
-/// runtime.
-///
-/// Its events carry a [`Message`], and a player's reward is an integer,
-/// because a game of Werewolf is won or lost and nothing finer is scored.
-///
-/// The name is not `Werewolf`, which is the role a player may be dealt. A
-/// domain is the whole game; the role is one thing inside it, and the two
-/// would be hard to tell apart in a signature if they shared a name.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct WerewolfDomain;
-
-impl Domain for WerewolfDomain {
-    type Payload = Message;
-    type Reward = i32;
-}
 
 pub use assignment::Assignment;
 pub use config::{Config, ConfigError, RoleCounts};
 pub use game::{Directive, Game};
 pub use knowledge::{Death, Knowledge, Phased};
 pub use live::Text;
-pub use message::{Cause, Message, Narration, Outcome, Phase, RequestKind, Round, Select};
+pub use message::{Cause, Look, Message, Narration, Outcome, Phase, Round, Select, SessionKind};
 pub use moderator::Moderator;
-pub use player::{Player, Seat};
-pub use policy::{Policy, RandomPolicy, View};
+pub use player::Player;
 pub use role::{Faction, Role};
-pub use roles::{Doctor, Seer, Villager, Werewolf};
 pub use seed::seed_for;
-pub use setup::{RunError, episode, run};
+pub use setup::{RunError, episode, limit, run};
+pub use strategy::{RandomStrategy, Strategy, View};
 pub use transcript::{PhaseRecord, RoundRecord, Transcript, TranscriptError};

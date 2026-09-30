@@ -64,6 +64,11 @@ td:first-child{font-weight:600;white-space:nowrap}
 .tab{font-family:var(--body);font-size:14px;font-weight:500;padding:6px 14px;border-radius:6px;border:1px solid var(--rule);background:transparent;color:var(--muted);cursor:pointer}
 .tab[aria-selected="true"]{background:var(--ink);color:var(--bg);border-color:var(--ink)}
 .play{margin-left:auto;font-family:var(--body);font-size:14px;font-weight:600;padding:6px 16px;border-radius:6px;border:0;background:var(--amber);color:#fff;cursor:pointer}
+.ghost{font-family:var(--body);font-size:14px;font-weight:600;padding:6px 16px;border-radius:6px;border:1px solid var(--rule);background:transparent;color:var(--muted);cursor:pointer}
+.ghost:focus-visible,.play:focus-visible{outline:2px solid var(--amber);outline-offset:2px}
+/* Filling the screen drops the page's own margins, which exist to sit a
+   document in a browser window and only waste room once the window is gone. */
+.wrap:fullscreen{max-width:none;width:100%;padding:24px 28px;overflow-y:auto;background:var(--bg)}
 :root[data-theme="dark"] .play{color:#1A1206}
 @media (prefers-color-scheme: dark){:root:not([data-theme="light"]) .play{color:#1A1206}}
 button:focus-visible{outline:2px solid var(--night);outline-offset:2px}
@@ -128,6 +133,7 @@ pre.mermaid{background:var(--surface);border:1px solid var(--rule);border-radius
         <button class="tab" role="tab" id="tab-day" aria-selected="false">Day 1</button>
       </div>
       <button class="play" id="play">Play night</button>
+      <button class="ghost" id="full" type="button" title="Full screen (f)" aria-pressed="false">Full screen</button>
     </div>
     <div class="stage-body">
       <div class="table-view">
@@ -316,6 +322,23 @@ pre.mermaid{background:var(--surface);border:1px solid var(--rule);border-radius
   $("tab-night").addEventListener("click",()=>select("night"));
   $("tab-day").addEventListener("click",()=>select("day"));
   $("play").addEventListener("click",()=>{if(!raf)play();});
+  // Full screen. The button reflects the browser's state rather than its own
+  // idea of it, because Escape and the browser's own shortcut leave without
+  // asking us, and `fullscreenchange` is the only thing that hears about it.
+  const stage=document.querySelector(".wrap");
+  $("full").addEventListener("click",()=>{
+    if(document.fullscreenElement) document.exitFullscreen();
+    else stage.requestFullscreen().catch(()=>{});
+  });
+  document.addEventListener("fullscreenchange",()=>{
+    const on=document.fullscreenElement===stage;
+    $("full").textContent=on?"Exit full screen":"Full screen";
+    $("full").setAttribute("aria-pressed",String(on));
+  });
+  document.addEventListener("keydown",(e)=>{
+    if(e.key==="f"||e.key==="F") $("full").click();
+  });
+
   select("night");
 })();
 </script>

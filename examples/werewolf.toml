@@ -2,7 +2,7 @@
 #
 # Run it with:
 #
-#     cargo run --bin werewolf -- play examples/werewolf.toml
+#     cargo run -- play examples/werewolf.toml
 
 # The master seed. Every generator in the episode is derived from it, so a
 # run is reproducible from this file alone.
@@ -14,7 +14,7 @@ players = ["alice", "bob", "carol", "dave", "erin", "frank", "grace"]
 # Where to write the trajectory. Optional: leave it out to write nothing.
 trajectory = "werewolf.jsonl"
 
-# The moderator's agent id. Optional, default "moderator". No player may
+# The moderator's actor id. Optional, default "moderator". No player may
 # share it.
 moderator = "moderator"
 

@@ -1,5 +1,6 @@
-//! Werewolf's own invariants: what every trajectory of a game of Werewolf
-//! satisfies beyond what [`super::check`] asserts of any trajectory.
+//! Werewolf's own invariants: what the log of a game of Werewolf
+//! satisfies beyond what [`super::actor::check`] asserts of any log of an
+//! actor runtime episode.
 //!
 //! The checks are written against the parsed lines, the way the runtime's own
 //! checks are, and read the game the way the transcript reader does: from the
@@ -9,7 +10,7 @@
 //! the moderator cannot vouch for, which is what actually reached each of
 //! them.
 //!
-//! Since ADR-0014 a trajectory holds no request at all. Nobody is told to
+//! Since ADR-0014 the log holds no request at all. Nobody is told to
 //! act: a player observes that a phase has begun, asks its own role what
 //! that phase wants of it, and selects. So a selection is no longer half of a
 //! pair to be joined up — it carries the round and the kind of the session
@@ -23,7 +24,7 @@
 //!   target inside the action space the rules allow it; the dead are never
 //!   heard from; players only ever address the moderator; and the
 //!   moderator's last word is the outcome. A
-//!   trajectory whose last narration is not an outcome is a game the
+//!   log whose last narration is not an outcome is a game the
 //!   moderator never ended, which the episode also catches as a stall;
 //! - **hidden information**: the realized observations stay inside each
 //!   role's observation space. Every message goes to exactly the players
@@ -32,14 +33,14 @@
 //!   seer alone, and a narration to the living goes to exactly the living.
 //!   Routing is the whole of the hidden-information mechanism, so these are
 //!   what the design exists to guarantee;
-//! - **the episode's shape**: every trajectory, the moderator's included,
-//!   begins with a `Start` control and ends with a `Stop`, because the
-//!   moderator is the episode's environment and starting and stopping the
+//! - **the episode's shape**: every agent's records, the moderator's
+//!   included, begin with a `Start` control and end with a `Stop`, because
+//!   the moderator is the episode's environment and starting and stopping the
 //!   players is its doing. Nothing at all reaches a dead player from the
 //!   moment of its death: not its own death, which it is never told, not
 //!   a peer's selection, nothing. The victim is left out of the `Eliminated`
 //!   narration and its agent is stopped in the same cycle (ADR-0012), so
-//!   its trajectory simply ends where the game ended for it. No message
+//!   its records simply end where the game ended for it. No message
 //!   of this game is broadcast, and the outcome, which ADR-0004 once
 //!   excepted, is narrated to the living like everything else;
 //! - **the rewards**: every player has exactly one, +1 exactly when the
@@ -62,24 +63,24 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Deserialize;
 use serde_json::Value;
-use social_deception::AgentId;
+use social_deception::ActorId;
 use social_deception::werewolf::{
-    Assignment, Cause, Config, Faction, Message, Narration, Outcome, Phase, RequestKind, Role,
-    Round, Select, roles,
+    Assignment, Cause, Config, Faction, Message, Narration, Outcome, Phase, Role, Round, Select,
+    SessionKind, role,
 };
 
 /// Something the moderator said.
 struct Said<'a> {
-    seq: u64,
-    to: BTreeSet<AgentId>,
+    at: usize,
+    to: BTreeSet<ActorId>,
     message: Message,
     line: &'a Value,
 }
 
 /// A selection the moderator heard.
 struct Heard<'a> {
-    seq: u64,
-    from: AgentId,
+    at: usize,
+    from: ActorId,
     selection: Select,
     line: &'a Value,
 }
@@ -87,13 +88,13 @@ struct Heard<'a> {
 /// A selection the moderator passed on: one it accepted.
 ///
 /// The moderator forwards only a selection whose session was still open
-/// (ADR-0014), so a forward is the trajectory's record that a selection was
+/// (ADR-0014), so a forward is the log's record that a selection was
 /// counted. Since nothing summarizes a session any more (ADR-0015), it is
 /// also the only such record: what a session decided is read off these.
 struct Forwarded<'a> {
-    seq: u64,
-    from: AgentId,
-    to: BTreeSet<AgentId>,
+    at: usize,
+    from: ActorId,
+    to: BTreeSet<ActorId>,
     selection: Select,
     line: &'a Value,
 }
@@ -111,26 +112,26 @@ struct Play<'a> {
     /// selections it accepted.
     forwarded: Vec<Forwarded<'a>>,
     /// Each phase, in the order it began: its round, its phase, and the
-    /// sequence number of the narration that announced it.
+    /// line of the narration that announced it.
     ///
     /// This is what a selection is placed in. Nothing is issued to a player
     /// any more (ADR-0014), so the phase narration is the only record of
     /// a session opening, and the phase a selection falls in is the latest
     /// one announced before it.
-    phases: Vec<(Round, Phase, u64)>,
+    phases: Vec<(Round, Phase, usize)>,
     /// Each player's role, from the `Assigned` narration it was sent.
     assignment: Assignment,
-    /// The sequence number of the narration that eliminated each player.
-    eliminated: BTreeMap<AgentId, u64>,
+    /// The line of the narration that eliminated each player.
+    eliminated: BTreeMap<ActorId, usize>,
     /// How the game ended: the moderator's last word.
     outcome: Outcome,
 }
 
-/// Asserts everything a trajectory of a game played from `config` must
+/// Asserts everything the log of a game played from `config` must
 /// satisfy; see the [module documentation](self).
 ///
-/// Run [`super::check`] first: these checks assume the moderator's records
-/// are in sequence order and that every message names its recipients.
+/// Run [`super::actor::check`] first: these checks assume the moderator's
+/// records are in sequence order and that every message names its recipients.
 ///
 /// # Panics
 ///
@@ -138,7 +139,7 @@ struct Play<'a> {
 pub fn check(lines: &[Value], config: &Config) {
     let play = Play::read(lines, config);
     // The phases first: a selection is placed by the phase it names
-    // (ADR-0014), so a trajectory whose phases are themselves wrong
+    // (ADR-0014), so a log whose phases are themselves wrong
     // should fail by that name rather than as a selection that cannot be
     // placed in them.
     play.check_phases();
@@ -150,17 +151,62 @@ pub fn check(lines: &[Value], config: &Config) {
     play.check_outcome();
     play.check_players(lines);
     // The episode's shape first: a reward is checked against the `Stop`
-    // that ends its agent's trajectory, so "everybody was stopped" should
+    // that ends its agent's records, so "everybody was stopped" should
     // fail by its own name rather than as a missing stop to compare with.
     check_episode(lines, config);
     play.check_rewards(lines);
 }
 
-/// Every agent's trajectory, the moderator's included, begins with a `Start`
-/// control and ends with a `Stop`, and nobody is started or stopped twice.
+/// Every member of every *night* session was counted: no night closed on
+/// a player the machine never got to.
+///
+/// This is **not** an invariant of Werewolf, and [`check`] does not run it.
+/// A member that never selects is abstaining (ADR-0011), which is legal,
+/// and a language-model player that spends too long thinking is abstaining
+/// in exactly the way the rules intend.
+///
+/// It is an invariant of *these tests*, where every player is a
+/// [`RandomStrategy`] that samples a list and cannot block. Such a player
+/// selects nowhere only when its action space is empty, and a player with
+/// an empty action space is not a member of the session at all — the
+/// moderator does not ask it (ADR-0014), and neither does
+/// [`members_of`](Play::members_of). So for a random game every member
+/// selects, always, and a member missing from a closed session did not
+/// choose to be missing: its thread was not scheduled inside the session's
+/// hard limit.
+///
+/// That is worth asserting because it is otherwise **silent**. The absent
+/// player is indistinguishable from one that abstained, so the session
+/// closes on a smaller field, a plurality falls differently, and the seed
+/// plays a different game that breaks no other invariant here and fails no
+/// assertion. The clocks in the integration tests are set with margin for
+/// exactly this reason; this is what notices when the margin was not
+/// enough.
+///
+/// The day is left out on purpose. It closes on a majority of the living
+/// rather than on its clock (ADR-0011), so a player that had not selected
+/// when the majority fell is unheard by the rules and not by the machine.
+/// A night has no such exit: it runs to its quiet period or its hard
+/// limit, so every member of it is expected to have been heard. That is
+/// also where a missed selection does damage, since it changes the
+/// plurality that decides who dies.
+///
+/// # Panics
+///
+/// If a night session closed with a member whose selection was never
+/// counted.
+// Live in the `werewolf` test binary and dead in `collatz_actor`, which
+// compiles this module too and reaches nothing in it.
+#[allow(dead_code, reason = "used by the werewolf test binary only")]
+pub fn check_everybody_was_heard(lines: &[Value], config: &Config) {
+    Play::read(lines, config).check_everybody_was_heard();
+}
+
+/// Every agent's records, the moderator's included, begin with a `Start`
+/// control and end with a `Stop`, and nobody is started or stopped twice.
 ///
 /// It is the moderator that sends both, being the episode's environment, so
-/// this is the check that the game's own shutdown happened: a trajectory
+/// this is the check that the game's own shutdown happened: a log
 /// whose players were stopped by the episode picking up the pieces would
 /// look the same here, but one where somebody was never stopped at all
 /// would not.
@@ -170,7 +216,7 @@ fn check_episode(lines: &[Value], config: &Config) {
         .iter()
         .chain([&config.moderator])
         .cloned()
-        .collect::<BTreeSet<AgentId>>();
+        .collect::<BTreeSet<ActorId>>();
     for who in &everybody {
         let controls: Vec<&str> = lines
             .iter()
@@ -180,12 +226,15 @@ fn check_episode(lines: &[Value], config: &Config) {
         assert_eq!(
             controls,
             ["start", "stop"],
-            "{who}'s trajectory begins with a start and ends with a stop"
+            "{who}'s records begin with a start and end with a stop"
         );
     }
-    let agents: BTreeSet<AgentId> = lines
+    // The `episode` header is nobody's record: it is the log's wall-clock
+    // anchor and names no agent (ADR-0017).
+    let agents: BTreeSet<ActorId> = lines
         .iter()
-        .map(|line| AgentId::new(super::agent(line)))
+        .filter(|line| line["type"] != "episode")
+        .map(|line| ActorId::new(super::agent(line)))
         .collect();
     assert_eq!(
         agents, everybody,
@@ -195,53 +244,92 @@ fn check_episode(lines: &[Value], config: &Config) {
 
 /// The payload of a message record, as a [`Message`].
 fn message(line: &Value) -> Message {
-    Message::deserialize(&line["event"]["payload"])
+    Message::deserialize(&line["message"]["payload"])
         .unwrap_or_else(|error| panic!("a payload is a werewolf message ({error}): {line}"))
 }
 
+/// The sender named inside a message record's wire shape, which is always the
+/// agent that sent it: nothing an actor sends claims another (ADR-0017).
+fn sender_of(line: &Value) -> ActorId {
+    ActorId::deserialize(&line["message"]["sender"]).expect("a message names its sender")
+}
+
+/// Which line each message the moderator sent went out on, by its key.
+///
+/// Every message a player observes came from the moderator, so this is the
+/// order in which the game said things, against which what a dead player
+/// heard is checked.
+fn sent_lines(lines: &[Value], moderator: &ActorId) -> BTreeMap<(ActorId, u64), usize> {
+    records_of(lines, moderator, "action")
+        .map(|(at, line)| ((sender_of(line), super::seq(line)), at))
+        .collect()
+}
+
 /// The recipients of a message record.
-fn recipients(line: &Value) -> BTreeSet<AgentId> {
-    BTreeSet::deserialize(&line["event"]["recipients"]).expect("a message lists its recipients")
+fn recipients(line: &Value) -> BTreeSet<ActorId> {
+    BTreeSet::deserialize(&line["message"]["recipients"]).expect("a message lists its recipients")
 }
 
 /// The records of `agent` of the given type, `"action"` for what it sent or
-/// `"observation"` for what it received, in file order.
+/// `"observation"` for what it received, each with its line's position in the
+/// file, in file order.
+///
+/// The position is how every check below orders one agent's records. Line
+/// order across agents carries no meaning (ADR-0017), but an agent is one
+/// thread, so its own records reach the writer in the order it wrote them,
+/// and for the moderator that is the order it played the game in. A sequence
+/// number will not do: it belongs to the *message*, so the moderator's
+/// observations carry the players' numbers, which are dense over each
+/// player's records and not over the moderator's.
 fn records_of<'a>(
     lines: &'a [Value],
-    agent: &'a AgentId,
+    agent: &'a ActorId,
     kind: &'a str,
-) -> impl Iterator<Item = &'a Value> {
+) -> impl Iterator<Item = (usize, &'a Value)> {
     lines
         .iter()
-        .filter(move |line| line["type"] == kind && super::agent(line) == agent.as_str())
+        .enumerate()
+        .filter(move |(_, line)| line["type"] == kind && super::agent(line) == agent.as_str())
 }
 
-/// The selections the moderator passed on for a player: those among its
-/// actions stamped with that player as sender (ADR-0014).
+/// The selections the moderator passed on for a player: the
+/// [`Message::Relayed`] among its actions (ADR-0018).
 ///
-/// A forward is what says the moderator accepted the selection, so the checks
-/// read what a session decided off these (ADR-0015).
+/// A relay is what says the moderator accepted the selection, so the checks
+/// read what a session decided off these (ADR-0015). The player it belongs to
+/// is the envelope's sender, not the message's: the message is the
+/// moderator's own.
 fn forwards_of<'a>(
     lines: &'a [Value],
     config: &'a Config,
-    players: &BTreeSet<&AgentId>,
+    players: &BTreeSet<&ActorId>,
 ) -> Vec<Forwarded<'a>> {
     records_of(lines, &config.moderator, "action")
-        .filter(|line| line["event"]["sender"] != config.moderator.as_str())
-        .map(|line| {
-            let Message::Select(selection) = message(line) else {
-                panic!("the moderator passes on only selections: {line}");
-            };
-            let from = AgentId::deserialize(&line["event"]["sender"]).unwrap();
+        .filter_map(|(at, line)| match message(line) {
+            Message::Relayed(envelope) => Some((at, line, envelope)),
+            Message::Narration(_) => None,
+            Message::Select(_) => {
+                panic!("the moderator relays a selection rather than sending one: {line}")
+            }
+            Message::Reminder(_) => panic!(
+                "a reminder is logged where it arrives and not where it is set (ADR-0016): {line}"
+            ),
+        })
+        .map(|(at, line, envelope)| {
+            assert_eq!(
+                sender_of(line),
+                config.moderator,
+                "a relay is the moderator's own message: {line}"
+            );
             assert!(
-                players.contains(&from),
+                players.contains(&envelope.from),
                 "the moderator passes on a selection of a player's: {line}"
             );
             Forwarded {
-                seq: super::seq(line),
-                from,
+                at,
+                from: envelope.from,
                 to: recipients(line),
-                selection,
+                selection: envelope.payload,
                 line,
             }
         })
@@ -249,7 +337,7 @@ fn forwards_of<'a>(
 }
 
 /// The one recipient of a message addressed to a single player.
-fn only<'a>(to: &'a BTreeSet<AgentId>, line: &Value) -> &'a AgentId {
+fn only<'a>(to: &'a BTreeSet<ActorId>, line: &Value) -> &'a ActorId {
     assert_eq!(to.len(), 1, "addressed to one player: {line}");
     to.first().unwrap()
 }
@@ -265,8 +353,8 @@ fn outcome(message: &Message) -> Option<&Outcome> {
 /// The players a session's selections name most often: the ones the
 /// elimination is drawn from. A member whose selection was never counted is
 /// absent and names nobody.
-fn leaders(votes: &BTreeMap<AgentId, AgentId>) -> BTreeSet<AgentId> {
-    let mut counts: BTreeMap<&AgentId, usize> = BTreeMap::new();
+fn leaders(votes: &BTreeMap<ActorId, ActorId>) -> BTreeSet<ActorId> {
+    let mut counts: BTreeMap<&ActorId, usize> = BTreeMap::new();
     for who in votes.values() {
         *counts.entry(who).or_default() += 1;
     }
@@ -275,6 +363,55 @@ fn leaders(votes: &BTreeMap<AgentId, AgentId>) -> BTreeSet<AgentId> {
         .into_iter()
         .filter(|(_, count)| *count == most)
         .map(|(who, _)| who.clone())
+        .collect()
+}
+
+/// Every selection the moderator heard, in file order.
+///
+/// The moderator hears two things: selections from players, and the reminders
+/// it set for itself, which arrive as ordinary messages from itself
+/// (ADR-0016). Its own reminders are its clocks running and say nothing about
+/// the game, so they are checked to be its own and then dropped; everything
+/// else is a selection or the log is wrong.
+fn heard_by<'a>(
+    lines: &'a [Value],
+    config: &'a Config,
+    players: &BTreeSet<&ActorId>,
+) -> Vec<Heard<'a>> {
+    records_of(lines, &config.moderator, "observation")
+        .filter_map(|(at, line)| {
+            let from = ActorId::deserialize(&line["message"]["sender"]).unwrap();
+            let selection = match message(line) {
+                Message::Select(selection) => selection,
+                Message::Reminder(_) => {
+                    assert_eq!(
+                        from, config.moderator,
+                        "a reminder is always self-directed: {line}"
+                    );
+                    assert_eq!(
+                        recipients(line),
+                        [config.moderator.clone()]
+                            .into_iter()
+                            .collect::<BTreeSet<ActorId>>(),
+                        "a reminder is addressed to the actor that set it and nobody else: {line}"
+                    );
+                    return None;
+                }
+                other => panic!(
+                    "the moderator hears selections and its own reminders, not {other:?}: {line}"
+                ),
+            };
+            assert!(
+                players.contains(&from),
+                "the moderator hears only from players: {line}"
+            );
+            Some(Heard {
+                at,
+                from,
+                selection,
+                line,
+            })
+        })
         .collect()
 }
 
@@ -287,50 +424,33 @@ impl<'a> Play<'a> {
     /// from one, a request issued twice, a player assigned twice or
     /// eliminated twice, or a game without an outcome.
     fn read(lines: &'a [Value], config: &'a Config) -> Self {
-        let players: BTreeSet<&AgentId> = config.players.iter().collect();
+        let players: BTreeSet<&ActorId> = config.players.iter().collect();
         let forwarded = forwards_of(lines, config, &players);
         let said: Vec<Said> = records_of(lines, &config.moderator, "action")
             // What the moderator says for itself, which is every narration
-            // and nothing else: the forwards above are the players'
-            // actions, read from the same records.
-            .filter(|line| line["event"]["sender"] == config.moderator.as_str())
-            .map(|line| {
-                let message = message(line);
-                assert!(
-                    !matches!(message, Message::Select(_)),
-                    "the moderator narrates what it says for itself: {line}"
-                );
+            // and nothing else: the relays above carry the players'
+            // selections, read from the same records, and a bare selection is
+            // not the moderator's to send at all — `forwards_of` has already
+            // caught one.
+            .filter_map(|(at, line)| match message(line) {
+                Message::Narration(narration) => Some((at, line, narration)),
+                Message::Relayed(_) | Message::Select(_) | Message::Reminder(_) => None,
+            })
+            .map(|(at, line, narration)| {
                 let to = recipients(line);
                 assert!(
                     to.iter().all(|who| players.contains(who)),
                     "the moderator addresses only players: {line}"
                 );
                 Said {
-                    seq: super::seq(line),
+                    at,
                     to,
-                    message,
+                    message: Message::Narration(narration),
                     line,
                 }
             })
             .collect();
-        let heard: Vec<Heard> = records_of(lines, &config.moderator, "observation")
-            .map(|line| {
-                let Message::Select(selection) = message(line) else {
-                    panic!("the moderator hears only selections: {line}");
-                };
-                let from = AgentId::deserialize(&line["event"]["sender"]).unwrap();
-                assert!(
-                    players.contains(&from),
-                    "the moderator hears only from players: {line}"
-                );
-                Heard {
-                    seq: super::seq(line),
-                    from,
-                    selection,
-                    line,
-                }
-            })
-            .collect();
+        let heard = heard_by(lines, config, &players);
 
         let mut phases = Vec::new();
         let mut roles = Vec::new();
@@ -339,14 +459,14 @@ impl<'a> Play<'a> {
             let line = said.line;
             match &said.message {
                 Message::Narration(Narration::PhaseBegan { round, phase, .. }) => {
-                    phases.push((*round, *phase, said.seq));
+                    phases.push((*round, *phase, said.at));
                 }
                 Message::Narration(Narration::Assigned { role, .. }) => {
                     roles.push((only(&said.to, line).clone(), *role));
                 }
                 Message::Narration(Narration::Eliminated { who, .. }) => {
                     assert!(
-                        eliminated.insert(who.clone(), said.seq).is_none(),
+                        eliminated.insert(who.clone(), said.at).is_none(),
                         "a player is eliminated once: {line}"
                     );
                 }
@@ -367,7 +487,7 @@ impl<'a> Play<'a> {
         let outcome = outcome(&last.message)
             .unwrap_or_else(|| {
                 panic!(
-                    "a trajectory without an outcome is a truncated game; the moderator's last \
+                    "a log without an outcome is a truncated game; the moderator's last \
                      word was {}",
                     last.line
                 )
@@ -387,14 +507,14 @@ impl<'a> Play<'a> {
     }
 
     /// The role dealt to `who`.
-    fn role(&self, who: &AgentId) -> Role {
+    fn role(&self, who: &ActorId) -> Role {
         self.assignment
             .role(who)
             .unwrap_or_else(|| panic!("{who} is not a player"))
     }
 
     /// The players `role` was dealt to.
-    fn holders(&self, role: Role) -> BTreeSet<AgentId> {
+    fn holders(&self, role: Role) -> BTreeSet<ActorId> {
         self.assignment
             .players()
             .filter(|(_, held)| *held == role)
@@ -402,17 +522,35 @@ impl<'a> Play<'a> {
             .collect()
     }
 
-    /// Whether `who` had been eliminated before the record numbered `seq`.
-    fn dead_at(&self, who: &AgentId, seq: u64) -> bool {
-        self.eliminated.get(who).is_some_and(|&at| at < seq)
+    /// Whether `who` had been eliminated before the record on line `at`.
+    fn dead_at(&self, who: &ActorId, at: usize) -> bool {
+        self.eliminated.get(who).is_some_and(|&died| died < at)
     }
 
-    /// Everyone not yet eliminated at the record numbered `seq`.
-    fn living_at(&self, seq: u64) -> BTreeSet<AgentId> {
+    /// Everyone not yet eliminated at the record on line `at`.
+    ///
+    /// This is the same predicate as [`all_the_living`], and deliberately not
+    /// the same code. That reading takes no roster: it learns the living from
+    /// the moderator's own `PhaseBegan` and `Eliminated` narrations, because
+    /// the live view's contract is that a reading of a log reproduces itself
+    /// from the log alone. This one builds the set from the configured roster
+    /// and the eliminations it found, which is setup input the live sink
+    /// refuses.
+    ///
+    /// The independence *is* the check. What the assertions below claim is
+    /// that the moderator narrated to exactly the living — and a moderator
+    /// that miscounted the living would narrate its miscount, so a check that
+    /// derived its answer from those same narrations would agree with the bug
+    /// and pass. Two derivations of one rule, from two sources, is what makes
+    /// the second an independent witness to the first rather than a restating
+    /// of it, and unifying them would cost exactly that.
+    ///
+    /// [`all_the_living`]: social_deception::werewolf::live
+    fn living_at(&self, at: usize) -> BTreeSet<ActorId> {
         self.config
             .players
             .iter()
-            .filter(|who| !self.dead_at(who, seq))
+            .filter(|who| !self.dead_at(who, at))
             .cloned()
             .collect()
     }
@@ -423,11 +561,11 @@ impl<'a> Play<'a> {
     /// reads straight off the selections with no request to join to. The
     /// doctor's latest selection of the round is its protection, the same
     /// rule the session itself applies (ADR-0011).
-    fn protections_in(&self, round: Round) -> BTreeMap<AgentId, AgentId> {
+    fn protections_in(&self, round: Round) -> BTreeMap<ActorId, ActorId> {
         self.heard
             .iter()
             .filter(|heard| {
-                heard.selection.round == round && heard.selection.kind == RequestKind::Protect
+                heard.selection.round == round && heard.selection.kind == SessionKind::Protect
             })
             .map(|heard| (heard.from.clone(), heard.selection.target.clone()))
             .collect()
@@ -440,23 +578,23 @@ impl<'a> Play<'a> {
     /// is the doctor's own rule; everything else is the living set.
     fn action_space(
         &self,
-        who: &AgentId,
-        kind: RequestKind,
+        who: &ActorId,
+        kind: SessionKind,
         round: Round,
-        living: &BTreeSet<AgentId>,
-    ) -> Vec<AgentId> {
+        living: &BTreeSet<ActorId>,
+    ) -> Vec<ActorId> {
         let last_protected = round
             .previous()
-            .filter(|_| kind == RequestKind::Protect)
+            .filter(|_| kind == SessionKind::Protect)
             .and_then(|before| self.protections_in(before).get(who).cloned());
-        roles::action_space(who, living, kind, last_protected.as_ref())
+        role::action_space(who, living, kind, last_protected.as_ref())
     }
 
     /// The members of the session of `kind` in `round`, with `living`
     /// alive: the living players whose role is asked that kind in that
     /// phase and whom the rules leave somewhere to select.
     ///
-    /// Nobody is told this and nothing in the trajectory states it
+    /// Nobody is told this and nothing in the log states it
     /// (ADR-0014), so the check derives it the way the players and the
     /// moderator each derive it: from the roles. The non-empty action
     /// space matters — a doctor the rules leave nobody it may protect is
@@ -465,10 +603,10 @@ impl<'a> Play<'a> {
     /// in.
     fn members_of(
         &self,
-        kind: RequestKind,
+        kind: SessionKind,
         round: Round,
-        living: &BTreeSet<AgentId>,
-    ) -> BTreeSet<AgentId> {
+        living: &BTreeSet<ActorId>,
+    ) -> BTreeSet<ActorId> {
         living
             .iter()
             .filter(|who| self.role(who).asked_in(kind.phase()) == Some(kind))
@@ -479,22 +617,22 @@ impl<'a> Play<'a> {
 
     /// The record that began the phase a selection names, if the game ever
     /// had such a phase.
-    fn began(&self, round: Round, phase: Phase) -> Option<u64> {
+    fn began(&self, round: Round, phase: Phase) -> Option<usize> {
         self.phases
             .iter()
             .find(|(had, was, _)| *had == round && *was == phase)
-            .map(|(_, _, seq)| *seq)
+            .map(|(_, _, at)| *at)
     }
 
     /// The record that began the phase *after* the given one, which is
     /// the first record after that phase had certainly ended. `None` for
     /// the last phase of the game, which nothing follows.
-    fn ended(&self, round: Round, phase: Phase) -> Option<u64> {
+    fn ended(&self, round: Round, phase: Phase) -> Option<usize> {
         let index = self
             .phases
             .iter()
             .position(|(had, was, _)| *had == round && *was == phase)?;
-        self.phases.get(index + 1).map(|(_, _, seq)| *seq)
+        self.phases.get(index + 1).map(|(_, _, at)| *at)
     }
 
     /// Every selection names a session the game really opened, with its
@@ -510,7 +648,7 @@ impl<'a> Play<'a> {
     /// under way when the moderator recorded hearing it. A selection that
     /// lost a race with its own session's clock — or with its sender's
     /// stop — arrives after that phase has ended, and ADR-0011 makes
-    /// that an ordinary event rather than a bug. Naming its own round is
+    /// that an ordinary message rather than a bug. Naming its own round is
     /// exactly what lets a reader place such a selection correctly instead
     /// of mistaking it for a selection in the phase that has since opened.
     ///
@@ -532,7 +670,7 @@ impl<'a> Play<'a> {
                 .began(round, kind.phase())
                 .unwrap_or_else(|| panic!("a selection names a phase the game played: {line}"));
             assert!(
-                began < heard.seq,
+                began < heard.at,
                 "a selection is heard after the phase it names began: {line}"
             );
             // Membership as it stood when that phase began, which is
@@ -544,6 +682,74 @@ impl<'a> Play<'a> {
                     .contains(who),
                 "a selection comes from a member of the session it names: {line}"
             );
+        }
+    }
+
+    /// Every member of every night session the game opened was heard. See
+    /// [`check_everybody_was_heard`](super::check_everybody_was_heard) for
+    /// why this holds only for a game of random players, and why it is
+    /// worth asserting separately.
+    ///
+    /// What counts as having been heard is read the way
+    /// [`leaders_of`](Seen::leaders_of) reads a session's votes, and for
+    /// the same reason. A forward is the moderator's record that it
+    /// counted a selection (ADR-0014), but it forwards only a selection
+    /// somebody else should see: a lone seer, doctor or werewolf selects
+    /// with an empty `seen_by`, and nothing is forwarded however promptly
+    /// it answered. Such a selection is counted as heard when the
+    /// moderator heard it before the phase ended, which is the same bound
+    /// `leaders_of` uses — a selection heard afterwards certainly lost its
+    /// race with the clock.
+    #[allow(dead_code, reason = "used by the werewolf test binary only")]
+    fn check_everybody_was_heard(&self) {
+        for (round, phase, began) in &self.phases {
+            let living = self.living_at(*began);
+            // The night's three kinds. `Nominate` is deliberately not
+            // among them: a day closes the moment a majority of the
+            // living agree (ADR-0011), so the members who had not yet
+            // selected are unheard by the rules rather than by the
+            // machine, and there is nothing here to assert. That is also
+            // the session a missed selection matters least in, since a
+            // selection that missed cannot have made the majority.
+            //
+            // Listed here rather than added to `SessionKind` as a
+            // constant: production code owes this check nothing.
+            let kinds = [
+                SessionKind::Devour,
+                SessionKind::Investigate,
+                SessionKind::Protect,
+            ];
+            for kind in kinds {
+                if kind.phase() != *phase {
+                    continue;
+                }
+                let members = self.members_of(kind, *round, &living);
+                if members.is_empty() {
+                    continue;
+                }
+                let mine = |selection: &Select| selection.round == *round && selection.kind == kind;
+                let ended = self.ended(*round, *phase).unwrap_or(usize::MAX);
+                let counted = self
+                    .forwarded
+                    .iter()
+                    .filter(|forwarded| mine(&forwarded.selection))
+                    .map(|forwarded| forwarded.from.clone());
+                let unseen = self
+                    .heard
+                    .iter()
+                    .filter(|heard| mine(&heard.selection) && heard.selection.seen_by.is_empty())
+                    .filter(|heard| heard.at < ended)
+                    .map(|heard| heard.from.clone());
+                let heard: BTreeSet<ActorId> = counted.chain(unseen).collect();
+                let missed: Vec<&ActorId> = members.difference(&heard).collect();
+                assert!(
+                    missed.is_empty(),
+                    "{kind:?} in round {round:?} closed without {missed:?}, who are members of \
+                     it and, being random players, always select: their threads were not \
+                     scheduled inside the session's hard limit, so this game is not the game \
+                     its seed names. Lower the concurrency or raise the limit."
+                );
+            }
         }
     }
 
@@ -636,7 +842,7 @@ impl<'a> Play<'a> {
                 // victim is not told, because it is stopped in the same
                 // cycle and there is nobody left to tell (ADR-0012).
                 Message::Narration(Narration::Eliminated { who, .. }) => {
-                    let mut living = self.living_at(said.seq);
+                    let mut living = self.living_at(said.at);
                     assert!(living.remove(who), "{who} was already dead: {line}");
                     assert_eq!(
                         said.to, living,
@@ -649,19 +855,19 @@ impl<'a> Play<'a> {
                     | Narration::NoLynch { .. },
                 ) => assert_eq!(
                     said.to,
-                    self.living_at(said.seq),
+                    self.living_at(said.at),
                     "a narration to the living goes to exactly the living: {line}"
                 ),
                 Message::Narration(Narration::Outcome(_)) => {
                     assert_eq!(
                         said.to,
-                        self.living_at(said.seq),
+                        self.living_at(said.at),
                         "the outcome goes to exactly the living: {line}"
                     );
                     outcomes += 1;
                 }
-                Message::Select(_) => {
-                    unreachable!("a forwarded selection is not among the moderator's own words")
+                Message::Select(_) | Message::Relayed(_) | Message::Reminder(_) => {
+                    unreachable!("a relay and a reminder are not among the moderator's own words")
                 }
             }
         }
@@ -681,7 +887,7 @@ impl<'a> Play<'a> {
     fn check_forwards(&self) {
         for forwarded in &self.forwarded {
             let line = forwarded.line;
-            let living = self.living_at(forwarded.seq);
+            let living = self.living_at(forwarded.at);
             assert!(
                 forwarded.to.iter().all(|who| living.contains(who)),
                 "a selection is passed on to living players only: {line}"
@@ -697,8 +903,8 @@ impl<'a> Play<'a> {
                 // `members_of`, the one place this file works out who a
                 // session's members are, so the audience a forward is
                 // held to is the session the rules opened.
-                RequestKind::Devour => {
-                    let mut pack = self.members_of(RequestKind::Devour, round, &living);
+                SessionKind::Devour => {
+                    let mut pack = self.members_of(SessionKind::Devour, round, &living);
                     pack.remove(&forwarded.from);
                     assert_eq!(
                         forwarded.to, pack,
@@ -712,7 +918,7 @@ impl<'a> Play<'a> {
                 }
                 // The day's vote is public among the living, whether or
                 // not the rules leave each of them somewhere to select.
-                RequestKind::Nominate => {
+                SessionKind::Nominate => {
                     let mut others = living;
                     others.remove(&forwarded.from);
                     assert_eq!(
@@ -720,7 +926,7 @@ impl<'a> Play<'a> {
                         "a nomination goes to the rest of the living: {line}"
                     );
                 }
-                RequestKind::Investigate | RequestKind::Protect => panic!(
+                SessionKind::Investigate | SessionKind::Protect => panic!(
                     "a {:?} selection is nobody else's business and is never passed on: {line}",
                     forwarded.selection.kind
                 ),
@@ -763,10 +969,10 @@ impl<'a> Play<'a> {
         // Straight off the selections: each says which round and which
         // session it was made in (ADR-0014), so there is nothing to join
         // it to. A doctor's latest selection of a round is its protection.
-        let protected: BTreeMap<Round, &AgentId> = self
+        let protected: BTreeMap<Round, &ActorId> = self
             .heard
             .iter()
-            .filter(|heard| heard.selection.kind == RequestKind::Protect)
+            .filter(|heard| heard.selection.kind == SessionKind::Protect)
             .map(|heard| (heard.selection.round, &heard.selection.target))
             .collect();
         let mut phases = Phases {
@@ -784,7 +990,9 @@ impl<'a> Play<'a> {
                     living,
                 }) => phases.began(said, *round, *phase, living),
                 Message::Narration(narration) => phases.narrated(said, narration),
-                Message::Select(_) => unreachable!("the moderator sends no selections"),
+                Message::Select(_) | Message::Relayed(_) | Message::Reminder(_) => {
+                    unreachable!("`said` is the moderator's narrations alone")
+                }
             }
         }
         phases.counts.close(phases.current);
@@ -799,7 +1007,7 @@ impl<'a> Play<'a> {
         let outcome = &self.outcome;
         assert_eq!(
             outcome.living,
-            self.living_at(u64::MAX),
+            self.living_at(usize::MAX),
             "the outcome names the survivors: {outcome:?}"
         );
         let werewolves = outcome
@@ -844,11 +1052,11 @@ impl<'a> Play<'a> {
     /// dealt and not merely with itself. There are no stalemates
     /// (ADR-0007), so every player is paid one of the two and never zero.
     fn check_rewards(&self, lines: &[Value]) {
-        let rewards: BTreeMap<AgentId, Vec<&Value>> = lines
+        let rewards: BTreeMap<ActorId, Vec<&Value>> = lines
             .iter()
             .filter(|line| line["type"] == "reward")
             .fold(BTreeMap::new(), |mut paid, line| {
-                let who = AgentId::new(super::agent(line));
+                let who = ActorId::new(super::agent(line));
                 paid.entry(who).or_default().push(line);
                 paid
             });
@@ -894,8 +1102,8 @@ impl<'a> Play<'a> {
     /// from the player's own, because the victim is never told: the
     /// `Eliminated` narration goes to the living after the death, which no
     /// longer includes the victim, and the victim's agent is stopped in the
-    /// same cycle (ADR-0012). A dead player's trajectory therefore simply
-    /// ends where the game ended for it, with no announcement to mark the
+    /// same cycle (ADR-0012). A dead player's records therefore simply
+    /// end where the game ended for it, with no announcement to mark the
     /// spot.
     ///
     /// Who may see a selection is the kind's to say (ADR-0011): a `Devour`
@@ -903,8 +1111,11 @@ impl<'a> Play<'a> {
     /// seer's and the doctor's to the moderator alone.
     fn check_players(&self, lines: &[Value]) {
         let moderator = &self.config.moderator;
+        // Built once, not once per player: it is the same map every time, and
+        // every player's records are checked against it.
+        let sent_at = sent_lines(lines, moderator);
         for who in &self.config.players {
-            for line in records_of(lines, who, "action") {
+            for (_, line) in records_of(lines, who, "action") {
                 let Message::Select(selection) = message(line) else {
                     panic!("a player sends only selections: {line}");
                 };
@@ -918,12 +1129,12 @@ impl<'a> Play<'a> {
                     to,
                     [moderator.clone()]
                         .into_iter()
-                        .collect::<BTreeSet<AgentId>>(),
+                        .collect::<BTreeSet<ActorId>>(),
                     "a selection is addressed to the moderator alone: {line}"
                 );
                 // Who should see it is named in the selection, for the
                 // moderator to forward to.
-                let others: BTreeSet<&AgentId> = selection.seen_by.iter().collect();
+                let others: BTreeSet<&ActorId> = selection.seen_by.iter().collect();
                 assert!(
                     !others.contains(&who),
                     "a selection does not name its own author as an observer: {line}"
@@ -934,27 +1145,28 @@ impl<'a> Play<'a> {
                 );
                 match selection.kind {
                     // The pack sees its own selecting and nobody else does.
-                    RequestKind::Devour => assert!(
+                    SessionKind::Devour => assert!(
                         others
                             .iter()
                             .all(|other| self.role(other) == Role::Werewolf),
                         "a devour selection is seen by the pack alone: {line}"
                     ),
                     // The day's vote is public among the living.
-                    RequestKind::Nominate => assert!(
+                    SessionKind::Nominate => assert!(
                         others.iter().all(|other| *other != who),
                         "a nomination does not name its own author: {line}"
                     ),
                     // Nobody's business but the moderator's.
-                    RequestKind::Investigate | RequestKind::Protect => assert!(
+                    SessionKind::Investigate | SessionKind::Protect => assert!(
                         others.is_empty(),
                         "a {:?} selection is nobody else's business: {line}",
                         selection.kind
                     ),
                 }
             }
-            let received: Vec<Message> =
-                records_of(lines, who, "observation").map(message).collect();
+            let received: Vec<Message> = records_of(lines, who, "observation")
+                .map(|(_, line)| message(line))
+                .collect();
             let assigned: Vec<&Role> = received
                 .iter()
                 .filter_map(|message| match message {
@@ -967,7 +1179,7 @@ impl<'a> Play<'a> {
                 [&self.role(who)],
                 "{who} is assigned its role exactly once"
             );
-            self.check_where_it_ended(lines, who, &received);
+            self.check_where_it_ended(lines, who, &received, &sent_at);
         }
         let counts = &self.config.roles;
         let villagers = self.config.players.len() - counts.special();
@@ -993,9 +1205,15 @@ impl<'a> Play<'a> {
     /// player's. Since ADR-0012 the victim is never told: the
     /// `Eliminated` narration goes to the living after the death, which
     /// no longer includes the victim, and its agent is stopped in the
-    /// same cycle. A dead player's trajectory simply stops, with no
+    /// same cycle. A dead player's records simply stop, with no
     /// announcement in it to mark the place.
-    fn check_where_it_ended(&self, lines: &[Value], who: &AgentId, received: &[Message]) {
+    fn check_where_it_ended(
+        &self,
+        lines: &[Value],
+        who: &ActorId,
+        received: &[Message],
+        sent_at: &BTreeMap<(ActorId, u64), usize>,
+    ) {
         // No player ever observes its own death, whatever else it saw.
         assert!(
             !received.iter().any(|message| {
@@ -1019,31 +1237,31 @@ impl<'a> Play<'a> {
             );
             return;
         };
-        // A dead player observes nothing from its death onward: not its
-        // own death, not a peer's selection, nothing at all (ADR-0012). It is
-        // stopped in the cycle the death is announced, and the router
-        // drops whatever is addressed to it after that.
+        // A dead player observes nothing sent after its death: not its own
+        // death, not a peer's selection, nothing at all (ADR-0012). It is
+        // stopped in the cycle the death is announced, and the router drops
+        // whatever is addressed to it after that.
         //
-        // "After the death" is measured on the wall clock rather than on
-        // sequence numbers, because the two sides of an event are
-        // numbered in different agents' trajectories. The eliminating
-        // narration's `created` stamp is the moment the game ended for
-        // this player, and everything it observed was created before it.
-        let died = self
-            .said
-            .iter()
-            .find(|said| said.seq == death)
-            .expect("the eliminating narration is one the moderator said")
-            .line["created"]
-            .as_u64()
-            .expect("a record says when it was created");
-        for line in records_of(lines, who, "observation") {
-            let created = line["created"]
-                .as_u64()
-                .expect("an observed event says when it was created");
+        // "After the death" is read off the moderator's own records rather
+        // than off a clock. The moderator sends everything a player observes,
+        // directly or as a relay, and it is one thread, so its records are in
+        // the order it sent them; a sequence number will not serve, since it
+        // is the *message's* and so is the relayed player's on a forward
+        // (ADR-0017). What every observation of this player joins to is
+        // therefore a line of the moderator's at or before the one that
+        // announced the death — and the death's own line is allowed, because
+        // the stop and the messages of that cycle are one batch and one of
+        // those messages may have been in flight.
+        for (_, line) in records_of(lines, who, "observation") {
+            let at = *sent_at
+                .get(&(sender_of(line), super::seq(line)))
+                .unwrap_or_else(|| {
+                    panic!("{who} observed something the moderator never sent: {line}")
+                });
             assert!(
-                created < died,
-                "{who} died at {died} but observed something created at {created}: {line}"
+                at <= death,
+                "{who} died at line {death} but observed something the moderator \
+                 sent on line {at}: {line}"
             );
         }
         assert!(
@@ -1057,14 +1275,14 @@ impl<'a> Play<'a> {
 struct Phases<'p, 'a> {
     play: &'p Play<'a>,
     /// Whom the doctor protected each round, from its responses.
-    protected: BTreeMap<Round, &'p AgentId>,
+    protected: BTreeMap<Round, &'p ActorId>,
     /// The phase in progress: its round and phase, and the record that
     /// began it.
     current: Option<(Round, Phase, &'p Value)>,
     /// What has been narrated in it so far.
     counts: PhaseCounts,
     /// The living when the most recent night began.
-    living_last_night: Option<BTreeSet<AgentId>>,
+    living_last_night: Option<BTreeSet<ActorId>>,
 }
 
 impl<'p, 'a> Phases<'p, 'a> {
@@ -1073,7 +1291,7 @@ impl<'p, 'a> Phases<'p, 'a> {
     ///
     /// Read from the selections the moderator *passed on*, which are the
     /// selections it accepted. Nothing summarizes a session any more
-    /// (ADR-0015), so a forward is the trajectory's record that a selection
+    /// (ADR-0015), so a forward is the log's record that a selection
     /// counted: a selection the moderator merely heard may have lost a race
     /// with its session's clock, and counting it would hold the
     /// moderator to a vote it never took.
@@ -1081,17 +1299,17 @@ impl<'p, 'a> Phases<'p, 'a> {
     /// A selection with nobody to see it is the exception. A lone werewolf's
     /// `Devour` names no audience, so there is nothing for the moderator
     /// to pass on and no forward is written however the race went; the
-    /// trajectory simply does not say whether that selection was accepted.
+    /// log simply does not say whether that selection was accepted.
     /// For those the check falls back to the selections the moderator heard
     /// *while the phase was still running*, which is as much as the
-    /// trajectory does say. Bounding it by the phase matters: an
+    /// log does say. Bounding it by the phase matters: an
     /// unforwarded selection heard after the phase ended certainly lost its
     /// race, and counting it would credit the session with a vote it
     /// never took.
-    fn leaders_of(&self, round: Round, phase: Phase) -> BTreeSet<AgentId> {
+    fn leaders_of(&self, round: Round, phase: Phase) -> BTreeSet<ActorId> {
         let deciding = match phase {
-            Phase::Night => RequestKind::Devour,
-            Phase::Day => RequestKind::Nominate,
+            Phase::Night => SessionKind::Devour,
+            Phase::Day => SessionKind::Nominate,
         };
         let mine = |selection: &Select| selection.round == round && selection.kind == deciding;
         let counted = self
@@ -1100,15 +1318,15 @@ impl<'p, 'a> Phases<'p, 'a> {
             .iter()
             .filter(|forwarded| mine(&forwarded.selection))
             .map(|forwarded| (forwarded.from.clone(), forwarded.selection.target.clone()));
-        let ended = self.play.ended(round, phase).unwrap_or(u64::MAX);
+        let ended = self.play.ended(round, phase).unwrap_or(usize::MAX);
         let unseen = self
             .play
             .heard
             .iter()
             .filter(|heard| mine(&heard.selection) && heard.selection.seen_by.is_empty())
-            .filter(|heard| heard.seq < ended)
+            .filter(|heard| heard.at < ended)
             .map(|heard| (heard.from.clone(), heard.selection.target.clone()));
-        let votes: BTreeMap<AgentId, AgentId> = counted.chain(unseen).collect();
+        let votes: BTreeMap<ActorId, ActorId> = counted.chain(unseen).collect();
         leaders(&votes)
     }
 
@@ -1119,7 +1337,7 @@ impl<'p, 'a> Phases<'p, 'a> {
         said: &'p Said<'a>,
         round: Round,
         phase: Phase,
-        living: &BTreeSet<AgentId>,
+        living: &BTreeSet<ActorId>,
     ) {
         let line = said.line;
         self.counts.close(self.current);
@@ -1136,7 +1354,7 @@ impl<'p, 'a> Phases<'p, 'a> {
         );
         assert_eq!(
             *living,
-            self.play.living_at(said.seq),
+            self.play.living_at(said.at),
             "a phase begins with the living as they are: {line}"
         );
         if phase == Phase::Night {
@@ -1324,7 +1542,9 @@ mod tests {
         lines
             .iter()
             .position(|line| {
-                line["type"] == kind && line["agent"] == agent && wanted(&line["event"]["payload"])
+                line["type"] == kind
+                    && line["agent"] == agent
+                    && wanted(&line["message"]["payload"])
             })
             .expect("the fixture has such a record")
     }
@@ -1351,10 +1571,12 @@ mod tests {
         }
     }
 
-    /// A selection of the given round and session kind.
-    fn selection_in(round: u32, kind: &str) -> impl Fn(&Value) -> bool + '_ {
+    /// A **relayed** selection of the given round and session kind: what the
+    /// moderator sends, whose payload is the envelope rather than the
+    /// selection itself (ADR-0018).
+    fn relay_in(round: u32, kind: &str) -> impl Fn(&Value) -> bool + '_ {
         move |payload| {
-            let selection = &payload["Select"];
+            let selection = &payload["Relayed"]["envelope"]["payload"];
             selection["round"] == round && selection["kind"] == kind
         }
     }
@@ -1380,8 +1602,8 @@ mod tests {
     /// why this matches the whole record.
     fn selection_of<'w>(who: &'w str, round: u32, kind: &'w str) -> impl Fn(&Value) -> bool + 'w {
         move |line| {
-            let selection = &line["event"]["payload"]["Select"];
-            line["event"]["sender"] == who
+            let selection = &line["message"]["payload"]["Select"];
+            line["message"]["sender"] == who
                 && selection["round"] == round
                 && selection["kind"] == kind
         }
@@ -1449,7 +1671,7 @@ mod tests {
     }
 
     /// Exchanges two players' names everywhere in `lines`, so that a
-    /// forgery that kills one in the other's place leaves a trajectory
+    /// forgery that kills one in the other's place leaves a log
     /// consistent about who is alive.
     fn swap(lines: &mut [Value], one: &str, other: &str) {
         fn rename(value: &mut Value, one: &str, other: &str) {
@@ -1488,21 +1710,27 @@ mod tests {
     }
 
     fn recipients(line: &mut Value, to: &[&str]) {
-        line["event"]["recipients"] = json!(to);
+        line["message"]["recipients"] = json!(to);
     }
 
     /// Rewrites the audience a selection names: who the moderator is asked to
     /// forward it to. A leak is a name in here that does not belong.
     fn seen_by(line: &mut Value, to: &[&str]) {
-        line["event"]["payload"]["Select"]["seen_by"] = json!(to);
+        line["message"]["payload"]["Select"]["seen_by"] = json!(to);
     }
 
     fn sender(line: &mut Value, from: &str) {
-        line["event"]["sender"] = json!(from);
+        line["message"]["sender"] = json!(from);
+    }
+
+    /// Rewrites who a relay says selected, which is the envelope's sender and
+    /// not the message's: the message is the moderator's own.
+    fn selected_by(line: &mut Value, from: &str) {
+        line["message"]["payload"]["Relayed"]["envelope"]["from"] = json!(from);
     }
 
     fn target(line: &mut Value, whom: &str) {
-        line["event"]["payload"]["Select"]["target"] = json!(whom);
+        line["message"]["payload"]["Select"]["target"] = json!(whom);
     }
 
     #[test]
@@ -1538,7 +1766,7 @@ mod tests {
         // alone: a night's save is read from the protections, and losing
         // one would fail as a quiet night without a save instead.
         let lines = heard_selection(selection_of("bob", 3, "Nominate"), |line| {
-            line["event"]["payload"]["Select"]["kind"] = json!("Protect");
+            line["message"]["payload"]["Select"]["kind"] = json!("Protect");
         });
         check(&lines, &config());
     }
@@ -1551,7 +1779,7 @@ mod tests {
         // never opened. This is what replaced the check that a selection
         // arrived after the request it answered.
         let lines = heard_selection(selection_of("bob", 3, "Nominate"), |line| {
-            line["event"]["payload"]["Select"]["round"] = json!(9);
+            line["message"]["payload"]["Select"]["round"] = json!(9);
         });
         check(&lines, &config());
     }
@@ -1564,7 +1792,7 @@ mod tests {
         // nobody selects in a session that has not opened, because what
         // opens it is the phase narration the player selects in answer to.
         let lines = heard_selection(selection_of("bob", 1, "Nominate"), |line| {
-            line["event"]["payload"]["Select"]["round"] = json!(3);
+            line["message"]["payload"]["Select"]["round"] = json!(3);
         });
         check(&lines, &config());
     }
@@ -1681,13 +1909,25 @@ mod tests {
     #[should_panic(expected = "a devour goes to the rest of the living pack")]
     fn a_devour_passed_on_to_a_villager_is_caught() {
         // What a night session leaks is where its selections go, and since
-        // ADR-0015 a forward is the only thing the moderator says about
-        // one. dave and erin are the pack; alice is a villager, and a
-        // devour passed on to her tells her both that somebody is being
-        // eaten and, by who sent it, that dave is a wolf.
+        // ADR-0015 a relay is the only thing the moderator says about one.
+        // dave and erin are the pack; alice is a villager, and a devour
+        // passed on to her tells her both that somebody is being eaten and,
+        // by the envelope, which of the two is a wolf.
+        //
+        // Who the relay really went to is left alone and alice is added, so
+        // that the only thing wrong with the line is the villager among its
+        // recipients: naming a fixed pair would risk naming the wolf whose
+        // selection it is, which a different check catches first.
         let mut lines = fixture();
-        let index = find(&lines, "moderator", "action", selection_in(1, "Devour"));
-        recipients(&mut lines[index], &["alice", "erin"]);
+        let index = find(&lines, "moderator", "action", relay_in(1, "Devour"));
+        let mut to: Vec<String> = lines[index]["message"]["recipients"]
+            .as_array()
+            .expect("a relay lists its recipients")
+            .iter()
+            .map(|who| who.as_str().expect("an id is a string").to_owned())
+            .collect();
+        to.push("alice".to_owned());
+        lines[index]["message"]["recipients"] = json!(to);
         check(&lines, &config());
     }
 
@@ -1699,7 +1939,7 @@ mod tests {
         // sending it to her too.
         let everyone = everyone();
         let lines = said(began(3, "Night"), |line| {
-            line["event"]["recipients"] = json!(everyone);
+            line["message"]["recipients"] = json!(everyone);
         });
         check(&lines, &config());
     }
@@ -1721,7 +1961,7 @@ mod tests {
         // out, so it is what this catches.
         let everyone = everyone();
         let lines = said(narration("Outcome"), |line| {
-            line["event"]["recipients"] = json!(everyone);
+            line["message"]["recipients"] = json!(everyone);
         });
         check(&lines, &config());
     }
@@ -1739,7 +1979,7 @@ mod tests {
     #[should_panic(expected = "no message naming the pack is addressed to a non-werewolf")]
     fn a_pack_named_to_a_villager_is_caught() {
         let lines = said(assigned("Werewolf", false), |line| {
-            line["event"]["payload"]["Narration"]["Assigned"]["pack"] = json!(["dave", "erin"]);
+            line["message"]["payload"]["Narration"]["Assigned"]["pack"] = json!(["dave", "erin"]);
         });
         check(&lines, &config());
     }
@@ -1748,7 +1988,7 @@ mod tests {
     #[should_panic(expected = "a werewolf is told its pack")]
     fn a_werewolf_kept_from_its_pack_is_caught() {
         let lines = said(assigned("Werewolf", true), |line| {
-            line["event"]["payload"]["Narration"]["Assigned"]["pack"] = json!([]);
+            line["message"]["payload"]["Narration"]["Assigned"]["pack"] = json!([]);
         });
         check(&lines, &config());
     }
@@ -1761,8 +2001,8 @@ mod tests {
         // the living pack, so that it is who made the selection that trips
         // the check rather than where it went.
         let mut lines = fixture();
-        let index = find(&lines, "moderator", "action", selection_in(1, "Devour"));
-        sender(&mut lines[index], "alice");
+        let index = find(&lines, "moderator", "action", relay_in(1, "Devour"));
+        selected_by(&mut lines[index], "alice");
         recipients(&mut lines[index], &["dave", "erin"]);
         check(&lines, &config());
     }
@@ -1771,7 +2011,7 @@ mod tests {
     #[should_panic(expected = "phases alternate from the first night")]
     fn a_phase_out_of_order_is_caught() {
         let lines = said(began(2, "Night"), |line| {
-            line["event"]["payload"]["Narration"]["PhaseBegan"]["round"] = json!(3);
+            line["message"]["payload"]["Narration"]["PhaseBegan"]["round"] = json!(3);
         });
         check(&lines, &config());
     }
@@ -1786,8 +2026,8 @@ mod tests {
         // trips the check rather than the routing.
         let everyone = everyone();
         let lines = said(began(3, "Night"), |line| {
-            line["event"]["payload"]["Narration"]["PhaseBegan"]["living"] = json!(everyone);
-            line["event"]["recipients"] = json!(everyone);
+            line["message"]["payload"]["Narration"]["PhaseBegan"]["living"] = json!(everyone);
+            line["message"]["recipients"] = json!(everyone);
         });
         check(&lines, &config());
     }
@@ -1833,10 +2073,10 @@ mod tests {
         // decided.
         let mut lines = fixture();
         let death = find(&lines, "moderator", "action", eliminated("alice"));
-        lines[death]["event"]["payload"]["Narration"]["Eliminated"] =
+        lines[death]["message"]["payload"]["Narration"]["Eliminated"] =
             json!({"who": "bob", "role": "Villager", "round": 4, "cause": "Devoured"});
         let outcome = find(&lines, "moderator", "action", narration("Outcome"));
-        lines[outcome]["event"]["payload"]["Narration"]["Outcome"]["living"] =
+        lines[outcome]["message"]["payload"]["Narration"]["Outcome"]["living"] =
             json!(["alice", "dave", "erin", "grace"]);
         check(&lines, &config());
     }
@@ -1875,7 +2115,7 @@ mod tests {
         let death = find(&lines, "moderator", "action", eliminated("carol"));
         swap(&mut lines[death..], "carol", "bob");
         // A swap exchanges the names, not the role the death reveals.
-        lines[death]["event"]["payload"]["Narration"]["Eliminated"]["role"] = json!("Villager");
+        lines[death]["message"]["payload"]["Narration"]["Eliminated"]["role"] = json!("Villager");
         check(&lines, &config());
     }
 
@@ -1901,7 +2141,7 @@ mod tests {
         // anybody, so the mismatch to forge is the other one: carol's
         // devouring on night 2, blamed on a vote that no night takes.
         let lines = said(devoured, |line| {
-            line["event"]["payload"]["Narration"]["Eliminated"]["cause"] = json!("Lynched");
+            line["message"]["payload"]["Narration"]["Eliminated"]["cause"] = json!("Lynched");
         });
         check(&lines, &config());
     }
@@ -1912,7 +2152,7 @@ mod tests {
         // carol, the doctor, is devoured on night 2 — the fixture's first
         // death — and her death is made to announce a seer instead.
         let lines = said(devoured, |line| {
-            line["event"]["payload"]["Narration"]["Eliminated"]["role"] = json!("Seer");
+            line["message"]["payload"]["Narration"]["Eliminated"]["role"] = json!("Seer");
         });
         check(&lines, &config());
     }
@@ -1923,7 +2163,7 @@ mod tests {
         // The werewolves won this game, so it is the village that is the
         // claim the survivors do not bear out.
         let lines = said(narration("Outcome"), |line| {
-            line["event"]["payload"]["Narration"]["Outcome"]["winner"] = json!("Village");
+            line["message"]["payload"]["Narration"]["Outcome"]["winner"] = json!("Village");
         });
         check(&lines, &config());
     }
@@ -1932,7 +2172,7 @@ mod tests {
     #[should_panic(expected = "the outcome names the survivors")]
     fn an_outcome_that_miscounts_the_survivors_is_caught() {
         let lines = said(narration("Outcome"), |line| {
-            line["event"]["payload"]["Narration"]["Outcome"]["living"] = json!(["bob"]);
+            line["message"]["payload"]["Narration"]["Outcome"]["living"] = json!(["bob"]);
         });
         check(&lines, &config());
     }
@@ -1964,7 +2204,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "but observed something created at")]
+    #[should_panic(expected = "but observed something the moderator")]
     fn a_dead_player_that_hears_more_is_caught() {
         // A dead player observes nothing from its death onward — not its
         // own death, not a peer's selection, nothing (ADR-0012). The leak is
@@ -1977,8 +2217,7 @@ mod tests {
         // has to put the leak after that moment rather than after an
         // announcement carol never received.
         let mut lines = fixture();
-        let mut leaked =
-            lines[find(&lines, "bob", "observation", selection_in(2, "Nominate"))].clone();
+        let mut leaked = lines[find(&lines, "bob", "observation", relay_in(2, "Nominate"))].clone();
         leaked["agent"] = json!("carol");
         let stop = lines
             .iter()
@@ -2045,7 +2284,7 @@ mod tests {
         // The bound is the episode's last stop and not the stop of the
         // agent being paid. Since ADR-0012 an agent may be stopped while
         // the others play on — a dead Werewolf player is — and it is
-        // still paid at the end, after its own trajectory has closed.
+        // still paid at the end, after its own records have closed.
         // That is sound because a reward is logged rather than sent
         // (ADR-0007): nobody has to be there to receive it. So the test
         // pushes the stamp past the *last* stop in the file, which is
@@ -2055,11 +2294,11 @@ mod tests {
         let end = lines
             .iter()
             .filter(|line| line["type"] == "control" && line["control"] == "stop")
-            .map(|line| line["created"].as_u64().expect("a stop says when"))
+            .map(|line| super::super::time(line, "t"))
             .max()
             .expect("somebody is stopped");
-        lines[index]["created"] = json!(end + 1);
-        super::super::check(&lines);
+        lines[index]["t"] = json!(end + 1);
+        super::super::actor::check(&lines);
     }
 
     #[test]
@@ -2077,27 +2316,23 @@ mod tests {
         let stops: BTreeMap<&str, u64> = lines
             .iter()
             .filter(|line| line["type"] == "control" && line["control"] == "stop")
-            .map(|line| {
-                (
-                    line["agent"].as_str().expect("a stop names its agent"),
-                    line["created"].as_u64().expect("a stop says when"),
-                )
-            })
+            .map(|line| (super::super::agent(line), super::super::time(line, "t")))
             .collect();
         let late = lines
             .iter()
             .filter(|line| line["type"] == "reward")
             .filter(|line| {
-                let who = line["agent"].as_str().expect("a reward names its agent");
-                let created = line["created"].as_u64().expect("a reward says when");
-                stops.get(who).is_some_and(|&stop| created > stop)
+                let who = super::super::agent(line);
+                stops
+                    .get(who)
+                    .is_some_and(|&stop| super::super::time(line, "t") > stop)
             })
             .count();
         assert!(
             late > 0,
             "the fixture should hold a player stopped before it was paid"
         );
-        super::super::check(&lines);
+        super::super::actor::check(&lines);
     }
 
     #[test]
@@ -2114,7 +2349,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "begins with a start and ends with a stop")]
+    #[should_panic(expected = "begin with a start and end with a stop")]
     fn an_agent_never_stopped_is_caught() {
         // The moderator ends the episode by stopping every player. One left
         // running is a game the moderator did not finish ending.
@@ -2128,9 +2363,9 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "begins with a start and ends with a stop")]
+    #[should_panic(expected = "begin with a start and end with a stop")]
     fn a_moderator_never_stopped_is_caught() {
-        // The environment's own trajectory has the same shape as everyone
+        // The environment's own records have the same shape as everyone
         // else's; the episode is what stops it, once the players have gone.
         let mut lines = fixture();
         let stop = lines

@@ -1,4 +1,4 @@
-# The effective configuration of the fixture trajectory beside it,
+# The effective configuration of the fixture log beside it,
 # werewolf.jsonl: the configuration the run was played from, after any
 # overrides, with no trajectory field so that replaying it cannot truncate
 # the file it describes.

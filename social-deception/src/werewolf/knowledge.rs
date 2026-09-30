@@ -2,7 +2,7 @@
 //! observations it has received.
 //!
 //! In the vocabulary of ADR-0007, `Knowledge` is the *state*: a sufficient
-//! statistic of an agent's [`Observation`] history, and what a policy
+//! statistic of an agent's [`Observation`] history, and what a strategy
 //! conditions on. It is one type for every role, because every role needs
 //! the same public picture (the round and phase, who is living, who is dead
 //! and what they turned out to be, how the phases before this one selected)
@@ -22,12 +22,12 @@
 //!
 //! That holds because [`Knowledge::observe`] folds only moderator narration
 //! and never infers. A doctor that protected someone and then hears that
-//! nobody died may conclude it saved them; the conclusion is the policy's to
-//! draw, and this type records only that nobody died. Player-to-player
-//! dialogue, which may be false, and a role whose investigations can be wrong
-//! would each call for a separate type holding what a player believes. The
-//! line between that type and this one is drawn here, so that it can be added
-//! without touching this one.
+//! nobody died may conclude it saved them; the conclusion is the
+//! strategy's to draw, and this type records only that nobody died.
+//! Player-to-player dialogue, which may be false, and a role whose
+//! investigations can be wrong would each call for a separate type holding
+//! what a player believes. The line between that type and this one is
+//! drawn here, so that it can be added without touching this one.
 //!
 //! The one thing here that the moderator never said is what the agent itself
 //! did in secret. What a player has done is still knowledge, and it is true
@@ -49,16 +49,16 @@
 //! A `Knowledge` is a pure function of the observations folded into it. The
 //! same stream over a fresh value yields the same state on every run, and
 //! nothing else is consulted: no clock, no sender, no recipient list. That is
-//! the property a policy depends on, and what a prompt for a language-model
-//! policy is rendered from.
+//! the property a strategy depends on, and what a prompt for a language-model
+//! strategy is rendered from.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::WerewolfDomain;
-use super::message::{Cause, Message, Narration, Outcome, Phase, RequestKind, Round};
+use super::message::{Cause, Message, Narration, Outcome, Phase, Round, SessionKind};
 use super::role::{Faction, Role};
-use crate::agent::Observation;
-use crate::event::AgentId;
+use crate::Observation;
+use crate::clock::Clock;
+use crate::message::ActorId;
 
 /// What one player knows: the fold of every observation it has received.
 ///
@@ -67,7 +67,7 @@ use crate::event::AgentId;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Knowledge {
     /// This agent's own id.
-    pub me: AgentId,
+    pub me: ActorId,
     /// This agent's role, fixed at construction. The `Assigned` narration
     /// must agree with it.
     pub role: Role,
@@ -78,18 +78,18 @@ pub struct Knowledge {
     pub moment: Option<(Round, Phase)>,
     /// Everyone still in the game, as last announced and kept current
     /// between announcements.
-    pub living: BTreeSet<AgentId>,
+    pub living: BTreeSet<ActorId>,
     /// Everyone out of the game, with how and when they left and the role
     /// their death revealed.
-    pub dead: BTreeMap<AgentId, Death>,
+    pub dead: BTreeMap<ActorId, Death>,
     /// The living werewolves this agent knows of. Empty unless it is one.
-    pub pack: BTreeSet<AgentId>,
+    pub pack: BTreeSet<ActorId>,
     /// What the seer has learned, by target. Empty unless it is the seer.
-    pub investigations: BTreeMap<AgentId, Faction>,
+    pub investigations: BTreeMap<ActorId, Faction>,
     /// Whom the doctor protected last night, if anyone: the one player the
     /// rules keep it from protecting again tonight. `None` unless it is the
     /// doctor and it selected somewhere last night.
-    pub last_protected: Option<AgentId>,
+    pub last_protected: Option<ActorId>,
     /// The latest target of each player whose selection this agent has seen
     /// in the current phase, including its own, cleared when a new phase
     /// begins.
@@ -99,17 +99,27 @@ pub struct Knowledge {
     /// addressed, plus what it selected itself: a villager never sees a
     /// `Devour`, and nobody but the moderator sees an `Investigate` or a
     /// `Protect`.
-    pub selections: BTreeMap<AgentId, AgentId>,
+    pub selections: BTreeMap<ActorId, ActorId>,
     /// How each finished phase selected, oldest first: the `selections` of
     /// that phase, archived when the next one began.
     ///
     /// Nobody narrates this. It is the agent's own record of what it
     /// watched happen, kept because a phase's selections are cleared when the
-    /// next phase begins and a policy may still want the argument that
+    /// next phase begins and a strategy may still want the argument that
     /// went before (ADR-0015).
     pub history: Vec<Phased>,
     /// Set once the game is over.
     pub outcome: Option<Outcome>,
+    /// The episode's origin, from the moment this player was started, or
+    /// `None` before it was.
+    ///
+    /// It is the one origin every actor and the log share (ADR-0017), handed
+    /// to every `start` hook by the episode itself, so a player that
+    /// measures time measures it on the log's timeline. A scripted player
+    /// reads nothing from it; it is here because a language-model player
+    /// stamps its prompt with how long the game has been going, and the
+    /// place to keep what a player knows is what it knows.
+    pub clock: Option<Clock>,
 }
 
 /// How and when a player left the game, and what they turned out to be.
@@ -139,13 +149,13 @@ pub struct Phased {
     /// selection it *sent*, which may have lost its race with the session's
     /// clock: whether a last-second selection counted is the moderator's
     /// bookkeeping and no agent is told it (ADR-0015).
-    pub selections: BTreeMap<AgentId, AgentId>,
+    pub selections: BTreeMap<ActorId, ActorId>,
 }
 
 impl Knowledge {
     /// The state of a player that has observed nothing yet.
     #[must_use]
-    pub fn new(me: AgentId, role: Role) -> Self {
+    pub fn new(me: ActorId, role: Role) -> Self {
         Self {
             me,
             role,
@@ -158,7 +168,14 @@ impl Knowledge {
             selections: BTreeMap::new(),
             history: Vec::new(),
             outcome: None,
+            clock: None,
         }
+    }
+
+    /// Records the episode's origin, which the episode hands every actor's
+    /// `start` hook (ADR-0017).
+    pub fn started(&mut self, clock: Clock) {
+        self.clock = Some(clock);
     }
 
     /// Folds one of this agent's own moves into the state: the target it
@@ -172,9 +189,9 @@ impl Knowledge {
     /// `Protect` is also remembered on its own as
     /// [`last_protected`](Self::last_protected), because the rules ask for it
     /// by name the next night.
-    pub fn acted(&mut self, kind: RequestKind, chosen: &AgentId) {
+    pub fn acted(&mut self, kind: SessionKind, chosen: &ActorId) {
         self.selections.insert(self.me.clone(), chosen.clone());
-        if kind == RequestKind::Protect {
+        if kind == SessionKind::Protect {
             self.last_protected = Some(chosen.clone());
         }
     }
@@ -182,9 +199,9 @@ impl Knowledge {
     /// Folds one observation into the state.
     ///
     /// Total: every observation has a defined effect, and most have none.
-    /// A narration changes the state, and so does a selection, which under
-    /// ADR-0011 another player may see. Nothing here is an error, so the
-    /// state stays a total function of whatever arrives.
+    /// A narration changes the state, and so does a relayed selection, which
+    /// under ADR-0011 another player may see. Nothing that can really arrive
+    /// is an error, so the state stays a total function of whatever does.
     ///
     /// Controls do not appear here at all: they are out-of-domain, the
     /// agent loop acts on them, and no handler ever sees one.
@@ -196,17 +213,44 @@ impl Knowledge {
     /// player type that was built disagree, which is a wiring bug, and it
     /// fails at the start of the episode rather than producing a plausible
     /// game.
-    pub fn observe(&mut self, observation: &Observation<WerewolfDomain>) {
-        match &observation.event.payload {
+    pub fn observe(&mut self, observation: &Observation<Message>) {
+        match &observation.message.payload {
             Message::Narration(narration) => self.narrated(narration),
-            // The sender's latest selection, which replaces whatever it
-            // selected before. The session is not checked: a selection this
-            // agent was addressed at all is one the rules let it see, and
-            // the phase's own `PhaseBegan` is what clears the slate.
-            Message::Select(selection) => {
+            // Who selected is read from the **envelope**, not from the
+            // message's sender: the sender is the moderator, which relayed
+            // it, and the envelope is what names the player whose selection
+            // it is (ADR-0018). It replaces whatever that player selected
+            // before. The session is not checked: a selection this agent was
+            // addressed at all is one the rules let it see, and the phase's
+            // own `PhaseBegan` is what clears the slate.
+            Message::Relayed(envelope) => {
                 self.selections
-                    .insert(observation.event.sender.clone(), selection.target.clone());
+                    .insert(envelope.from.clone(), envelope.payload.target.clone());
             }
+            // A selection a player addressed to the moderator. No player is
+            // ever among its recipients — a selection reaches another player
+            // only as a relay — so nothing here should observe one. The
+            // check is a `debug_assert!` for the reason ADR-0018 gives for
+            // the player's own: players cooperate with the moderator and are
+            // not assumed to cheat, so this catches a wiring mistake rather
+            // than enforcing a rule. In release the fold stays total, and it
+            // leaves the state alone rather than pretending the sender
+            // selected in this agent's hearing.
+            Message::Select(selection) => debug_assert!(
+                false,
+                "{} was sent {}'s {:?} selection directly rather than relayed",
+                self.me, observation.message.sender, selection.kind
+            ),
+            // A reminder is always self-directed, and only the moderator ever
+            // sets one in this game (ADR-0016, ADR-0018), so a player can
+            // reach this arm only by having been sent something nobody
+            // sends. It is a `debug_assert!` for the same reason the arm
+            // above is, and the fold stays total.
+            Message::Reminder(look) => debug_assert!(
+                false,
+                "{} was sent a {:?} reminder, which only the moderator sets and only for itself",
+                self.me, look
+            ),
         }
     }
 
@@ -267,8 +311,8 @@ impl Knowledge {
                     },
                 );
             }
-            // Still an observation, and still recorded in the trajectory;
-            // whether it means a save is for a policy to infer.
+            // Still an observation, and still recorded in the log;
+            // whether it means a save is for a strategy to infer.
             Narration::NoDeath { .. } | Narration::NoLynch { .. } => {}
             Narration::Outcome(outcome) => self.outcome = Some(outcome.clone()),
         }
@@ -276,7 +320,7 @@ impl Knowledge {
 
     /// Whether `who` is still in the game.
     #[must_use]
-    pub fn is_living(&self, who: &AgentId) -> bool {
+    pub fn is_living(&self, who: &ActorId) -> bool {
         self.living.contains(who)
     }
 
@@ -284,7 +328,7 @@ impl Knowledge {
     /// space. Sorted, so that an index into an action space built from it
     /// is a stable action label.
     #[must_use]
-    pub fn living_others(&self) -> BTreeSet<AgentId> {
+    pub fn living_others(&self) -> BTreeSet<ActorId> {
         self.living
             .iter()
             .filter(|who| **who != self.me)
@@ -296,29 +340,35 @@ impl Knowledge {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::Event;
-    use crate::testing::{ME, from, id, ids, narrated, observed, phase_began, target};
+    // Two types are called `Message`: this module's payload, which
+    // `super::*` brings in, and the runtime message that carries it. The
+    // carrier is named more often than the payload here, so it is the one
+    // that gets a short name — and not `Envelope`, which is a type of its
+    // own and the thing a relay actually carries.
+    use crate::Message as Wire;
+    use crate::message::Envelope;
+    use crate::testing::{ME, from, id, ids, narrated, observed, phase_began, relayed, target};
     use crate::werewolf::message::Select;
 
-    fn votes<const N: usize>(votes: [(&str, AgentId); N]) -> BTreeMap<AgentId, AgentId> {
+    fn votes<const N: usize>(votes: [(&str, ActorId); N]) -> BTreeMap<ActorId, ActorId> {
         votes
             .into_iter()
             .map(|(who, action)| (id(who), action))
             .collect()
     }
 
-    fn assigned(role: Role, pack: BTreeSet<AgentId>) -> Event<WerewolfDomain> {
+    fn assigned(role: Role, pack: BTreeSet<ActorId>) -> Wire<Message> {
         narrated(Narration::Assigned { role, pack })
     }
 
-    fn investigated(target: &str, faction: Faction) -> Event<WerewolfDomain> {
+    fn investigated(target: &str, faction: Faction) -> Wire<Message> {
         narrated(Narration::Investigated {
             target: id(target),
             faction,
         })
     }
 
-    fn eliminated(who: &str, role: Role, round: u32, cause: Cause) -> Event<WerewolfDomain> {
+    fn eliminated(who: &str, role: Role, round: u32, cause: Cause) -> Wire<Message> {
         narrated(Narration::Eliminated {
             who: id(who),
             role,
@@ -335,21 +385,18 @@ mod tests {
         }
     }
 
-    /// A fresh state for this agent with every event folded in, in order.
-    fn folded<'a>(
-        role: Role,
-        events: impl IntoIterator<Item = &'a Event<WerewolfDomain>>,
-    ) -> Knowledge {
+    /// A fresh state for this agent with every message folded in, in order.
+    fn folded<'a>(role: Role, messages: impl IntoIterator<Item = &'a Wire<Message>>) -> Knowledge {
         let mut knowledge = Knowledge::new(id(ME), role);
-        for event in events {
-            knowledge.observe(&observed(event.clone()));
+        for message in messages {
+            knowledge.observe(&observed(message.clone()));
         }
         knowledge
     }
 
     /// The day-1 selections of [`a_seers_game`], as this seer saw them: the
     /// other living players' nominations, forwarded to it one by one.
-    fn day_selections() -> BTreeMap<AgentId, AgentId> {
+    fn day_selections() -> BTreeMap<ActorId, ActorId> {
         votes([
             ("bob", target("carol")),
             ("carol", target("bob")),
@@ -357,22 +404,23 @@ mod tests {
         ])
     }
 
-    /// One player's nomination, forwarded by the moderator as the player
-    /// that made it (ADR-0014).
-    fn nominated(who: &str, whom: &str, round: u32) -> Event<WerewolfDomain> {
-        from(
+    /// One player's nomination, relayed by the moderator in the envelope
+    /// that names who made it (ADR-0018).
+    fn nominated(who: &str, whom: &str, round: u32) -> Wire<Message> {
+        relayed(
             who,
-            Message::Select(Select {
+            0,
+            Select {
                 round: Round::new(round),
-                kind: RequestKind::Nominate,
+                kind: SessionKind::Nominate,
                 target: id(whom),
                 seen_by: BTreeSet::new(),
-            }),
+            },
         )
     }
 
     /// A seer's whole game, from the deal to the werewolves' win.
-    fn a_seers_game() -> Vec<Event<WerewolfDomain>> {
+    fn a_seers_game() -> Vec<Wire<Message>> {
         vec![
             assigned(Role::Seer, BTreeSet::new()),
             phase_began(
@@ -439,6 +487,9 @@ mod tests {
                     rounds: Round::new(2),
                     living: ids([ME, "wolfgang"]),
                 }),
+                // The origin is kept by `start`, and this fold never
+                // started anybody: it is the fold that is under test here.
+                clock: None,
             }
         );
     }
@@ -536,11 +587,82 @@ mod tests {
         let no_ops = [narrated(Narration::NoDeath {
             round: Round::new(2),
         })];
-        for event in &no_ops {
+        for message in &no_ops {
             let mut after = knowledge.clone();
-            after.observe(&observed(event.clone()));
-            assert_eq!(after, knowledge, "{event:?}");
+            after.observe(&observed(message.clone()));
+            assert_eq!(after, knowledge, "{message:?}");
         }
+    }
+
+    #[test]
+    fn who_selected_is_read_from_the_envelope_and_not_from_the_sender() {
+        // The whole point of the envelope (ADR-0018). Every relay is the
+        // moderator's own message, so a fold that read the sender would
+        // record the moderator as having voted for everybody in turn.
+        let mut knowledge = Knowledge::new(id(ME), Role::Villager);
+        let relay = relayed(
+            "alice",
+            4,
+            Select {
+                round: Round::FIRST,
+                kind: SessionKind::Nominate,
+                target: target("bob"),
+                seen_by: BTreeSet::new(),
+            },
+        );
+        assert_eq!(
+            relay.sender,
+            id("moderator"),
+            "the moderator is what sent it"
+        );
+        knowledge.observe(&observed(relay));
+        assert_eq!(knowledge.selections, votes([("alice", target("bob"))]));
+    }
+
+    #[test]
+    #[should_panic(expected = "directly rather than relayed")]
+    fn a_selection_sent_to_a_player_directly_is_a_wiring_bug() {
+        // A player addresses the moderator alone, so no player is ever among
+        // a selection's recipients: one arriving here means somebody wired
+        // the recipients wrong (ADR-0018). Caught in debug and, in release,
+        // left alone rather than recorded as the sender having selected in
+        // this agent's hearing.
+        let mut knowledge = Knowledge::new(id(ME), Role::Villager);
+        knowledge.observe(&observed(from(
+            "carol",
+            Message::Select(Select {
+                round: Round::FIRST,
+                kind: SessionKind::Nominate,
+                target: target("bob"),
+                seen_by: BTreeSet::new(),
+            }),
+        )));
+    }
+
+    #[test]
+    fn a_relay_carries_the_players_own_sequence_number() {
+        // The number in the envelope is the *player's*, which is what joins
+        // the relay back to the player's own action record (ADR-0017). The
+        // fold does not read it, so this is a claim about the message the
+        // moderator builds rather than about the state.
+        let Message::Relayed(envelope) = relayed(
+            "alice",
+            9,
+            Select {
+                round: Round::FIRST,
+                kind: SessionKind::Nominate,
+                target: target("bob"),
+                seen_by: BTreeSet::new(),
+            },
+        )
+        .payload
+        else {
+            panic!("a relay carries an envelope");
+        };
+        assert_eq!(
+            envelope,
+            Envelope::new("alice", 9, envelope.payload.clone())
+        );
     }
 
     #[test]
@@ -548,10 +670,10 @@ mod tests {
         let mut knowledge = Knowledge::new(id(ME), Role::Doctor);
         assert_eq!(knowledge.last_protected, None);
 
-        knowledge.acted(RequestKind::Protect, &target("alice"));
+        knowledge.acted(SessionKind::Protect, &target("alice"));
         assert_eq!(knowledge.last_protected, Some(id("alice")));
 
-        knowledge.acted(RequestKind::Protect, &target("bob"));
+        knowledge.acted(SessionKind::Protect, &target("bob"));
         assert_eq!(knowledge.last_protected, Some(id("bob")));
     }
 
@@ -562,14 +684,15 @@ mod tests {
         // watching its vote form.
         let mut knowledge = Knowledge::new(id(ME), Role::Villager);
         let selecting = |who: &str, target: &str| {
-            from(
+            relayed(
                 who,
-                Message::Select(Select {
+                0,
+                Select {
                     round: Round::new(1),
-                    kind: RequestKind::Nominate,
+                    kind: SessionKind::Nominate,
                     target: id(target),
                     seen_by: BTreeSet::new(),
-                }),
+                },
             )
         };
 
@@ -590,7 +713,7 @@ mod tests {
 
         // The agent's own selection is one of the phase's too, and it is the
         // one entry no forward could supply.
-        knowledge.acted(RequestKind::Nominate, &target("alice"));
+        knowledge.acted(SessionKind::Nominate, &target("alice"));
         assert_eq!(
             knowledge.selections,
             votes([
@@ -618,9 +741,9 @@ mod tests {
         // own.
         let before = folded(Role::Seer, &a_seers_game()[..8]);
         for kind in [
-            RequestKind::Nominate,
-            RequestKind::Devour,
-            RequestKind::Investigate,
+            SessionKind::Nominate,
+            SessionKind::Devour,
+            SessionKind::Investigate,
         ] {
             let mut after = before.clone();
             after.acted(kind, &target("alice"));
@@ -633,7 +756,7 @@ mod tests {
         }
 
         let mut protecting = before.clone();
-        protecting.acted(RequestKind::Protect, &target("alice"));
+        protecting.acted(SessionKind::Protect, &target("alice"));
         assert_eq!(protecting.selections.get(&id(ME)), Some(&id("alice")));
         assert_eq!(protecting.last_protected, Some(id("alice")));
     }
@@ -688,7 +811,7 @@ mod tests {
                 Phase::Night,
                 ids(["alice", "bob", ME]),
             )));
-            knowledge.acted(RequestKind::Protect, &target("alice"));
+            knowledge.acted(SessionKind::Protect, &target("alice"));
             knowledge.observe(&observed(narrated(Narration::NoDeath {
                 round: Round::new(1),
             })));
@@ -730,7 +853,7 @@ mod tests {
 
         knowledge.observe(&observed(phase_began(1, Phase::Day, living.clone())));
         knowledge.observe(&observed(nominated("alice", "bob", 1)));
-        knowledge.acted(RequestKind::Nominate, &target("alice"));
+        knowledge.acted(SessionKind::Nominate, &target("alice"));
         assert_eq!(
             knowledge.selections,
             votes([("alice", target("bob")), (ME, target("alice"))]),
