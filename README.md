@@ -83,11 +83,15 @@ lists the rest.
 
 ## Developing
 
-After cloning, run this once so that the checked-in pre-push hook runs
-before every push:
+After cloning, run this once so that the checked-in hooks run:
 
     git config core.hooksPath .githooks
 
-The hook runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`
-and `cargo test`, plus `cargo deny check` and `typos` when those tools are
-installed. CI runs the same checks on every push and pull request.
+The pre-push hook runs `cargo fmt --check`,
+`cargo clippy --all-targets -- -D warnings` and `cargo test`, plus
+`cargo deny check` and `typos` when those tools are installed. CI runs the
+same checks on every push and pull request.
+
+The pre-commit hook runs `typos` over the staged files alone, so a
+misspelling is caught on the commit that introduces it rather than at push
+time, when it means amending. Everything slower waits for the push.
