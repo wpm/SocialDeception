@@ -157,6 +157,51 @@ pub fn check(lines: &[Value], config: &Config) {
     play.check_rewards(lines);
 }
 
+/// Every member of every *night* session was counted: no night closed on
+/// a player the machine never got to.
+///
+/// This is **not** an invariant of Werewolf, and [`check`] does not run it.
+/// A member that never selects is abstaining (ADR-0011), which is legal,
+/// and a language-model player that spends too long thinking is abstaining
+/// in exactly the way the rules intend.
+///
+/// It is an invariant of *these tests*, where every player is a
+/// [`RandomStrategy`] that samples a list and cannot block. Such a player
+/// selects nowhere only when its action space is empty, and a player with
+/// an empty action space is not a member of the session at all — the
+/// moderator does not ask it (ADR-0014), and neither does
+/// [`members_of`](Play::members_of). So for a random game every member
+/// selects, always, and a member missing from a closed session did not
+/// choose to be missing: its thread was not scheduled inside the session's
+/// hard limit.
+///
+/// That is worth asserting because it is otherwise **silent**. The absent
+/// player is indistinguishable from one that abstained, so the session
+/// closes on a smaller field, a plurality falls differently, and the seed
+/// plays a different game that breaks no other invariant here and fails no
+/// assertion. The clocks in the integration tests are set with margin for
+/// exactly this reason; this is what notices when the margin was not
+/// enough.
+///
+/// The day is left out on purpose. It closes on a majority of the living
+/// rather than on its clock (ADR-0011), so a player that had not selected
+/// when the majority fell is unheard by the rules and not by the machine.
+/// A night has no such exit: it runs to its quiet period or its hard
+/// limit, so every member of it is expected to have been heard. That is
+/// also where a missed selection does damage, since it changes the
+/// plurality that decides who dies.
+///
+/// # Panics
+///
+/// If a night session closed with a member whose selection was never
+/// counted.
+// Live in the `werewolf` test binary and dead in `collatz_actor`, which
+// compiles this module too and reaches nothing in it.
+#[allow(dead_code, reason = "used by the werewolf test binary only")]
+pub fn check_everybody_was_heard(lines: &[Value], config: &Config) {
+    Play::read(lines, config).check_everybody_was_heard();
+}
+
 /// Every agent's records, the moderator's included, begin with a `Start`
 /// control and end with a `Stop`, and nobody is started or stopped twice.
 ///
@@ -637,6 +682,74 @@ impl<'a> Play<'a> {
                     .contains(who),
                 "a selection comes from a member of the session it names: {line}"
             );
+        }
+    }
+
+    /// Every member of every night session the game opened was heard. See
+    /// [`check_everybody_was_heard`](super::check_everybody_was_heard) for
+    /// why this holds only for a game of random players, and why it is
+    /// worth asserting separately.
+    ///
+    /// What counts as having been heard is read the way
+    /// [`leaders_of`](Seen::leaders_of) reads a session's votes, and for
+    /// the same reason. A forward is the moderator's record that it
+    /// counted a selection (ADR-0014), but it forwards only a selection
+    /// somebody else should see: a lone seer, doctor or werewolf selects
+    /// with an empty `seen_by`, and nothing is forwarded however promptly
+    /// it answered. Such a selection is counted as heard when the
+    /// moderator heard it before the phase ended, which is the same bound
+    /// `leaders_of` uses — a selection heard afterwards certainly lost its
+    /// race with the clock.
+    #[allow(dead_code, reason = "used by the werewolf test binary only")]
+    fn check_everybody_was_heard(&self) {
+        for (round, phase, began) in &self.phases {
+            let living = self.living_at(*began);
+            // The night's three kinds. `Nominate` is deliberately not
+            // among them: a day closes the moment a majority of the
+            // living agree (ADR-0011), so the members who had not yet
+            // selected are unheard by the rules rather than by the
+            // machine, and there is nothing here to assert. That is also
+            // the session a missed selection matters least in, since a
+            // selection that missed cannot have made the majority.
+            //
+            // Listed here rather than added to `SessionKind` as a
+            // constant: production code owes this check nothing.
+            let kinds = [
+                SessionKind::Devour,
+                SessionKind::Investigate,
+                SessionKind::Protect,
+            ];
+            for kind in kinds {
+                if kind.phase() != *phase {
+                    continue;
+                }
+                let members = self.members_of(kind, *round, &living);
+                if members.is_empty() {
+                    continue;
+                }
+                let mine = |selection: &Select| selection.round == *round && selection.kind == kind;
+                let ended = self.ended(*round, *phase).unwrap_or(usize::MAX);
+                let counted = self
+                    .forwarded
+                    .iter()
+                    .filter(|forwarded| mine(&forwarded.selection))
+                    .map(|forwarded| forwarded.from.clone());
+                let unseen = self
+                    .heard
+                    .iter()
+                    .filter(|heard| mine(&heard.selection) && heard.selection.seen_by.is_empty())
+                    .filter(|heard| heard.at < ended)
+                    .map(|heard| heard.from.clone());
+                let heard: BTreeSet<ActorId> = counted.chain(unseen).collect();
+                let missed: Vec<&ActorId> = members.difference(&heard).collect();
+                assert!(
+                    missed.is_empty(),
+                    "{kind:?} in round {round:?} closed without {missed:?}, who are members of \
+                     it and, being random players, always select: their threads were not \
+                     scheduled inside the session's hard limit, so this game is not the game \
+                     its seed names. Lower the concurrency or raise the limit."
+                );
+            }
         }
     }
 

@@ -183,6 +183,15 @@ fn read(path: &Path, config: &Config) -> Transcript {
 /// it. The outcome the run reported on its channel is checked against the
 /// one the moderator announced in world: the announcement is the record of
 /// truth, and the channel must agree.
+///
+/// Every game played here is a game of random players on the [`FAST`]
+/// clocks, so it is also held to
+/// [`check_everybody_was_heard`](support::werewolf::check_everybody_was_heard):
+/// no night of it closed on a player whose thread was not scheduled in
+/// time. That is a claim about this machine rather than about Werewolf,
+/// which is why it is asked for here and not inside
+/// [`support::werewolf::check`] — the fixture goes through `read` too, and
+/// a log is not required to have heard from everybody.
 fn run(config: &Config) -> Transcript {
     let dir = TempDir::new();
     let file = dir.join("werewolf.jsonl");
@@ -191,6 +200,8 @@ fn run(config: &Config) -> Transcript {
         ..config.clone()
     };
     let outcome = werewolf::run(&config, None).unwrap();
+    let lines = support::parse(&fs::read(&file).unwrap());
+    support::werewolf::check_everybody_was_heard(&lines, &config);
     let transcript = read(&file, &config);
     assert_eq!(
         transcript.outcome, outcome,
